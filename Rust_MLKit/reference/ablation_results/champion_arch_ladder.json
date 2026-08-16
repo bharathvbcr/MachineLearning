@@ -1,0 +1,27 @@
+{
+  "artifact_bytes": 1341003.0,
+  "calibrated_bpb": 1.9847424805646139,
+  "candidate": "gated_value_resid",
+  "env_overrides": {
+    "GATED_ATTENTION": "1",
+    "VALUE_RESIDUAL": "1"
+  },
+  "num_runs": 2,
+  "returncodes": [
+    0,
+    0
+  ],
+  "run_ids": [
+    "ablate_sota_arch_ladder_long_gated_value_resid_seed1337",
+    "ablate_sota_arch_ladder_long_gated_value_resid_seed42"
+  ],
+  "sanitized_env": [],
+  "seeds": [
+    1337,
+    42
+  ],
+  "sliding_bpb": 1.9879757699999998,
+  "stage": "long",
+  "step_avg_ms": 1441.175,
+  "suite": "sota_arch_ladder"
+}

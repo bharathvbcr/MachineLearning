@@ -1,0 +1,21 @@
+{
+  "checkpoint_version": 6,
+  "current_physical_mb": 13483.37020111084,
+  "dispatches": 1707,
+  "failures": [],
+  "grad_norm_delta": 0.0,
+  "loss_delta": 1.430511474609375e-6,
+  "optimizer": "muon_polar_adamw",
+  "parameter_count": 128367988,
+  "passed": true,
+  "resume_tolerances": {
+    "gradient_and_weight_atol": 0.00009999999747378752,
+    "loss_atol": 9.999999747378752e-6
+  },
+  "sampled_weight_max_delta": 2.5572371669113636e-6,
+  "schema_version": 1,
+  "swap_after_mb": 0.25,
+  "swap_before_mb": 0.25,
+  "swap_delta_mb": 0.0,
+  "swap_pressure": false
+}

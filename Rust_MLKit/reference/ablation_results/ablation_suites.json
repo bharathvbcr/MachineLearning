@@ -1,0 +1,854 @@
+{
+  "sota_local": {
+    "base_preset": "sota",
+    "ranking_metric": "calibrated_bpb",
+    "tie_breakers": [
+      "sliding_bpb",
+      "step_avg_ms",
+      "artifact_bytes"
+    ],
+    "stages": [
+      {
+        "name": "short",
+        "steps": 300,
+        "calib": true,
+        "calib_tokens": 16384,
+        "promote_top_k": 4
+      },
+      {
+        "name": "mid",
+        "steps": 1000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "promote_top_k": 3
+      },
+      {
+        "name": "long",
+        "steps": 3000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "seeds": [
+          1337,
+          42
+        ]
+      }
+    ],
+    "candidates": [
+      {
+        "name": "control",
+        "env": {}
+      },
+      {
+        "name": "clip_lo",
+        "env": {
+          "GRAD_CLIP_NORM": "0.25"
+        }
+      },
+      {
+        "name": "clip_hi",
+        "env": {
+          "GRAD_CLIP_NORM": "0.35"
+        }
+      },
+      {
+        "name": "muon_097",
+        "env": {
+          "MUON_MOMENTUM": "0.97"
+        }
+      },
+      {
+        "name": "lr_up",
+        "env": {
+          "MATRIX_LR": "0.027",
+          "SCALAR_LR": "0.027"
+        }
+      },
+      {
+        "name": "xsa_1",
+        "env": {
+          "XSA_MODE": "paper",
+          "XSA_LAST_N": "1"
+        }
+      },
+      {
+        "name": "xsa_3",
+        "env": {
+          "XSA_MODE": "paper",
+          "XSA_LAST_N": "3"
+        }
+      },
+      {
+        "name": "xsa_off",
+        "env": {
+          "XSA_MODE": "off"
+        }
+      },
+      {
+        "name": "lean_aux",
+        "env": {
+          "BIGRAM_DIM": "48",
+          "VE_DIM": "24"
+        }
+      }
+    ]
+  },
+  "sota_lean_followup": {
+    "base_preset": "sota",
+    "ranking_metric": "calibrated_bpb",
+    "tie_breakers": [
+      "sliding_bpb",
+      "step_avg_ms",
+      "artifact_bytes"
+    ],
+    "stages": [
+      {
+        "name": "short",
+        "steps": 300,
+        "calib": true,
+        "calib_tokens": 16384,
+        "promote_top_k": 4
+      },
+      {
+        "name": "mid",
+        "steps": 1000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "promote_top_k": 2
+      },
+      {
+        "name": "long",
+        "steps": 3000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "seeds": [
+          1337,
+          42
+        ]
+      }
+    ],
+    "candidates": [
+      {
+        "name": "control",
+        "env": {}
+      },
+      {
+        "name": "leaner_aux",
+        "env": {
+          "BIGRAM_DIM": "40",
+          "VE_DIM": "20"
+        }
+      },
+      {
+        "name": "aux_floor",
+        "env": {
+          "BIGRAM_DIM": "32",
+          "VE_DIM": "16"
+        }
+      },
+      {
+        "name": "lr_up",
+        "env": {
+          "MATRIX_LR": "0.027",
+          "SCALAR_LR": "0.027"
+        }
+      },
+      {
+        "name": "muon_097",
+        "env": {
+          "MUON_MOMENTUM": "0.97"
+        }
+      },
+      {
+        "name": "clip_hi",
+        "env": {
+          "GRAD_CLIP_NORM": "0.35"
+        }
+      },
+      {
+        "name": "xsa_off",
+        "env": {
+          "XSA_MODE": "off"
+        }
+      },
+      {
+        "name": "lr_up_xsa_off",
+        "env": {
+          "MATRIX_LR": "0.027",
+          "SCALAR_LR": "0.027",
+          "XSA_MODE": "off"
+        }
+      }
+    ]
+  },
+  "sota_depth_proxy": {
+    "base_preset": "sota",
+    "ranking_metric": "calibrated_bpb",
+    "tie_breakers": [
+      "sliding_bpb",
+      "artifact_bytes",
+      "step_avg_ms"
+    ],
+    "stages": [
+      {
+        "name": "short",
+        "steps": 300,
+        "calib": true,
+        "calib_tokens": 16384,
+        "promote_top_k": 4
+      },
+      {
+        "name": "mid",
+        "steps": 1000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "promote_top_k": 2
+      },
+      {
+        "name": "long",
+        "steps": 3000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "seeds": [
+          1337,
+          42
+        ]
+      }
+    ],
+    "candidates": [
+      {
+        "name": "control",
+        "env": {}
+      },
+      {
+        "name": "control_lr_up",
+        "env": {
+          "MATRIX_LR": "0.027",
+          "SCALAR_LR": "0.027"
+        }
+      },
+      {
+        "name": "d6_128_m3",
+        "env": {
+          "NUM_LAYERS": "6",
+          "MODEL_DIM": "128",
+          "MLP_MULT": "3.0"
+        }
+      },
+      {
+        "name": "d8_112_m3",
+        "env": {
+          "NUM_LAYERS": "8",
+          "MODEL_DIM": "112",
+          "MLP_MULT": "3.0"
+        }
+      },
+      {
+        "name": "d8_128_m26",
+        "env": {
+          "NUM_LAYERS": "8",
+          "MODEL_DIM": "128",
+          "MLP_MULT": "2.6"
+        }
+      },
+      {
+        "name": "d10_96_m3",
+        "env": {
+          "NUM_LAYERS": "10",
+          "MODEL_DIM": "96",
+          "MLP_MULT": "3.0"
+        }
+      },
+      {
+        "name": "d6_128_m3_lr_up",
+        "env": {
+          "NUM_LAYERS": "6",
+          "MODEL_DIM": "128",
+          "MLP_MULT": "3.0",
+          "MATRIX_LR": "0.027",
+          "SCALAR_LR": "0.027"
+        }
+      },
+      {
+        "name": "d8_112_m3_lr_up",
+        "env": {
+          "NUM_LAYERS": "8",
+          "MODEL_DIM": "112",
+          "MLP_MULT": "3.0",
+          "MATRIX_LR": "0.027",
+          "SCALAR_LR": "0.027"
+        }
+      }
+    ]
+  },
+  "sota_arch_ladder": {
+    "base_preset": "sota",
+    "ranking_metric": "calibrated_bpb",
+    "tie_breakers": [
+      "sliding_bpb",
+      "step_avg_ms",
+      "artifact_bytes"
+    ],
+    "stages": [
+      {
+        "name": "short",
+        "steps": 300,
+        "calib": true,
+        "calib_tokens": 16384,
+        "promote_top_k": 5
+      },
+      {
+        "name": "mid",
+        "steps": 1000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "promote_top_k": 3
+      },
+      {
+        "name": "long",
+        "steps": 3000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "seeds": [
+          1337,
+          42
+        ]
+      }
+    ],
+    "candidates": [
+      {
+        "name": "control",
+        "env": {}
+      },
+      {
+        "name": "kv1",
+        "env": {
+          "NUM_KV_HEADS": "1"
+        }
+      },
+      {
+        "name": "kv1_ln",
+        "env": {
+          "LN_SCALE": "1",
+          "NUM_KV_HEADS": "1"
+        }
+      },
+      {
+        "name": "kv1_lean_ve",
+        "env": {
+          "NUM_KV_HEADS": "1",
+          "VE_DIM": "16",
+          "VE_LAYERS": "2,3"
+        }
+      },
+      {
+        "name": "kv1_bigram64",
+        "env": {
+          "BIGRAM_DIM": "64",
+          "NUM_KV_HEADS": "1"
+        }
+      },
+      {
+        "name": "ve_mid",
+        "env": {
+          "VE_DIM": "16",
+          "VE_LAYERS": "1,2"
+        }
+      },
+      {
+        "name": "ve_late_wide",
+        "env": {
+          "VE_DIM": "32",
+          "VE_LAYERS": "2,3"
+        }
+      },
+      {
+        "name": "gated_attn",
+        "env": {
+          "GATED_ATTENTION": "1"
+        }
+      },
+      {
+        "name": "value_resid",
+        "env": {
+          "VALUE_RESIDUAL": "1"
+        }
+      },
+      {
+        "name": "gated_value_resid",
+        "env": {
+          "GATED_ATTENTION": "1",
+          "VALUE_RESIDUAL": "1"
+        }
+      },
+      {
+        "name": "recur_2x3",
+        "env": {
+          "ARCH_VARIANT": "recur_int6",
+          "RECUR_PASSES": "3",
+          "RECUR_UNIQUE_LAYERS": "2",
+          "NUM_LAYERS": "6",
+          "XSA_LAST_N": "2"
+        }
+      }
+    ]
+  },
+  "sota_arch_followup_value_resid": {
+    "base_preset": "sota",
+    "ranking_metric": "calibrated_bpb",
+    "tie_breakers": [
+      "sliding_bpb",
+      "step_avg_ms",
+      "artifact_bytes"
+    ],
+    "stages": [
+      {
+        "name": "short",
+        "steps": 300,
+        "calib": true,
+        "calib_tokens": 16384,
+        "promote_top_k": 4
+      },
+      {
+        "name": "mid",
+        "steps": 1000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "promote_top_k": 2
+      },
+      {
+        "name": "long",
+        "steps": 3000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "seeds": [
+          1337,
+          42
+        ]
+      }
+    ],
+    "candidates": [
+      {
+        "name": "value_resid",
+        "env": {
+          "VALUE_RESIDUAL": "1"
+        }
+      },
+      {
+        "name": "value_resid_kv1",
+        "env": {
+          "NUM_KV_HEADS": "1",
+          "VALUE_RESIDUAL": "1"
+        }
+      },
+      {
+        "name": "value_resid_kv1_ln",
+        "env": {
+          "LN_SCALE": "1",
+          "NUM_KV_HEADS": "1",
+          "VALUE_RESIDUAL": "1"
+        }
+      },
+      {
+        "name": "value_resid_ve_mid",
+        "env": {
+          "VALUE_RESIDUAL": "1",
+          "VE_DIM": "16",
+          "VE_LAYERS": "1,2"
+        }
+      },
+      {
+        "name": "value_resid_ve_late",
+        "env": {
+          "VALUE_RESIDUAL": "1",
+          "VE_DIM": "16",
+          "VE_LAYERS": "2,3"
+        }
+      },
+      {
+        "name": "gated_value_resid",
+        "env": {
+          "GATED_ATTENTION": "1",
+          "VALUE_RESIDUAL": "1"
+        }
+      },
+      {
+        "name": "gated_value_resid_kv1",
+        "env": {
+          "GATED_ATTENTION": "1",
+          "NUM_KV_HEADS": "1",
+          "VALUE_RESIDUAL": "1"
+        }
+      },
+      {
+        "name": "gated_value_resid_kv1_ln",
+        "env": {
+          "GATED_ATTENTION": "1",
+          "LN_SCALE": "1",
+          "NUM_KV_HEADS": "1",
+          "VALUE_RESIDUAL": "1"
+        }
+      },
+      {
+        "name": "gated_value_resid_xsa1",
+        "env": {
+          "GATED_ATTENTION": "1",
+          "VALUE_RESIDUAL": "1",
+          "XSA_LAST_N": "1"
+        }
+      },
+      {
+        "name": "gated_value_resid_xsa3",
+        "env": {
+          "GATED_ATTENTION": "1",
+          "VALUE_RESIDUAL": "1",
+          "XSA_LAST_N": "3"
+        }
+      },
+      {
+        "name": "gated_value_resid_ve_mid",
+        "env": {
+          "GATED_ATTENTION": "1",
+          "VALUE_RESIDUAL": "1",
+          "VE_DIM": "16",
+          "VE_LAYERS": "1,2"
+        }
+      },
+      {
+        "name": "gated_value_resid_ve_late",
+        "env": {
+          "GATED_ATTENTION": "1",
+          "VALUE_RESIDUAL": "1",
+          "VE_DIM": "16",
+          "VE_LAYERS": "2,3"
+        }
+      }
+    ]
+  },
+  "sota_h100_depth": {
+    "runner": "sprint",
+    "script": "train_gpt_sprint.py",
+    "ranking_metric": "calibrated_bpb",
+    "tie_breakers": [
+      "sliding_bpb",
+      "artifact_bytes",
+      "step_avg_ms"
+    ],
+    "base_env": {
+      "BIGRAM_DIM": "48",
+      "BIGRAM_VOCAB_SIZE": "2048",
+      "COMPILE_POLICY": "auto",
+      "MODEL_DIM": "512",
+      "NUM_HEADS": "8",
+      "NUM_KV_HEADS": "4",
+      "PYTHONUNBUFFERED": "1",
+      "VE_DIM": "24",
+      "VE_ENABLED": "1",
+      "WINDOWS_SAFE_MODE": "0",
+      "XSA_LAST_N": "4",
+      "XSA_MODE": "paper"
+    },
+    "stages": [
+      {
+        "name": "timing",
+        "steps": 400,
+        "calib": false,
+        "max_wallclock_seconds": 120,
+        "promote_top_k": 4
+      },
+      {
+        "name": "full",
+        "steps": 20000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "max_wallclock_seconds": 600
+      }
+    ],
+    "candidates": [
+      {
+        "name": "10L_m26",
+        "env": {
+          "NUM_LAYERS": "10",
+          "MLP_MULT": "2.6"
+        }
+      },
+      {
+        "name": "10L_m30",
+        "env": {
+          "NUM_LAYERS": "10",
+          "MLP_MULT": "3.0"
+        }
+      },
+      {
+        "name": "11L_m26",
+        "env": {
+          "NUM_LAYERS": "11",
+          "MLP_MULT": "2.6"
+        }
+      },
+      {
+        "name": "11L_m30",
+        "env": {
+          "NUM_LAYERS": "11",
+          "MLP_MULT": "3.0"
+        }
+      }
+    ]
+  },
+  "sota_ttt_optimizer": {
+    "runner": "sprint",
+    "script": "train_gpt_sprint.py",
+    "ranking_metric": "calibrated_bpb",
+    "tie_breakers": [
+      "sliding_bpb",
+      "artifact_bytes",
+      "step_avg_ms"
+    ],
+    "base_env": {
+      "BIGRAM_DIM": "48",
+      "BIGRAM_VOCAB_SIZE": "2048",
+      "COMPILE_POLICY": "auto",
+      "MLP_MULT": "3.0",
+      "MODEL_DIM": "512",
+      "NUM_HEADS": "8",
+      "NUM_KV_HEADS": "4",
+      "NUM_LAYERS": "11",
+      "PYTHONUNBUFFERED": "1",
+      "VE_DIM": "24",
+      "VE_ENABLED": "1",
+      "WINDOWS_SAFE_MODE": "0",
+      "XSA_LAST_N": "4",
+      "XSA_MODE": "paper"
+    },
+    "stages": [
+      {
+        "name": "timing",
+        "steps": 400,
+        "calib": false,
+        "max_wallclock_seconds": 120,
+        "promote_top_k": 6
+      },
+      {
+        "name": "full",
+        "steps": 20000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "max_wallclock_seconds": 600,
+        "seeds": [
+          1337,
+          42
+        ]
+      }
+    ],
+    "candidates": [
+      {
+        "name": "control",
+        "env": {}
+      },
+      {
+        "name": "lr_up",
+        "env": {
+          "MATRIX_LR": "0.027",
+          "SCALAR_LR": "0.027"
+        }
+      },
+      {
+        "name": "muon_097",
+        "env": {
+          "MUON_MOMENTUM": "0.97"
+        }
+      },
+      {
+        "name": "clip_hi",
+        "env": {
+          "GRAD_CLIP_NORM": "0.35"
+        }
+      },
+      {
+        "name": "lr_up_muon_097",
+        "env": {
+          "MATRIX_LR": "0.027",
+          "MUON_MOMENTUM": "0.97",
+          "SCALAR_LR": "0.027"
+        }
+      },
+      {
+        "name": "lr_up_clip_hi",
+        "env": {
+          "GRAD_CLIP_NORM": "0.35",
+          "MATRIX_LR": "0.027",
+          "SCALAR_LR": "0.027"
+        }
+      },
+      {
+        "name": "ttt_base",
+        "env": {
+          "TTT_BATCH_SEQS": "32",
+          "TTT_CHUNK_TOKENS": "32768",
+          "TTT_ENABLED": "1",
+          "TTT_EPOCHS": "2",
+          "TTT_FREEZE_BLOCKS": "2",
+          "TTT_GRAD_CLIP": "1.0",
+          "TTT_LR": "0.002"
+        }
+      },
+      {
+        "name": "ttt_conservative",
+        "env": {
+          "TTT_BATCH_SEQS": "16",
+          "TTT_CHUNK_TOKENS": "16384",
+          "TTT_ENABLED": "1",
+          "TTT_EPOCHS": "1",
+          "TTT_FREEZE_BLOCKS": "4",
+          "TTT_GRAD_CLIP": "1.0",
+          "TTT_LR": "0.0015"
+        }
+      },
+      {
+        "name": "ttt_base_lr_up",
+        "env": {
+          "MATRIX_LR": "0.027",
+          "SCALAR_LR": "0.027",
+          "TTT_BATCH_SEQS": "32",
+          "TTT_CHUNK_TOKENS": "32768",
+          "TTT_ENABLED": "1",
+          "TTT_EPOCHS": "2",
+          "TTT_FREEZE_BLOCKS": "2",
+          "TTT_GRAD_CLIP": "1.0",
+          "TTT_LR": "0.002"
+        }
+      },
+      {
+        "name": "ttt_base_muon_097",
+        "env": {
+          "MUON_MOMENTUM": "0.97",
+          "TTT_BATCH_SEQS": "32",
+          "TTT_CHUNK_TOKENS": "32768",
+          "TTT_ENABLED": "1",
+          "TTT_EPOCHS": "2",
+          "TTT_FREEZE_BLOCKS": "2",
+          "TTT_GRAD_CLIP": "1.0",
+          "TTT_LR": "0.002"
+        }
+      }
+    ]
+  },
+  "sota_qat_export": {
+    "runner": "sprint",
+    "script": "train_gpt_sprint.py",
+    "ranking_metric": "calibrated_bpb",
+    "tie_breakers": [
+      "sliding_bpb",
+      "artifact_bytes",
+      "step_avg_ms"
+    ],
+    "base_env": {
+      "BIGRAM_DIM": "48",
+      "BIGRAM_VOCAB_SIZE": "2048",
+      "COMPILE_POLICY": "auto",
+      "MLP_MULT": "3.0",
+      "MODEL_DIM": "512",
+      "NUM_HEADS": "8",
+      "NUM_KV_HEADS": "4",
+      "NUM_LAYERS": "11",
+      "PYTHONUNBUFFERED": "1",
+      "VE_DIM": "24",
+      "VE_ENABLED": "1",
+      "WINDOWS_SAFE_MODE": "0",
+      "XSA_LAST_N": "4",
+      "XSA_MODE": "paper"
+    },
+    "stages": [
+      {
+        "name": "timing",
+        "steps": 400,
+        "calib": false,
+        "max_wallclock_seconds": 120,
+        "promote_top_k": 6
+      },
+      {
+        "name": "full",
+        "steps": 20000,
+        "calib": true,
+        "calib_tokens": 65536,
+        "max_wallclock_seconds": 600,
+        "seeds": [
+          1337,
+          42
+        ]
+      }
+    ],
+    "candidates": [
+      {
+        "name": "control",
+        "env": {}
+      },
+      {
+        "name": "qat_010",
+        "env": {
+          "QAT_ENABLED": "1",
+          "LATE_QAT_THRESHOLD": "0.10"
+        }
+      },
+      {
+        "name": "qat_012",
+        "env": {
+          "QAT_ENABLED": "1",
+          "LATE_QAT_THRESHOLD": "0.12"
+        }
+      },
+      {
+        "name": "qat_015",
+        "env": {
+          "QAT_ENABLED": "1",
+          "LATE_QAT_THRESHOLD": "0.15"
+        }
+      },
+      {
+        "name": "int6_clip_a",
+        "env": {
+          "INT6_CLIP_PCTS": "0.999,1.0"
+        }
+      },
+      {
+        "name": "int6_clip_b",
+        "env": {
+          "INT6_CLIP_PCTS": "0.995,0.999,1.0"
+        }
+      },
+      {
+        "name": "int6_clip_c",
+        "env": {
+          "INT6_CLIP_PCTS": "0.99,0.995,0.999,1.0"
+        }
+      },
+      {
+        "name": "int8_clip_999",
+        "env": {
+          "INT8_CLIP_PERCENTILE": "99.9"
+        }
+      },
+      {
+        "name": "int8_clip_9995",
+        "env": {
+          "INT8_CLIP_PERCENTILE": "99.95"
+        }
+      },
+      {
+        "name": "qat_012_int6_clip_b",
+        "env": {
+          "INT6_CLIP_PCTS": "0.995,0.999,1.0",
+          "LATE_QAT_THRESHOLD": "0.12",
+          "QAT_ENABLED": "1"
+        }
+      },
+      {
+        "name": "qat_012_int8_clip_9995",
+        "env": {
+          "INT8_CLIP_PERCENTILE": "99.95",
+          "LATE_QAT_THRESHOLD": "0.12",
+          "QAT_ENABLED": "1"
+        }
+      }
+    ]
+  }
+}

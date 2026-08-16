@@ -1,0 +1,18 @@
+{
+  "checkpoint_version": 6,
+  "current_physical_mb": 13477.573280334473,
+  "dispatches": 1707,
+  "grad_norm_delta": 7.152557373046875e-7,
+  "loss_delta": 0.0,
+  "optimizer": "muon_ns5_adamw",
+  "parameter_count": 128367988,
+  "passed": true,
+  "resume_tolerances": {
+    "gradient_and_weight_atol": 0.00009999999747378752,
+    "loss_atol": 9.999999747378752e-6
+  },
+  "sampled_weight_max_delta": 2.4109904188662767e-6,
+  "schema_version": 1,
+  "swap_after_mb": 0.0,
+  "swap_before_mb": 0.0
+}

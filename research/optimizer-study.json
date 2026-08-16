@@ -1,0 +1,239 @@
+{
+  "schema_version": 1,
+  "selection_metric": "mean_validation_bpb_at_equal_tokens",
+  "tie_breakers": [
+    "time_to_loss",
+    "current_footprint",
+    "step_time"
+  ],
+  "hard_gates": {
+    "exact_resume": true,
+    "max_current_footprint_gib": 52,
+    "swap_pressure": false,
+    "silent_fallback": false,
+    "soft_split_clip": {
+      "muon_scale": "sqrt(c)",
+      "adaptive_scale": "c",
+      "global_threshold": 0.3
+    }
+  },
+  "required_metrics": [
+    "optimizer_ms",
+    "step_ms",
+    "validation_bpb",
+    "gradient_norm_by_role",
+    "update_norm_by_role",
+    "orthogonality_error",
+    "row_drift",
+    "spectral_drift",
+    "current_footprint",
+    "numerical_failures"
+  ],
+  "candidates": [
+    {
+      "name": "muon_ns5_adamw",
+      "family": "muon_hybrid",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://github.com/KellerJordan/Muon",
+      "native_block_reason": null
+    },
+    {
+      "name": "muon_ns3_adamw",
+      "family": "muon_hybrid",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://github.com/KellerJordan/Muon",
+      "native_block_reason": null
+    },
+    {
+      "name": "muon_polar_adamw",
+      "family": "muon_hybrid",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://arxiv.org/abs/2505.16932",
+      "native_block_reason": null
+    },
+    {
+      "name": "normuon_adamw",
+      "family": "muon_hybrid",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://github.com/zichongli5/NorMuon",
+      "native_block_reason": null
+    },
+    {
+      "name": "muown_adamw",
+      "family": "muon_hybrid",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://arxiv.org/abs/2605.10797",
+      "native_block_reason": null
+    },
+    {
+      "name": "mona_adamw",
+      "family": "muon_hybrid",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://arxiv.org/abs/2605.26842",
+      "native_block_reason": null
+    },
+    {
+      "name": "mimuon_adamw",
+      "family": "muon_hybrid",
+      "oracle_ready": true,
+      "native_ready": false,
+      "source": "https://arxiv.org/abs/2605.19619",
+      "native_block_reason": "Exact singular-gap routing requires per-matrix SVD; Metal/MPS exposes no GPU SVD/eigensolver, and an Accelerate fallback would force a host synchronization."
+    },
+    {
+      "name": "adamw",
+      "family": "full_parameter",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://arxiv.org/abs/1711.05101",
+      "native_block_reason": null
+    },
+    {
+      "name": "lion",
+      "family": "full_parameter",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://arxiv.org/abs/2302.06675",
+      "native_block_reason": null
+    },
+    {
+      "name": "cautious_adamw",
+      "family": "full_parameter",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://github.com/kyleliang919/C-Optim",
+      "native_block_reason": null
+    },
+    {
+      "name": "cautious_lion",
+      "family": "full_parameter",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://github.com/kyleliang919/C-Optim",
+      "native_block_reason": null
+    },
+    {
+      "name": "sgd_momentum",
+      "family": "full_parameter",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://pytorch.org/docs/stable/generated/torch.optim.SGD.html",
+      "native_block_reason": null
+    },
+    {
+      "name": "sophia",
+      "family": "full_parameter",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://arxiv.org/abs/2305.14342",
+      "native_block_reason": null
+    },
+    {
+      "name": "schedule_free_adamw",
+      "family": "full_parameter",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://github.com/facebookresearch/schedule_free",
+      "native_block_reason": null
+    },
+    {
+      "name": "prodigy",
+      "family": "full_parameter",
+      "oracle_ready": true,
+      "native_ready": true,
+      "source": "https://github.com/konstmish/prodigy",
+      "native_block_reason": null
+    },
+    {
+      "name": "soap_adamw",
+      "family": "full_parameter",
+      "oracle_ready": true,
+      "native_ready": false,
+      "source": "https://github.com/nikhilvyas/SOAP",
+      "native_block_reason": "Exact SOAP basis refresh requires symmetric eigendecomposition; Metal/MPS exposes no GPU eigensolver, and a CPU LAPACK fallback violates the no-forced-sync gate."
+    }
+  ],
+  "stages": [
+    {
+      "name": "toy_numerics",
+      "model": "toy",
+      "steps": 20,
+      "seeds": [
+        1337
+      ],
+      "candidates": "all"
+    },
+    {
+      "name": "lr_sweep_16m",
+      "model": "arch02-16m",
+      "steps": 100,
+      "seeds": [
+        1337
+      ],
+      "lr_multipliers": [
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        4.0
+      ],
+      "candidates": "native_ready"
+    },
+    {
+      "name": "stable_500",
+      "model": "arch02-16m",
+      "steps": 500,
+      "seeds": [
+        1337
+      ],
+      "candidates": "stable_after_lr_sweep"
+    },
+    {
+      "name": "advance_1000",
+      "model": "arch02-16m",
+      "steps": 1000,
+      "seeds": [
+        42,
+        2026
+      ],
+      "candidates": "best_validation_plus_adamw_and_muon"
+    },
+    {
+      "name": "exact_128m_500",
+      "model": "arch02-128m",
+      "steps": 500,
+      "seeds": [
+        1337
+      ],
+      "candidates": "top_four"
+    },
+    {
+      "name": "exact_128m_1000",
+      "model": "arch02-128m",
+      "steps": 1000,
+      "seeds": [
+        42,
+        2026
+      ],
+      "candidates": "top_two"
+    },
+    {
+      "name": "champion_128m_2000",
+      "model": "arch02-128m",
+      "steps": 2000,
+      "seeds": [
+        1337
+      ],
+      "candidates": "winner",
+      "final_warmdown": 350,
+      "eval_every": 250,
+      "checkpoint_every": 250
+    }
+  ]
+}

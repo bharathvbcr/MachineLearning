@@ -1,0 +1,22 @@
+# nanolab — modern small-LM training guide companion
+# Core (required)
+torch>=2.2           # CUDA build for GPU; CPU build is enough for cpu_smoke
+numpy>=1.24
+tiktoken>=0.5        # GPT-2 BPE tokenizer
+
+# Data (Phase 0/1 real datasets; not needed for char shakespeare / cpu_smoke)
+datasets>=2.16       # HuggingFace: TinyStories, FineWeb-edu, OpenWebText, Cosmopedia
+
+# Optional instrumentation (guide §6.1) — enable with WANDB=1
+# wandb>=0.16
+
+# Optional fast recurrent kernels (guide §2.5). nanolab's mamba2/gdn are
+# pure-PyTorch references and do NOT need these; install only to swap in the
+# fused paths.
+# mamba-ssm
+# causal-conv1d
+# flash-linear-attention
+
+# Optional single-GPU systems speedups (guide §7). Ampere+ only.
+# flash-attn
+# liger-kernel

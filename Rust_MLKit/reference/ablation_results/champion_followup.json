@@ -1,0 +1,27 @@
+{
+  "artifact_bytes": null,
+  "calibrated_bpb": null,
+  "candidate": "gated_value_resid",
+  "env_overrides": {
+    "GATED_ATTENTION": "1",
+    "VALUE_RESIDUAL": "1"
+  },
+  "num_runs": 2,
+  "returncodes": [
+    1,
+    1
+  ],
+  "run_ids": [
+    "ablate_sota_arch_followup_value_resid_long_gated_value_resid_seed1337",
+    "ablate_sota_arch_followup_value_resid_long_gated_value_resid_seed42"
+  ],
+  "sanitized_env": [],
+  "seeds": [
+    1337,
+    42
+  ],
+  "sliding_bpb": null,
+  "stage": "long",
+  "step_avg_ms": null,
+  "suite": "sota_arch_followup_value_resid"
+}
