@@ -254,6 +254,10 @@ Run:
 python3 scripts/bench_qwen38.py --arms all --repeat 3 --max-tokens 256
 ```
 
+Any arm whose weights are not in the local HF cache is **skipped, not silently fetched** — a
+benchmark should not be the thing that fills a disk. The skip is recorded in the run's preflight
+notes, so an artifact always says what it did not measure. Pass `--allow-download` to fetch.
+
 Arms:
 
 | Arm | Class | What it tests |
@@ -262,7 +266,7 @@ Arms:
 | `mtp` | lossless | + official MTP drafter (same checkpoint, block size 3) |
 | `dflash` | lossless | + 3.6 DFlash drafter cross-applied (block size 16) |
 | `dspark` | lossless | + 3.8-native DSpark drafter on the 4-bit target (mlx-dspark) |
-| `dspark-8bit` | max-throughput | 8-bit target + RadixArk DSpark — different quant, quality NOT held constant |
+| `dspark-8bit` | max-throughput | 8-bit target + RadixArk DSpark — different quant, quality NOT held constant. **Gated:** its ~30 GB of weights are not kept locally (measured and rejected, §4b-iii), so it is skipped unless `--allow-download` is passed. |
 | `nvfp4-mtp` | max-throughput | NVFP4 target + NVFP4 MTP drafter |
 | `ollama` | max-throughput | `qwen3.8:27b-mlx` |
 

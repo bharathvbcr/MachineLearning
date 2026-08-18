@@ -182,6 +182,31 @@ check("B17 per-round value never rendered as a percentage",
 check("B18 acceptance genuinely absent is still INCONCLUSIVE",
       "INCONCLUSIVE" in vt([arm("ar", tok=11.0), arm("dspark", tok=29.9)]))
 
+print("\n=== B-GATE. DOWNLOAD GATE ===")
+# An arm whose weights are absent downloads them mid-run. `dspark-8bit` pulls ~30 GB,
+# so `--arms all` used to mean "and also fill the disk". The gate is injected a cached
+# set so these stay pure — no network, no cache scan.
+ALL_CACHED = {"mlx-community/Qwen3.8-27B-4bit", "mlx-community/Qwen3.8-27B-MTP-4bit",
+              "z-lab/Qwen3.6-27B-DFlash", "DimInfer/Qwen3.8-27B-Dspark-v1",
+              "mlx-community/Qwen3.8-27B-8bit", "RadixArk/Qwen3.8-27B-DSpark",
+              "mlx-community/Qwen3.8-27B-nvfp4", "mlx-community/Qwen3.8-27B-MTP-nvfp4"}
+NO_8BIT = ALL_CACHED - {"mlx-community/Qwen3.8-27B-8bit", "RadixArk/Qwen3.8-27B-DSpark"}
+
+runnable, gnotes = m.gate_uncached(["ar", "mtp", "dspark", "dspark-8bit"], NO_8BIT)
+check("B-G1 uncached arm is skipped", "dspark-8bit" not in runnable)
+check("B-G2 cached arms still run", runnable == ["ar", "mtp", "dspark"])
+check("B-G3 skip note names the missing repo and the escape hatch",
+      any("Qwen3.8-27B-8bit" in n and "--allow-download" in n for n in gnotes))
+check("B-G4 nothing skipped when everything is cached",
+      m.gate_uncached(["ar", "mtp", "dspark-8bit"], ALL_CACHED) == (["ar", "mtp", "dspark-8bit"], []))
+check("B-G5 ollama is never gated on an HF cache it does not use",
+      m.gate_uncached(["ollama"], set()) == (["ollama"], []))
+check("B-G6 gate is silent for arms with no draft repo",
+      m.gate_uncached(["ar"], {"mlx-community/Qwen3.8-27B-4bit"}) == (["ar"], []))
+check("B-G7 both target and draft are checked",
+      set(m.repos_for_arm("dspark-8bit")) ==
+      {"mlx-community/Qwen3.8-27B-8bit", "RadixArk/Qwen3.8-27B-DSpark"})
+
 print("\n=== C. CORRECTNESS GATE ===")
 fake_dflash(BAD)
 b = m.correctness_blockers(["ar", "dflash"])

@@ -319,6 +319,48 @@ ARM_META = {
 
 
 # --------------------------------------------------------------------------- #
+# Download gate
+# --------------------------------------------------------------------------- #
+
+# An arm whose weights are not cached will fetch them mid-run: `dspark-8bit` pulls
+# ~30 GB before it prints a single token. Gate the whole class rather than that one
+# arm — a benchmark should never be the thing that fills a disk, and the arm that
+# happens to be large today is not the one that will be large tomorrow.
+
+def repos_for_arm(arm: str):
+    """HF repo ids an arm needs locally. Local paths and non-HF targets excluded."""
+    kind, _label, target, draft = ARM_META[arm]
+    candidates = [c for c in (target, draft) if c]
+    # `ollama` names an ollama tag, not an HF repo; ollama manages its own store.
+    if arm == "ollama":
+        return []
+    return [c for c in candidates if "/" in c and not Path(c).exists()]
+
+
+def cached_repo_ids():
+    """Repo ids present in the local HF cache."""
+    from huggingface_hub import scan_cache_dir
+    try:
+        return {r.repo_id for r in scan_cache_dir().repos}
+    except Exception:
+        return set()
+
+
+def gate_uncached(arms, cached):
+    """(runnable_arms, notes). Pure: `cached` is injected so this is testable."""
+    runnable, notes = [], []
+    for a in arms:
+        missing = [r for r in repos_for_arm(a) if r not in cached]
+        if missing:
+            notes.append(
+                f"SKIPPED [{a}]: weights not in the local HF cache ({', '.join(missing)}). "
+                "Running it would download them mid-benchmark. Pass --allow-download to fetch.")
+        else:
+            runnable.append(a)
+    return runnable, notes
+
+
+# --------------------------------------------------------------------------- #
 # Preflight
 # --------------------------------------------------------------------------- #
 
@@ -720,6 +762,10 @@ def main():
                         "after ~2-3 min; too short a cooldown flatters whichever arm runs first.")
     p.add_argument("--timeout", type=int, default=1800, help="Per-run timeout in seconds.")
     p.add_argument("--outdir", type=str, default=None)
+    p.add_argument("--allow-download", action="store_true",
+                   help="Permit arms whose weights are not in the local HF cache to download "
+                        "them. Without this, such arms are skipped rather than silently "
+                        "pulling multi-GB checkpoints mid-run (`dspark-8bit` fetches ~30 GB).")
     p.add_argument("--strict", action="store_true",
                    help="Exit non-zero instead of running when a correctness blocker is "
                         "present (e.g. a dflash-mlx build whose verifier is known wrong). "
@@ -744,8 +790,18 @@ def main():
     if any(ARM_META[a][0] == "lossless" for a in arms) and "ar" not in arms:
         arms.insert(0, "ar")
 
+    gate_notes = []
+    if not args.allow_download:
+        arms, gate_notes = gate_uncached(arms, cached_repo_ids())
+        if not arms:
+            print("\nEvery requested arm needs weights that are not cached:", file=sys.stderr)
+            for n in gate_notes:
+                print(f"  {n}", file=sys.stderr)
+            sys.exit(2)
+
     print(f"\nArms: {arms}")
     notes, blockers = preflight(arms, args.max_tokens)
+    notes = gate_notes + notes
     if notes:
         print("\nPreflight:")
         for n in notes:
