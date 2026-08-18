@@ -18,6 +18,23 @@ from dflash_guard import warn_unless_lossless  # noqa: E402
 DEFAULT_TARGET_MODEL = "mlx-community/Qwen3.8-27B-4bit"
 DEFAULT_MTP_DRAFT = "mlx-community/Qwen3.8-27B-MTP-4bit"
 DEFAULT_DFLASH_DRAFT = "z-lab/Qwen3.6-27B-DFlash"
+# 3.8-native DSpark drafter for the 4-bit target. Measured 2026-08-17: 31.20 tok/s
+# (1.84x, lossless — verified byte-identical against AR), against the cross-applied
+# 3.6 DFlash drafter's 1.17x. Second to MTP's 36.91, and the better non-MTP path.
+DEFAULT_DSPARK_DRAFT = "DimInfer/Qwen3.8-27B-Dspark-v1"
+
+
+def resolve_drafter(repo: str) -> str:
+    """Resolve a drafter repo to a local directory, weight files only.
+
+    Canonical owner for this: `scripts/bench_qwen38.py` imports it rather than
+    keeping a second copy. mlx-dspark resolves a bare `--drafter` repo id with a
+    full snapshot_download, which on DimInfer drags down 5.7 GB of GGUFs beside the
+    3.7 GB safetensors — files nothing in this repo loads, re-attempted on every
+    start until they complete. Already-cached weights make this a no-op.
+    """
+    from huggingface_hub import snapshot_download
+    return snapshot_download(repo, allow_patterns=["*.json", "*.safetensors", "*.md"])
 
 # mlx-vlm's server defaults to 2048 output tokens and truncates silently — no
 # error, no finish_reason=length surfaced to the caller. A coding agent asked to
@@ -85,6 +102,36 @@ def serve_dflash(model: str, draft: Optional[str] = None, host: str = "127.0.0.1
     print(f"Command: {' '.join(cmd)}")
     subprocess.run(cmd)
 
+def serve_dspark(model: str, draft: Optional[str] = None, host: str = "127.0.0.1", port: int = 8000,
+                 prefix_cache: bool = True, max_tokens: int = DEFAULT_MAX_TOKENS) -> None:
+    print(f"\n{'='*70}")
+    print(f"[Starting DSpark Speculative Decoding Server]")
+    print(f"  Target Model: {model}")
+    print(f"  Draft Model : {draft or DEFAULT_DSPARK_DRAFT}")
+    print(f"  Host:Port   : http://{host}:{port}")
+    print(f"  Prefix Cache: {'Enabled' if prefix_cache else 'Disabled'}")
+    print(f"{'='*70}\n")
+
+    # No losslessness guard here, unlike the dflash path: that guard exists for a
+    # specific dflash-mlx verifier bug, not as a general speculative-decoding gate.
+    # mlx-dspark 0.12.2 was checked directly on this target — greedy output matched
+    # the AR baseline character for character (docs/qwen_mlx_dflash_guide.md 4b-iii).
+    cmd = [
+        "mlx-dspark", "serve",
+        "--model", model,
+        "--mode", "dspark",
+        "--drafter", resolve_drafter(draft or DEFAULT_DSPARK_DRAFT),
+        "--host", host,
+        "--port", str(port),
+        "--default-max-tokens", str(max_tokens),
+    ]
+    if not prefix_cache:
+        cmd.append("--no-prefix-cache")
+
+    print(f"Command: {' '.join(cmd)}")
+    subprocess.run(cmd)
+
+
 def serve_mlx_lm(model: str, host: str = "127.0.0.1", port: int = 8000,
                  max_tokens: int = DEFAULT_MAX_TOKENS) -> None:
     print(f"\n{'='*70}")
@@ -105,9 +152,12 @@ def serve_mlx_lm(model: str, host: str = "127.0.0.1", port: int = 8000,
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve Qwen models with OpenAI-compatible API on Apple Silicon.")
-    parser.add_argument("--backend", type=str, choices=["mlx-vlm", "dflash", "mlx-lm"], default="mlx-vlm",
-                        help="Serving backend. mlx-vlm = Qwen3.8 + official MTP drafter (also serves vision); "
-                             "dflash = block-diffusion drafter; mlx-lm = plain AR baseline.")
+    parser.add_argument("--backend", type=str, choices=["mlx-vlm", "dspark", "dflash", "mlx-lm"],
+                        default="mlx-vlm",
+                        help="Serving backend. mlx-vlm = Qwen3.8 + official MTP drafter, the measured "
+                             "fastest (36.91 tok/s, 2.18x) and the default; dspark = 3.8-native DSpark "
+                             "drafter (31.20 tok/s, 1.84x, lossless); dflash = 3.6 drafter cross-applied "
+                             "(1.17x, superseded by dspark); mlx-lm = plain AR baseline.")
     parser.add_argument("--model", type=str, default=DEFAULT_TARGET_MODEL,
                         help=f"Model repository or local path (default: {DEFAULT_TARGET_MODEL}).")
     parser.add_argument("--draft", type=str, default=None,
@@ -117,7 +167,7 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
                         help=f"Max output tokens per response (default: {DEFAULT_MAX_TOKENS}). "
                              "The mlx-vlm default of 2048 truncates long agent edits silently.")
-    parser.add_argument("--no-prefix-cache", action="store_true", help="Disable prefix cache in DFlash.")
+    parser.add_argument("--no-prefix-cache", action="store_true", help="Disable prefix cache (dflash and dspark backends).")
     args = parser.parse_args()
 
     draft = None if args.draft == "none" else args.draft
@@ -125,6 +175,9 @@ def main() -> None:
     if args.backend == "mlx-vlm":
         serve_mlx_vlm(args.model, draft=draft or DEFAULT_MTP_DRAFT, host=args.host, port=args.port,
                       max_tokens=args.max_tokens)
+    elif args.backend == "dspark":
+        serve_dspark(args.model, draft=draft, host=args.host, port=args.port,
+                     prefix_cache=not args.no_prefix_cache, max_tokens=args.max_tokens)
     elif args.backend == "dflash":
         # Explicit draft required: the dflash registry has no Qwen3.8 entry.
         serve_dflash(args.model, draft=draft or DEFAULT_DFLASH_DRAFT, host=args.host,

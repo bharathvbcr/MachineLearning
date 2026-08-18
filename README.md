@@ -169,6 +169,13 @@ Measured on M5 Pro 64 GB (2026-08-16): the official MTP drafter gives **2.26x lo
 (34.56 tok/s vs 15.26 AR, 91.2% acceptance). The cross-applied Qwen3.6 DFlash drafter manages only
 1.17x — acceptance falls from 80.5% on 3.6 to 53.5% on 3.8 — so MTP is the default.
 
+3.8-native **DSpark** drafters were evaluated 2026-08-17 (`mlx-dspark`, lossless — verified
+byte-identical against AR). On a clean run MTP still wins: **36.91 vs 31.20 tok/s** (18 sigma,
+AR 16.92), and the 8-bit pair is slower still at 23.50 while accepting *below* its published figure.
+DSpark accepts more per round (3.79 vs 2.81) and is nonetheless slower — a 1.36B drafter costs more
+per round than MTP's 239 MB head saves. **MTP is retained.** See `docs/qwen_mlx_dflash_guide.md`
+§4b-iii.
+
 ```bash
 python3 scripts/download_qwen.py --model all-recommended
 python3 scripts/serve_qwen.py --backend mlx-vlm --port 8000    # MTP speculative

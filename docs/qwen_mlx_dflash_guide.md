@@ -3,10 +3,17 @@
 Setup, inference pipelines, and benchmarks for **Qwen 27B speculative decoding** on Apple Silicon
 (Apple M5 Pro, 64 GB unified memory).
 
-Status as of **2026-08-16**: the stack has moved from Qwen3.6 to **Qwen3.8-27B**, and section 4b is
-now measured. Headline: the **official MTP drafter wins at 2.26× lossless** (34.56 tok/s vs 15.26
-AR, 91.2% acceptance). The cross-applied 3.6 DFlash drafter manages only 1.17× — acceptance falls
-from 80.5% on 3.6 to 53.5% on 3.8 — so `dflash` is no longer the default path for 3.8.
+Status as of **2026-08-17**: the stack has moved from Qwen3.6 to **Qwen3.8-27B**, and sections 4b
+and 4b-iii are measured. Headline: the **official MTP drafter remains the default** (34.56 tok/s vs
+15.26 AR, 91.2% acceptance, 2.26× on 2026-08-16). The cross-applied 3.6 DFlash drafter manages only
+1.17× — acceptance falls from 80.5% on 3.6 to 53.5% on 3.8 — so `dflash` is not the path for 3.8.
+
+**3.8-native drafters now exist.** z-lab has still published no Qwen3.8 DFlash checkpoint, but the
+DSpark family (DFlash + target auxiliary features + a confidence head) is trained against 3.8
+itself and runs on Apple Silicon via `mlx-dspark`. Measured 2026-08-17 (§4b-iii): DSpark is real and
+lossless, but MTP beats it on the 4-bit target by 18% (36.91 vs 31.20 tok/s, 18 sigma), and the
+8-bit pair did not earn its 32 GB. DSpark accepts *more* per round and is still slower — its 1.36B
+drafter costs more per round than MTP's 239 MB head saves.
 
 ---
 
@@ -19,13 +26,20 @@ from 80.5% on 3.6 to 53.5% on 3.8 — so `dflash` is no longer the default path 
 | **Target** | `mlx-community/Qwen3.8-27B-4bit` | affine 4-bit, gs=64 | ~16.1 GB | `mlx-lm` / `mlx-vlm` / `dflash-mlx` |
 | **MTP drafter** | `mlx-community/Qwen3.8-27B-MTP-4bit` | native MTP head, block size 3 | 239 MB | `mlx-vlm` |
 | **DFlash drafter** | `z-lab/Qwen3.6-27B-DFlash` | block diffusion, 16 tok/pass | ~1.5 GB | `dflash-mlx` |
+| **DSpark drafter (4-bit)** | `DimInfer/Qwen3.8-27B-Dspark-v1` | 1.36B, block 15, 3.8-native | ~3.5 GB | `mlx-dspark` |
+| **DSpark drafter (8-bit)** | `RadixArk/Qwen3.8-27B-DSpark` | 1.36B, block 7, 3.8-native | ~2.7 GB | `mlx-dspark` |
 
 The MTP drafter is split from the **same** `Qwen/Qwen3.8-27B` checkpoint as the target — it holds
 only the MTP weights and borrows the target's embeddings and LM head at runtime. Same training run,
 so there is no cross-model acceptance risk.
 
-The DFlash drafter is a **cross-application**. There is no `z-lab/Qwen3.8-27B-DFlash`, and none is
-announced. 3.6 and 3.8 match on every field DFlash depends on (`hidden_size=5120`,
+The DSpark drafters are **3.8-native** — trained against 3.8's own hidden states, so they carry
+none of the cross-application risk below. Each is matched to a precision: DimInfer to the 4-bit
+class, RadixArk to the FP8/8-bit verifier. On this machine that pairing rule did not hold (§4b-iii).
+
+The DFlash drafter is a **cross-application**. There is still no `z-lab/Qwen3.8-27B-DFlash`, and
+none is announced — verified against z-lab's published model list on 2026-08-17, whose newest
+DFlash checkpoints are Alpamayo (2026-07-04) and gemma4-12B (2026-06-28). 3.6 and 3.8 match on every field DFlash depends on (`hidden_size=5120`,
 `num_hidden_layers=64`, identical `layer_types`, `vocab_size=248320`, mask id `248070`), and the
 drafter's tap layers `[1, 16, 31, 46, 61]` all exist on 3.8 — so it will **load**. Whether it
 **accepts** is the open question, because DFlash is trained against a specific target's hidden
@@ -50,6 +64,9 @@ pip install -U mlx-vlm            # needs >= 0.6.13 for --draft-model / --draft-
 
 # DFlash path — v0.1.9 and v0.1.10 are GitHub-only; PyPI still serves 0.1.8
 pip install "git+https://github.com/bstnxbt/dflash-mlx@v0.1.10"
+
+# DSpark path — 3.8-native drafters, Apple Silicon
+pip install mlx-dspark            # 0.12.2 measured; needs mlx >= 0.32, mlx-vlm >= 0.6.12
 ```
 
 **The dflash upgrade is not optional if you plan to trust the DFlash arm.** v0.1.9 fixes Qwen
@@ -126,8 +143,9 @@ python3 scripts/run_qwen_inference.py --mode mlx-direct --prompt "..."
 ### D. OpenAI-compatible server
 
 ```bash
-python3 scripts/serve_qwen.py --backend mlx-vlm --port 8000   # MTP, also serves vision
-python3 scripts/serve_qwen.py --backend dflash  --port 8000   # DFlash + L1/L2 prefix cache
+python3 scripts/serve_qwen.py --backend mlx-vlm --port 8000   # MTP — default, fastest (2.18x)
+python3 scripts/serve_qwen.py --backend dspark  --port 8000   # 3.8-native DSpark (1.84x, lossless)
+python3 scripts/serve_qwen.py --backend dflash  --port 8000   # 3.6 cross-apply (1.17x, superseded)
 python3 scripts/serve_qwen.py --backend mlx-lm  --port 8000   # plain AR
 ```
 
@@ -179,6 +197,55 @@ that unreliable. There is no throughput case for taking the quantization quality
 Every lossless arm shows a monotonic tok/s decline across the three runs even with 60s cooldowns —
 these remain fresh-GPU numbers. See §4c.
 
+### 4b-iii. Qwen3.8 DSpark — measured, M5 Pro 64 GB, 2026-08-17
+
+DSpark extends DFlash with target auxiliary features and a confidence head. Unlike the 3.6 DFlash
+drafter of §4b, these checkpoints are trained against **3.8 itself**, so this is not a cross-apply.
+
+`--arms ar,mtp,dspark,dspark-8bit --repeat 3 --max-tokens 256`, mlx-dspark 0.12.2 / mlx-vlm 0.6.13 /
+mlx 0.32.0. Artifacts: `.artifacts/dflash/qwen38_bench/20260817-213108/` (clean run; the earlier
+`20260817-203145/` was taken under load and its verdict section predates the arm-derivation fix).
+
+| Arm | tok/s (median) | vs AR | Spread | Acceptance | Peak | Verdict |
+| :-- | --: | --: | --: | --: | --: | :-- |
+| `ar` | 16.92 | 1.00x | 1.6% | — | 15.72 GB | baseline |
+| `mtp` | **36.91** | **2.18x** | 2.5% | 91.2% of drafted (2.81/round) | 17.46 GB | **SHIP AS DEFAULT** |
+| `dspark` (4-bit, DimInfer) | 31.20 | 1.84x | 0.3% | 3.79 accepted/round | — | lossless, second |
+| `dspark-8bit` (RadixArk) | 23.50 | 1.39x | 0.4% | 3.51 accepted/round | — | does not earn its 32 GB |
+
+No stability flags and no parse flags on this run; the AR baseline came in at 16.92 tok/s, above the
+15.26 of 2026-08-16, so these absolutes are quotable.
+
+**MTP wins outright.** The gap over `dspark` is 5.37 tok/s against a pooled standard deviation of
+0.30 across n=3 — **18 sigma**. An earlier contended run put the same comparison at 1.04 sigma and
+could not separate them; this one can.
+
+**Higher acceptance, lower throughput.** DSpark accepts 3.79 tokens/round to MTP's 2.81 and is still
+18% slower. The reason is drafter cost, not draft quality: MTP's drafter is a 239 MB head split from
+the target checkpoint, DSpark's is a full 1.36B model, and that per-round cost outweighs the extra
+accepted token. Acceptance is not the figure of merit — tok/s is. (The two engines' per-round
+figures are indicative rather than strictly comparable: mlx-dspark documents its count as including
+the target's bonus token, and mlx-vlm's convention is not stated.)
+
+**The 8-bit pair did not justify its download.** Slowest speculative arm at 23.50 tok/s, and its
+acceptance came in at 3.51/round against the **4.05** its card publishes — while the 4-bit pair
+came in at 3.79 against its published **3.28**. Upstream's precision-matching rule (RadixArk trained
+against the FP8 verifier, therefore best at 8-bit) inverts on this machine. 32 GB buys 8-bit weights
+at ~64% of MTP's throughput; it does not buy speed.
+
+**Losslessness spot-checked, not assumed.** Greedy `--temperature 0` on the same prompt, AR versus
+`dspark`: **351/351 characters identical**. DSpark ran 3 tokens past AR's budget (` 7 ×`) because
+block granularity overshoots `--max-new-tokens`, which is a budget artefact, not a divergence.
+
+**Qwen3.8 is hybrid-GDN and mlx-dspark handles it.** The target's `layer_types` is 48
+`linear_attention` to 16 `full_attention`. §7 previously recorded that mlx-dspark could not run a
+hybrid-GDN 3.8 target on this machine; that is refuted — it ran on both the 4-bit and 8-bit targets
+and produced verified-identical output.
+
+**The calibrated cap differs from upstream's.** mlx-dspark measured this machine's cost curves and
+derived **cap 4** for the DimInfer pair, where upstream's M4 Pro derived 7. The benchmark leaves
+`--max-draft` unpinned deliberately, so the table reports what this machine chooses by default.
+
 ### 4b-ii. Reproducing
 
 Run:
@@ -194,6 +261,8 @@ Arms:
 | `ar` | lossless | `Qwen3.8-27B-4bit` autoregressive — the anchor for every speedup |
 | `mtp` | lossless | + official MTP drafter (same checkpoint, block size 3) |
 | `dflash` | lossless | + 3.6 DFlash drafter cross-applied (block size 16) |
+| `dspark` | lossless | + 3.8-native DSpark drafter on the 4-bit target (mlx-dspark) |
+| `dspark-8bit` | max-throughput | 8-bit target + RadixArk DSpark — different quant, quality NOT held constant |
 | `nvfp4-mtp` | max-throughput | NVFP4 target + NVFP4 MTP drafter |
 | `ollama` | max-throughput | `qwen3.8:27b-mlx` |
 
@@ -416,10 +485,9 @@ is tolerable for one-shots. omp at ~13 minutes is not.
 
 ## 7. Out of scope
 
-- Training a 3.8-specific DFlash drafter (z-lab's recipe is not public).
-- `RadixArk/Qwen3.8-27B-DSpark` — a 3.8-matched speculator exists, but it targets the FP8
-  checkpoint via SGLang. The MLX port (`ARahim3/mlx-dspark`) does not wire gated-delta KV rollback,
-  so it cannot run a hybrid-GDN 3.8 target on this machine.
+- Training a 3.8-specific DFlash drafter (z-lab's recipe is not public). Moot as of 2026-08-17:
+  the DSpark family covers 3.8 natively and is measured in §4b-iii, so there is nothing left for a
+  hand-trained drafter to unlock here.
 - A Rust/Metal GatedDeltaNet port. `Rust_MLKit/gemma-metal` holds Gemma-4 kernels (SWA, GELU MLP,
   PLE); Qwen3.8 needs GDN + Qwen MLP/RoPE/MTP. New architecture, multi-week project, not a wiring
   task.

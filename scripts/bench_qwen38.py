@@ -13,6 +13,7 @@ Two classes of arm:
     ar          mlx-lm autoregressive baseline (no drafter)
     mtp         + official Qwen3.8 MTP drafter, via mlx-vlm      [same checkpoint]
     dflash      + z-lab Qwen3.6-27B-DFlash, via dflash-mlx       [cross-applied]
+    dspark      + DimInfer Qwen3.8 DSpark drafter, via mlx-dspark [3.8-native]
 
   MAX-THROUGHPUT — different quantization. Faster numbers here are NOT free: the
               model itself differs, so quality is not held constant and tok/s is
@@ -20,6 +21,13 @@ Two classes of arm:
 
     nvfp4-mtp   Qwen3.8-27B-nvfp4 + nvfp4 MTP drafter, via mlx-vlm
     ollama      `ollama run qwen3.8:27b-mlx` (modelopt mixed-precision)
+    dspark-8bit Qwen3.8-27B-8bit + RadixArk DSpark drafter, via mlx-dspark
+
+              dspark-8bit sits here because it verifies against the 8-bit target,
+              not the 4-bit one — so it is not comparable to the lossless arms on
+              equal terms. Note the class name reads backwards for this arm: 8-bit
+              is quality-SUPERIOR to the 4-bit lossless class, not a shortcut. What
+              the class encodes is "different model", not "worse model".
 
 Usage:
     python3 scripts/bench_qwen38.py                       # lossless arms only
@@ -52,12 +60,19 @@ from dflash_guard import (  # noqa: E402
     dflash_lossless_blocker,
     dflash_version,
 )
+from serve_qwen import resolve_drafter  # noqa: E402
 
 TARGET_4BIT = "mlx-community/Qwen3.8-27B-4bit"
 TARGET_NVFP4 = "mlx-community/Qwen3.8-27B-nvfp4"
 MTP_4BIT = "mlx-community/Qwen3.8-27B-MTP-4bit"
 MTP_NVFP4 = "mlx-community/Qwen3.8-27B-MTP-nvfp4"
 DFLASH_36 = "z-lab/Qwen3.6-27B-DFlash"
+TARGET_8BIT = "mlx-community/Qwen3.8-27B-8bit"
+# First drafters trained against 3.8 itself, so neither is a cross-application.
+# Each is matched to the precision it was trained for: DimInfer to the 4-bit class,
+# RadixArk to the FP8/8-bit verifier. Pairing them the other way costs acceptance.
+DSPARK_4BIT = "DimInfer/Qwen3.8-27B-Dspark-v1"
+DSPARK_8BIT = "RadixArk/Qwen3.8-27B-DSpark"
 OLLAMA_TAG = "qwen3.8:27b-mlx"
 
 # Same functional-equation prompt dflash-mlx uses for its published numbers, so
@@ -69,8 +84,8 @@ DEFAULT_PROMPT = (
     r"and put your final answer within \boxed{}."
 )
 
-LOSSLESS_ARMS = ["ar", "mtp", "dflash"]
-MAXTP_ARMS = ["nvfp4-mtp", "ollama"]
+LOSSLESS_ARMS = ["ar", "mtp", "dflash", "dspark"]
+MAXTP_ARMS = ["nvfp4-mtp", "ollama", "dspark-8bit"]
 
 
 # --------------------------------------------------------------------------- #
@@ -157,13 +172,14 @@ TOK_S_PATTERNS = [
     # (decode). Anchor to line start so the prefill rate can never be read as
     # decode throughput — it is roughly half, and silently wrong.
     r"(?m)^\s*eval rate:\s*([\d.]+)\s*tokens?/s",
-    r"([\d.]+)\s*tok/s",                                          # dflash summary line
+    r"([\d.]+)\s*tok/s",                                          # dflash + mlx-dspark summary line
 ]
 
 TOKENS_PATTERNS = [
     r"Generation:\s*(\d+)\s*tokens?",
     r"(?m)^\s*eval count:\s*(\d+)\s*token",   # not "prompt eval count"
     r"(\d+)\s*tokens?\s*\|",                  # dflash: "256 tokens | 16.4 tok/s | ..."
+    r"(\d+)\s*tokens?\s*\u00b7",              # mlx-dspark: "33 tokens \u00b7 3.35s \u00b7 9.8 tok/s \u00b7 ..."
 ]
 
 PEAK_MEM_PATTERNS = [
@@ -182,8 +198,14 @@ ACCEPT_PATTERNS = [
     r"([\d.]+)\s*%\s*of\s*drafted",
 ]
 
+# mlx-dspark reports accepted tokens PER ROUND and no percentage at all, so it
+# lands in accept_len and leaves accept_pct None. Do not synthesise a percentage
+# from it: accept_len includes the target's bonus token, so it is not the same
+# quantity as "share of drafted tokens accepted" and the two must not be compared
+# as if they were.
 ACCEPT_LEN_PATTERNS = [
     r"([\d.]+)\s*accepted\s*tokens?/round",   # mlx-vlm
+    r"accept\s+([\d.]+)\s*/\s*round",         # mlx-dspark
 ]
 
 
@@ -251,6 +273,34 @@ def build_cmd(arm: str, prompt: str, max_tokens: int):
             "--verify-mode", "adaptive",
         ]
 
+    # --max-draft is deliberately NOT pinned. mlx-dspark measures this machine's
+    # verify/drafter cost curves once and derives the cap from them (it picked 4
+    # here, where upstream's M4 Pro derived 7 for the same drafter). Pinning a cap
+    # would report a number this machine does not choose on its own.
+    if arm == "dspark":
+        return [
+            "mlx-dspark", "generate",
+            "--model", TARGET_4BIT,
+            "--drafter", resolve_drafter(DSPARK_4BIT),
+            "--mode", "dspark",
+            "--prompt", prompt,
+            "--max-new-tokens", str(max_tokens),
+            "--temperature", "0",
+            "--no-stream",
+        ]
+
+    if arm == "dspark-8bit":
+        return [
+            "mlx-dspark", "generate",
+            "--model", TARGET_8BIT,
+            "--drafter", resolve_drafter(DSPARK_8BIT),
+            "--mode", "dspark",
+            "--prompt", prompt,
+            "--max-new-tokens", str(max_tokens),
+            "--temperature", "0",
+            "--no-stream",
+        ]
+
     if arm == "ollama":
         return ["ollama", "run", OLLAMA_TAG, "--verbose", prompt]
 
@@ -261,7 +311,9 @@ ARM_META = {
     "ar":        ("lossless", "mlx-lm AR baseline", TARGET_4BIT, None),
     "mtp":       ("lossless", "official MTP drafter (mlx-vlm)", TARGET_4BIT, MTP_4BIT),
     "dflash":    ("lossless", "3.6 DFlash cross-applied (dflash-mlx)", TARGET_4BIT, DFLASH_36),
+    "dspark":    ("lossless", "3.8-native DSpark drafter (mlx-dspark)", TARGET_4BIT, DSPARK_4BIT),
     "nvfp4-mtp": ("max-throughput", "NVFP4 target + NVFP4 MTP (mlx-vlm)", TARGET_NVFP4, MTP_NVFP4),
+    "dspark-8bit": ("max-throughput", "8-bit target + RadixArk DSpark (mlx-dspark)", TARGET_8BIT, DSPARK_8BIT),
     "ollama":    ("max-throughput", "Ollama MLX build (modelopt mixed-precision)", OLLAMA_TAG, None),
 }
 
@@ -312,6 +364,16 @@ def preflight(arms, max_tokens=None):
                 notes.append("WARNING: mlx-vlm < 0.6.13 — --draft-model/--draft-kind may be absent.")
         except Exception:
             notes.append("MISSING: mlx-vlm not importable — MTP arms will fail. `pip install -U mlx-vlm`")
+
+    if any(a in arms for a in ("dspark", "dspark-8bit")):
+        if not shutil.which("mlx-dspark"):
+            notes.append("MISSING: `mlx-dspark` not on PATH — the dspark arms will fail. "
+                         "`pip install mlx-dspark`")
+        try:
+            import importlib.metadata as md
+            notes.append(f"mlx-dspark version: {md.version('mlx-dspark')}")
+        except Exception:
+            notes.append("mlx-dspark version: UNDETERMINED")
 
     if "ollama" in arms and not shutil.which("ollama"):
         notes.append("MISSING: `ollama` not on PATH — the ollama arm will fail.")
@@ -391,6 +453,7 @@ def run_arm(arm, prompt, max_tokens, repeat, cooldown, timeout):
     good = [r for r in runs if r["ok"] and r["tok_s_reported"]]
     median_tok_s = statistics.median([r["tok_s_reported"] for r in good]) if good else None
     accepts = [r["accept_pct"] for r in runs if r["accept_pct"] is not None]
+    accept_lens = [r["accept_len"] for r in runs if r["accept_len"] is not None]
     peaks = [r["peak_gb"] for r in runs if r["peak_gb"] is not None]
 
     # A median over throttling runs is a number with no referent. Record the
@@ -432,6 +495,7 @@ def run_arm(arm, prompt, max_tokens, repeat, cooldown, timeout):
         "all_ok": all(r["ok"] for r in runs),
         "median_tok_s": round(median_tok_s, 2) if median_tok_s else None,
         "median_accept_pct": round(statistics.median(accepts), 1) if accepts else None,
+        "median_accept_len": round(statistics.median(accept_lens), 2) if accept_lens else None,
         "median_peak_gb": round(statistics.median(peaks), 2) if peaks else None,
         "runs": runs,
     }
@@ -440,6 +504,29 @@ def run_arm(arm, prompt, max_tokens, repeat, cooldown, timeout):
 # --------------------------------------------------------------------------- #
 # Verdict
 # --------------------------------------------------------------------------- #
+
+# Acceptance arrives in one of two units and they are NOT interconvertible:
+#   share    — MTP / dflash: percent of drafted tokens accepted
+#   perround — mlx-dspark: accepted tokens per round, INCLUDING the target's bonus
+#              token, so 1.0 means nothing drafted survived verification
+# Converting one into the other would manufacture a number the engine never
+# reported, so each unit carries its own floor instead.
+ACCEPT_SHARE_COLLAPSED_PCT = 30.0
+ACCEPT_SHARE_HEALTHY_PCT = 60.0
+ACCEPT_PERROUND_COLLAPSED = 1.05
+ACCEPT_PERROUND_HEALTHY = 2.0    # >=1 drafted token accepted per round on average
+
+
+def acceptance(r):
+    """(display, unit, value) for an arm's acceptance, or ('unreported', None, None)."""
+    pct = r.get("median_accept_pct")
+    if pct is not None:
+        return f"{pct:.0f}%", "share", pct
+    per_round = r.get("median_accept_len")
+    if per_round is not None:
+        return f"{per_round:.2f}/rnd", "perround", per_round
+    return "unreported", None, None
+
 
 # An AR baseline below this is a broken run, not a slow machine. Every speedup is
 # a ratio against it, so a near-zero baseline manufactures spectacular nonsense.
@@ -468,14 +555,20 @@ def verdict(results, blockers=None):
                      "meaningless until the `ar` arm is fixed — do not act on them.")
     lines.append("")
 
-    for arm in ("mtp", "dflash"):
+    # Derived from what ran, never a hardcoded list: a hardcoded tuple silently
+    # drops any lossless arm added later (it dropped `dspark`) and invents a
+    # "no result" line for arms the user never asked for.
+    lossless = [r["arm"] for r in results if r["kind"] == "lossless" and r["arm"] != "ar"]
+    if not lossless:
+        lines.append("No lossless arm ran besides the baseline — nothing to compare.")
+
+    for arm in lossless:
         r = by_arm.get(arm)
         if not r or not r["median_tok_s"]:
             lines.append(f"{arm:<10} no result — see artifact")
             continue
         speedup = r["median_tok_s"] / base
-        acc = r["median_accept_pct"]
-        acc_s = f"{acc:.0f}%" if acc is not None else "unreported"
+        acc_s, acc_unit, acc_val = acceptance(r)
 
         # Order matters: correctness gates precede any performance judgement.
         if arm in blockers:
@@ -486,11 +579,15 @@ def verdict(results, blockers=None):
             call = "INCONCLUSIVE — baseline implausible"
         elif speedup <= 1.0:
             call = "DO NOT SHIP — slower than plain AR"
-        elif acc is not None and acc < 30:
+        elif acc_unit == "share" and acc_val < ACCEPT_SHARE_COLLAPSED_PCT:
             call = "DO NOT SHIP — acceptance collapsed"
-        elif acc is None:
+        elif acc_unit == "perround" and acc_val <= ACCEPT_PERROUND_COLLAPSED:
+            call = "DO NOT SHIP — acceptance collapsed"
+        elif acc_unit is None:
             call = "INCONCLUSIVE — acceptance unreported, cannot confirm lossless"
-        elif speedup > 1.8 and acc >= 60:
+        elif speedup > 1.8 and (
+                (acc_unit == "share" and acc_val >= ACCEPT_SHARE_HEALTHY_PCT)
+                or (acc_unit == "perround" and acc_val >= ACCEPT_PERROUND_HEALTHY)):
             call = "SHIP AS DEFAULT"
         else:
             call = "KEEP AVAILABLE, default to AR"
@@ -564,7 +661,7 @@ def write_artifacts(outdir: Path, results, notes, config, blockers=None):
             f"{'`'+r['draft']+'`' if r['draft'] else '—'} | "
             f"{r['median_tok_s'] if r['median_tok_s'] else 'n/a'} | "
             f"{spread_s} | "
-            f"{str(r['median_accept_pct'])+'%' if r['median_accept_pct'] is not None else '—'} | "
+            f"{acceptance(r)[0].replace('unreported', '—')} | "
             f"{r['median_peak_gb'] if r['median_peak_gb'] else '—'} |"
         )
     md.append("")

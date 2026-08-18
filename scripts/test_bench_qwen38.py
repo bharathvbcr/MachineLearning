@@ -27,10 +27,11 @@ def check(name, cond, detail=""):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  -- {detail}" if detail and not cond else ""))
 
 
-def arm(name, kind="lossless", tok=None, acc=None, ok=True, draft="d", runs=None):
+def arm(name, kind="lossless", tok=None, acc=None, ok=True, draft="d", runs=None,
+        acc_len=None):
     return {"arm": name, "kind": kind, "label": name, "target": "t", "draft": draft,
             "cmd": [], "all_ok": ok, "median_tok_s": tok, "median_accept_pct": acc,
-            "median_peak_gb": None, "runs": runs or []}
+            "median_accept_len": acc_len, "median_peak_gb": None, "runs": runs or []}
 
 
 def vt(results, blockers=None):
@@ -156,6 +157,30 @@ check("B9 missing baseline handled", "No usable AR baseline" in vt([arm("dflash"
 check("B10 empty results handled", "No usable AR baseline" in vt([]))
 check("B11 boundary 1.8x/60% not over-shipped",
       "SHIP AS DEFAULT" not in vt([arm("ar", tok=10.0), arm("dflash", tok=18.0, acc=60.0)]))
+
+# The verdict used to iterate a hardcoded ("mtp", "dflash") tuple, so any lossless
+# arm added later was silently absent from the headline output while still sitting
+# in the JSON — the harness reporting on less than it measured.
+check("B12 lossless arm outside the old hardcoded pair is judged",
+      "dspark" in vt([arm("ar", tok=11.0), arm("dspark", tok=29.9, acc_len=3.67)]))
+check("B13 no phantom result line for an arm that never ran",
+      "dflash" not in vt([arm("ar", tok=11.0), arm("mtp", tok=33.0, acc=91.2)]))
+
+# mlx-dspark reports accepted tokens per round, not a share of drafted tokens.
+# Treating a missing percentage as "acceptance unreported" would park every dspark
+# arm at INCONCLUSIVE forever; converting per-round into a percentage would invent
+# a figure the engine never emitted. Each unit is gated on its own floor.
+check("B14 per-round acceptance is not mistaken for unreported",
+      "INCONCLUSIVE" not in vt([arm("ar", tok=11.0), arm("dspark", tok=29.9, acc_len=3.67)]))
+check("B15 healthy per-round acceptance can ship",
+      "SHIP AS DEFAULT" in vt([arm("ar", tok=11.0), arm("dspark", tok=29.9, acc_len=3.67)]))
+check("B16 collapsed per-round acceptance rejected",
+      "DO NOT SHIP" in vt([arm("ar", tok=11.0), arm("dspark", tok=25.0, acc_len=1.0)]))
+check("B17 per-round value never rendered as a percentage",
+      "3.67/rnd" in vt([arm("ar", tok=11.0), arm("dspark", tok=29.9, acc_len=3.67)])
+      and "3.67%" not in vt([arm("ar", tok=11.0), arm("dspark", tok=29.9, acc_len=3.67)]))
+check("B18 acceptance genuinely absent is still INCONCLUSIVE",
+      "INCONCLUSIVE" in vt([arm("ar", tok=11.0), arm("dspark", tok=29.9)]))
 
 print("\n=== C. CORRECTNESS GATE ===")
 fake_dflash(BAD)
