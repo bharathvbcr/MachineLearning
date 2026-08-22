@@ -158,7 +158,16 @@ Bank-batched NS5 removed the optimizer dispatch bottleneck, but which Muon-famil
 | Exact gate `loss_delta` | **1.430511474609375e-6** | A |
 | Exact gate `passed` | **true** | A |
 | Resume loss atol | 1e-5 | A |
-| Champion FINAL EMA sliding BPB | **2.015756** | A |
+| Champion FINAL EMA sliding BPB | **2.015756** | **DISPUTED** |
+
+> **Conflict (2026-08-22).** `research/champion-run.json` records
+> `champion_final_ema_sliding_bpb = 2.010659` (seed 1337) and `2.040352` (seed 2026)
+> for this run, against the **2.015756** recorded here, in
+> `Rust_MLKit/docs/optimization_map.md` and in `metal-native/DECISIONS.md`. The two
+> figures come from different audit passes and have not been reconciled, so the grade is
+> downgraded from A to DISPUTED. Do not cite either number until the passes are
+> identified. Tracked as D4 in `docs/ISSUES_AND_GAPS_2026-08-22.md`.
+
 | Steady dispatch budget | ~1975–2019 typical; gate sample 1707 | A/B |
 
 #### Distillation one-liner
@@ -551,7 +560,7 @@ Use §§1,2,3,6,7,8 (honest MLX stats),9,10 — omit unverified 8.8× and native
 ```
 Arch ladder:     BPB 1.984742 · 1,341,003 B
 Soft 100k:       EMA 1.882767 · ~60k tok/s
-Polar select:    BPB 2.1699185 · gate Δloss 1.43e-6 · FINAL 2.015756
+Polar select:    BPB 2.1699185 · gate Δloss 1.43e-6 · FINAL 2.015756  [DISPUTED — see D4]
 GDN:             238.18 → 1605.70 tok/s
 Mamba2:          333.23 → ~2305 tok/s (recorded)
 Hazard E4B:      17.72 → 22.54 tok/s (1.272×); default 23.24

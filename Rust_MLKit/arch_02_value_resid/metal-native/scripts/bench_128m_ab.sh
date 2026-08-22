@@ -31,7 +31,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
 
-ROOT=/Users/bharath/Code/parameter_golf
+ROOT=${PARAMETER_GOLF_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)}
 DATA=(--data-dir "$ROOT/parameter-golf/data/datasets/fineweb10B_sp1024"
       --token-bytes "$ROOT/Rust_MLKit/arch_02_value_resid/burn-port/token_bytes.json")
 PRESET=(--preset arch02-128m --batch 16 --seq-len 256)

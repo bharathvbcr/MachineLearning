@@ -105,3 +105,9 @@ learning-notes/ml-notes.html
 
 # Regenerable parity activations (python3 metal-native/scripts/export_goldens.py)
 Rust_MLKit/arch_02_value_resid/metal-native/golden/fwd/
+
+# Personal / non-research content — drafts, marketing, and machine-local sync.
+# This repo is public; keep it to research artifacts.
+LinkedIn_Article_*.md
+sync_to_obsidian/
+*.draft.md
