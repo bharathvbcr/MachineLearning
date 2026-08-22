@@ -410,6 +410,108 @@ def load_eval_curve(run_dir: Path) -> list[dict]:
     return points
 
 
+def load_run_timing(run_dir: Path) -> dict:
+    """Wall clock and throughput for one finished run.
+
+    ``done.elapsed_s`` is authoritative and is written by ``Logger.done``.  Runs
+    finished before 2026-08-22 do not carry it -- the trainer computed the
+    elapsed time, printed it, and threw it away -- so for those we fall back to
+    the median per-log ``tok_s`` and mark the row ``estimated``.  A row that had
+    to be estimated must never be reported as a measurement.
+    """
+    metrics = run_dir / "metrics.jsonl"
+    out = {"run": run_dir.name, "elapsed_s": None, "mean_tok_s": None,
+           "median_tok_s": None, "median_mfu": None, "tokens": None,
+           "source": "missing"}
+    if not metrics.exists():
+        return out
+    tok_s, mfu = [], []
+    with metrics.open(encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event = rec.get("event")
+            if event == "train":
+                if rec.get("tok_s"):
+                    tok_s.append(float(rec["tok_s"]))
+                if rec.get("mfu"):
+                    mfu.append(float(rec["mfu"]))
+            elif event == "done":
+                out["tokens"] = rec.get("tokens")
+                if rec.get("elapsed_s") is not None:
+                    out["elapsed_s"] = float(rec["elapsed_s"])
+                    out["mean_tok_s"] = rec.get("mean_tok_s")
+                    out["source"] = "measured"
+    if tok_s:
+        out["median_tok_s"] = statistics.median(tok_s)
+    if mfu:
+        out["median_mfu"] = statistics.median(mfu)
+    if out["elapsed_s"] is None and out["median_tok_s"] and out["tokens"]:
+        out["elapsed_s"] = float(out["tokens"]) / out["median_tok_s"]
+        out["source"] = "estimated_from_median_tok_s"
+    return out
+
+
+def timing_summary(out_root: Path) -> dict:
+    """Per-suite GPU time. Measured and estimated rows are counted separately."""
+    rows = [load_run_timing(d) for d in sorted(Path(out_root).glob("*"))
+            if d.is_dir() and (d / "metrics.jsonl").exists()]
+    measured = [r for r in rows if r["source"] == "measured"]
+    estimated = [r for r in rows if r["source"].startswith("estimated")]
+    timed = measured + estimated
+    total_s = sum(r["elapsed_s"] for r in timed if r["elapsed_s"])
+    return {
+        "out": str(out_root),
+        "runs_seen": len(rows),
+        "runs_measured": len(measured),
+        "runs_estimated": len(estimated),
+        "runs_untimed": len(rows) - len(timed),
+        "gpu_seconds_total": total_s,
+        "gpu_hours_total": total_s / 3600.0,
+        "gpu_hours_measured": sum(
+            r["elapsed_s"] for r in measured if r["elapsed_s"]) / 3600.0,
+        "gpu_hours_estimated": sum(
+            r["elapsed_s"] for r in estimated if r["elapsed_s"]) / 3600.0,
+        "median_run_seconds": (
+            statistics.median([r["elapsed_s"] for r in timed if r["elapsed_s"]])
+            if any(r["elapsed_s"] for r in timed) else None),
+        "median_tok_s": (
+            statistics.median([r["median_tok_s"] for r in rows if r["median_tok_s"]])
+            if any(r["median_tok_s"] for r in rows) else None),
+        "median_mfu": (
+            statistics.median([r["median_mfu"] for r in rows if r["median_mfu"]])
+            if any(r["median_mfu"] for r in rows) else None),
+        "runs": rows,
+    }
+
+
+def cmd_timing(args) -> None:
+    summary = timing_summary(Path(args.out))
+    print(f"out={summary['out']}")
+    print(f"  runs seen      : {summary['runs_seen']} "
+          f"(measured {summary['runs_measured']}, "
+          f"estimated {summary['runs_estimated']}, "
+          f"untimed {summary['runs_untimed']})")
+    print(f"  GPU hours      : {summary['gpu_hours_total']:.2f} total "
+          f"({summary['gpu_hours_measured']:.2f} measured, "
+          f"{summary['gpu_hours_estimated']:.2f} estimated)")
+    if summary["median_run_seconds"]:
+        print(f"  median run     : {summary['median_run_seconds']/60:.1f} min")
+    if summary["median_tok_s"]:
+        print(f"  median tok/s   : {summary['median_tok_s']:,.0f}")
+    if summary["median_mfu"]:
+        print(f"  median MFU     : {summary['median_mfu']*100:.1f}%")
+    if summary["runs_untimed"]:
+        print(f"  NOTE: {summary['runs_untimed']} run(s) carry no timing at all "
+              f"and are excluded from the totals above.")
+    if args.json:
+        path = Path(args.out) / "timing.json"
+        path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        print(f"  wrote {path}")
+
+
 # ---------------------------------------------------------------------------
 # queue (file-locked JSON; one worker claims one pending job)
 # ---------------------------------------------------------------------------
@@ -1179,6 +1281,10 @@ def main():
     worker = sub.add_parser("worker", parents=[common])
     worker.add_argument("--worker-id", type=int, required=True)
     sub.add_parser("status", parents=[common])
+    timing = sub.add_parser("timing", parents=[common],
+                            help="GPU hours and throughput for a suite")
+    timing.add_argument("--json", action="store_true",
+                        help="also write <out>/timing.json")
     sub.add_parser("compute", parents=[common])
     sub.add_parser("repack", parents=[common])
     probe = sub.add_parser("probe", parents=[common])
@@ -1212,6 +1318,7 @@ def main():
         "launch": cmd_launch,
         "worker": cmd_worker,
         "status": cmd_status,
+        "timing": cmd_timing,
         "compute": cmd_compute,
         "repack": cmd_repack,
         "probe": cmd_probe,

@@ -174,7 +174,25 @@ grounding. DocGen's *structure* (section flow, revision tasks, lineage critique)
 | E3 | **Optimizer axis is n=2** at `advance_1000` and `exact_128m_1000` | Metal/M5 only, not CUDA |
 | E4 | **Suites 14/15 are single-seed with no preserved replay command**; suite 15's two follow-up scales are n=1 | needs 3070 Ti |
 | E5 | **Hardware is never isolated** — suite 25 isolated batch on GH200 only | needs 3070 Ti |
-| E6 | **No wall-clock/throughput artifact for suites 22–26.** No `ms/step` or GPU-hours recorded in any lock file, so the compute plan in Part 3 is an estimate rather than a measurement | fix in runner |
+| E6 | **No wall-clock/throughput artifact for suites 22–26.** | **FIXED 2026-08-22** (see below); suites 22–26 remain estimate-only |
+
+**E6 detail (fixed).** `Logger.done` in `nanolab/utils.py` computed the elapsed time, printed it
+to the console, and emitted a `done` record containing only `best_val` and `tokens` — so every
+suite's wall clock was discarded at the moment it was known. That is why Part 3 below is an
+estimate.
+
+- `Logger.done` now persists `elapsed_s` and `mean_tok_s`; `train.py` passes them.
+- `nanolab/crossover_replicate.py` gained `load_run_timing()`, `timing_summary()` and a
+  `timing` subcommand: `python -m nanolab.crossover_replicate timing --out <run-dir> --json`.
+- Runs finished **before** this change carry no `elapsed_s`. They are back-estimated from median
+  `tok_s` and labelled `estimated_from_median_tok_s`; a run with no throughput records at all is
+  labelled `missing` and contributes **nothing** to the totals rather than reading as zero.
+  `gpu_hours_measured` and `gpu_hours_estimated` are reported separately so an estimate can never
+  be mistaken for a measurement.
+- Two new tests cover the measured, estimated and untimed paths. 50/50 pass.
+
+Suites 22–26 are therefore still estimate-only; the first suite to carry a true wall clock will be
+the µP arm.
 
 ### 2.3 Data integrity
 
@@ -232,7 +250,11 @@ Only the CUDA `nanolab` work. E3 is Rust/Metal on the M5 Pro; E4/E5 need the RTX
 | E2 suite 26 completion | 10 | 50M |
 
 **Estimated** ~10–14 H100-equivalent GPU-hours of compute, plus 1–2 h for data prep. This is an
-estimate, not a measurement — see E6.
+estimate, not a measurement — see E6. Once the first jobs land, replace it with the real number:
+
+```bash
+python -m nanolab.crossover_replicate timing --out nanolab/out/<suite> --json
+```
 
 ### 3.2 Instance recommendation
 

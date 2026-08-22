@@ -29,6 +29,7 @@ from .optim import (
 )
 from .schedules import apply_lr, make_schedule
 from .optimizer_funnel import CANDIDATES
+from .crossover_replicate import load_run_timing, timing_summary
 from .native_funnel import (
     _mean_ci95, _rank_candidates, _read_result, _t_critical_95, advance,
     champion_argv, unlock_from_gate, write_champion,
@@ -545,6 +546,61 @@ def _funnel_job(candidate, seed, bpb, step_ms):
             "training_loss_trace": [{"step": 9, "loss": 3.0}],
         },
     }
+
+
+@test
+def crossover_timing_reads_measured_wall_clock():
+    with tempfile.TemporaryDirectory() as directory:
+        run = Path(directory) / "cx32_attention_s1337"
+        run.mkdir()
+        (run / "metrics.jsonl").write_text(
+            '{"event":"train","step":10,"tok_s":120000.0,"mfu":0.31}\n'
+            '{"event":"train","step":20,"tok_s":124000.0,"mfu":0.33}\n'
+            '{"event":"done","best_val":4.22,"tokens":50000000,'
+            '"elapsed_s":900.0,"mean_tok_s":55555.6}\n',
+            encoding="utf-8")
+        row = load_run_timing(run)
+    assert row["source"] == "measured"
+    assert row["elapsed_s"] == 900.0
+    assert abs(row["median_tok_s"] - 122000.0) < 1e-6
+    assert abs(row["median_mfu"] - 0.32) < 1e-9
+
+
+@test
+def crossover_timing_estimates_pre_2026_08_runs_and_labels_them():
+    # Runs finished before Logger.done persisted elapsed_s carry no wall clock.
+    # They must be estimated from median tok/s AND flagged, never counted as a
+    # measurement.
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        legacy = root / "cx50_mingru_s42"
+        legacy.mkdir()
+        (legacy / "metrics.jsonl").write_text(
+            '{"event":"train","step":10,"tok_s":100000.0,"mfu":0.25}\n'
+            '{"event":"done","best_val":4.45,"tokens":50000000}\n',
+            encoding="utf-8")
+        untimed = root / "cx50_gdn_s42"
+        untimed.mkdir()
+        (untimed / "metrics.jsonl").write_text(
+            '{"event":"eval","step":10,"val_loss":5.0,"tokens":163840}\n',
+            encoding="utf-8")
+
+        row = load_run_timing(legacy)
+        assert row["source"] == "estimated_from_median_tok_s"
+        assert abs(row["elapsed_s"] - 500.0) < 1e-6
+
+        blank = load_run_timing(untimed)
+        assert blank["source"] == "missing"
+        assert blank["elapsed_s"] is None
+
+        summary = timing_summary(root)
+    assert summary["runs_seen"] == 2
+    assert summary["runs_measured"] == 0
+    assert summary["runs_estimated"] == 1
+    assert summary["runs_untimed"] == 1
+    # The untimed run contributes nothing rather than silently reading as zero.
+    assert abs(summary["gpu_hours_total"] - 500.0 / 3600.0) < 1e-9
+    assert summary["gpu_hours_measured"] == 0.0
 
 
 @test

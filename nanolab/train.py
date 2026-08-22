@@ -245,7 +245,8 @@ def train(cfg, overfit: int = 0):
     if val <= best_val or not (out_dir / "best.pt").exists():
         _save(out_dir / "best.pt", model, optimizers, cfg.max_steps, cfg, val, light=True)
     best_val = min(best_val, val)
-    log.done(best_val, human_time(time.time() - t0), tokens_seen)
+    elapsed_s = time.time() - t0
+    log.done(best_val, human_time(elapsed_s), tokens_seen, elapsed_s=elapsed_s)
     return best_val
 
 

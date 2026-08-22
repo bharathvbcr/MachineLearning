@@ -109,8 +109,15 @@ class Logger:
         print(f"  -------- eval @ {step}: {train_bit}"
               f"val {kw['val_loss']:.4f}  ppl {kw['val_ppl']:.2f}{bpc} --------")
 
-    def done(self, best_val, elapsed, tokens):
-        self._emit({"event": "done", "best_val": best_val, "tokens": tokens})
+    def done(self, best_val, elapsed, tokens, elapsed_s=None):
+        # elapsed is a human string for the console; elapsed_s is the machine
+        # readable wall clock.  Emitting only the former is why no suite before
+        # 2026-08-22 has a recoverable run time.
+        record = {"event": "done", "best_val": best_val, "tokens": tokens}
+        if elapsed_s is not None:
+            record["elapsed_s"] = float(elapsed_s)
+            record["mean_tok_s"] = float(tokens) / max(float(elapsed_s), 1e-9)
+        self._emit(record)
         print("=" * 70)
         print(f"  DONE  best_val_loss={best_val:.4f}  "
               f"tokens={format_count(tokens)}  time={elapsed}")
