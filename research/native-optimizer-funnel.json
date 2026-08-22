@@ -8787,7 +8787,7 @@
         {
           "candidate": "muon_polar_adamw",
           "mean_validation_bpb": 2.407025,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8795,12 +8795,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5463.457656860352,
           "mean_logged_step_ms": 516.3273939090909,
-          "confidence_interval_overlaps_best": true
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "normuon_adamw",
           "mean_validation_bpb": 2.467975,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8808,12 +8813,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5463.457588195801,
           "mean_logged_step_ms": 517.8604848181818,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "muon_ns5_adamw",
           "mean_validation_bpb": 2.480362,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8821,12 +8831,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5463.395111083984,
           "mean_logged_step_ms": 521.8989960909091,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "muon_ns3_adamw",
           "mean_validation_bpb": 2.509174,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8834,12 +8849,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5463.973304748535,
           "mean_logged_step_ms": 511.3581703636364,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "muown_adamw",
           "mean_validation_bpb": 2.796907,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8847,12 +8867,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5448.489547729492,
           "mean_logged_step_ms": 539.1949509090908,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "mona_adamw",
           "mean_validation_bpb": 2.888677,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8860,12 +8885,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5463.363861083984,
           "mean_logged_step_ms": 526.7023937272727,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "lion",
           "mean_validation_bpb": 5.805887,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8873,12 +8903,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5447.255058288574,
           "mean_logged_step_ms": 488.88467036363636,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "cautious_lion",
           "mean_validation_bpb": 6.00039,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8886,12 +8921,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5463.410736083984,
           "mean_logged_step_ms": 486.6221325454546,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "schedule_free_adamw",
           "mean_validation_bpb": 6.593316,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8899,12 +8939,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5463.410736083984,
           "mean_logged_step_ms": 483.34381809090905,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "adamw",
           "mean_validation_bpb": 8.489102,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8912,12 +8957,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5463.301383972168,
           "mean_logged_step_ms": 498.2132159090909,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "sophia",
           "mean_validation_bpb": 8.94509,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8925,12 +8975,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5463.285736083984,
           "mean_logged_step_ms": 486.53655681818185,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "cautious_adamw",
           "mean_validation_bpb": 9.253303,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8938,12 +8993,17 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5463.488906860352,
           "mean_logged_step_ms": 492.9615263636364,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "sgd_momentum",
           "mean_validation_bpb": 12.50312,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -8951,7 +9011,12 @@
           "common_training_loss_target": 6.860776901245117,
           "max_current_physical_mb": 5463.363838195801,
           "mean_logged_step_ms": 484.63800372727275,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         }
       ],
       "excluded_candidates": [
@@ -8978,7 +9043,7 @@
         {
           "candidate": "mona_adamw",
           "mean_validation_bpb": 2.180898,
-          "ci95": 0.004198320000000173,
+          "ci95": 0.027216691110001124,
           "seeds": [
             42,
             2026
@@ -8987,12 +9052,17 @@
           "common_training_loss_target": 6.8457841873168945,
           "max_current_physical_mb": 5464.035781860352,
           "mean_logged_step_ms": 528.2132548809524,
-          "confidence_interval_overlaps_best": true
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.004198320000000173,
+          "ci95_method": "student_t",
+          "ci95_df": 1,
+          "ci95_informative": false,
+          "n_seeds": 2
         },
         {
           "candidate": "muon_polar_adamw",
           "mean_validation_bpb": 2.1823215,
-          "ci95": 0.006418019999999699,
+          "ci95": 0.04160646827249806,
           "seeds": [
             42,
             2026
@@ -9001,12 +9071,17 @@
           "common_training_loss_target": 6.8457841873168945,
           "max_current_physical_mb": 5463.348258972168,
           "mean_logged_step_ms": 550.4080814285714,
-          "confidence_interval_overlaps_best": true
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.006418019999999699,
+          "ci95_method": "student_t",
+          "ci95_df": 1,
+          "ci95_informative": false,
+          "n_seeds": 2
         },
         {
           "candidate": "normuon_adamw",
           "mean_validation_bpb": 2.2322195000000002,
-          "ci95": 0.007844900000000255,
+          "ci95": 0.05085658551250167,
           "seeds": [
             42,
             2026
@@ -9015,12 +9090,17 @@
           "common_training_loss_target": 6.8457841873168945,
           "max_current_physical_mb": 5463.567031860352,
           "mean_logged_step_ms": 542.2097747619048,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.007844900000000255,
+          "ci95_method": "student_t",
+          "ci95_df": 1,
+          "ci95_informative": false,
+          "n_seeds": 2
         },
         {
           "candidate": "muon_ns5_adamw",
           "mean_validation_bpb": 2.232637,
-          "ci95": 0.01314375999999976,
+          "ci95": 0.08520781072999845,
           "seeds": [
             42,
             2026
@@ -9029,12 +9109,17 @@
           "common_training_loss_target": 6.8457841873168945,
           "max_current_physical_mb": 5463.645156860352,
           "mean_logged_step_ms": 567.0650485714286,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.01314375999999976,
+          "ci95_method": "student_t",
+          "ci95_df": 1,
+          "ci95_informative": false,
+          "n_seeds": 2
         },
         {
           "candidate": "muon_ns3_adamw",
           "mean_validation_bpb": 2.2591655,
-          "ci95": 0.007015819999999699,
+          "ci95": 0.04548186079749805,
           "seeds": [
             42,
             2026
@@ -9043,12 +9128,17 @@
           "common_training_loss_target": 6.8457841873168945,
           "max_current_physical_mb": 5463.488883972168,
           "mean_logged_step_ms": 543.7297561190476,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.007015819999999699,
+          "ci95_method": "student_t",
+          "ci95_df": 1,
+          "ci95_informative": false,
+          "n_seeds": 2
         },
         {
           "candidate": "muown_adamw",
           "mean_validation_bpb": 2.584592,
-          "ci95": 0.0017600800000001282,
+          "ci95": 0.011410172090000831,
           "seeds": [
             42,
             2026
@@ -9057,12 +9147,17 @@
           "common_training_loss_target": 6.8457841873168945,
           "max_current_physical_mb": 5471.426361083984,
           "mean_logged_step_ms": 556.3064127619048,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0017600800000001282,
+          "ci95_method": "student_t",
+          "ci95_df": 1,
+          "ci95_informative": false,
+          "n_seeds": 2
         },
         {
           "candidate": "adamw",
           "mean_validation_bpb": 11.2789345,
-          "ci95": 0.19579321999999913,
+          "ci95": 1.2692799953724945,
           "seeds": [
             42,
             2026
@@ -9071,7 +9166,12 @@
           "common_training_loss_target": 6.8457841873168945,
           "max_current_physical_mb": 5463.457633972168,
           "mean_logged_step_ms": 511.4185912142857,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.19579321999999913,
+          "ci95_method": "student_t",
+          "ci95_df": 1,
+          "ci95_informative": false,
+          "n_seeds": 2
         }
       ],
       "excluded_candidates": []
@@ -9084,7 +9184,7 @@
         {
           "candidate": "muon_polar_adamw",
           "mean_validation_bpb": 2.420958,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -9092,12 +9192,17 @@
           "common_training_loss_target": 4.067625045776367,
           "max_current_physical_mb": 13779.669296264648,
           "mean_logged_step_ms": 3014.845658909091,
-          "confidence_interval_overlaps_best": true
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "normuon_adamw",
           "mean_validation_bpb": 2.567474,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -9105,12 +9210,17 @@
           "common_training_loss_target": 4.067625045776367,
           "max_current_physical_mb": 13780.778648376465,
           "mean_logged_step_ms": 2925.538409090909,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "muon_ns5_adamw",
           "mean_validation_bpb": 2.601096,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -9118,12 +9228,17 @@
           "common_training_loss_target": 4.067625045776367,
           "max_current_physical_mb": 13780.450592041016,
           "mean_logged_step_ms": 2915.5018484545453,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         },
         {
           "candidate": "mona_adamw",
           "mean_validation_bpb": 2.950696,
-          "ci95": 0.0,
+          "ci95": null,
           "seeds": [
             1337
           ],
@@ -9131,7 +9246,12 @@
           "common_training_loss_target": 4.067625045776367,
           "max_current_physical_mb": 13779.841217041016,
           "mean_logged_step_ms": 3146.9899203636364,
-          "confidence_interval_overlaps_best": false
+          "confidence_interval_overlaps_best": null,
+          "ci95_legacy_z": 0.0,
+          "ci95_method": "undefined_single_sample",
+          "ci95_df": 0,
+          "ci95_informative": false,
+          "n_seeds": 1
         }
       ],
       "excluded_candidates": []
@@ -9142,5 +9262,16 @@
     "lr": 0.05,
     "mean_validation_bpb": 2.1699185,
     "winner_exact_gate": "pending"
-  }
+  },
+  "corrections": [
+    {
+      "id": "ci95-normal-quantile-2026-08-22",
+      "field": "history[].ranking[].ci95",
+      "was": "1.96 * stdev / sqrt(n) for n>1, and 0.0 for n==1",
+      "now": "Student-t 95% half-width with df=n-1; null (undefined) for n==1",
+      "impact": "At the funnel's two-seed stages the normal quantile understated the interval by ~6.5x (t_1 = 12.706 vs z = 1.960), and a single-seed arm was recorded as having a zero-width interval, i.e. infinite precision. Because confidence_interval_overlaps_best gates the declared systems tie breakers, both defects could route selection incorrectly. The recorded champion (muon_polar_adamw) is unchanged: it leads on mean validation BPB at every stage and on both seeds at exact_128m_1000.",
+      "not_established": "exact_128m_1000 was previously read as separating muon_polar_adamw from normuon_adamw. With df=1 the intervals overlap ([2.1364, 2.2034] vs [2.1889, 2.2134]); the ordering rests on a sign-consistent 2-of-2 result, not on separated intervals.",
+      "original_values_preserved_in": "history[].ranking[].ci95_legacy_z"
+    }
+  ]
 }

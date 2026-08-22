@@ -26,6 +26,7 @@ drafter costs more per round than MTP's 239 MB head saves.
 | **Target** | `mlx-community/Qwen3.8-27B-4bit` | affine 4-bit, gs=64 | ~16.1 GB | `mlx-lm` / `mlx-vlm` / `dflash-mlx` |
 | **MTP drafter** | `mlx-community/Qwen3.8-27B-MTP-4bit` | native MTP head, block size 3 | 239 MB | `mlx-vlm` |
 | **DFlash drafter** | `z-lab/Qwen3.6-27B-DFlash` | block diffusion, 16 tok/pass | ~1.5 GB | `dflash-mlx` |
+| **DFlash 2 drafter** | `incoai/Qwen3.8-27B-DFlash2` | block diffusion + candidate selector, block 8, 3.8-native | 3.85 GB | oMLX only (§2a) |
 | **DSpark drafter (4-bit)** | `DimInfer/Qwen3.8-27B-Dspark-v1` | 1.36B, block 15, 3.8-native | ~3.5 GB | `mlx-dspark` |
 | **DSpark drafter (8-bit)** | `RadixArk/Qwen3.8-27B-DSpark` | 1.36B, block 7, 3.8-native | ~2.7 GB | `mlx-dspark` |
 
@@ -37,9 +38,15 @@ The DSpark drafters are **3.8-native** — trained against 3.8's own hidden stat
 none of the cross-application risk below. Each is matched to a precision: DimInfer to the 4-bit
 class, RadixArk to the FP8/8-bit verifier. On this machine that pairing rule did not hold (§4b-iii).
 
-The DFlash drafter is a **cross-application**. There is still no `z-lab/Qwen3.8-27B-DFlash`, and
-none is announced — verified against z-lab's published model list on 2026-08-17, whose newest
-DFlash checkpoints are Alpamayo (2026-07-04) and gemma4-12B (2026-06-28). 3.6 and 3.8 match on every field DFlash depends on (`hidden_size=5120`,
+**Superseded 2026-08-18: a 3.8-native DFlash drafter now exists.** z-lab/Inco AI released
+**DFlash 2** with `incoai/Qwen3.8-27B-DFlash2` (mirror `z-lab/Qwen3.8-27B-DFlash2`) — trained
+against 3.8 itself, so the cross-application caveat below no longer applies to it. It does not
+run under `dflash-mlx`; see §2a for why, and treat the paragraph below as history for the 3.6
+drafter only.
+
+The DFlash drafter is a **cross-application**. As of 2026-08-17 there was no
+`z-lab/Qwen3.8-27B-DFlash` — verified against z-lab's published model list, whose newest
+DFlash checkpoints were Alpamayo (2026-07-04) and gemma4-12B (2026-06-28). 3.6 and 3.8 match on every field DFlash depends on (`hidden_size=5120`,
 `num_hidden_layers=64`, identical `layer_types`, `vocab_size=248320`, mask id `248070`), and the
 drafter's tap layers `[1, 16, 31, 46, 61]` all exist on 3.8 — so it will **load**. Whether it
 **accepts** is the open question, because DFlash is trained against a specific target's hidden
@@ -106,6 +113,87 @@ python3 scripts/download_qwen.py --model bench-arms
 
 ---
 
+## 2a. DFlash 2 — installed 2026-08-18, unverified
+
+`dflash-mlx` **cannot run DFlash 2.** Upstream bstnxbt/dflash-mlx stops at v0.1.10 (2026-06-11,
+PyPI still serves 0.1.8) and jundot's production fork stops at `2eb169f`; neither knows the
+`DFlash2DraftModel` architecture. The runtime that does is pinned only inside the oMLX fork as
+`z-lab/dflash-mlx@415cc48`, and **that repo is private (404)** — so a source install of
+`omlx-fork` cannot resolve its own dependency. The prebuilt DMG is the only way in. Note also
+that `z-lab/omlx-fork` **main reverted the DFlash-MLX pin**; the DFlash2 build is the
+`0.6.2-dflash2` tag, not main.
+
+Installed here: `/Applications/oMLX.app` 0.6.2 (772 MB DMG, Developer ID *Yesheng Liang*
+C5UH93T368; the DMG is notarized but the `.app` carries no stapled ticket, so `spctl -t exec`
+rejects it — it runs because a terminal `cp` sets no quarantine attribute). It bundles
+`dflash_mlx 0.1.10+omlx.5`, which does carry `DFlash2DraftModel`.
+
+Serve it through the repo, which audits the config first (§2b):
+
+```bash
+python3 scripts/serve_qwen.py --backend omlx --port 8891
+```
+
+oMLX discovers HF-cache models directly (ids replace `/` with `--`), so the already-cached
+`mlx-community/Qwen3.8-27B-4bit` target is reused. Per-model config lives in
+`~/.omlx/model_settings.json`, not in argv.
+
+**Neither of DFlash 2's two claims is verified on this machine:**
+
+- *Throughput.* Every measurement was taken while the repo's own `mlx_vlm.server` MTP arm was
+  resident on the GPU and swap sat at 7.3/8 GB. Runs ranged 4.8–17.8 tok/s against an 8.94 tok/s
+  same-server AR control. The ratio suggests the drafter works; the absolutes are worthless, and
+  nothing here shows whether it beats MTP's 36.91.
+- *Losslessness.* Greedy `temperature 0` output was **not** bit-identical to AR. AR is
+  self-consistent (two runs identical), and all three DFlash configurations diverged from
+  VLM-engine AR at the *same* character (179) — the signature of a DFlashEngine-vs-VLM-engine
+  numerics difference rather than drafter corruption, and that AR control is not same-engine, so
+  it is not a clean test. But DFlash2 and the 3.6 drafter also diverged from *each other* at
+  char 290, and accepted tokens should not depend on which drafter proposed them. Unexplained.
+
+Until both are settled, `--backend omlx` prints an unverified-losslessness banner on every start,
+and DFlash 2 is not any engine's default.
+
+## 2b. The drafter policy — a 27B target never loads bare
+
+Owner: `scripts/qwen_draft_policy.py`. Bare AR on this target is 15–17 tok/s against 36.91 with
+the MTP drafter, and a drafter-less load is not an error — it answers every request, just slowly,
+for as long as the process stays up. Two holes were closed:
+
+- **Omission.** Any entry point that omits `--draft` now has the measured drafter for
+  (engine, target) attached automatically, and the attachment is announced on stderr.
+- **Silent reinterpretation.** `serve_qwen.py --draft none` documented itself as "serve plain AR"
+  while `draft or DEFAULT_MTP_DRAFT` put the drafter straight back — the one documented way to
+  ask for a bare load did the opposite. `none` now means bare, and bare requires `--allow-bare`.
+
+`mlx-lm` has no drafter hook at all, so `--backend mlx-lm` and `--mode mlx-direct` are refused on
+a Qwen3.8-27B target unless `--allow-bare` is passed; an approved bare load still prints a banner
+naming its reason. The `ar` benchmark arm takes that opt-out programmatically and its exemption is
+recorded in `preflight_notes`, so `results.json` says which number came from a drafter-less load.
+
+Pairings live in one table, keyed by engine, because a drafter is only valid for the runtime that
+can execute it. An unpaired (engine, target) refuses rather than guessing — pairing an unmeasured
+drafter with a target is how an unverified speedup ships as a default.
+
+oMLX takes its drafter from a config file rather than argv, so the same rule is a config audit:
+
+```bash
+python3 scripts/qwen_draft_policy.py --check-omlx   # exit 3 if a target would load bare
+python3 scripts/qwen_draft_policy.py --apply-omlx   # write the pairing
+```
+
+`--backend omlx` runs that audit before launching and repairs a drifted config, so a repo-launched
+oMLX cannot come up bare. Launching `oMLX.app` or `omlx-cli` by hand bypasses this — run
+`--check-omlx` for that path.
+
+Regression suite, no models or network required:
+
+```bash
+python3 scripts/test_qwen_draft_policy.py
+```
+
+---
+
 ## 3. CLI quickstart
 
 ### A. MTP speculative generation (default)
@@ -146,7 +234,8 @@ python3 scripts/run_qwen_inference.py --mode mlx-direct --prompt "..."
 python3 scripts/serve_qwen.py --backend mlx-vlm --port 8000   # MTP — default, fastest (2.18x)
 python3 scripts/serve_qwen.py --backend dspark  --port 8000   # 3.8-native DSpark (1.84x, lossless)
 python3 scripts/serve_qwen.py --backend dflash  --port 8000   # 3.6 cross-apply (1.17x, superseded)
-python3 scripts/serve_qwen.py --backend mlx-lm  --port 8000   # plain AR
+python3 scripts/serve_qwen.py --backend omlx    --port 8891   # DFlash 2 (UNVERIFIED — see 2a)
+python3 scripts/serve_qwen.py --backend mlx-lm --allow-bare --port 8000   # plain AR
 ```
 
 ---
@@ -365,16 +454,16 @@ server and scored by `scripts/bench_agents.py`. kon is the only one that was bot
 
 ### Launching it
 
-Two shell functions in `~/.zshrc` do everything — `qq` starts the server if it is not already up,
+Two shell functions in `~/.zshrc` do everything — `qwendev` starts the server if it is not already up,
 waits for it, then hands off to kon:
 
 ```bash
-qq                      # interactive
-qq -p "your task"       # one-shot
-qwen-stop               # unload the model, frees ~15 GB
+qwendev                 # interactive
+qwendev -p "your task"  # one-shot
+qwendev-stop            # unload the model, frees ~15 GB
 ```
 
-Measured cold (server down, page cache warm): **36 s** from `qq` to answer. A genuinely cold first
+Measured cold (server down, page cache warm): **36 s** from `qwendev` to answer. A genuinely cold first
 run after boot is slower, since the 15 GB has to come off disk.
 
 kon expects noise on stderr at exit — `RuntimeError: generator didn't stop after athrow()` — from
@@ -398,7 +487,7 @@ string must match what `GET /v1/models` reports, which is whatever you passed to
 `serve_qwen.py --model`.
 
 Those four flags can move into `~/.config/kon/config.toml` instead, which is what makes bare `kon`
-(and therefore `qq`) work:
+(and therefore `qwendev`) work:
 
 ```toml
 [llm]
@@ -489,9 +578,11 @@ is tolerable for one-shots. omp at ~13 minutes is not.
 
 ## 7. Out of scope
 
-- Training a 3.8-specific DFlash drafter (z-lab's recipe is not public). Moot as of 2026-08-17:
-  the DSpark family covers 3.8 natively and is measured in §4b-iii, so there is nothing left for a
-  hand-trained drafter to unlock here.
+- Training a 3.8-specific DFlash drafter (z-lab's recipe is not public). Moot twice over: the
+  DSpark family covers 3.8 natively (§4b-iii), and z-lab shipped an official 3.8 DFlash 2 drafter
+  on 2026-08-18 (§2a).
+- Getting DFlash 2 onto `dflash-mlx`. Its runtime dependency is a private repo (§2a), so this is
+  blocked upstream, not a wiring task.
 - A Rust/Metal GatedDeltaNet port. `Rust_MLKit/gemma-metal` holds Gemma-4 kernels (SWA, GELU MLP,
   PLE); Qwen3.8 needs GDN + Qwen MLP/RoPE/MTP. New architecture, multi-week project, not a wiring
   task.

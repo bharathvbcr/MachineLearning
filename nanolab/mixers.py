@@ -463,7 +463,11 @@ def gdn_chunked(q, k, v, alpha, beta, chunk=32):
     fully-vectorised analogue of `ssd_chunk_parallel` for the delta rule."""
     with torch.autocast(device_type=k.device.type, enabled=False):
         q, k, v = q.float(), k.float(), v.float()
-        alpha, beta = alpha.float(), beta.float()
+        # log(alpha) in the WY kernel: sigmoid gates can be 0 after a large
+        # update, then backward of log is 1/alpha = inf and the run NaNs
+        # (loss stayed finite through step 50 on GH200; gnorm blew at 55).
+        alpha = alpha.float().clamp(min=1e-4, max=1.0)
+        beta = beta.float().clamp(min=0.0, max=1.0)
         B, H, L, D = k.shape
         C = chunk
         pad = (-L) % C
@@ -477,16 +481,21 @@ def gdn_chunked(q, k, v, alpha, beta, chunk=32):
         cum = torch.cumsum(torch.log(alpha.view(B, H, N, C)), dim=-1)   # A_t = exp(cum_t)
         cum_prev = cum - torch.log(alpha.view(B, H, N, C))              # A_{t-1}
         # (I+M) U = R, M strictly lower; U = (I+M)^{-1} R via one batched solve
-        decM = torch.exp(cum_prev[..., :, None] - cum[..., None, :])    # A_{t-1}/A_j
+        # Exponentiate only the triangular part we use. The full CxC ratio
+        # A_{t-1}/A_j is >>1 for j>t and overflowed to inf; autograd then NaN'd
+        # even though .tril() hid those entries in the forward.
+        logM = (cum_prev[..., :, None] - cum[..., None, :]).tril(-1)
+        decM = torch.exp(logM.clamp(max=0.0))
         M = (bc[..., :, None] * decM * (kc @ kc.transpose(-1, -2))).tril(-1)
         eye = torch.eye(C, device=k.device, dtype=k.dtype).expand(B, H, N, C, C)
         Tinv = torch.linalg.solve_triangular(eye + M, eye, upper=False, unitriangular=True)
-        decY = torch.exp(cum[..., :, None] - cum[..., None, :])         # A_t/A_j
-        Wy = (decY * (qc @ kc.transpose(-1, -2))).tril(0)               # output weights
-        A_t = torch.exp(cum)[..., None]                                 # (B,H,N,C,1)
+        logY = (cum[..., :, None] - cum[..., None, :]).tril(0)
+        decY = torch.exp(logY.clamp(max=0.0))                 # A_t/A_j
+        Wy = (decY * (qc @ kc.transpose(-1, -2))).tril(0)     # output weights
+        A_t = torch.exp(cum)[..., None]                       # (B,H,N,C,1)
         A_prev = torch.exp(cum_prev)
-        dec_jC = torch.exp(cum[..., -1:] - cum)[..., None]              # A_C/A_j
-        A_C = torch.exp(cum[..., -1])[..., None, None]                  # (B,H,N,1,1)
+        dec_jC = torch.exp((cum[..., -1:] - cum).clamp(max=0.0))[..., None]  # A_C/A_j
+        A_C = torch.exp(cum[..., -1])[..., None, None]        # (B,H,N,1,1)
 
         S = torch.zeros(B, H, D, D, device=k.device, dtype=k.dtype)     # state k->v
         ys = []
@@ -539,8 +548,8 @@ class GatedDeltaNet(nn.Module):
         k = self.k_norm(k.view(B, T, H, P))
         k = F.normalize(k, dim=-1)                    # L2-normalize keys
         v = v.view(B, T, H, P)
-        alpha = torch.sigmoid(a_gate + self.decay_bias)   # (B,T,H) decay
-        beta = torch.sigmoid(b_gate + self.update_bias)   # (B,T,H) write strength
+        alpha = torch.sigmoid(a_gate + self.decay_bias).clamp(1e-4, 1.0)
+        beta = torch.sigmoid(b_gate + self.update_bias).clamp(0.0, 1.0)
         # -> [B,H,T,P] / [B,H,T], fp32 for the scan (state accumulation is touchy)
         q, k, v = (t.transpose(1, 2).float() for t in (q, k, v))
         return q, k, v, alpha.transpose(1, 2).float(), beta.transpose(1, 2).float()
@@ -655,8 +664,11 @@ MIXER_REGISTRY = {
 }
 
 
-def build_mixer(cfg) -> nn.Module:
-    return MIXER_REGISTRY[cfg.mixer](cfg)
+def build_mixer(cfg, mixer: str | None = None) -> nn.Module:
+    kind = mixer if mixer is not None else cfg.mixer
+    if kind not in MIXER_REGISTRY:
+        raise KeyError(f"unknown mixer {kind!r}; known: {list(MIXER_REGISTRY)}")
+    return MIXER_REGISTRY[kind](cfg)
 
 
 def mixer_needs_eager(mixer: str) -> bool:

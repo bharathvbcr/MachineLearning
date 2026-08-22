@@ -1,0 +1,7 @@
+{
+  "suite": "24-matched20-prefix",
+  "recipe": {"batch_size": 32, "eval_iters": 20, "max_steps": 1220, "lr_max_steps": 3051},
+  "flips_M": [1.038, 12.335],
+  "per_seed_late_flips_M": {"42": 11.93, "2026": 12.287, "100": 12.365, "777": 12.564, "1337": 12.579},
+  "gap_19.677M": -0.192
+}

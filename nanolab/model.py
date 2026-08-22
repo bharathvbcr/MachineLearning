@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .mixers import RMSNorm, build_mixer, build_rope_cache
+from .config import parse_layer_mixers
 
 
 def _norm(cfg, dim):
@@ -169,11 +170,11 @@ def fused_linear_cross_entropy(x, weight, target, n_chunks=8, ignore_index=-1):
 class Block(nn.Module):
     """Pre-norm residual block: x += mixer(norm(x)); x += ffn(norm(x))."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, mixer: str | None = None):
         super().__init__()
         self.cfg = cfg
         self.norm1 = _norm(cfg, cfg.d_model)
-        self.mixer = build_mixer(cfg)
+        self.mixer = build_mixer(cfg, mixer)
         self.norm2 = _norm(cfg, cfg.d_model)
         self.ffn = build_ffn(cfg)
 
@@ -199,7 +200,10 @@ class GPT(nn.Module):
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
-        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+        self.layer_kinds = parse_layer_mixers(cfg)
+        self.blocks = nn.ModuleList(
+            [Block(cfg, kind) for kind in self.layer_kinds]
+        )
         self.norm_f = _norm(cfg, cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         if cfg.tie_embeddings:
@@ -383,8 +387,9 @@ class GPT(nn.Module):
             ffn_params = sum(p.numel() for b in self.blocks for p in b.ffn.experts.parameters())
             inactive = ffn_params * (1 - cfg.moe_top_k / cfg.moe_experts)
             N -= int(inactive)
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.head_dim, cfg.block_size
-        attn = 12 * L * H * Q * T if cfg.mixer in ("attention", "mla") else 0
+        n_attn = sum(1 for k in parse_layer_mixers(cfg) if k in ("attention", "mla"))
+        H, Q, T = cfg.n_head, cfg.head_dim, cfg.block_size
+        attn = 12 * n_attn * H * Q * T
         return 6 * N + attn
 
     @torch.no_grad()

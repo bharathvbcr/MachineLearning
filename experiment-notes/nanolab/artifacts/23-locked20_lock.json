@@ -1,0 +1,24 @@
+{
+  "suite": "23-locked20-attn-mingru",
+  "recipe": {
+    "batch_size": 32,
+    "eval_iters": 20,
+    "max_steps": 1220,
+    "compile": false,
+    "cosine": "short (lr_max_steps=max_steps=1220); not 50M horizon"
+  },
+  "flips_M": [1.047, 14.582],
+  "per_seed_late_flips_M": {
+    "42": 13.709,
+    "2026": 14.49,
+    "1337": 14.929,
+    "100": 15.058,
+    "777": 15.193
+  },
+  "last_eval_19.677M": {
+    "attention_mean": 4.771,
+    "mingru_mean": 4.836,
+    "gap_A_minus_G": -0.065
+  },
+  "suite22_50M_cosine_late_flips_M": [12.031, 12.216, 12.453, 12.474, 12.579]
+}

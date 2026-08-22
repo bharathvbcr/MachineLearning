@@ -1,0 +1,9 @@
+{
+  "suite": "25-gh200-bs8",
+  "recipe": {"batch_size": 8, "eval_iters": 20, "max_steps": 2000, "token_budget": 8192000},
+  "logged_evals": 9,
+  "last_logged_tokens": 7376896,
+  "mean_flips_in_logged_evals": [],
+  "gap_7.377M": 0.030,
+  "note": "final 8.192M evaluate() is not logged as event=eval; only best_val"
+}

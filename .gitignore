@@ -99,3 +99,9 @@ modded-nanogpt
 # Nested repos with their own history (tracked independently, not as gitlinks)
 binn
 parameter-golf
+
+# Generated learning-notes bundle (rebuild with: python learning-notes/build_html.py)
+learning-notes/ml-notes.html
+
+# Regenerable parity activations (python3 metal-native/scripts/export_goldens.py)
+Rust_MLKit/arch_02_value_resid/metal-native/golden/fwd/

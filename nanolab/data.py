@@ -322,7 +322,27 @@ def _prepare_fineweb_bin(cfg):
 # between steps (guide §7.4: an efficient, packed loader is part of maximizing
 # MFU). Larger corpora fall back to the pinned-memory async path. Kept well below
 # 8 GB so the resident data never crowds out the model/optimizer/activations.
+# 8 GB cards: 150M int32 tokens ≈ 0.6 GB. H100/GH200-class cards hold the
+# whole FineWeb shard on device (~2 GB for 500M tokens) so the host gather
+# never stalls tensor cores.
 _GPU_RESIDENT_MAX_TOKENS = 150_000_000
+_GPU_RESIDENT_LARGE_VRAM = 40 * (1024 ** 3)
+
+
+def should_gpu_resident(n_tokens: int, device: str) -> bool:
+    """Keep the token buffer on GPU when the copy is cheap relative to VRAM."""
+    if not device.startswith("cuda"):
+        return False
+    bytes_needed = int(n_tokens) * 4  # int32 resident
+    if bytes_needed <= _GPU_RESIDENT_MAX_TOKENS * 4:
+        return True
+    try:
+        free, total = torch.cuda.mem_get_info()
+    except Exception:
+        return False
+    if total < _GPU_RESIDENT_LARGE_VRAM:
+        return False
+    return bytes_needed < 0.2 * free and bytes_needed < 8 * (1024 ** 3)
 
 
 class Batcher:
@@ -343,8 +363,9 @@ class Batcher:
         self.device = device
         self.gen = torch.Generator().manual_seed(cfg.seed + (0 if split == "train" else 1))
 
-        self.gpu_resident = (device.startswith("cuda")
-                             and len(data) <= _GPU_RESIDENT_MAX_TOKENS)
+        self.gpu_resident = should_gpu_resident(len(data), device)
+        self._pin = [None, None]
+        self._pin_i = 0
         if self.gpu_resident:
             # one copy, then everything is on-device (int32 keeps it compact)
             self.data = torch.as_tensor(np.asarray(data, dtype=np.int32),
@@ -371,15 +392,23 @@ class Batcher:
             offsets = ix[:, None] + torch.arange(bs + 1, device=self.device)[None, :]
             seq = self.data[offsets].long()              # (B, T+1) on-GPU gather
             return seq[:, :-1].contiguous(), seq[:, 1:].contiguous()
-        ix = torch.randint(n, (self.batch_size,), generator=self.gen)
-        x = torch.stack([torch.from_numpy(
-            self.data[i:i + bs].astype(np.int64)) for i in ix])
-        y = torch.stack([torch.from_numpy(
-            self.data[i + 1:i + 1 + bs].astype(np.int64)) for i in ix])
+        ix = torch.randint(n, (self.batch_size,), generator=self.gen).tolist()
+        width = bs + 1
+        buf = np.empty((self.batch_size, width), dtype=np.uint16)
+        for row, start in enumerate(ix):
+            buf[row] = self.data[start:start + width]
+        seq = torch.from_numpy(np.asarray(buf, dtype=np.int64))
         if self.device.startswith("cuda"):
-            return x.pin_memory().to(self.device, non_blocking=True), \
-                   y.pin_memory().to(self.device, non_blocking=True)
-        return x.to(self.device), y.to(self.device)
+            slot = self._pin_i
+            pin = self._pin[slot]
+            if pin is None or pin.shape != seq.shape:
+                pin = torch.empty(seq.shape, dtype=torch.long).pin_memory()
+                self._pin[slot] = pin
+            pin.copy_(seq)
+            gpu = pin.to(self.device, non_blocking=True)
+            self._pin_i ^= 1
+            return gpu[:, :-1], gpu[:, 1:]
+        return seq[:, :-1].contiguous(), seq[:, 1:].contiguous()
 
     def iterator(self):
         while True:

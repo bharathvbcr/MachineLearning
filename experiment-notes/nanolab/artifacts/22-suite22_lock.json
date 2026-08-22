@@ -1,0 +1,88 @@
+{
+  "flips_M": [
+    1.049,
+    12.353
+  ],
+  "rank_50M": [
+    {
+      "arm": "attention",
+      "mean": 4.2219,
+      "lo": 4.204,
+      "hi": 4.2398,
+      "seed_min": 4.2044,
+      "seed_max": 4.2371
+    },
+    {
+      "arm": "hybrid_mingru10_attn2",
+      "mean": 4.2749,
+      "lo": 4.2452,
+      "hi": 4.3046,
+      "seed_min": 4.2405,
+      "seed_max": 4.302
+    },
+    {
+      "arm": "hybrid_gdn_periodic",
+      "mean": 4.2803,
+      "lo": 4.2474,
+      "hi": 4.3132,
+      "seed_min": 4.2543,
+      "seed_max": 4.3212
+    },
+    {
+      "arm": "hybrid_gdn_bookend",
+      "mean": 4.2926,
+      "lo": 4.2575,
+      "hi": 4.3277,
+      "seed_min": 4.2617,
+      "seed_max": 4.3353
+    },
+    {
+      "arm": "hybrid_gdn10_attn2",
+      "mean": 4.3086,
+      "lo": 4.2736,
+      "hi": 4.3437,
+      "seed_min": 4.2781,
+      "seed_max": 4.3512
+    },
+    {
+      "arm": "gdn",
+      "mean": 4.429,
+      "lo": 4.4018,
+      "hi": 4.4561,
+      "seed_min": 4.4039,
+      "seed_max": 4.456
+    },
+    {
+      "arm": "mingru",
+      "mean": 4.4491,
+      "lo": 4.4228,
+      "hi": 4.4755,
+      "seed_min": 4.4301,
+      "seed_max": 4.473
+    },
+    {
+      "arm": "hybrid_mamba10_attn2",
+      "mean": 4.6043,
+      "lo": 4.5165,
+      "hi": 4.6921,
+      "seed_min": 4.5344,
+      "seed_max": 4.7188
+    },
+    {
+      "arm": "mla",
+      "mean": 4.6062,
+      "lo": 4.5786,
+      "hi": 4.6337,
+      "seed_min": 4.5769,
+      "seed_max": 4.627
+    },
+    {
+      "arm": "mamba2",
+      "mean": 4.6567,
+      "lo": 4.5864,
+      "hi": 4.7271,
+      "seed_min": 4.5784,
+      "seed_max": 4.7155
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "suite": "26-matched32-hybrids",
+  "recipe": {"batch_size": 32, "eval_iters": 20, "max_steps": 3051},
+  "rank_50M": [
+    {"arm": "attention", "source": "suite22", "mean": 4.2219, "lo": 4.204, "hi": 4.2398},
+    {"arm": "hybrid_mingru10_attn2", "source": "suite26", "mean": 4.2319, "lo": 4.2099, "hi": 4.2539},
+    {"arm": "hybrid_gdn_periodic", "source": "suite26", "mean": 4.2895, "lo": 4.2705, "hi": 4.3086},
+    {"arm": "hybrid_gdn_bookend", "source": "suite26", "mean": 4.3008, "lo": 4.2781, "hi": 4.3235},
+    {"arm": "hybrid_gdn10_attn2", "source": "suite26", "mean": 4.3136, "lo": 4.2917, "hi": 4.3356},
+    {"arm": "hybrid_mamba10_attn2", "source": "suite26", "mean": 4.3327, "lo": 4.3123, "hi": 4.3532},
+    {"arm": "gdn", "source": "suite26", "mean": 4.4407, "lo": 4.4194, "hi": 4.4619},
+    {"arm": "mingru", "source": "suite22", "mean": 4.4491, "lo": 4.4228, "hi": 4.4755},
+    {"arm": "mamba2", "source": "suite26", "mean": 4.5962, "lo": 4.5621, "hi": 4.6302},
+    {"arm": "mla", "source": "suite26", "mean": 4.6272, "lo": 4.6041, "hi": 4.6503}
+  ]
+}

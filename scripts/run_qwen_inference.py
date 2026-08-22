@@ -21,20 +21,16 @@ from mlx_lm.sample_utils import make_sampler
 # scripts/ is not a package; make sibling modules importable regardless of cwd.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from dflash_guard import warn_unless_lossless  # noqa: E402
-
-DEFAULT_TARGET_MODEL = "mlx-community/Qwen3.8-27B-4bit"
-
-# Official MTP drafter split from the same Qwen3.8-27B checkpoint as the target.
-# Runs under mlx-vlm (--draft-kind mtp). Same training run as the target, so there is
-# no cross-model acceptance risk.
-DEFAULT_MTP_DRAFT = "mlx-community/Qwen3.8-27B-MTP-4bit"
-
-# Cross-applied 3.6 drafter. There is NO z-lab Qwen3.8 DFlash checkpoint as of
-# 2026-08-16, and dflash-mlx's registry will not auto-resolve a draft for a 3.8
-# target, so this must always be passed explicitly. Architecturally compatible
-# (same hidden size / layer count / layer_types) but trained on 3.6 hidden states —
-# acceptance is an open question. See scripts/bench_qwen38.py.
-DEFAULT_DFLASH_DRAFT = "z-lab/Qwen3.6-27B-DFlash"
+# Target/drafter pairings and the "never load 27B bare" rule live in one module,
+# so every entry point here inherits the same defaults and the same refusal.
+# The MTP drafter is split from the same Qwen3.8-27B checkpoint as the target
+# (no cross-model acceptance risk); the DFlash drafter is the 3.6 cross-apply and
+# must always be passed explicitly, since dflash-mlx's registry has no 3.8 entry.
+from qwen_draft_policy import (  # noqa: E402
+    DEFAULT_TARGET_MODEL,
+    add_allow_bare_flag,
+    resolve_draft,
+)
 
 def run_mlx_direct(model_id: str, prompt: str, max_tokens: int = 512, temp: float = 0.7, enable_thinking: bool = False) -> dict[str, object]:
     print(f"\n{'='*70}")
@@ -224,21 +220,32 @@ def main() -> None:
     parser.add_argument("--temp", type=float, default=0.7, help="Sampling temperature.")
     parser.add_argument("--enable-thinking", action="store_true",
                         help="Enable the Qwen thinking template (mtp-speculative mode).")
+    add_allow_bare_flag(parser)
     args = parser.parse_args()
+
+    # mlx-direct decodes through mlx-lm, which has no drafter hook at all — so on a
+    # Qwen3.8-27B target it is a bare load by construction and needs the opt-out.
+    engine = {"mlx-direct": "mlx-lm", "mtp-speculative": "mlx-vlm"}.get(args.mode, "dflash")
+    draft = resolve_draft(
+        args.model, args.draft, engine=engine,
+        context=f"run_qwen_inference.py --mode {args.mode}",
+        allow_bare=args.allow_bare,
+        bare_reason="operator passed --allow-bare" if args.allow_bare else None,
+    )
 
     if args.mode == "mlx-direct":
         run_mlx_direct(args.model, args.prompt, max_tokens=args.max_tokens, temp=args.temp)
     elif args.mode == "mtp-speculative":
-        run_mtp_speculative(args.model, args.draft or DEFAULT_MTP_DRAFT, args.prompt,
+        run_mtp_speculative(args.model, draft, args.prompt,
                             max_tokens=args.max_tokens, temp=args.temp,
                             enable_thinking=args.enable_thinking)
     elif args.mode == "dflash-speculative":
         # Always explicit: the dflash registry has no Qwen3.8 entry and will reject
         # the target rather than auto-resolving a drafter.
-        run_dflash_speculative(args.model, args.draft or DEFAULT_DFLASH_DRAFT,
+        run_dflash_speculative(args.model, draft,
                                args.prompt, max_tokens=args.max_tokens)
     elif args.mode == "benchmark":
-        run_benchmark(args.model, args.draft or DEFAULT_DFLASH_DRAFT,
+        run_benchmark(args.model, draft,
                       args.prompt, max_tokens=args.max_tokens)
 
 if __name__ == "__main__":

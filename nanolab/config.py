@@ -25,6 +25,8 @@ from dataclasses import dataclass, fields
 
 # Registries — the pluggable axes the guide calls out (§2.5, §4.2, §5.3).
 MIXERS = ("attention", "mingru", "mamba2", "gdn", "mla")
+# Compact LAYER_TYPES aliases used by the hypercascade trainers.
+MIXER_ALIASES = {"attn": "attention", "mamba": "mamba2"}
 OPTIMIZERS = (
     "muon_ns5_adamw", "muon_ns3_adamw", "muon_polar_adamw",
     "normuon_adamw", "muown_adamw", "mona_adamw", "mimuon_adamw",
@@ -79,6 +81,11 @@ class Config:
 
     # ---- sequence mixer (guide §2.5) — the one A/B flag ----
     mixer: str = "attention"
+    # Per-layer mixer stack. Empty = every layer uses ``mixer``. Compact syntax
+    # matches the hypercascade LAYER_TYPES recipe, e.g. ``gdn*10,attention*2``
+    # or ``gdn*3,attention,gdn*3,attention,gdn*3,attention``. Length must equal
+    # ``n_layer``. Unknown names and length mismatches fail closed.
+    layer_mixers: str = ""
     # attention-only knobs (champion variant from old runs):
     gated_attention: bool = True   # per-head sigmoid gate on attn output
     value_residual: bool = True    # blend layer-0 values into later layers
@@ -136,6 +143,7 @@ class Config:
     lr_max_steps: int = 0  # if >0, schedule decays over this many steps instead of max_steps
     eval_interval: int = 250
     eval_iters: int = 100
+    eval_train: bool = True        # also eval the train split (doubles eval cost)
     log_interval: int = 10
     ckpt_interval: int = 1000
 
@@ -180,6 +188,7 @@ class Config:
         assert self.optimizer in OPTIMIZERS, f"optimizer must be one of {OPTIMIZERS}"
         assert self.schedule in SCHEDULES, f"schedule must be one of {SCHEDULES}"
         assert self.diffusion_mode in DIFFUSION_MODES, f"diffusion_mode must be one of {DIFFUSION_MODES}"
+        parse_layer_mixers(self)  # fail closed on bad hybrid specs
 
     # -- convenience --------------------------------------------------------
     @property
@@ -199,6 +208,52 @@ class Config:
         )
         emb = V * d * (1 if self.tie_embeddings else 2)
         return L * per_layer + emb
+
+
+def _resolve_mixer_name(name: str) -> str:
+    key = name.strip().lower()
+    key = MIXER_ALIASES.get(key, key)
+    if key not in MIXERS:
+        raise ValueError(f"unknown mixer {name!r}; known: {MIXERS} (aliases: {MIXER_ALIASES})")
+    return key
+
+
+def parse_layer_mixers(cfg: Config) -> tuple[str, ...]:
+    """Expand ``cfg.layer_mixers`` into one mixer name per layer.
+
+    Empty/blank → every layer is ``cfg.mixer``. ``name*N`` repeats. Length must
+    equal ``cfg.n_layer``; mismatches and unknown names raise ``ValueError``.
+    """
+    spec = (cfg.layer_mixers or "").strip()
+    if not spec:
+        return tuple(cfg.mixer for _ in range(cfg.n_layer))
+    kinds: list[str] = []
+    for raw in spec.split(","):
+        part = raw.strip()
+        if not part:
+            raise ValueError(f"empty entry in layer_mixers {spec!r}")
+        if "*" in part:
+            name, _, count_s = part.partition("*")
+            name = name.strip()
+            try:
+                count = int(count_s.strip())
+            except ValueError as e:
+                raise ValueError(f"bad repeat count in {part!r}") from e
+            if count <= 0:
+                raise ValueError(f"repeat count must be >0 in {part!r}")
+        else:
+            name, count = part, 1
+        kinds.extend([_resolve_mixer_name(name)] * count)
+    if len(kinds) != cfg.n_layer:
+        raise ValueError(
+            f"layer_mixers specifies {len(kinds)} layers, n_layer={cfg.n_layer} "
+            f"(spec={spec!r})"
+        )
+    return tuple(kinds)
+
+
+def stack_is_attention_only(cfg: Config) -> bool:
+    return all(k == "attention" for k in parse_layer_mixers(cfg))
 
 
 def _swiglu_hidden(d_model: int) -> int:
@@ -290,6 +345,21 @@ PRESETS: dict[str, dict] = {
         diffusion_mode="block",
         diffusion_init_ckpt="nanolab/out/run128m_10k/best.pt",
         diffusion_block_len=32, diffusion_complementary=True,
+    ),
+    # Token-budget crossover replication (suite 14 architecture, 50M-token horizon).
+    # Batch is a cluster knob: GH200 uses a large microbatch (see
+    # nanolab.crossover_replicate.scale_to_token_budget) so tensor cores see a
+    # wide GEMM. Warmup/eval cadence is kept in *tokens* matching suite 14
+    # (256 steps × 4096 tok, eval every 0.8192M). Hybrids set --layer_mixers.
+    "crossover50m": dict(
+        run_name="crossover50m", n_layer=12, d_model=768, n_head=12, head_dim=64,
+        block_size=512, vocab_size=50304, dataset="hf", tokenizer="gpt2",
+        hf_dataset="HuggingFaceFW/fineweb-edu", hf_config="sample-10BT",
+        batch_size=96, grad_accum=1, max_steps=1017, eval_interval=16,
+        eval_iters=4, eval_train=False, log_interval=1, ckpt_interval=166,
+        warmup_steps=21, optimizer="muon", lr=6e-4, schedule="cosine",
+        mixer_chunk=32, fused_ce=True, fused_ce_chunks=16, compile=False,
+        tf32=True, grad_checkpoint=False, mem_fraction=0.0, dtype="bf16",
     ),
 }
 

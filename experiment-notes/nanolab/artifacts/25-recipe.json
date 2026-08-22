@@ -1,0 +1,12 @@
+{
+  "batch_size": 8,
+  "eval_iters": 20,
+  "token_budget": 8192000,
+  "lr_horizon": null,
+  "arms": [
+    "attention",
+    "mingru"
+  ],
+  "prefix": "cx8",
+  "compile": false
+}

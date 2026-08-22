@@ -175,6 +175,53 @@ def _tuned_lrs(plan: dict[str, Any]) -> dict[str, float]:
     }
 
 
+# Two-sided 95% Student-t critical values by degrees of freedom.  The funnel
+# runs two- and five-seed stages, where the normal quantile (1.96) understates
+# the interval badly: at df=1 the correct multiplier is 12.706, so a z-interval
+# is ~6.5x too narrow and will report separation that the sample cannot support.
+T_CRITICAL_95 = {
+    1: 12.706205, 2: 4.302653, 3: 3.182446, 4: 2.776445, 5: 2.570582,
+    6: 2.446912, 7: 2.364624, 8: 2.306004, 9: 2.262157, 10: 2.228139,
+    11: 2.200985, 12: 2.178813, 13: 2.160369, 14: 2.144787, 15: 2.131450,
+    16: 2.119905, 17: 2.109816, 18: 2.100922, 19: 2.093024, 20: 2.085963,
+    21: 2.079614, 22: 2.073873, 23: 2.068658, 24: 2.063899, 25: 2.059539,
+    26: 2.055529, 27: 2.051831, 28: 2.048407, 29: 2.045230, 30: 2.042272,
+}
+NORMAL_CRITICAL_95 = 1.959964
+
+# Below this many seeds the overlap test cannot separate candidates at all (a
+# df=1 interval spans roughly six standard errors either side), so the declared
+# systems tie breakers must not be invoked off the back of it.
+MIN_SEEDS_FOR_INFORMATIVE_CI = 3
+
+
+def _t_critical_95(df: int) -> float:
+    """Two-sided 95% t multiplier; falls back to the normal quantile past df=30."""
+    if df < 1:
+        return math.inf
+    return T_CRITICAL_95.get(df, NORMAL_CRITICAL_95)
+
+
+def _mean_ci95(values: list[float]) -> tuple[float, float, bool]:
+    """Return (half_width, degrees_of_freedom_used, informative).
+
+    A single sample has no interval.  Reporting 0.0 there — as this function
+    used to — is the worst possible failure: it makes an unmeasured arm look
+    infinitely precise and lets it be declared separated from every rival.  An
+    unmeasurable interval is infinite, not zero.
+    """
+    n = len(values)
+    if n < 2:
+        return math.inf, 0, False
+    df = n - 1
+    standard_error = statistics.stdev(values) / math.sqrt(n)
+    return (
+        _t_critical_95(df) * standard_error,
+        df,
+        n >= MIN_SEEDS_FOR_INFORMATIVE_CI,
+    )
+
+
 def _rank_candidates(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for job in jobs:
@@ -192,7 +239,7 @@ def _rank_candidates(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         scores = [_completed_score(job) for job in candidate_jobs]
         values = [float(score) for score in scores if score is not None]
         mean = statistics.fmean(values)
-        ci95 = (1.96 * statistics.stdev(values) / math.sqrt(len(values))) if len(values) > 1 else 0.0
+        ci95, ci95_df, ci95_informative = _mean_ci95(values)
         step_times = [float(job["result"]["mean_logged_step_ms"]) for job in candidate_jobs
                       if job["result"].get("mean_logged_step_ms") is not None]
         footprints = [float(job["result"]["max_current_physical_mb"]) for job in candidate_jobs
@@ -209,6 +256,10 @@ def _rank_candidates(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "candidate": candidate,
             "mean_validation_bpb": mean,
             "ci95": ci95,
+            "ci95_method": "student_t" if ci95_df >= 1 else "undefined_single_sample",
+            "ci95_df": ci95_df,
+            "ci95_informative": ci95_informative,
+            "n_seeds": len(values),
             "seeds": [job["seed"] for job in candidate_jobs],
             "time_to_common_training_loss_ms": (
                 statistics.fmean(times_to_loss) if times_to_loss else math.inf
@@ -221,12 +272,34 @@ def _rank_candidates(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return []
     rankings.sort(key=lambda item: item["mean_validation_bpb"])
     best = rankings[0]
+    # The overlap test is only meaningful when every arm carries an informative
+    # interval.  With two seeds the df=1 interval is so wide that a plainly
+    # worse arm overlaps the leader, and the systems tie breakers would then
+    # hand the stage to whichever arm merely ran fastest.  A check that cannot
+    # run must not be reported as a check that ran: record None rather than
+    # False, and fall back to ordering by mean.
+    ci_usable = all(item["ci95_informative"] for item in rankings)
+    if not ci_usable:
+        underpowered = sorted({item["n_seeds"] for item in rankings})
+        for item in rankings:
+            item["confidence_interval_overlaps_best"] = None
+            item["tiebreakers_applied"] = False
+            item["tiebreaker_skip_reason"] = (
+                "confidence intervals are not informative at "
+                f"n_seeds={underpowered}; need >= {MIN_SEEDS_FOR_INFORMATIVE_CI} "
+                "seeds per arm before the declared systems tie breakers may be "
+                "invoked. Ranked by mean validation BPB only."
+            )
+        return rankings
+
     best_lo = best["mean_validation_bpb"] - best["ci95"]
     best_hi = best["mean_validation_bpb"] + best["ci95"]
     for item in rankings:
         lo = item["mean_validation_bpb"] - item["ci95"]
         hi = item["mean_validation_bpb"] + item["ci95"]
         item["confidence_interval_overlaps_best"] = lo <= best_hi and best_lo <= hi
+        item["tiebreakers_applied"] = item["confidence_interval_overlaps_best"]
+        item["tiebreaker_skip_reason"] = None
     # Only arms statistically tied with the best invoke the declared systems
     # tie breakers. Non-overlapping arms remain ordered by mean validation BPB.
     tied = [item for item in rankings if item["confidence_interval_overlaps_best"]]

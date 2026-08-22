@@ -80,6 +80,8 @@ class Logger:
         print(f"  run        : {self.cfg.run_name}")
         print(f"  mixer      : {self.cfg.mixer}    optimizer: {self.cfg.optimizer}"
               f"    schedule: {self.cfg.schedule}")
+        if getattr(self.cfg, "layer_mixers", ""):
+            print(f"  layers     : {self.cfg.layer_mixers}")
         print(f"  params     : {format_count(n)} total ({format_count(nemb)} non-embed)")
         print(f"  arch       : L{self.cfg.n_layer} d{self.cfg.d_model} "
               f"h{self.cfg.n_head}/{self.cfg.n_kv_head}kv  ctx{self.cfg.block_size}  "
@@ -103,7 +105,8 @@ class Logger:
         rec = {"event": "eval", "step": step, **kw}
         self._emit(rec)
         bpc = f"  bpc {kw['bpc']:.3f}" if "bpc" in kw else ""
-        print(f"  -------- eval @ {step}: train {kw['train_loss']:.4f}  "
+        train_bit = (f"train {kw['train_loss']:.4f}  " if "train_loss" in kw else "")
+        print(f"  -------- eval @ {step}: {train_bit}"
               f"val {kw['val_loss']:.4f}  ppl {kw['val_ppl']:.2f}{bpc} --------")
 
     def done(self, best_val, elapsed, tokens):

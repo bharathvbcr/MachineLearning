@@ -129,7 +129,66 @@ graph TD
 
 ---
 
-## 16.8 The general debugging workflow you converged on
+## 16.8 Failure: the whole Mac freezes and there is no crash log (wired unified memory)
+
+- **Symptom:** running DiffusionGemma 26B-A4B (8-bit MLX) through the benchmark harness **froze the
+  entire machine** — beachball, no SSH, hard reboot required. Crucially, `/Library/Logs/
+  DiagnosticReports` contained **zero `.panic` files** afterwards.
+- **Diagnosis:** *no panic log means it never crashed* — it starved. On Apple Silicon the GPU and CPU
+  share one memory pool, and mlx-vlm wraps generation in `wired_limit`, which unconditionally calls
+  `mx.set_wired_limit(max_recommended_working_set_size)` = **51.8 GiB on a 64 GiB machine**
+  (`mlx_vlm/generate/common.py:139`, applied at `diffusion.py:1179`). **Wired pages cannot be evicted
+  by the kernel.** Meanwhile Ollama's default `keep_alive` is **5 minutes**, so the previously
+  benchmarked model (18–36 GB) was *still resident* when MLX wired another 26 GB. 36 + 26 > 64, and
+  the OS had nothing left to reclaim — so instead of swapping slowly, it stopped responding entirely.
+- **The two guards that look like they'd help and don't:**
+  - `mx.set_memory_limit` is documented as a *guideline* that raises only "if the memory limit is
+    exceeded and there is no more RAM (**including swap**)" — it fires *after* the machine is dead.
+    Its default is 1.5× the working set (~78 GB on a 64 GiB box), i.e. above physical RAM by design.
+  - The wired limit **cannot be lowered**: no env var, no parameter, and it is re-set inside the
+    library on *every* generation, so anything you set beforehand is overwritten.
+- **Fix:** you cannot constrain it in-process, so **isolate it into a killable child**. `bench_mlx.py`
+  (in the Benchmark project) evicts Ollama first via `keep_alive: 0` and *proves* `/api/ps` is empty,
+  preflights the budget against both the Metal working set and live `vm_stat` availability, then runs
+  MLX in a subprocess under a watchdog that `SIGKILL`s the **process group** on a memory floor or
+  swap-growth breach. The parent never allocates, so it can always act.
+- **General rule:** **a freeze with no panic log is memory starvation, not a crash.** And when a
+  library sets a *global system* limit internally, in-process guards are theatre — the only real
+  containment is a separate process you can kill. Note the symmetry with **16.3**: same root cause
+  (allocation exceeding physical memory, silently absorbed instead of thrown), but the CUDA/WDDM
+  version *degrades* to a 25× PCIe crawl, while the unified-memory version *wires* the pages and
+  takes the OS down with it. Slow is a gift; unevictable is not.
+
+---
+
+## 16.9 Failure: the harness is wrong, not the model (measurement integrity)
+
+- **Symptom:** DiffusionGemma scored **0.67** on a 3-prompt benchmark, failing the coding task
+  with `exec failed: invalid syntax (<string>, line 1)`. The obvious read: the model can't code.
+- **Diagnosis:** the model's code was *perfect*. The grader `exec()`'d the raw response, which
+  began with a markdown fence and Gemma's `<|channel>thought<channel|>` control marker — so
+  "line 1" was never Python at all. Worse, that checker had **never once executed**: every prior
+  benchmark had been run with `--quick`, which only runs prompt 1. The bug had sat latent since
+  the day it was written, and the first real invocation was also its first test.
+- **Two more measurement bugs found in the same pass:**
+  - `forwards_per_token` divided denoising steps by **canvas size** instead of *emitted tokens*.
+    The canvas is what was *allocated* (256 slots for a 10-token answer), so unused slots were
+    counted as free output — flattering the model **16×**. A metric whose denominator you did
+    not choose deliberately is a metric that lies.
+  - `skip_special_tokens=True` looked like it fixed the marker leak, and it did nothing: those
+    markers aren't in the tokenizer's `all_special_ids`. **Confirming the flag exists is not
+    confirming the flag works** — only the output proves it.
+- **Fix:** strip control tokens and fences at one canonical owner before scoring; divide by
+  emitted tokens and report `canvas_utilization` alongside so the gap stays visible; add a test
+  per bug that fails against the pre-fix code. Re-scored, the true accuracy was **1.0**.
+- **General rule:** **a bad score is a claim about your harness until you have read the raw
+  output.** Grade the grader first — print what the model actually said before believing what
+  the scorer said about it. And a code path that has never run is not "working", it is
+  *unobserved*: `--quick` had quietly meant "skip the only test that exercises the checker."
+
+---
+
+## 16.10 The general debugging workflow you converged on
 
 ```
   1. LOG everything from step 1 (loss, val, grad-norm, lr, tok/s, MFU, + nvidia-smi power/mem).
@@ -138,6 +197,7 @@ graph TD
   4. VERIFY custom math against a brute-force reference to 1e-5.
   5. For "is this real?" — ≥2 seeds, staged short→long, fixed tokens.
   6. Distrust too-good numbers (0 loss, val ≪ train) more than bad ones.
+  7. Before believing a BAD score, read the raw output — grade the grader first.
 ```
 
 This is the actual scientific method applied to training. Most of your real findings — the

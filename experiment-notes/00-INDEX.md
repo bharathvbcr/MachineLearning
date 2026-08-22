@@ -1,12 +1,12 @@
 # Experiment suite index
 
-This lab notebook records methods, variants, failures, results, reproduction paths, and concrete artifacts for 32 experiment suites. Of these, 25 are done, five are partial, one is blocked, and one is planned. Confidence grades describe the evidence actually preserved, not the ambition of the experiment.
+This lab notebook records methods, variants, failures, results, reproduction paths, and concrete artifacts for 37 experiment suites. Of these, 30 are done, five are partial, one is blocked, and one is planned. Confidence grades describe the evidence actually preserved, not the ambition of the experiment.
 
 Copy [`_TEMPLATE.md`](_TEMPLATE.md) for new suites. Status values: `done` / `partial` / `planned` / `blocked`.
 
 ## Headline findings
 
-- Attention overtook minGRU between **6.6M and 7.4M tokens**; two follow-up scales preserved the early-recurrent/late-attention crossover.
+- On a 3070 Ti (one seed, bs8) attention overtook minGRU between **6.6M and 7.4M tokens**. On GH200 bs32 n=5 the same pair flips at **~1.05M** then **~12.4M** (independent 20M prefix recovered 12.34M). GH200 bs8 n=5 has **no flip by 7.38M**. Short rankings lie; the token of the flip is recipe-dependent.
 - Value residual supplied the architecture ladder’s robust gain; gated attention’s additional **~0.0027 BPB** edge was within seed noise, while gating alone was **~0.104 BPB** worse than the champion.
 - Lean auxiliary heads improved calibrated BPB from **2.093 to 2.066** while shrinking the export.
 - Compact 4L×128 + higher LR matched or beat the nearly 2× larger/slower depth proxy at long horizon; short-stage depth rankings did not survive promotion.
@@ -52,6 +52,11 @@ Copy [`_TEMPLATE.md`](_TEMPLATE.md) for new suites. Status values: `done` / `par
 | [19-chunk-parallel-kernels](nanolab/19-chunk-parallel-kernels.md) | Mamba-2/GDN speedups | done | High | RTX 3070 Ti Laptop 8 GB | Verified chunk-parallel kernels required fp32 accumulation. |
 | [20-run128m-long](nanolab/20-run128m-long.md) | `run128m_{2k,10k,20k}` | done | Medium | RTX 3070 Ti Laptop 8 GB | The 10k run at 6e-4 beat the lower-LR 20k continuation on best val. |
 | [21-diffusion-lm](nanolab/21-diffusion-lm.md) | `diffusion_phase0` + `diffusion128_block32` | done | Medium | RTX 3070 Ti Laptop 8 GB | Masked diffusion worked once loss targeted clean tokens instead of collapsing to zero. |
+| [22-gh200-crossover-50m](nanolab/22-gh200-crossover-50m.md) | GH200 50M n=5 mixer grid | done | High (pair) / Medium (zoo) | Lambda GH200 (ParameterGolf) | Short rankings lie: minGRU overtakes ~1.05M, attention ~12.4M under 50M cosine; 50M mean attention 4.222. |
+| [23-locked20-attn-mingru](nanolab/23-locked20-attn-mingru.md) | Locked attn vs minGRU 20M n=5 | done | High | Lambda GH200 (ParameterGolf) | Early 1.05M flip replicates; late flip moves to 14.6M on a 20M cosine. |
+| [24-matched20-prefix](nanolab/24-matched20-prefix.md) | 20M stop, 50M cosine | done | High | Lambda GH200 | Independent prefix recovered flips at 1.04M and 12.34M. |
+| [25-gh200-bs8](nanolab/25-gh200-bs8.md) | GH200 bs8 n=5 @ 8.192M | done | High (to 7.38M) | Lambda GH200 | No flip by 7.38M; minGRU leads from eval 1 on every seed. |
+| [26-matched32-hybrids](nanolab/26-matched32-hybrids.md) | 8 arms bs32 eval_iters=20 50M | done | High | Lambda GH200 | Attn 4.222 ties hybrid_mingru 4.232; Mamba hybrid 4.333 not 4.60. |
 
 ## Gemma-metal
 
@@ -99,7 +104,9 @@ Nanolab restarted from first principles. A CPU character smoke and a 6L×384 Tin
 
 Mixer experiments then climbed a budget ladder. At roughly 461K TinyStories tokens, minGRU narrowly led attention, while slow Mamba-2 and GDN paths already exposed very low MFU. At 2.048M matched FineWeb tokens, minGRU led at 5.837 best validation loss; GDN and Mamba-2 also finished ahead of attention’s 6.073, with MLA last at 6.156. The observation was a low-budget ranking. Calling it recurrent “inductive bias” was explicitly interpretation, because one seed and unequal kernel efficiency left alternative explanations.
 
-The 8.192M extension changed the story. Attention trailed minGRU by 0.182 loss at 0.8M tokens, by 0.075 at 4.1M, and by only 0.005 at 6.6M. Between 6.6M and 7.4M the sign flipped; at 8.2M attention led by 0.019. Two further pairs preserved the shape. A smaller 6L×384 pair crossed near step 1,000, while a longer 124M pair crossed near step 900 and eventually opened about a 0.32 gap. The durable result was not a universal crossover token count. It was that a short-run winner could become a long-run loser, and that model/budget selection had to be treated jointly.
+The 8.192M extension changed the story. Attention trailed minGRU by 0.182 loss at 0.8M tokens, by 0.075 at 4.1M, and by only 0.005 at 6.6M. Between 6.6M and 7.4M the sign flipped; at 8.2M attention led by 0.019. Two further pairs preserved the shape. A smaller 6L×384 pair crossed near step 1,000, while a longer 124M pair crossed near step 900 and eventually opened about a 0.32 gap. The durable laptop result was not a universal crossover token count. It was that a short-run winner could become a long-run loser, and that model/budget selection had to be treated jointly.
+
+The GH200 50M n=5 grid then showed that even the *token* of the flip is recipe-dependent. On a matched attention/minGRU pair (bs32, `eval_iters=20`, 50M cosine) minGRU overtook at ~1.05M and attention overtook for good at ~12.4M (per-seed late 12.03–12.58M); an independent 20M prefix recovered 1.04M and 12.34M. Inside suite 14’s 6.6–8.2M window minGRU still led by 0.13–0.18 at bs32. A short 20M cosine moved the late flip to 14.6M. GH200 bs8 n=5 never flipped by 7.38M and started with minGRU ahead. Shipping “7M crossover, replicated” would have been a false reading. At matched bs32 / 50M, attention 4.222 ties last-2-attention minGRU 4.232; the mixed-batch zoo had underrated the Mamba hybrid.
 
 The optimizer work reinforced metric separation. In a matched 4.096M-token quality bakeoff, Lion and AdamW led at 5.557 and 5.565, Muon followed at 5.643, and default Prodigy soft-diverged. In the fixed-shape throughput probe, AdamW was cheaper per step and Muon paid a Newton–Schulz tax. Those results do not contradict each other: they answer quality-at-recorded-defaults and execution-cost questions. Nor did either justify ranking optimizers without tuning; Schedule-Free and Prodigy were evidence about these settings, not their theoretical ceiling.
 
@@ -139,6 +146,7 @@ Across all three tracks, the project’s durable method is more important than a
 | 2026-04-01 | Keep value residual; hold combo champion cautiously | 1.9847 combo vs 1.9875 value-only; gating-only 2.0887 | Made value flow the supported architecture lever |
 | 2026-04-02 | Reject promotion from failed follow-up | XSA1 short hint; all promoted mid/long rc=1 | Held suite-04 champion |
 | 2026-06-15 | Use token budget as an experimental axis | minGRU led at 2M; attention crossed at 6.6–7.4M | Triggered two crossover replications |
+| 2026-08-21 | Treat the 7M overtake as recipe-local, not replicated | GH200 n=5: flips at 1.05M and 12.4M; suite-14 window still minGRU-led | Locked a 20M attn-vs-minGRU follow-up; forbade mixing bs8/bs32 tables |
 | 2026-06-15 | Fix SSM kernels before wall-clock comparisons | 238–333 tok/s sequential paths | Built verified chunk-parallel scans |
 | 2026-06-15 | Optimize residency as a stack | Baseline spill/14% util vs 13.7K tok/s/25.5% MFU | Enabled laptop long runs |
 | 2026-06-18 | Keep 10k recipe as reliable long-run result | Lower-LR 20k arm regressed after early best | Avoided a false “more steps” conclusion |
@@ -155,7 +163,7 @@ Across all three tracks, the project’s durable method is more important than a
 2. **Depth won the screens and lost the decision.** Deeper models led short and mid, then the compact LR-up control tied them at long horizon while being markedly faster and smaller.
 3. **Gating was not an independent win.** Gated attention alone was about 0.104 BPB worse than the champion; value residual supplied nearly all of the combination’s gain.
 4. **A promising XSA hint became no result.** `gated_value_resid_xsa1` led the short board, but promotion produced return-code failures rather than confirmation.
-5. **The low-budget mixer champion changed with scale.** minGRU led attention by 0.182 at 0.8M tokens; attention overtook between 6.6M and 7.4M and widened its lead in follow-ups.
+5. **The low-budget mixer champion changed with scale — and the flip token moved with the recipe.** minGRU led attention by 0.182 at 0.8M on the 3070; attention overtook between 6.6M and 7.4M there. On GH200 n=5 the same pair flipped at 1.05M then 12.4M; the 7M window did not replicate.
 6. **Optimizer quality and optimizer speed disagreed.** Lion/AdamW led the short quality board, while AdamW was cheapest per step and Muon’s systems case depended on batching and convergence.
 7. **Loss hid the GPU failure.** The spilling baseline could appear numerically healthy while utilization, power, step time, and memory showed a practically unusable run.
 8. **Longer training was not the winning recipe.** The lower-LR 20k arm reached an early best then regressed; schedule changed with horizon, preventing a simplistic duration claim.

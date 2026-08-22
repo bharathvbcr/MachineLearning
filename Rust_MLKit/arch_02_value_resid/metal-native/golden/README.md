@@ -47,3 +47,16 @@ python Rust_MLKit/arch_02_value_resid/metal-native/scripts/export_goldens.py
 
 See `manifest.json` → `deviations_from_reference`. Notably: f32 NS5 (not bf16),
 SDPA math fallback if FlashAttention-3 is missing, synthetic tokens.
+
+## Not stored in git
+
+`golden/fwd/` (~65 MB of f32 activation dumps, incl. two 16 MB logits tensors) is **not
+committed**. It is a pure build output and is regenerated with no external inputs:
+
+```bash
+python3 metal-native/scripts/export_goldens.py --out metal-native/golden
+```
+
+Run that before `fwd_parity_vs_goldens` on a fresh clone. `weights_init/`, `grads/`,
+`optim_step3/`, `inputs/` and the mixer fixtures are committed, because documented commands
+take them as inputs. Optim-only grads were already excluded on the same principle (see above).

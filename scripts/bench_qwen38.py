@@ -61,19 +61,30 @@ from dflash_guard import (  # noqa: E402
     dflash_version,
 )
 from serve_qwen import resolve_drafter  # noqa: E402
+# Targets and drafters are named once, in the module that owns the pairing rule.
+# The DSpark pair is the first trained against 3.8 itself, so neither half is a
+# cross-application; each is matched to the precision it was trained for (DimInfer
+# to the 4-bit class, RadixArk to the FP8/8-bit verifier), and pairing them the
+# other way costs acceptance.
+from qwen_draft_policy import (  # noqa: E402
+    DFLASH_36,
+    DSPARK_4BIT,
+    DSPARK_8BIT,
+    MTP_4BIT,
+    MTP_NVFP4,
+    TARGET_4BIT,
+    TARGET_8BIT,
+    TARGET_NVFP4,
+    resolve_draft,
+)
 
-TARGET_4BIT = "mlx-community/Qwen3.8-27B-4bit"
-TARGET_NVFP4 = "mlx-community/Qwen3.8-27B-nvfp4"
-MTP_4BIT = "mlx-community/Qwen3.8-27B-MTP-4bit"
-MTP_NVFP4 = "mlx-community/Qwen3.8-27B-MTP-nvfp4"
-DFLASH_36 = "z-lab/Qwen3.6-27B-DFlash"
-TARGET_8BIT = "mlx-community/Qwen3.8-27B-8bit"
-# First drafters trained against 3.8 itself, so neither is a cross-application.
-# Each is matched to the precision it was trained for: DimInfer to the 4-bit class,
-# RadixArk to the FP8/8-bit verifier. Pairing them the other way costs acceptance.
-DSPARK_4BIT = "DimInfer/Qwen3.8-27B-Dspark-v1"
-DSPARK_8BIT = "RadixArk/Qwen3.8-27B-DSpark"
 OLLAMA_TAG = "qwen3.8:27b-mlx"
+
+# The `ar` arm is the one place a bare Qwen3.8-27B load is correct: it is the
+# denominator of every speedup in the report. It still goes through the policy
+# rather than around it, so the exemption is granted and logged by the same owner
+# that refuses everyone else.
+AR_BARE_REASON = "AR baseline arm — the anchor every speedup in this report is measured against"
 
 # Same functional-equation prompt dflash-mlx uses for its published numbers, so
 # our figures sit on the same footing as the upstream Qwen3.6 table.
@@ -228,6 +239,9 @@ def parse_metrics(stdout: str):
 
 def build_cmd(arm: str, prompt: str, max_tokens: int):
     if arm == "ar":
+        resolve_draft(TARGET_4BIT, "none", engine="mlx-lm",
+                      context="bench_qwen38.py arm: ar", allow_bare=True,
+                      bare_reason=AR_BARE_REASON)
         return resolve_cli("mlx_lm.generate", "mlx_lm", "generate") + [
             "--model", TARGET_4BIT,
             "--prompt", prompt,
@@ -395,6 +409,12 @@ def preflight(arms, max_tokens=None):
 
     for arm_name, why in blockers.items():
         notes.append(f"BLOCKER [{arm_name}]: {why} {DFLASH_UPGRADE_HINT}")
+
+    # An arm that loads the target bare is a policy exemption, not a normal arm.
+    # Recording it here means the artifact says which number came from a
+    # drafter-less load instead of leaving a reader to infer it from the arm name.
+    if "ar" in arms:
+        notes.append(f"EXEMPT [ar]: bare load approved by qwen_draft_policy — {AR_BARE_REASON}.")
 
     if any(a in arms for a in ("mtp", "nvfp4-mtp")):
         try:

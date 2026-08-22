@@ -24,13 +24,21 @@ from pathlib import Path
 
 import torch
 
-from .config import add_config_args, config_from_args
+from .config import add_config_args, config_from_args, parse_layer_mixers
 from .data import Batcher, get_dataset
 from .model import build_model
 from .optim import build_optimizers, is_lr_free, is_schedule_free
 from .schedules import apply_lr, make_schedule
 from .utils import (Logger, pick_device, resolve_dtype,
                     set_seed, human_time)
+
+
+def require_finite(step: int, **metrics: float) -> None:
+    """Fail closed on NaN/Inf. A check that did not run must not look like a pass."""
+    bad = [f"{name}={value}" for name, value in metrics.items()
+           if not math.isfinite(float(value))]
+    if bad:
+        raise RuntimeError(f"non-finite at step {step}: {', '.join(bad)}")
 
 
 def evaluate(model, batcher, cfg, ctx, optimizers=None):
@@ -50,7 +58,9 @@ def evaluate(model, batcher, cfg, ctx, optimizers=None):
     model.train()
     if sf:
         optimizers[0].train()
-    return losses.mean().item()
+    val = losses.mean().item()
+    require_finite(-1, val_loss=val)
+    return val
 
 
 def train(cfg, overfit: int = 0):
@@ -100,10 +110,13 @@ def train(cfg, overfit: int = 0):
     import importlib.util
     has_triton = importlib.util.find_spec("triton") is not None
     if (cfg.compile and has_triton and device.startswith("cuda")
-            and cfg.mixer == "attention" and cfg.ffn != "moe"):
+            and all(k == "attention" for k in parse_layer_mixers(cfg))
+            and cfg.ffn != "moe"):
         model = torch.compile(model)
     elif cfg.compile and not has_triton:
         log.info("torch.compile requested but Triton not available -> running eager")
+    elif cfg.compile and not all(k == "attention" for k in parse_layer_mixers(cfg)):
+        log.info("torch.compile skipped: non-attention mixer in the stack")
 
     # ---- optimizer + schedule (guide §4, §5) ----
     optimizers = build_optimizers(model, cfg)
@@ -156,14 +169,22 @@ def train(cfg, overfit: int = 0):
         frontier = _curriculum_frontier(cfg, step)
 
         # ---- gradient accumulation (guide §4.1) ----
-        t_step = time.time()
+        # Host syncs (loss.item, cuda.synchronize) only happen on log steps so
+        # the GPU can run ahead. clip_grad_norm_ stays every step (that's the
+        # clip); we just avoid pulling scalars to CPU.
+        log_now = (step % cfg.log_interval == 0)
+        if device.startswith("cuda"):
+            if log_now:
+                torch.cuda.synchronize()
+                t_step = time.time()
+        else:
+            t_step = time.time()
         for micro in range(cfg.grad_accum):
             x, y = train_batcher.batch(cur_len, frontier)
             with autocast:
                 _, loss = model(x, y)
                 loss = loss / cfg.grad_accum
             loss.backward()
-        loss_val = loss.item() * cfg.grad_accum
         step_tokens = cfg.batch_size * cfg.grad_accum * cur_len
 
         # ---- gradient clipping (guide §5.4) ----
@@ -178,28 +199,37 @@ def train(cfg, overfit: int = 0):
             opt.zero_grad(set_to_none=True)
 
         tokens_seen += step_tokens
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
-        dt = time.time() - t_step
-        tok_s = step_tokens / max(dt, 1e-9)
-        mfu = _mfu(flops_per_tok, step_tokens, dt, device)
+
+        loss_v = float(loss.detach()) * cfg.grad_accum
+        gnorm = float(grad_norm)
+        require_finite(step, loss=loss_v, gnorm=gnorm)
 
         # ---- logging (guide §6.1) ----
-        if step % cfg.log_interval == 0:
-            log.step(step, loss=loss_val, lr=lr, grad_norm=float(grad_norm),
-                     tok_s=tok_s, mfu=mfu)
+        if log_now:
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
+                dt = time.time() - t_step
+            else:
+                dt = time.time() - t_step
+            tok_s = step_tokens / max(dt, 1e-9)
+            mfu = _mfu(flops_per_tok, step_tokens, dt, device)
+            log.step(step, loss=loss_v, lr=lr,
+                     grad_norm=gnorm, tok_s=tok_s, mfu=mfu,
+                     tokens=tokens_seen)
 
         # ---- periodic eval + checkpoint (guide §6.1, §6.4) ----
         if step > 0 and step % cfg.eval_interval == 0:
             val = evaluate(model, val_batcher, cfg, autocast, optimizers)
-            train_eval = evaluate(model, train_batcher, cfg, autocast, optimizers)
+            extra = {}
+            if cfg.eval_train:
+                extra["train_loss"] = evaluate(
+                    model, train_batcher, cfg, autocast, optimizers)
             if getattr(schedule, "reactive", False):
                 schedule.observe(val)          # ReduceLROnPlateau
-            extra = {}
             if cfg.tokenizer == "char":        # char models: bits-per-char (§3)
                 extra["bpc"] = val / math.log(2)
-            log.eval(step, train_loss=train_eval, val_loss=val,
-                     val_ppl=math.exp(min(val, 20)), **extra)
+            log.eval(step, val_loss=val,
+                     val_ppl=math.exp(min(val, 20)), tokens=tokens_seen, **extra)
             if val < best_val:
                 best_val = val
                 _save(out_dir / "best.pt", model, optimizers, step, cfg, val, light=True)
