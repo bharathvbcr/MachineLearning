@@ -1,0 +1,111 @@
+{
+  "id": "d7-lr-retune-1000",
+  "generated": "2026-08-23",
+  "protocol": "arch02-128m, 1000 steps, seeds 42+2026; argv byte-identical to native-optimizer-funnel.json stage exact_128m_1000 except --out",
+  "jobs": 24,
+  "gpu_hours": 15.57,
+  "results_mean_bpb": {
+    "muon_polar_adamw": {
+      "0.0125": 2.136578,
+      "0.018": 2.141252,
+      "0.025": 2.151164,
+      "0.035": 2.157846,
+      "0.05": 2.169085
+    },
+    "normuon_adamw": {
+      "0.0125": 2.12026,
+      "0.018": 2.128616,
+      "0.025": 2.135047,
+      "0.035": 2.144653,
+      "0.05": 2.15389,
+      "0.07": 2.171642,
+      "0.1": 2.199308
+    }
+  },
+  "matched_lr_gaps_polar_minus_normuon": {
+    "0.0125": {
+      "per_seed": {
+        "42": 0.01841399999999993,
+        "2026": 0.014220000000000343
+      },
+      "mean": 0.016317000000000137,
+      "sign_consistent_2_of_2": true
+    },
+    "0.018": {
+      "per_seed": {
+        "42": 0.01684600000000014,
+        "2026": 0.008425000000000349
+      },
+      "mean": 0.012635500000000244,
+      "sign_consistent_2_of_2": true
+    },
+    "0.025": {
+      "per_seed": {
+        "42": 0.011623999999999857,
+        "2026": 0.020610999999999713
+      },
+      "mean": 0.016117499999999785,
+      "sign_consistent_2_of_2": true
+    },
+    "0.035": {
+      "per_seed": {
+        "42": 0.003330000000000055,
+        "2026": 0.023055999999999965
+      },
+      "mean": 0.01319300000000001,
+      "sign_consistent_2_of_2": true
+    },
+    "0.05": {
+      "per_seed": {
+        "42": 0.017129000000000172,
+        "2026": 0.013260000000000272
+      },
+      "mean": 0.015194500000000222,
+      "sign_consistent_2_of_2": true
+    }
+  },
+  "best_tested": {
+    "muon_polar_adamw": {
+      "lr": 0.0125,
+      "mean_bpb": 2.136578
+    },
+    "normuon_adamw": {
+      "lr": 0.0125,
+      "mean_bpb": 2.12026
+    },
+    "normuon_ahead_by": 0.016317,
+    "sign_consistent_2_of_2": true
+  },
+  "inherited_lr_penalties": {
+    "muon_polar_adamw": {
+      "selected_lr": 0.05,
+      "penalty_bpb": 0.032507,
+      "x_selection_margin": 1.04
+    },
+    "normuon_adamw": {
+      "selected_lr": 0.1,
+      "penalty_bpb": 0.079048,
+      "x_selection_margin": 2.53
+    }
+  },
+  "verdict": {
+    "funnel_recorded": "muon_polar_adamw by 0.031226 (Polar@0.05 vs NorMuon@0.1, unequal LRs)",
+    "corrected": "normuon_adamw by 0.016317 at matched and at best-tested LR, 2-of-2",
+    "swing_bpb": 0.047543,
+    "claim": "The recorded selection is not supported by its own evidence. This does NOT crown normuon_adamw: neither optimum is precisely located and n=2 supports a sign, not a magnitude."
+  },
+  "drift_check_vs_recorded_funnel": {
+    "polar_lr0.05_seed42": -0.001939,
+    "polar_lr0.05_seed2026": 0.000271,
+    "normuon_lr0.1_seed42": -0.005813,
+    "normuon_lr0.1_seed2026": 0.00214,
+    "note": "max 0.26%; recorded funnel values reproduce on a rebuilt binary"
+  },
+  "limits": [
+    "n=2: sign tests only; Student-t intervals at df=1 are uninformative (see paper 5.3)",
+    "Polar optimum is between 0.0125 and 0.018 and is not resolved (the two tie on seed 2026)",
+    "NorMuon is monotone to its left edge 0.0125; its optimum is not bracketed",
+    "the matched-LR gap is LR-dependent (0.0126-0.0163) and is not a constant",
+    "throughput/step-time from this run is contended and must not be quoted"
+  ]
+}

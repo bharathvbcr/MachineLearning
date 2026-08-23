@@ -78,6 +78,17 @@ class Config:
     rope_base: float = 10000.0
     mup: bool = False            # muP-style 1/d attention + LR scaling (§10)
     mup_base_width: int = 256    # d_model at which HPs were tuned; transfer target
+    # Per-layer standard-parametrization LR prescription (Everett et al.,
+    # arXiv:2407.05872, Table 1, Adam column): hidden and readout learning rates
+    # scale as 1/sqrt(width) while the embedding LR stays constant. Mutually
+    # exclusive with ``mup`` -- they are different parametrizations. See the caveats
+    # in ``optim.build_optimizers``: the prescription is stated for pure Adam, and
+    # tied embeddings prevent giving the readout its own rate.
+    per_layer_sp: bool = False
+    # Multiply ONLY the embedding/head LR by this factor, under standard
+    # parametrization. The Kalra & Barkeshli probe (arXiv:2605.21486) sets it to the
+    # width ratio to test whether the embedding LR alone carries muP's advantage.
+    embed_lr_mult: float = 1.0
 
     # ---- sequence mixer (guide §2.5) — the one A/B flag ----
     mixer: str = "attention"

@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "purpose": "Polar exact-128M LR spot-check around champion LR 0.05",
+  "protocol": {
+    "preset": "arch02-128m",
+    "optimizer": "muon_polar_adamw",
+    "steps": 500,
+    "seed": 1337,
+    "eval_every": 500,
+    "log_every": 50,
+    "metric": "final_ema_sliding_bpb"
+  },
+  "ledger_repair": {
+    "id": "lr-spot-ledger-reconciliation-2026-08-22",
+    "reason": "This ledger was written when the lr=0.025 job started and was never updated again. It recorded that job as 'running' and omitted lr=0.035, 0.07 and 0.1 entirely, although all four completed on 2026-07-16. The job list below was reconstructed from the run directories on disk; every validation_bpb is the final_ema_sliding_bpb on the last line of that run's metrics.jsonl.",
+    "recovered_from": "out/funnel/polar_exact_lr_spot/muon_polar_adamw_lr0p*_seed1337_128m/metrics.jsonl",
+    "jobs_previously_missing": [0.035, 0.07, 0.1],
+    "jobs_previously_mislabelled": [{"lr": 0.025, "was": "running", "is": "done"}]
+  },
+  "jobs": [
+    {
+      "lr": 0.025,
+      "status": "done",
+      "output": "out/funnel/polar_exact_lr_spot/muon_polar_adamw_lr0p025_seed1337_128m",
+      "validation_bpb": 2.366180,
+      "started_at": 1784176863.839023,
+      "finished_at": "2026-07-16T11:06:36"
+    },
+    {
+      "lr": 0.035,
+      "status": "done",
+      "output": "out/funnel/polar_exact_lr_spot/muon_polar_adamw_lr0p035_seed1337_128m",
+      "validation_bpb": 2.359962,
+      "finished_at": "2026-07-16T11:30:51"
+    },
+    {
+      "lr": 0.05,
+      "status": "reused",
+      "output": "out/funnel/exact_128m_500/muon_polar_adamw_seed1337_128m",
+      "validation_bpb": 2.420958,
+      "source": "exact_128m_500__muon_polar_adamw__seed1337",
+      "note": "This is the funnel champion's selected LR, tuned at arch02-16m."
+    },
+    {
+      "lr": 0.07,
+      "status": "done",
+      "output": "out/funnel/polar_exact_lr_spot/muon_polar_adamw_lr0p07_seed1337_128m",
+      "validation_bpb": 2.512071,
+      "finished_at": "2026-07-16T11:56:55"
+    },
+    {
+      "lr": 0.1,
+      "status": "done",
+      "output": "out/funnel/polar_exact_lr_spot/muon_polar_adamw_lr0p1_seed1337_128m",
+      "validation_bpb": 2.686179,
+      "finished_at": "2026-07-16T12:22:18"
+    }
+  ],
+  "finding": {
+    "summary": "At exact-128M the LR optimum sits near 0.035, not at the champion's 0.05. The curve is U-shaped with a single interior minimum: 0.025 -> 2.366180, 0.035 -> 2.359962, 0.05 -> 2.420958, 0.07 -> 2.512071, 0.1 -> 2.686179.",
+    "champion_lr_penalty_bpb": 0.060996,
+    "champion_lr_penalty_definition": "validation_bpb(lr=0.05) - validation_bpb(lr=0.035), both at 128M / 500 steps / seed 1337.",
+    "selection_margin_bpb": 0.031226,
+    "selection_margin_definition": "mean validation_bpb of normuon_adamw (2.201145) minus muon_polar_adamw (2.1699185) at exact_128m_1000, seeds 42 and 2026.",
+    "why_this_matters": "The champion's LR mis-tuning penalty is 1.95x the margin by which it was selected. The champion LR was tuned at arch02-16m and never re-tuned at 128M; normuon_adamw's lr 0.1 was likewise never re-tuned. Neither finalist was tuned at the scale where the selection was made, so the ordering between them is not established by this evidence.",
+    "lr_conditional_reversal": "muon_polar_adamw at lr 0.1 scores 2.686179, which is worse than normuon_adamw's 2.567474 at the same 128M / 500-step protocol. The Polar-vs-NorMuon ordering is therefore LR-conditional within the range swept here.",
+    "limits": "n=1 per LR point, 500 steps, seed 1337 only. normuon_adamw has no matching LR spot-check. This is a threat to the validity of the selection, not a refutation of it. Closing it requires the Polar and NorMuon LR grids at 1000 steps on seeds 42 and 2026.",
+    "recorded": "2026-08-22"
+  }
+}

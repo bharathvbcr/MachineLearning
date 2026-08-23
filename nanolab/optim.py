@@ -16,6 +16,8 @@ and scalars stay on AdamW even in the Muon path.
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 
@@ -747,6 +749,40 @@ def build_optimizers(model, cfg):
     hidden_lr = cfg.lr / width_mult
     matrix_lr = cfg.matrix_lr / width_mult
 
+    # ---- per-layer standard parametrization (Everett et al., arXiv:2407.05872) ----
+    # Table 1, "Adam LR" column for the Standard row: embedding LR is width-constant,
+    # hidden and readout LRs scale as 1/sqrt(n). This is a *standard* parametrization
+    # prescription, so it uses the width ratio directly rather than model.width_mult,
+    # which is 1.0 whenever cfg.mup is False.
+    #
+    # Two caveats, both real and neither resolvable here:
+    #
+    #   1. The prescription is derived for pure Adam. Our Muon-family runs are a
+    #      hybrid: 2-D hidden matrices go to Muon (whose update is normalized by
+    #      construction) and only embeddings/scalars go to AdamW. Everett et al. give
+    #      no exponent for that combination, so applying the Adam hidden exponent to
+    #      the Muon group is an extrapolation, not their result. Prefer
+    #      ``optimizer="adamw"`` when the point is to reproduce their prescription.
+    #   2. ``_split_params`` groups tok_emb, pos_emb and lm_head together, and with
+    #      cfg.tie_embeddings the embedding and readout are the SAME tensor. Their
+    #      table gives these different exponents (constant vs 1/sqrt(n)); we cannot
+    #      honour both. We apply the embedding rule (constant) to that group, because
+    #      under tying the input embedding dominates the parameter count.
+    if cfg.per_layer_sp:
+        if cfg.mup:
+            raise ValueError(
+                "per_layer_sp and mup are different parametrizations; enable at most one")
+        width_ratio = (cfg.d_model / cfg.mup_base_width) if cfg.mup_base_width else 1.0
+        sp_scale = math.sqrt(width_ratio) if width_ratio > 0 else 1.0
+        hidden_lr = cfg.lr / sp_scale
+        matrix_lr = cfg.matrix_lr / sp_scale
+
+    # ---- embedding-LR-only ablation (Kalra & Barkeshli, arXiv:2605.21486) ----
+    # Raise ONLY the embedding/head LR and change nothing else, to test whether that
+    # single layer carries the advantage attributed to the parametrization. Applies
+    # on top of whichever parametrization is active; the default 1.0 is a no-op.
+    embed_lr = cfg.lr * cfg.embed_lr_mult
+
     muon_family = {
         "muon_ns5_adamw", "muon_ns3_adamw", "muon_polar_adamw",
         "normuon_adamw", "muown_adamw", "mona_adamw", "mimuon_adamw",
@@ -780,8 +816,8 @@ def build_optimizers(model, cfg):
                               singular_gap=cfg.mimuon_singular_gap,
                               ns_steps=cfg.muon_ns_steps, weight_decay=cfg.weight_decay)
         opt_adam = torch.optim.AdamW(
-            [{"params": embed_head, "weight_decay": 0.0},
-             {"params": scalar, "weight_decay": 0.0}],
+            [{"params": embed_head, "weight_decay": 0.0, "lr": embed_lr},
+             {"params": scalar, "weight_decay": 0.0, "lr": cfg.lr}],
             lr=cfg.lr, betas=(cfg.beta1, cfg.beta2), eps=cfg.eps)
         return [opt_muon, opt_adam]
 
@@ -792,7 +828,7 @@ def build_optimizers(model, cfg):
     if opt == "adamw":
         return [torch.optim.AdamW(
             [{"params": matrix, "weight_decay": cfg.weight_decay, "lr": hidden_lr},
-             {"params": embed_head, "weight_decay": cfg.weight_decay, "lr": cfg.lr},
+             {"params": embed_head, "weight_decay": cfg.weight_decay, "lr": embed_lr},
              {"params": no_decay, "weight_decay": 0.0, "lr": cfg.lr}],
             lr=cfg.lr, betas=(cfg.beta1, cfg.beta2), eps=cfg.eps)]
     if opt == "sgd_momentum":

@@ -268,6 +268,67 @@ def mup_scaling_rules():
 
 
 @test
+def per_layer_sp_scales_hidden_lr_by_sqrt_width():
+    # Everett et al. (arXiv:2407.05872) Table 1, Standard row, Adam LR column:
+    # hidden LR ~ 1/sqrt(n) while the embedding LR is width-constant. Contrast with
+    # muP, which scales the hidden LR by 1/n -- the two must not agree at width > 1.
+    base = _toy_model(per_layer_sp=True, mup_base_width=64, d_model=64, optimizer="adamw")
+    wide = _toy_model(per_layer_sp=True, mup_base_width=64, d_model=256,
+                      n_head=8, head_dim=32, optimizer="adamw")
+    lr_base = build_optimizers(*base)[0].param_groups[0]["lr"]
+    lr_wide = build_optimizers(*wide)[0].param_groups[0]["lr"]
+    # width ratio 4 -> hidden LR divided by sqrt(4) = 2
+    assert abs(lr_wide - lr_base / 2) < 1e-9, (
+        f"hidden LR should scale 1/sqrt(width): {lr_base} -> {lr_wide}")
+    mu = _toy_model(mup=True, mup_base_width=64, d_model=256, n_head=8, head_dim=32,
+                    optimizer="adamw")
+    lr_mup = build_optimizers(*mu)[0].param_groups[0]["lr"]
+    assert abs(lr_mup - lr_base / 4) < 1e-9, "muP should scale 1/width, not 1/sqrt(width)"
+    assert abs(lr_wide - lr_mup) > 1e-9, "per-layer SP must differ from muP at width > 1"
+
+
+@test
+def per_layer_sp_and_mup_are_mutually_exclusive():
+    m, cfg = _toy_model(per_layer_sp=True, mup=True, mup_base_width=64, d_model=128)
+    try:
+        build_optimizers(m, cfg)
+    except ValueError:
+        return
+    raise AssertionError("enabling both per_layer_sp and mup must raise")
+
+
+@test
+def embed_lr_mult_moves_only_the_embedding_group():
+    # Kalra & Barkeshli probe: raise the embedding LR alone and change nothing else.
+    # Checked on the Muon hybrid, where embeddings sit on the AdamW half.
+    m0, c0 = _toy_model(optimizer="muon_ns5_adamw", d_model=128)
+    m4, c4 = _toy_model(optimizer="muon_ns5_adamw", d_model=128, embed_lr_mult=4.0)
+    muon0, adam0 = build_optimizers(m0, c0)
+    muon4, adam4 = build_optimizers(m4, c4)
+    assert abs(muon0.param_groups[0]["lr"] - muon4.param_groups[0]["lr"]) < 1e-12, \
+        "matrix (Muon) LR must be untouched by embed_lr_mult"
+    assert abs(adam4.param_groups[0]["lr"] - 4.0 * adam0.param_groups[0]["lr"]) < 1e-12, \
+        "embedding/head LR should scale by embed_lr_mult"
+    assert abs(adam0.param_groups[1]["lr"] - adam4.param_groups[1]["lr"]) < 1e-12, \
+        "scalar group must be untouched by embed_lr_mult"
+
+
+@test
+def embed_lr_mult_survives_the_schedule():
+    # apply_lr rescales from each group's initial_lr, so the ablation must persist
+    # across the cosine rather than being flattened at the first step.
+    m, cfg = _toy_model(optimizer="muon_ns5_adamw", d_model=128, embed_lr_mult=4.0)
+    opts = build_optimizers(m, cfg)
+    sched = make_schedule(cfg)
+    ratios = []
+    for step in (0, cfg.max_steps // 2, cfg.max_steps - 1):
+        apply_lr(opts, sched(step), cfg)
+        ratios.append(opts[1].param_groups[0]["lr"] / opts[1].param_groups[1]["lr"])
+    assert max(ratios) - min(ratios) < 1e-9, f"embed/scalar ratio drifted: {ratios}"
+    assert abs(ratios[0] - 4.0) < 1e-9, f"ratio should stay 4x, got {ratios[0]}"
+
+
+@test
 def apply_lr_preserves_group_ratios():
     # the Muon hybrid: matrix group and adam group must keep their LR ratio as
     # the schedule scales both.

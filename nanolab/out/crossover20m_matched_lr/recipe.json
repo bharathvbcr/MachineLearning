@@ -1,0 +1,12 @@
+{
+  "batch_size": 32,
+  "eval_iters": 20,
+  "token_budget": 20000000,
+  "lr_horizon": 50000000,
+  "arms": [
+    "attention",
+    "mingru"
+  ],
+  "prefix": "cx20h",
+  "compile": false
+}

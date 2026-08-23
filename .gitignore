@@ -68,7 +68,22 @@ Thumbs.db
 # ---- ML artifacts (added 2026-08-16) --------------------------------------
 # Training output, datasets, and model weights: large, regenerable or
 # re-downloadable, and never belongs in git. Source and configs stay tracked.
-out/
+# Build outputs. Model weights are never committed (they are large and regenerable),
+# but the per-job run records ARE published: PAPER section 10 lists them as required
+# reproduction artifacts, and excluding them wholesale was gap B3. metrics.jsonl +
+# config.json across all of nanolab/out is ~16 MB; the 542 MB is .pt checkpoints.
+# NOTE: these patterns must match at any depth. A bare `out/**` contains a slash,
+# so git anchors it to the repo root and every nested out/ (Rust_MLKit/.../out,
+# nanolab/out) silently becomes tracked -- that added 1862 + 376 files here.
+**/out/**
+!**/out/**/
+!**/out/**/metrics.jsonl
+!**/out/**/config.json
+!**/out/**/queue.json
+!**/out/**/recipe.json
+!**/out/**/ledger.json
+!**/out/**/summary.json
+*.pt
 models/
 .artifacts/
 data/
@@ -84,6 +99,7 @@ ema_weights/
 *.pt
 *.pth
 *.bin
+*.npy
 *.onnx
 *.gguf
 *.npz

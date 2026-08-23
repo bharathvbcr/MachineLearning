@@ -126,12 +126,31 @@ CUDA sprint quality (~1.99 BPB class) and Apple Silicon training throughput had 
 
 ### 3. Polar Express Muon — Exact-128M Funnel Champion
 
+> **RETIRED 2026-08-23 — this section names the wrong candidate.**
+> A 24-job matched-LR re-tune at the exact `exact_128m_1000` protocol
+> (`research/d7-lr-retune.json`) finds **`normuon_adamw` ahead of `muon_polar_adamw`
+> at all five matched learning rates on both seeds**, and at each candidate's best
+> tested LR by **0.016317 BPB** (sign-consistent 2-of-2).
+>
+> Both LRs below were tuned at `arch02-16m` and never re-tuned at 128M. Measured
+> against their own optima at this protocol: Polar's 0.05 costs **0.032507 BPB**
+> (1.04× the 0.031226 selection margin), NorMuon's 0.1 costs **0.079048** (2.53×).
+> The funnel's margin measured *which inherited LR was less wrong*, not which
+> optimizer was better.
+>
+> The systems results in this section stand — the exact-resume gate, the parity
+> fixtures, the dispatch and footprint numbers are unaffected, and the champion
+> *run* reproduces (four drift checks, max 0.26%). What is retired is the
+> **selection**: any Polar-vs-NorMuon ordering is now graded **RETIRED**, and
+> `research/champion-run.json` stays `locked: false`. Do not re-lock on
+> `normuon_adamw` either — n=2 supports a sign, not a magnitude.
+
 **Grade:** A  
 **Systems:** metal-native exact gate + train; research manifests  
 **Primary artifacts:**
 - `research/champion-run.json`
 - `research/exact-128m-gate-polar.json`
-- `out/champion_128m_seed1337/metrics.jsonl`
+- `out/champion_128m_seed1337_audit8/metrics.jsonl` (audit7 sibling holds the pre-Audit-8 figure)
 - Funnel notes: `experiment-notes/arch-metal/51-m5-128m-optimizer-funnel-preflight.md`
 
 #### Context
@@ -158,15 +177,28 @@ Bank-batched NS5 removed the optimizer dispatch bottleneck, but which Muon-famil
 | Exact gate `loss_delta` | **1.430511474609375e-6** | A |
 | Exact gate `passed` | **true** | A |
 | Resume loss atol | 1e-5 | A |
-| Champion FINAL EMA sliding BPB | **2.015756** | **DISPUTED** |
+| Champion FINAL EMA sliding BPB | **2.010659** (audit8, seed 1337) | A |
+| — same run, audit7 kernel stack | 2.015576 | A |
+| — seed 2026, audit8 | 2.040352 | A |
 
-> **Conflict (2026-08-22).** `research/champion-run.json` records
-> `champion_final_ema_sliding_bpb = 2.010659` (seed 1337) and `2.040352` (seed 2026)
-> for this run, against the **2.015756** recorded here, in
-> `Rust_MLKit/docs/optimization_map.md` and in `metal-native/DECISIONS.md`. The two
-> figures come from different audit passes and have not been reconciled, so the grade is
-> downgraded from A to DISPUTED. Do not cite either number until the passes are
-> identified. Tracked as D4 in `docs/ISSUES_AND_GAPS_2026-08-22.md`.
+> **D4 resolved (2026-08-22): the conflict was a typo, not a disagreement.**
+> This table previously carried **2.015756** and graded it DISPUTED against
+> `research/champion-run.json`'s 2.010659. Reading the artifacts directly settles it:
+>
+> | source | value |
+> |---|---|
+> | `out/champion_128m_seed1337_audit7/metrics.jsonl` (last line) | **2.015576** |
+> | `out/champion_128m_seed1337_audit8/metrics.jsonl` (last line) | **2.010659** |
+> | `research/champion-run.json` | 2.010659 ✓ matches audit8 |
+> | this table, previously | 2.0157**56** ✗ matches no artifact |
+>
+> `2.015756` is a `57`↔`75` transposition of audit7's `2.015576`. There were never two
+> conflicting measurements — there was one superseded audit pass and one mistyped digit.
+> The citable number is **2.010659** (audit8, current kernel stack); audit7's 2.015576 is
+> the same run before the Audit-8 forward-flash fix and is a speed result, not a quality
+> regression (the two tie on quality; audit7 ran at 2005.1 ms/step, audit8 at ~1580–1683).
+> `Rust_MLKit/docs/optimization_map.md` and `metal-native/DECISIONS.md` carry the same
+> typo and need the same correction.
 
 | Steady dispatch budget | ~1975–2019 typical; gate sample 1707 | A/B |
 
@@ -560,7 +592,8 @@ Use §§1,2,3,6,7,8 (honest MLX stats),9,10 — omit unverified 8.8× and native
 ```
 Arch ladder:     BPB 1.984742 · 1,341,003 B
 Soft 100k:       EMA 1.882767 · ~60k tok/s
-Polar select:    BPB 2.1699185 · gate Δloss 1.43e-6 · FINAL 2.015756  [DISPUTED — see D4]
+Polar select:    BPB 2.1699185 · gate Δloss 1.43e-6 · FINAL 2.010659 (audit8)
+                 [LR CAVEAT — 128M optimum ≈0.035, not the selected 0.05; see §3]
 GDN:             238.18 → 1605.70 tok/s
 Mamba2:          333.23 → ~2305 tok/s (recorded)
 Hazard E4B:      17.72 → 22.54 tok/s (1.272×); default 23.24
@@ -578,6 +611,12 @@ E4B ladder:      4.78 → ~25.1 peak / ~23.9 quiet
 | Date | Change |
 |------|--------|
 | 2026-07-20 | Initial artifact-verified master KB after deep audit (code + JSON/metrics, not docs alone). Replaces earlier narrative “Ten Achievements” drafts that mixed peak/median, QAT causality, and unmet native DFlash gates. |
+| 2026-08-22 | **D4 resolved as a typo.** Champion FINAL EMA sliding BPB was recorded here as 2.015756 and graded DISPUTED. The artifacts read 2.015576 (audit7) and 2.010659 (audit8); 2.015756 matches neither and is a `57`↔`75` transposition of audit7. Citable value is now **2.010659**, grade restored to A. `Rust_MLKit/docs/optimization_map.md` and `metal-native/DECISIONS.md` carry the same typo. |
+| 2026-08-22 | **New LR-transfer caveat on the Polar champion (§3).** An exact-128M LR spot-check (`out/funnel/polar_exact_lr_spot/`, 5 points, n=1, 500 steps) puts the LR optimum near **0.035**, not the selected **0.05**. *(Superseded 2026-08-23 — see next row. Both figures were artifacts of a 500-step horizon and a truncated grid.)* |
+| 2026-08-23 | **The Polar champion is retired (§3).** A 24-job matched-LR re-tune at the exact `exact_128m_1000` protocol (`research/d7-lr-retune.json`, 15.6 GPU-h) finds **`normuon_adamw` ahead of `muon_polar_adamw` at all five matched learning rates on both seeds**, and at each candidate's best tested LR by **0.016317 BPB** (2-of-2). Both LRs were inherited from `arch02-16m`: Polar's 0.05 costs 0.032507 BPB (1.04× the selection margin), NorMuon's 0.1 costs 0.079048 (2.53×). The funnel's 0.031226 margin measured which inherited LR was less wrong. **Neither candidate may be cited as champion**; `champion-run.json` stays `locked: false`. Grade for any Polar-vs-NorMuon ordering: **RETIRED**. |
+| 2026-08-22 | **Funnel CI method corrected (D1).** `ci95` used the normal quantile at n=2 (correct `t₁ = 12.706`, interval ~6.5× too narrow) and `0.0` at n=1. Post-fix, Polar vs NorMuon at `exact_128m_1000` goes from `overlaps_best = False` to `None`. Legacy values preserved under `ci95_legacy_z`. |
+| 2026-08-22 | **D2 closed.** `native-optimizer-funnel.json → champion.winner_exact_gate` read `"pending"` while `research/exact-128m-gate-polar.json` recorded `passed: true` for the same candidate. Now `"passed"`, with the gate evidence inlined. |
+| 2026-08-22 | **GH200 crossover suites 22–26 are still not represented in this KB.** 120 completed runs at n=5 (attention/minGRU crossing at 12.35M, moving to 14.58M under a truncated cosine, absent at bs8) live only in `experiment-notes/nanolab/22–26` and `PAPER_2026-08_Recipe_Dependent_Rankings.md`. Folding them in is outstanding. |
 
 ---
 
@@ -587,7 +626,9 @@ E4B ladder:      4.78 → ~25.1 peak / ~23.9 quiet
 /Users/bharath/Code/parameter_golf/Rust_MLKit/reference/ablation_results/champion_arch_ladder.json
 /Users/bharath/Code/parameter_golf/research/champion-run.json
 /Users/bharath/Code/parameter_golf/research/exact-128m-gate-polar.json
-/Users/bharath/Code/parameter_golf/out/champion_128m_seed1337/metrics.jsonl
+/Users/bharath/Code/parameter_golf/out/champion_128m_seed1337_audit8/metrics.jsonl
+/Users/bharath/Code/parameter_golf/out/champion_128m_seed1337_audit7/metrics.jsonl
+/Users/bharath/Code/parameter_golf/out/funnel/polar_exact_lr_spot/ledger.json
 /Users/bharath/Code/parameter_golf/Rust_MLKit/arch_02_value_resid/metal-native/out/sota_f32_clipsoft_seed1337_100k_fa_tiled_softsplit_wsd/metrics.jsonl
 /Users/bharath/Code/parameter_golf/Rust_MLKit/arch_02_value_resid/metal-native/src/optim.rs
 /Users/bharath/Code/parameter_golf/nanolab/out/gpu_sweep_mixer.json

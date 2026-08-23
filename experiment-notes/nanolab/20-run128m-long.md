@@ -50,6 +50,35 @@ With the gpu_max stack held fixed, extending a 124M attention LM on FineWeb-edu 
 
 **Interpretation boundary.** The 10k and 20k values are measured, but their learning rates and schedules differ; attributing the regression to horizon alone would be a contradiction.
 
+> **Correction (2026-08-22): `run128m_20k` is eight resumed segments, not one run, and the
+> ranking above depends on which number you read.** Its `metrics.jsonl` holds **9 `start` and
+> 8 `done` events**. Per-segment `best_val`:
+>
+> ```
+> 3.6279  3.5869  3.5806  3.5854  3.5928  3.5998  3.6059  3.6109
+> ```
+>
+> Two consequences the original table did not state:
+>
+> 1. **The global minimum across segments is 3.5806**, which is *better* than
+>    `run128m_10k`'s 3.621. Ranked on global minimum, `run128m_20k` wins; ranked on final
+>    value, `run128m_10k` wins. The note asserts the second ordering without saying a
+>    different reading exists. Neither is a controlled comparison — LR (6e-4 vs 1.2e-4),
+>    `matrix_lr` (0.025 vs 0.005) and warmup (500 vs 100) all move with the horizon.
+> 2. **The monotone drift `3.5806 → 3.6109` across the last six segments is a
+>    resume artifact, not established late-train degradation.** Each resume re-warms the LR
+>    and re-seeds the EMA, so the "regressed to ~3.79 by step 19500" reading conflates the
+>    schedule with the restart boundaries.
+>
+> **Token accounting for this run is also wrong.** Every `done` event records
+> `tokens: 98,304,000` (= 3000 steps × bs32 × ctx1024) although the run reached step
+> **19,990**; 20,000 steps at this shape is **655,360,000** tokens. The counter reports the
+> current segment, not the cumulative total, so any tokens-seen figure for `run128m_20k` is
+> unusable.
+>
+> **This suite cannot support a horizon claim in either direction as run.** Closing it needs
+> one uninterrupted 20k run at the 10k learning rate.
+
 ## Failures
 
 - `run128m_20k`: late-train degradation (best early, worse final) — LR/schedule mismatch, not a crash.

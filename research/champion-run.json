@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "locked": false,
-  "lock_reason": null,
+  "lock_reason": "Not locked, and the recorded candidate is not supported by its own evidence. Both finalists' LRs were tuned at arch02-16m and never re-tuned at 128M. A 24-job matched-grid re-tune at the exact_128m_1000 protocol (research/d7-lr-retune.json) finds normuon_adamw ahead of muon_polar_adamw at ALL FIVE matched learning rates on both seeds, and at each candidate's best tested LR by 0.016317 BPB. The funnel's 0.031226 margin for muon_polar_adamw came from comparing it at 0.05 against normuon_adamw at 0.1 - two unequally-wrong inherited values. Do not lock, and do not re-lock on normuon_adamw either: n=2 supports a sign, not a magnitude.",
   "candidate": "muon_polar_adamw",
   "tuned_lr": 0.05,
   "selection_mean_validation_bpb": 2.1699185,
@@ -63,5 +63,35 @@
     "--matrix-lr",
     "0.05"
   ],
-  "winner_exact_gate_artifact": "/Users/bharath/Code/parameter_golf/research/exact-128m-gate-polar.json"
+  "winner_exact_gate_artifact": "/Users/bharath/Code/parameter_golf/research/exact-128m-gate-polar.json",
+  "lr_transfer_finding": {
+    "id": "d7-lr-retune-2026-08-23",
+    "supersedes": "polar-lr-transfer-2026-08-22, which was measured at 500 steps, n=1, on a truncated grid",
+    "artifact": "research/d7-lr-retune.json",
+    "protocol": "arch02-128m, 1000 steps, seeds 42+2026; argv byte-identical to stage exact_128m_1000 except --out",
+    "matched_lr_result": "normuon_adamw leads at lr 0.0125/0.018/0.025/0.035/0.05, sign-consistent 2-of-2 at every point; mean gaps 0.0126-0.0163",
+    "best_tested_result": "normuon_adamw 2.120260 vs muon_polar_adamw 2.136578, both at lr 0.0125; NorMuon ahead 0.016317, 2-of-2",
+    "inherited_lr_penalty_bpb": {
+      "muon_polar_adamw": 0.032507,
+      "normuon_adamw": 0.079048
+    },
+    "penalty_x_selection_margin": {
+      "muon_polar_adamw": 1.04,
+      "normuon_adamw": 2.53
+    },
+    "why_the_funnel_got_it_wrong": "Polar's LR sensitivity across the grid is 0.032507 BPB, about 2x the 0.0126-0.0163 optimizer gap. When the uncontrolled variable moves the metric twice as much as the effect being measured, comparing candidates at different settings of it measures the setting, not the candidate.",
+    "corrections_to_the_superseded_finding": [
+      "The 500-step optimum of 0.035 does not reproduce at 1000 steps; the optimum is near 0.0125-0.018.",
+      "The '1.95x the selection margin' figure was a 500-step n=1 artifact. At the selection protocol it is 1.04x.",
+      "The superseded finding said the ordering was 'not established'. It is now established, and it is the reverse of the recorded one."
+    ],
+    "limits": [
+      "n=2: sign tests only; df=1 intervals are uninformative",
+      "muon_polar_adamw's optimum lies between 0.0125 and 0.018 and is unresolved (they tie on seed 2026)",
+      "normuon_adamw is still monotone at its left edge; its optimum is not bracketed",
+      "This does not crown normuon_adamw. It retires the recorded selection."
+    ]
+  },
+  "champion_final_ema_sliding_bpb_provenance": "audit8, last line of champion_artifact/metrics.jsonl. audit7 recorded 2.015576 for the same run under the pre-Audit-8 kernel stack. MASTER_ARCHITECTURAL_KB.md previously carried 2.015756, which is a digit transposition of the audit7 value and matches no artifact; corrected 2026-08-22.",
+  "tuned_lr_provenance": "Selected at arch02-16m (stage lr_sweep_16m, 100 steps, seed 1337) and never re-tuned at 128M. Measured 3-4x too high for muon_polar_adamw and ~8x too high for normuon_adamw."
 }

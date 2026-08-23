@@ -9261,7 +9261,19 @@
     "candidate": "muon_polar_adamw",
     "lr": 0.05,
     "mean_validation_bpb": 2.1699185,
-    "winner_exact_gate": "pending"
+    "winner_exact_gate": "passed",
+    "winner_exact_gate_artifact": "research/exact-128m-gate-polar.json",
+    "winner_exact_gate_evidence": {
+      "loss_delta": 1.430511474609375e-06,
+      "grad_norm_delta": 0.0,
+      "sampled_weight_max_delta": 2.5572371669113636e-06,
+      "parameter_count": 128367988,
+      "dispatches": 1707,
+      "current_physical_mb": 13483.37020111084,
+      "swap_delta_mb": 0.0
+    },
+    "winner_exact_gate_note": "Closed 2026-08-22. The field read 'pending' while research/exact-128m-gate-polar.json had recorded passed=true for this same candidate. This is a systems gate (exact checkpoint resume); it says nothing about the selection.",
+    "selection_caveat": "SUPERSEDED. A 24-job matched-LR re-tune at this exact stage protocol (research/d7-lr-retune.json, 2026-08-23) finds normuon_adamw ahead at all five matched learning rates on both seeds and at each candidate's best tested LR by 0.016317 BPB. This stage compared muon_polar_adamw at lr 0.05 with normuon_adamw at lr 0.1 - both inherited from arch02-16m, neither re-tuned here, and unequally wrong (0.033 vs 0.079 BPB from their own optima). The 0.031226 margin recorded below measures that inequality. Treat the selection as retired, not reversed."
   },
   "corrections": [
     {

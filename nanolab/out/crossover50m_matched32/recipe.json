@@ -1,0 +1,18 @@
+{
+  "batch_size": 32,
+  "eval_iters": 20,
+  "token_budget": 50000000,
+  "lr_horizon": null,
+  "arms": [
+    "mamba2",
+    "gdn",
+    "mla",
+    "hybrid_gdn10_attn2",
+    "hybrid_gdn_periodic",
+    "hybrid_gdn_bookend",
+    "hybrid_mingru10_attn2",
+    "hybrid_mamba10_attn2"
+  ],
+  "prefix": "cx32",
+  "compile": false
+}

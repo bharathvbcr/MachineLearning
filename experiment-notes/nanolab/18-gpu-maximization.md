@@ -40,10 +40,27 @@ On 8 GB, invisible sysmem thrash is the real limiter; stacking residency/fusion/
 
 | Rank | Run / config | Metric | Notes |
 |------|--------------|--------|-------|
-| 1 | `gpu_opt_bs32` | peak **13.7K tok/s**, MFU **25.5%** | Matches §8.6 headline ceiling |
+| 1 | `gpu_opt_bs32` | peak **13.7K tok/s**, MFU **25.5%** | best_val **4.907** @ bs32 — *worst quality on the board* |
 | 2 | `gpu_opt_validate` | peak **13.6K tok/s**, MFU **25.3%** | best_val 4.808 @ bs24 |
-| 3 | `gpu_max` | peak **11.9K tok/s**, MFU **22.1%** | best_val 4.800; mid-stack |
+| 3 | `gpu_max` | peak **11.9K tok/s**, MFU **22.1%** | best_val **4.800**; mid-stack — *best quality on the board* |
 | — | `gpu_baseline` | util/power story in §8.6 | metrics.jsonl only has `start` (run aborted/thrash) — **14% util, ~18 s/step, >8 GB spill** per chapter |
+
+> **Correction (2026-08-22): this suite ranks speed and quality in opposite orders, and the
+> earlier version of this table omitted the number that showed it.** `gpu_opt_bs32`'s own
+> `best_val` is **4.9065** (verified: `done` event in `nanolab/out/gpu_opt_bs32/metrics.jsonl`).
+> It was the only arm whose `best_val` this note did not report. With it restored:
+>
+> | arm | tok/s rank | best_val | quality rank |
+> |---|---|---|---|
+> | `gpu_opt_bs32` | **1** (13.7K) | 4.9065 | **3** |
+> | `gpu_opt_validate` | 2 (13.6K) | 4.8084 | 2 |
+> | `gpu_max` | 3 (11.9K) | 4.8001 | **1** |
+>
+> The ordering is exactly inverted. The three arms differ in batch size (16 / 24 / 32) at a
+> fixed step count, so they do not see the same token budget and this is **not** a controlled
+> quality comparison — which is precisely why the rank inversion must be stated rather than
+> left as an unreported cell. Reading the throughput ladder as a recipe ladder would pick the
+> worst of the three models. Matched-token reruns are not in this suite.
 
 §8.6 session read: baseline thrash (14% util / 57 W / ~18 s/step) → gpu_max preset **96–100% util, 130 W, 13.7K tok/s, 25.5% MFU, 6.1 GB**. Loss curves look fine under thrash; power/util/reserved-mem tell the truth.
 
