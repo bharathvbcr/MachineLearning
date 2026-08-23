@@ -6,7 +6,7 @@ The main tracks are:
 
 - **[`Rust_MLKit/`](Rust_MLKit/)** — Rust, Metal, MLX, and Core ML implementations for Apple silicon, including native Gemma inference, custom GPU kernels, decode benchmarks, and ports of the strongest experimental architectures.
 - **[`nanolab/`](nanolab/)** — a clean, instrumented small-LM lab where architectural and training choices are exposed as CLI flags, with attention, Mamba-2, Gated DeltaNet, minGRU, SFT, STaR, and diffusion experiments.
-- **[`parameter-golf/`](parameter-golf/)** — the OpenAI Parameter Golf challenge repository plus local architecture, optimizer, quantization, ablation, and submission work.
+- **`parameter-golf/`** — a *local-only* working clone of the OpenAI Parameter Golf challenge repository. It is excluded from this repository (see Credits And Provenance); the original trainers, verification scripts, and packaging tooling built on top of it are published here under [`Rust_MLKit/`](Rust_MLKit/).
 - **[`experiment-notes/`](experiment-notes/)** and **[`research/`](research/)** — experiment records, benchmark results, and reproducible study manifests across all tracks.
 - **[`learning-notes/`](learning-notes/)** and [`modern-small-lm-training-guide.md`](modern-small-lm-training-guide.md) — first-principles notes and a practical guide to modern small-model training.
 
@@ -41,7 +41,20 @@ This workspace builds directly on third-party code, which remains the property o
 - `parameter-golf/` is a clone of [openai/parameter-golf](https://github.com/openai/parameter-golf), the official challenge repository. The baseline `train_gpt.py`, `train_gpt_mlx.py`, the `data/` preprocessing pipeline, and the `records/` leaderboard submissions are upstream work by OpenAI and challenge participants.
 - `modded-nanogpt/` is an unmodified clone of [KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt), the NanoGPT speedrunning project that inspired the challenge. It is kept as a reference only.
 
-Everything else in `parameter-golf/` — every `train_*`, `run_*`, `verify_*`, packaging, and preflight script listed below — is original work added as untracked files on top of the upstream clone, plus two small local patches to upstream `train_gpt.py` (disable `torch.compile` and enable fallback SDPA backends so it runs on Windows/consumer GPUs).
+**Neither clone is redistributed here.** `parameter-golf/` and `modded-nanogpt/` are local working directories, excluded from this repository, so no upstream code is vendored into it. To reproduce the challenge work, clone [openai/parameter-golf](https://github.com/openai/parameter-golf) yourself and place it alongside this checkout.
+
+Everything else described below — every `train_*`, `run_*`, `verify_*`, packaging, and preflight script — is original work written on top of that clone, plus two small local patches to upstream `train_gpt.py` (disable `torch.compile` and enable fallback SDPA backends so it runs on Windows/consumer GPUs).
+
+The pieces that are published in this repository live under `Rust_MLKit/`:
+
+| Script | Published at |
+| --- | --- |
+| `train_gpt_sprint_native.py` | [`Rust_MLKit/arch_01_gated_value_resid/`](Rust_MLKit/arch_01_gated_value_resid/), [`Rust_MLKit/arch_02_value_resid/`](Rust_MLKit/arch_02_value_resid/) |
+| `submission_packaging.py` | [`Rust_MLKit/arch_01_gated_value_resid/`](Rust_MLKit/arch_01_gated_value_resid/) |
+| `train_toy_adaptive.py` | [`Rust_MLKit/arch_03_aprdh_adaptive/`](Rust_MLKit/arch_03_aprdh_adaptive/) |
+| `verify_scan.py`, `verify_gdn.py` | [`Rust_MLKit/reference/verification/`](Rust_MLKit/reference/verification/) |
+
+The remaining single-GPU adaptation and ablation drivers (`train_gpt_local.py`, `run_local.py`, `train_rada.py`, `train_hypercascade.py`, `run_ablation_*.py`, `preflight_h100.py`) ran inside the local clone and are not published here.
 
 ## Parameter Golf Track
 
@@ -112,7 +125,7 @@ The submission-oriented track, mirroring techniques from the public leaderboard:
 |   |-- reason.py                    # structured schema JSON decoding & free-form reasoning
 |   |-- diffusion.py                 # Phase 3 AR-to-diffusion conversion and block-causal decoding
 |   `-- star.py                      # Phase-3 STaR bootstrap reasoning loop
-|-- parameter-golf/                  # clone of openai/parameter-golf + original experiments
+|-- parameter-golf/                  # LOCAL ONLY, not in this repo: clone of openai/parameter-golf
 |   |-- train_gpt.py                 # upstream baseline (locally patched for Windows/no-compile)
 |   |-- train_gpt_mlx.py             # upstream Apple Silicon baseline
 |   |-- data/                        # upstream FineWeb download + tokenizer pipeline
@@ -160,7 +173,7 @@ The submission-oriented track, mirroring techniques from the public leaderboard:
 `-- sync_to_obsidian/                # helper scripts that move workspace .md notes to an Obsidian vault
 ```
 
-Note: experiment notes and the upstream READMEs were Markdown files that the `sync_to_obsidian/` scripts relocate into an Obsidian vault, which is why `git status` inside `parameter-golf/` shows upstream `.md` files as deleted.
+Note: the map above shows the full local workspace. `parameter-golf/`, `modded-nanogpt/`, and `sync_to_obsidian/` are local-only and absent from this repository. Inside the local `parameter-golf/` clone, `git status` shows upstream `.md` files as deleted because the `sync_to_obsidian/` scripts relocate workspace notes into an Obsidian vault.
 
 ## Local Qwen Coding Agent
 
@@ -229,7 +242,10 @@ flowchart LR
 
 Install dependencies and download the cached FineWeb dataset with the 1024-token SentencePiece vocabulary:
 
+These steps run inside the upstream clone, which is not part of this repository — clone it first:
+
 ```bash
+git clone https://github.com/openai/parameter-golf
 cd parameter-golf
 pip install -r requirements.txt
 python data/cached_challenge_fineweb.py --variant sp1024 --train-shards 1
