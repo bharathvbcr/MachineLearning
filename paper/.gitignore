@@ -1,0 +1,19 @@
+# Generated from ../PAPER_2026-08_Recipe_Dependent_Rankings.md by md2tex.py and
+# mkbib.py; regenerate with `make`. Tracking them would let a stale build product
+# disagree with the manuscript, which is the drift this directory exists to catch.
+body.tex
+refs.tex
+main.pdf
+main.aux
+main.log
+main.out
+main.bbl
+main.blg
+main.fls
+main.fdb_latexmk
+build.log
+conv.log
+arxiv-src/
+arxiv-submission.tar.gz
+__pycache__/
+.DS_Store
