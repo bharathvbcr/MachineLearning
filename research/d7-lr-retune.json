@@ -1,111 +1,572 @@
 {
-  "id": "d7-lr-retune-1000",
-  "generated": "2026-08-23",
-  "protocol": "arch02-128m, 1000 steps, seeds 42+2026; argv byte-identical to native-optimizer-funnel.json stage exact_128m_1000 except --out",
-  "jobs": 24,
-  "gpu_hours": 15.57,
-  "results_mean_bpb": {
+  "candidates": {
     "muon_polar_adamw": {
-      "0.0125": 2.136578,
-      "0.018": 2.141252,
-      "0.025": 2.151164,
-      "0.035": 2.157846,
-      "0.05": 2.169085
+      "cells": {
+        "0.0035": {
+          "mean": 2.138058,
+          "n": 3,
+          "per_seed": {
+            "42": 2.129107,
+            "1337": 2.145536,
+            "2026": 2.139531
+          },
+          "sd": 0.008313,
+          "ci95_half_width": 0.020651
+        },
+        "0.005": {
+          "mean": 2.125631,
+          "n": 3,
+          "per_seed": {
+            "42": 2.117122,
+            "1337": 2.132366,
+            "2026": 2.127404
+          },
+          "sd": 0.007775,
+          "ci95_half_width": 0.019315
+        },
+        "0.008": {
+          "mean": 2.12543,
+          "n": 3,
+          "per_seed": {
+            "42": 2.118333,
+            "1337": 2.129709,
+            "2026": 2.128249
+          },
+          "sd": 0.00619,
+          "ci95_half_width": 0.015376
+        },
+        "0.0125": {
+          "mean": 2.139372,
+          "n": 3,
+          "per_seed": {
+            "42": 2.132084,
+            "1337": 2.14496,
+            "2026": 2.141071
+          },
+          "sd": 0.006604,
+          "ci95_half_width": 0.016405
+        },
+        "0.018": {
+          "mean": 2.141161,
+          "n": 3,
+          "per_seed": {
+            "42": 2.141446,
+            "1337": 2.140979,
+            "2026": 2.141058
+          },
+          "sd": 0.00025,
+          "ci95_half_width": 0.000621
+        },
+        "0.025": {
+          "mean": 2.152357,
+          "n": 3,
+          "per_seed": {
+            "42": 2.14478,
+            "1337": 2.154743,
+            "2026": 2.157548
+          },
+          "sd": 0.00671,
+          "ci95_half_width": 0.016669
+        },
+        "0.035": {
+          "mean": 2.158727,
+          "n": 3,
+          "per_seed": {
+            "42": 2.153202,
+            "1337": 2.160489,
+            "2026": 2.162491
+          },
+          "sd": 0.004889,
+          "ci95_half_width": 0.012144
+        },
+        "0.05": {
+          "mean": 2.17145,
+          "n": 3,
+          "per_seed": {
+            "42": 2.165343,
+            "1337": 2.176182,
+            "2026": 2.172826
+          },
+          "sd": 0.005549,
+          "ci95_half_width": 0.013784
+        }
+      },
+      "best_tested_lr": 0.008,
+      "best_tested_mean": 2.12543,
+      "bracket": {
+        "lr": 0.008,
+        "has_left_neighbour": true,
+        "has_right_neighbour": true,
+        "left": {
+          "lr": 0.005,
+          "worse_than_candidate": true,
+          "sign_consistent": false,
+          "detail": {
+            "seeds": [
+              42,
+              1337,
+              2026
+            ],
+            "per_seed": {
+              "42": -0.001211,
+              "1337": 0.002657,
+              "2026": -0.000845
+            },
+            "mean": 0.0002,
+            "ci95_half_width": 0.005305,
+            "ci95_informative": true,
+            "excludes_zero": false,
+            "sign_consistent": false,
+            "n": 3
+          }
+        },
+        "right": {
+          "lr": 0.0125,
+          "worse_than_candidate": true,
+          "sign_consistent": true,
+          "detail": {
+            "seeds": [
+              42,
+              1337,
+              2026
+            ],
+            "per_seed": {
+              "42": 0.013751,
+              "1337": 0.015251,
+              "2026": 0.012822
+            },
+            "mean": 0.013941,
+            "ci95_half_width": 0.003045,
+            "ci95_informative": true,
+            "excludes_zero": true,
+            "sign_consistent": true,
+            "n": 3
+          }
+        },
+        "bracketed": false
+      },
+      "selected_lr": 0.05,
+      "inherited_lr_penalty": {
+        "seeds": [
+          42,
+          1337,
+          2026
+        ],
+        "per_seed": {
+          "42": 0.04701,
+          "1337": 0.046473,
+          "2026": 0.044577
+        },
+        "mean": 0.04602,
+        "ci95_half_width": 0.003175,
+        "ci95_informative": true,
+        "excludes_zero": true,
+        "sign_consistent": true,
+        "n": 3
+      },
+      "penalty_x_selection_margin": 1.474
     },
     "normuon_adamw": {
-      "0.0125": 2.12026,
-      "0.018": 2.128616,
-      "0.025": 2.135047,
-      "0.035": 2.144653,
-      "0.05": 2.15389,
-      "0.07": 2.171642,
-      "0.1": 2.199308
+      "cells": {
+        "0.0035": {
+          "mean": 2.14422,
+          "n": 3,
+          "per_seed": {
+            "42": 2.138956,
+            "1337": 2.148747,
+            "2026": 2.144957
+          },
+          "sd": 0.004937,
+          "ci95_half_width": 0.012264
+        },
+        "0.005": {
+          "mean": 2.128408,
+          "n": 3,
+          "per_seed": {
+            "42": 2.121899,
+            "1337": 2.135429,
+            "2026": 2.127897
+          },
+          "sd": 0.006779,
+          "ci95_half_width": 0.016841
+        },
+        "0.008": {
+          "mean": 2.121334,
+          "n": 3,
+          "per_seed": {
+            "42": 2.115936,
+            "1337": 2.126185,
+            "2026": 2.12188
+          },
+          "sd": 0.005146,
+          "ci95_half_width": 0.012784
+        },
+        "0.0125": {
+          "mean": 2.121866,
+          "n": 3,
+          "per_seed": {
+            "42": 2.11367,
+            "1337": 2.125078,
+            "2026": 2.126851
+          },
+          "sd": 0.007153,
+          "ci95_half_width": 0.01777
+        },
+        "0.018": {
+          "mean": 2.129755,
+          "n": 3,
+          "per_seed": {
+            "42": 2.1246,
+            "1337": 2.132031,
+            "2026": 2.132633
+          },
+          "sd": 0.004474,
+          "ci95_half_width": 0.011115
+        },
+        "0.025": {
+          "mean": 2.13523,
+          "n": 3,
+          "per_seed": {
+            "42": 2.133156,
+            "1337": 2.135596,
+            "2026": 2.136937
+          },
+          "sd": 0.001917,
+          "ci95_half_width": 0.004762
+        },
+        "0.035": {
+          "mean": 2.146234,
+          "n": 3,
+          "per_seed": {
+            "42": 2.149872,
+            "1337": 2.149395,
+            "2026": 2.139435
+          },
+          "sd": 0.005893,
+          "ci95_half_width": 0.014639
+        },
+        "0.05": {
+          "mean": 2.155408,
+          "n": 3,
+          "per_seed": {
+            "42": 2.148214,
+            "1337": 2.158444,
+            "2026": 2.159566
+          },
+          "sd": 0.006255,
+          "ci95_half_width": 0.015539
+        },
+        "0.07": {
+          "mean": 2.171642,
+          "n": 2,
+          "per_seed": {
+            "42": 2.165703,
+            "2026": 2.177582
+          },
+          "sd": 0.0084,
+          "ci95_half_width": null
+        },
+        "0.1": {
+          "mean": 2.199308,
+          "n": 2,
+          "per_seed": {
+            "42": 2.196293,
+            "2026": 2.202324
+          },
+          "sd": 0.004265,
+          "ci95_half_width": null
+        }
+      },
+      "best_tested_lr": 0.008,
+      "best_tested_mean": 2.121334,
+      "bracket": {
+        "lr": 0.008,
+        "has_left_neighbour": true,
+        "has_right_neighbour": true,
+        "left": {
+          "lr": 0.005,
+          "worse_than_candidate": true,
+          "sign_consistent": true,
+          "detail": {
+            "seeds": [
+              42,
+              1337,
+              2026
+            ],
+            "per_seed": {
+              "42": 0.005963,
+              "1337": 0.009244,
+              "2026": 0.006017
+            },
+            "mean": 0.007075,
+            "ci95_half_width": 0.004667,
+            "ci95_informative": true,
+            "excludes_zero": true,
+            "sign_consistent": true,
+            "n": 3
+          }
+        },
+        "right": {
+          "lr": 0.0125,
+          "worse_than_candidate": true,
+          "sign_consistent": false,
+          "detail": {
+            "seeds": [
+              42,
+              1337,
+              2026
+            ],
+            "per_seed": {
+              "42": -0.002266,
+              "1337": -0.001107,
+              "2026": 0.004971
+            },
+            "mean": 0.000533,
+            "ci95_half_width": 0.009656,
+            "ci95_informative": true,
+            "excludes_zero": false,
+            "sign_consistent": false,
+            "n": 3
+          }
+        },
+        "bracketed": false
+      },
+      "selected_lr": 0.1,
+      "inherited_lr_penalty": {
+        "seeds": [
+          42,
+          2026
+        ],
+        "per_seed": {
+          "42": 0.080357,
+          "2026": 0.080444
+        },
+        "mean": 0.0804,
+        "ci95_half_width": null,
+        "ci95_informative": false,
+        "excludes_zero": false,
+        "sign_consistent": true,
+        "n": 2
+      },
+      "penalty_x_selection_margin": 2.575
     }
   },
-  "matched_lr_gaps_polar_minus_normuon": {
-    "0.0125": {
+  "matched_lr": {
+    "0.0035": {
+      "seeds": [
+        42,
+        1337,
+        2026
+      ],
       "per_seed": {
-        "42": 0.01841399999999993,
-        "2026": 0.014220000000000343
+        "42": -0.009849,
+        "1337": -0.003211,
+        "2026": -0.005426
       },
-      "mean": 0.016317000000000137,
-      "sign_consistent_2_of_2": true
+      "mean": -0.006162,
+      "ci95_half_width": 0.008396,
+      "ci95_informative": true,
+      "excludes_zero": false,
+      "sign_consistent": true,
+      "n": 3
+    },
+    "0.005": {
+      "seeds": [
+        42,
+        1337,
+        2026
+      ],
+      "per_seed": {
+        "42": -0.004777,
+        "1337": -0.003063,
+        "2026": -0.000493
+      },
+      "mean": -0.002778,
+      "ci95_half_width": 0.005356,
+      "ci95_informative": true,
+      "excludes_zero": false,
+      "sign_consistent": true,
+      "n": 3
+    },
+    "0.008": {
+      "seeds": [
+        42,
+        1337,
+        2026
+      ],
+      "per_seed": {
+        "42": 0.002397,
+        "1337": 0.003524,
+        "2026": 0.006369
+      },
+      "mean": 0.004097,
+      "ci95_half_width": 0.005085,
+      "ci95_informative": true,
+      "excludes_zero": false,
+      "sign_consistent": true,
+      "n": 3
+    },
+    "0.0125": {
+      "seeds": [
+        42,
+        1337,
+        2026
+      ],
+      "per_seed": {
+        "42": 0.018414,
+        "1337": 0.019882,
+        "2026": 0.01422
+      },
+      "mean": 0.017505,
+      "ci95_half_width": 0.007299,
+      "ci95_informative": true,
+      "excludes_zero": true,
+      "sign_consistent": true,
+      "n": 3
     },
     "0.018": {
+      "seeds": [
+        42,
+        1337,
+        2026
+      ],
       "per_seed": {
-        "42": 0.01684600000000014,
-        "2026": 0.008425000000000349
+        "42": 0.016846,
+        "1337": 0.008948,
+        "2026": 0.008425
       },
-      "mean": 0.012635500000000244,
-      "sign_consistent_2_of_2": true
+      "mean": 0.011406,
+      "ci95_half_width": 0.011721,
+      "ci95_informative": true,
+      "excludes_zero": false,
+      "sign_consistent": true,
+      "n": 3
     },
     "0.025": {
+      "seeds": [
+        42,
+        1337,
+        2026
+      ],
       "per_seed": {
-        "42": 0.011623999999999857,
-        "2026": 0.020610999999999713
+        "42": 0.011624,
+        "1337": 0.019147,
+        "2026": 0.020611
       },
-      "mean": 0.016117499999999785,
-      "sign_consistent_2_of_2": true
+      "mean": 0.017127,
+      "ci95_half_width": 0.011978,
+      "ci95_informative": true,
+      "excludes_zero": true,
+      "sign_consistent": true,
+      "n": 3
     },
     "0.035": {
+      "seeds": [
+        42,
+        1337,
+        2026
+      ],
       "per_seed": {
-        "42": 0.003330000000000055,
-        "2026": 0.023055999999999965
+        "42": 0.00333,
+        "1337": 0.011094,
+        "2026": 0.023056
       },
-      "mean": 0.01319300000000001,
-      "sign_consistent_2_of_2": true
+      "mean": 0.012493,
+      "ci95_half_width": 0.024685,
+      "ci95_informative": true,
+      "excludes_zero": false,
+      "sign_consistent": true,
+      "n": 3
     },
     "0.05": {
+      "seeds": [
+        42,
+        1337,
+        2026
+      ],
       "per_seed": {
-        "42": 0.017129000000000172,
-        "2026": 0.013260000000000272
+        "42": 0.017129,
+        "1337": 0.017738,
+        "2026": 0.01326
       },
-      "mean": 0.015194500000000222,
-      "sign_consistent_2_of_2": true
+      "mean": 0.016042,
+      "ci95_half_width": 0.006033,
+      "ci95_informative": true,
+      "excludes_zero": true,
+      "sign_consistent": true,
+      "n": 3
     }
   },
-  "best_tested": {
-    "muon_polar_adamw": {
-      "lr": 0.0125,
-      "mean_bpb": 2.136578
-    },
-    "normuon_adamw": {
-      "lr": 0.0125,
-      "mean_bpb": 2.12026
-    },
-    "normuon_ahead_by": 0.016317,
-    "sign_consistent_2_of_2": true
+  "notes": [],
+  "matched_lr_summary": {
+    "points": 8,
+    "normuon_leads_sign_consistent": 6,
+    "intervals_excluding_zero": 3
   },
-  "inherited_lr_penalties": {
-    "muon_polar_adamw": {
-      "selected_lr": 0.05,
-      "penalty_bpb": 0.032507,
-      "x_selection_margin": 1.04
+  "best_tested_comparison": {
+    "muon_polar_adamw_lr": 0.008,
+    "normuon_adamw_lr": 0.008,
+    "paired": {
+      "seeds": [
+        42,
+        1337,
+        2026
+      ],
+      "per_seed": {
+        "42": 0.002397,
+        "1337": 0.003524,
+        "2026": 0.006369
+      },
+      "mean": 0.004097,
+      "ci95_half_width": 0.005085,
+      "ci95_informative": true,
+      "excludes_zero": false,
+      "sign_consistent": true,
+      "n": 3
     },
-    "normuon_adamw": {
-      "selected_lr": 0.1,
-      "penalty_bpb": 0.079048,
-      "x_selection_margin": 2.53
-    }
+    "lowest_lr_swept": {
+      "muon_polar_adamw": 0.0035,
+      "normuon_adamw": 0.0035
+    },
+    "equal_depth_on_the_low_side": true,
+    "a_minimum_at_low_edge": false,
+    "b_minimum_at_low_edge": false,
+    "biased_by_unequal_depth": false
   },
   "verdict": {
-    "funnel_recorded": "muon_polar_adamw by 0.031226 (Polar@0.05 vs NorMuon@0.1, unequal LRs)",
-    "corrected": "normuon_adamw by 0.016317 at matched and at best-tested LR, 2-of-2",
-    "swing_bpb": 0.047543,
-    "claim": "The recorded selection is not supported by its own evidence. This does NOT crown normuon_adamw: neither optimum is precisely located and n=2 supports a sign, not a magnitude."
-  },
-  "drift_check_vs_recorded_funnel": {
-    "polar_lr0.05_seed42": -0.001939,
-    "polar_lr0.05_seed2026": 0.000271,
-    "normuon_lr0.1_seed42": -0.005813,
-    "normuon_lr0.1_seed2026": 0.00214,
-    "note": "max 0.26%; recorded funnel values reproduce on a rebuilt binary"
+    "headline": "The muon_polar_adamw / normuon_adamw ordering CROSSES OVER in learning rate. muon_polar_adamw leads at the low end, normuon_adamw at the high end, each sign-consistent across all seeds tested. There is no recipe-independent answer to which optimizer is better at this scale.",
+    "polar_leads_at_lr": [
+      "0.0035",
+      "0.005"
+    ],
+    "normuon_leads_at_lr": [
+      "0.008",
+      "0.0125",
+      "0.018",
+      "0.025",
+      "0.035",
+      "0.05"
+    ],
+    "mechanism": "Offset flat basins: muon_polar_adamw is flat across 0.005-0.008, normuon_adamw across 0.008-0.0125. Each wins inside its own basin and loses inside the other's.",
+    "what_the_funnel_did": "exact_128m_1000 compared muon_polar_adamw at lr 0.05 against normuon_adamw at lr 0.1 -- both far up the high-LR wall, on one side of a crossing it had no way to see -- and recorded a 0.031226 BPB margin. That margin measures the learning rates, not the optimizers.",
+    "selection_status": "RETIRED. Not reversed: normuon_adamw is not crowned in its place, because the ordering is learning-rate conditional and no cell separates the two at their respective optima.",
+    "supersedes": [
+      "polar-lr-transfer-2026-08-22 (500 steps, n=1, truncated grid)",
+      "the '1.95x the selection margin' figure, withdrawn",
+      "the 'optimum is near 0.035' figure, withdrawn"
+    ]
   },
   "limits": [
-    "n=2: sign tests only; Student-t intervals at df=1 are uninformative (see paper 5.3)",
-    "Polar optimum is between 0.0125 and 0.018 and is not resolved (the two tie on seed 2026)",
-    "NorMuon is monotone to its left edge 0.0125; its optimum is not bracketed",
-    "the matched-LR gap is LR-dependent (0.0126-0.0163) and is not a constant",
-    "throughput/step-time from this run is contended and must not be quoted"
-  ]
+    "Sign tests are the primary evidence. Only 3 of 8 matched cells have an interval excluding zero; the effects are at or below the per-cell seed sd of ~0.006.",
+    "Neither candidate's optimum is a POINT: both have flat basins whose interior minimum is not resolvable at n=3.",
+    "One protocol only: arch02-128m, 1000 steps, Metal/M5. Nothing here transfers to other scales, horizons or hardware.",
+    "Wall-clock and step timings from these runs are contended and must not be quoted as throughput."
+  ],
+  "provenance": {
+    "generated_by": "scripts/d7_analyze.py",
+    "from_ledger": "out/funnel/d7_lr_retune_1000/ledger.json",
+    "jobs": 52,
+    "protocol": "argv byte-identical to native-optimizer-funnel.json stage exact_128m_1000 except --out",
+    "note": "Regenerate with `python3 scripts/d7_analyze.py --write` rather than editing by hand."
+  }
 }

@@ -220,6 +220,58 @@ def main() -> int:
         elif bt["equal_depth_on_the_low_side"]:
             print("  (grids are equally deep on the low side; best-tested comparison is fair)")
 
+    # Self-describing artifact: the numbers above plus what they do and do not support.
+    if report.get("matched_lr"):
+        pol = [lr for lr, q in report["matched_lr"].items() if q and q["mean"] < 0]
+        nor = [lr for lr, q in report["matched_lr"].items() if q and q["mean"] > 0]
+        report["verdict"] = {
+            "headline": (
+                "The muon_polar_adamw / normuon_adamw ordering CROSSES OVER in learning "
+                "rate. muon_polar_adamw leads at the low end, normuon_adamw at the high "
+                "end, each sign-consistent across all seeds tested. There is no "
+                "recipe-independent answer to which optimizer is better at this scale."),
+            "polar_leads_at_lr": pol,
+            "normuon_leads_at_lr": nor,
+            "mechanism": (
+                "Offset flat basins: muon_polar_adamw is flat across 0.005-0.008, "
+                "normuon_adamw across 0.008-0.0125. Each wins inside its own basin and "
+                "loses inside the other's."),
+            "what_the_funnel_did": (
+                "exact_128m_1000 compared muon_polar_adamw at lr 0.05 against "
+                "normuon_adamw at lr 0.1 -- both far up the high-LR wall, on one side of "
+                "a crossing it had no way to see -- and recorded a 0.031226 BPB margin. "
+                "That margin measures the learning rates, not the optimizers."),
+            "selection_status": (
+                "RETIRED. Not reversed: normuon_adamw is not crowned in its place, "
+                "because the ordering is learning-rate conditional and no cell separates "
+                "the two at their respective optima."),
+            "supersedes": [
+                "polar-lr-transfer-2026-08-22 (500 steps, n=1, truncated grid)",
+                "the '1.95x the selection margin' figure, withdrawn",
+                "the 'optimum is near 0.035' figure, withdrawn",
+            ],
+        }
+        report["limits"] = [
+            "Sign tests are the primary evidence. Only 3 of 8 matched cells have an "
+            "interval excluding zero; the effects are at or below the per-cell seed "
+            "sd of ~0.006.",
+            "Neither candidate's optimum is a POINT: both have flat basins whose "
+            "interior minimum is not resolvable at n=3.",
+            "One protocol only: arch02-128m, 1000 steps, Metal/M5. Nothing here "
+            "transfers to other scales, horizons or hardware.",
+            "Wall-clock and step timings from these runs are contended and must not "
+            "be quoted as throughput.",
+        ]
+        report["provenance"] = {
+            "generated_by": "scripts/d7_analyze.py",
+            "from_ledger": "out/funnel/d7_lr_retune_1000/ledger.json",
+            "jobs": sum(len(c) for cand in (data[a], data[b]) for c in cand.values()),
+            "protocol": ("argv byte-identical to native-optimizer-funnel.json stage "
+                         "exact_128m_1000 except --out"),
+            "note": ("Regenerate with `python3 scripts/d7_analyze.py --write` rather "
+                     "than editing by hand."),
+        }
+
     if args.write:
         ARTIFACT.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(f"\nwrote {ARTIFACT.relative_to(ROOT)}")
