@@ -130,11 +130,14 @@ holds. Its location does not.
 
 Each condition below changes exactly one thing and re-runs five seeds.
 
-| condition | run | result |
-|---|---|---|
-| batch 8, the original batch size | `crossover8m_bs8` | **no crossing** through 7.38M tokens |
-| 20M budget, cosine schedule truncated with it | `crossover20m_locked` | crossings at 1.05M and **14.58M** |
-| 20M budget, 50M cosine horizon kept | `crossover20m_matched_lr` | crossings at 1.04M and **12.33M** |
+| condition | run | measured through | result |
+|---|---|---|---|
+| batch 8, the original batch size | `crossover8m_bs8` | 7.38M tokens | **no crossing** |
+| 20M budget, cosine schedule truncated with it | `crossover20m_locked` | 19.68M tokens | crossings at 1.05M and **14.58M** |
+| 20M budget, 50M cosine horizon kept | `crossover20m_matched_lr` | 19.68M tokens | crossings at 1.04M and **12.33M** |
+
+"20M budget" is the nominal setting; the evaluation grid's last point falls at
+19.68M tokens, which is the horizon actually measured.
 
 The batch-size row is the sharpest. At the original batch size, on the new
 hardware, the crossing the original measurement reported **does not occur at
@@ -172,8 +175,18 @@ attention's. The 4.232 figure appears in no surviving run.
 
 The nearest thing to it is the matched batch-32 sweep
 (`crossover50m_matched32`), which does place a minGRU hybrid on top at 4.214
-[4.207, 4.221] — but that sweep contains **no attention arm**, so it cannot
+[4.204, 4.224] — but that sweep contains **no attention arm**, so it cannot
 support a claim about a tie with attention.
+
+That interval is itself a correction, recorded 2026-08-23. `derive_figures.py`
+computed this board — and only this board — with the normal quantile (1.96)
+rather than the Student-*t* multiplier the sample size requires (t₄ = 2.776 at
+n = 5), so every interval in it was reported **1.42× too narrow**; the leader
+was previously printed as [4.207, 4.221]. This is the same defect §6 records
+the optimizer funnel fixing, committed here in the very script that checks this
+manuscript for drift. The means are unaffected, and the paragraph above does
+not rest on the interval. It is listed because a paper about measurement
+artifacts does not get to keep a quiet one.
 
 A paper arguing that rankings are artifacts of the measurement had a ranking
 claim of its own that depended on which condition was tabulated. It is recorded

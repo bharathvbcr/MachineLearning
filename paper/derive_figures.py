@@ -16,6 +16,18 @@ numbers anybody remembered. That ordering is the point: a figure in the
 manuscript that this script cannot reproduce is a figure that should not be in
 the manuscript, and `--check` is what says so.
 
+`--check` enforces that in both directions:
+
+  * every figure this script derives must appear in the manuscript, so the
+    prose cannot silently fall behind a re-run; and
+  * every figure the manuscript states must either be one this script derives
+    or carry a documented reason in STATED_NOT_DERIVED, so a stale or invented
+    number cannot sit in prose the check never reads.
+
+Until 2026-08-23 only the first direction existed, and it covered five figures
+against the manuscript's forty-four -- an unqualified OK over an 11% sample.
+Both the coverage and the second direction were added after that audit.
+
 One claim from the pre-loss version did not survive that test. See MIXER_BOARD
 below.
 """
@@ -34,6 +46,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "nanolab" / "out"
 MANUSCRIPT = ROOT / "PAPER_2026-08_Recipe_Dependent_Rankings.md"
+
+sys.path.insert(0, str(ROOT))
+# The one 95% multiplier in this repository, table and fallback included.  This
+# script used to carry its own 1.96 for the matched-batch board, which is the
+# same normal-quantile defect §6 of the manuscript records the funnel fixing --
+# committed in the script that checks the manuscript. Import, do not re-derive.
+from nanolab.native_funnel import _t_critical_95  # noqa: E402
 
 
 # ----------------------------------------------------------------- loading
@@ -107,9 +126,14 @@ def headline():
     d = json.loads((OUT / "crossover50m" / "summary.json").read_text())
     A, M = d["arms"]["attention"], d["arms"]["mingru"]
     cx = crossings(A, M)
+    gaps = [b - a for a, b in zip(A["tokens"], A["tokens"][1:])]
     return {
         "n": A["n"],
         "final_tokens": A["tokens"][-1],
+        # §2 states the grid spacing to justify how precisely a crossing can be
+        # located; it is a property of the eval grid, so derive it, don't type it.
+        "grid_spacing": st.fmean(gaps),
+        "grid_uniform": len(set(gaps)) == 1,
         "crossings": cx,
         "attention_final": A["mean"][-1],
         "attention_ci": [A["lo"][-1], A["hi"][-1]],
@@ -203,10 +227,11 @@ def matched_batch_board():
             if last and last.get("event") == "done" and last.get("best_val") is not None:
                 finals.append(last["best_val"])
         if len(finals) >= 2:
+            n = len(finals)
             m, sd = st.fmean(finals), st.stdev(finals)
-            h = 1.96 * sd / math.sqrt(len(finals))
+            h = _t_critical_95(n - 1) * sd / math.sqrt(n)
             rows.append({"arm": a.replace("cx32_", ""), "final": m,
-                         "ci": [m - h, m + h], "n": len(finals)})
+                         "ci": [m - h, m + h], "n": n, "df": n - 1})
     rows.sort(key=lambda r: r["final"])
     return {"rows": rows, "has_attention_arm": any("attention" == r["arm"] for r in rows)}
 
@@ -337,30 +362,147 @@ def render(f):
         print(f"  two-seed Student-t interval correction recorded: {o['ci_correction']}")
 
 
+def expected_figures(f):
+    """(token, description) for every figure this script derives.
+
+    This list is the contract `--check` enforces, so it must stay exhaustive.
+    It used to hold five entries -- two crossings, the advantage and the top
+    two board rows -- while the manuscript stated forty-four decimal figures
+    and the docstring above promised all of them were re-derived. A check that
+    examines 11% of its subject and prints an unqualified OK is worse than no
+    check: it certifies the 89% it never read. Anything rendered by `render()`
+    belongs here.
+    """
+    h, c, b = f["headline"], f["controls"], f["mixer_board"]
+    mb, o = f["matched_batch_board"], f["optimizer_funnel"]
+    cx = h["crossings"]
+
+    want = [
+        (f"{cx[0]['tokens']/1e6:.2f}M", "headline: early crossing"),
+        (f"{cx[1]['tokens']/1e6:.2f}M", "headline: late crossing"),
+        (f"{h['advantage']:.3f}".lstrip("-"), "headline: final advantage"),
+        (f"{h['final_tokens']/1e6:.2f}M", "headline: final token count"),
+        (f"{h['grid_spacing']/1e6:.2f}M", "protocol: eval grid spacing"),
+        (f"{h['attention_final']:.3f}", "headline: attention final"),
+        (f"{h['attention_ci'][0]:.3f}", "headline: attention CI low"),
+        (f"{h['attention_ci'][1]:.3f}", "headline: attention CI high"),
+        (f"{h['mingru_final']:.3f}", "headline: minGRU final"),
+        (f"{h['mingru_ci'][0]:.3f}", "headline: minGRU CI low"),
+        (f"{h['mingru_ci'][1]:.3f}", "headline: minGRU CI high"),
+        (f"n = {h['n']}", "headline: seed count"),
+    ]
+
+    late = {}
+    for row in c:
+        if "error" in row:
+            continue
+        want.append((f"{row['through_tokens']/1e6:.2f}M",
+                     f"control {row['run']}: horizon"))
+        for x in row["crossings"]:
+            want.append((f"{x['tokens']/1e6:.2f}M",
+                         f"control {row['run']}: crossing"))
+        if row["crossings"]:
+            late[row["run"]] = row["crossings"][-1]["tokens"]
+
+    # §4's load-bearing claim: telling the cosine schedule about the truncation
+    # is the only difference between these two rows, and it moves the late
+    # crossing by this much. Subtract it here rather than trusting the prose.
+    if {"crossover20m_locked", "crossover20m_matched_lr"} <= late.keys():
+        shift = late["crossover20m_locked"] - late["crossover20m_matched_lr"]
+        want.append((f"{shift/1e6:.2f}M", "controls: schedule-truncation shift"))
+
+    for i, row in enumerate(b["rows"], 1):
+        want.append((f"{row['final']:.3f}", f"board rank {i}: mean"))
+        want.append((f"{row['ci'][0]:.3f}", f"board rank {i}: CI low"))
+        want.append((f"{row['ci'][1]:.3f}", f"board rank {i}: CI high"))
+
+    if mb and mb["rows"]:
+        r = mb["rows"][0]
+        want.append((f"{r['final']:.3f}", "matched batch-32: leader mean"))
+        want.append((f"{r['ci'][0]:.3f}", "matched batch-32: leader CI low"))
+        want.append((f"{r['ci'][1]:.3f}", "matched batch-32: leader CI high"))
+
+    if o:
+        want += [
+            (str(o["candidates_total"]), "funnel: candidates enrolled"),
+            (str(o["candidates_ran"]), "funnel: candidates that ran"),
+            (f"{o['bpb16_mona']:.6f}", "funnel: MONA BPB at 16M"),
+            (f"{o['bpb128_mona']:.6f}", "funnel: MONA BPB at 128M"),
+            (f"{o['champion_bpb']:.6f}", "funnel: champion BPB"),
+        ]
+        want += [(name, f"funnel: blocked candidate {name}")
+                 for name in o["blocked"]]
+
+    # De-duplicate while preserving order; several figures repeat by design
+    # (the headline finals are also board rows 1 and 7).
+    seen, out = set(), []
+    for token, why in want:
+        if token not in seen:
+            seen.add(token)
+            out.append((token, why))
+    return out
+
+
+# Figures the manuscript states that are deliberately not derived from the
+# runs. Every entry carries its reason, and anything numeric in the text that
+# is neither derived nor listed here fails the check -- that is what stops a
+# stale figure surviving in prose the script never reads.
+STATED_NOT_DERIVED = {
+    "4.0": "CC BY 4.0 licence identifier, not a measurement",
+    "6.6M": "the original single-seed claim under test, quoted from §1",
+    "7.4M": "the original single-seed claim under test, quoted from §1",
+    "1.96": "normal quantile, named in §5 as the wrong multiplier",
+    "1.960": "normal quantile, named in §6 as the wrong multiplier",
+    "2.776": "Student-t multiplier at df=4, named in §5",
+    "12.706": "Student-t multiplier at df=1, named in §6",
+    "6.5": "ratio 12.706/1.960, the §6 understatement factor",
+    "1.42": "ratio 2.776/1.960, the §5 understatement factor",
+    "4.207": "superseded normal-quantile bound, quoted in §5 as superseded",
+    "4.221": "superseded normal-quantile bound, quoted in §5 as superseded",
+    "4.232": "pre-loss figure §5 corrects; appears in no surviving run",
+    "4.210": "pre-loss figure §5 corrects; appears in no surviving run",
+    "4.254": "pre-loss figure §5 corrects; appears in no surviving run",
+}
+
+_FIGURE_RE = re.compile(r"(?<![\w.])\d+\.\d+M?(?![\w])")
+
+
 def check(f):
-    """Every figure the manuscript states must appear in what we just derived."""
+    """Both directions: derived figures appear, stated figures are accounted for."""
     if not MANUSCRIPT.exists():
         print(f"FAIL: {MANUSCRIPT.name} does not exist")
         return 1
     body = MANUSCRIPT.read_text()
-    h, b = f["headline"], f["mixer_board"]
-    cx = h["crossings"]
 
-    wanted = {
-        f"{cx[0]['tokens']/1e6:.2f}M": "early crossing",
-        f"{cx[1]['tokens']/1e6:.2f}M": "late crossing",
-        f"{h['advantage']:.3f}".lstrip("-"): "final advantage",
-        f"{b['rows'][0]['final']:.3f}": "board leader",
-        f"{b['rows'][1]['final']:.3f}": "board runner-up",
-    }
-    missing = [why for token, why in wanted.items() if token not in body]
-    if missing:
-        print("FAIL: the manuscript states figures this script does not derive, "
-              "or omits ones it does:")
-        for why in missing:
-            print(f"  - {why}")
+    wanted = expected_figures(f)
+    missing = [(token, why) for token, why in wanted if token not in body]
+
+    # Reverse direction. The docstring above promises that a figure the script
+    # cannot reproduce is caught; for years it only checked that derived
+    # figures were present, which never reads the prose's own numbers.
+    derived = {token for token, _ in wanted}
+    derived |= {t[:-1] for t in derived if t.endswith("M")}
+    stated = sorted(set(_FIGURE_RE.findall(body)))
+    unaccounted = [s for s in stated
+                   if s not in derived and s not in STATED_NOT_DERIVED]
+
+    if missing or unaccounted:
+        if missing:
+            print(f"FAIL: {len(missing)} of {len(wanted)} derived figures are "
+                  f"absent from {MANUSCRIPT.name} (the prose has drifted):")
+            for token, why in missing:
+                print(f"  - {why}: derived {token!r}, not found in the text")
+        if unaccounted:
+            print(f"FAIL: {len(unaccounted)} figure(s) stated in "
+                  f"{MANUSCRIPT.name} are neither derived from the runs nor "
+                  f"listed in STATED_NOT_DERIVED with a reason:")
+            for s in unaccounted:
+                print(f"  - {s!r}")
         return 1
-    print(f"OK: every derived figure appears in {MANUSCRIPT.name}")
+
+    print(f"OK: all {len(wanted)} derived figures appear in {MANUSCRIPT.name}, "
+          f"and all {len(stated)} figures it states are accounted for "
+          f"({len(STATED_NOT_DERIVED)} by documented exception)")
     return 0
 
 

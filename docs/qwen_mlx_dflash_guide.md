@@ -11,7 +11,8 @@ and 4b-iii are measured. Headline: the **official MTP drafter remains the defaul
 **3.8-native drafters now exist.** z-lab has still published no Qwen3.8 DFlash checkpoint, but the
 DSpark family (DFlash + target auxiliary features + a confidence head) is trained against 3.8
 itself and runs on Apple Silicon via `mlx-dspark`. Measured 2026-08-17 (§4b-iii): DSpark is real and
-lossless, but MTP beats it on the 4-bit target by 18% (36.91 vs 31.20 tok/s, 18 sigma), and the
+lossless, but MTP beats it on the 4-bit target by 18% (36.91 vs 31.20 tok/s, paired *t* = 18.1 on
+df = 2, p ≈ 0.003), and the
 8-bit pair did not earn its 32 GB. DSpark accepts *more* per round and is still slower — its 1.36B
 drafter costs more per round than MTP's 239 MB head saves.
 
@@ -305,12 +306,23 @@ mlx 0.32.0. Artifacts: `.artifacts/dflash/qwen38_bench/20260817-213108/` (clean 
 No stability flags and no parse flags on this run; the AR baseline came in at 16.92 tok/s, above the
 15.26 of 2026-08-16, so these absolutes are quotable.
 
-**MTP wins outright.** The gap over `dspark` is 5.37 tok/s against a pooled standard deviation of
-0.30 across n=3 — **18 sigma**. An earlier contended run put the same comparison at 1.04 sigma and
-could not separate them; this one can.
+**MTP wins outright.** Pairing the three runs by index, the mean per-run gap over `dspark` is
+**5.37 tok/s** with a standard error of **0.30**, so the paired *t* is **18.1 on 2 degrees of
+freedom** (two-sided p ≈ 0.003). An earlier contended run put the same paired comparison at t ≈ 1.0
+and could not separate them; this one can.
+
+Two cautions on that number, both corrected here on 2026-08-23. It was previously written as "a
+pooled standard deviation of 0.30 — **18 sigma**", and neither half was right. 0.30 is the standard
+error of the paired differences, not a pooled standard deviation: the pooled SD is 0.38, against
+which the same gap is 14 sigma, not 18. And *t* = 18.1 at df = 2 is not eighteen sigma of evidence
+— with three runs the honest reading is p ≈ 0.003, roughly 3 sigma. The ranking is unaffected: MTP
+leads on every one of the three paired runs. What changes is how much this run is allowed to
+claim.
 
 **Higher acceptance, lower throughput.** DSpark accepts 3.79 tokens/round to MTP's 2.81 and is still
-18% slower. The reason is drafter cost, not draft quality: MTP's drafter is a 239 MB head split from
+**15% slower** (31.20 against 36.91 tok/s; equivalently MTP is 18% faster — the 18% figure belongs
+to that direction only, and read as "DSpark is 18% slower" here until 2026-08-23). The reason is
+drafter cost, not draft quality: MTP's drafter is a 239 MB head split from
 the target checkpoint, DSpark's is a full 1.36B model, and that per-round cost outweighs the extra
 accepted token. Acceptance is not the figure of merit — tok/s is. (The two engines' per-round
 figures are indicative rather than strictly comparable: mlx-dspark documents its count as including

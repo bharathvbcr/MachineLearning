@@ -17,6 +17,7 @@ import sys
 import tempfile
 import json
 import math
+import statistics
 from pathlib import Path
 
 import torch
@@ -677,6 +678,61 @@ def native_funnel_ci95_uses_student_t_not_the_normal_quantile():
     assert abs(_t_critical_95(4) - 2.776445) < 1e-6
     # Past the tabulated range the normal quantile is the documented fallback.
     assert abs(_t_critical_95(500) - 1.959964) < 1e-6
+
+
+@test
+def paper_matched_batch_board_uses_student_t_not_the_normal_quantile():
+    # The manuscript's matched batch-32 board was the last place in the repo
+    # still computing a 95% interval with z = 1.96.  At n = 5 the correct
+    # multiplier is t_4 = 2.776445, so every interval on that board was
+    # reported 1.42x too narrow -- the same defect the funnel fixed above,
+    # sitting in the very script that checks the manuscript for drift.
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "_derive_figures", root / "paper" / "derive_figures.py")
+    df = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(df)
+
+    board = df.matched_batch_board()
+    assert board is not None, "crossover50m_matched32 artifacts are missing"
+    assert board["rows"], "matched batch-32 board derived no rows"
+
+    # Recompute each arm's sample straight off disk.  Deriving the standard
+    # error from the reported half-width instead would make this test a
+    # tautology: half/(half/t) == t for any half, so it would pass against the
+    # very z-quantile code it exists to catch.
+    src = Path(df.OUT) / "crossover50m_matched32"
+    samples: dict[str, list[float]] = {}
+    for run_dir in sorted(src.iterdir()):
+        if not run_dir.is_dir() or "_s" not in run_dir.name:
+            continue
+        arm = run_dir.name.rsplit("_s", 1)[0].replace("cx32_", "")
+        last = None
+        for line in (run_dir / "metrics.jsonl").open():
+            try:
+                last = json.loads(line)
+            except json.JSONDecodeError:
+                pass
+        if last and last.get("event") == "done" and last.get("best_val") is not None:
+            samples.setdefault(arm, []).append(last["best_val"])
+
+    checked = 0
+    for row in board["rows"]:
+        n = row["n"]
+        assert row["df"] == n - 1, row
+        xs = samples[row["arm"]]
+        assert len(xs) == n, f"{row['arm']}: board n={n}, disk n={len(xs)}"
+        sem = statistics.stdev(xs) / math.sqrt(n)
+        half = (row["ci"][1] - row["ci"][0]) / 2
+        multiplier = half / sem
+        assert abs(multiplier - _t_critical_95(n - 1)) < 1e-4, (
+            f"{row['arm']}: interval uses multiplier {multiplier:.4f}, expected "
+            f"t_{n - 1} = {_t_critical_95(n - 1):.4f} "
+            f"(1.96 here is the normal-quantile defect)")
+        checked += 1
+    assert checked >= 8, f"only {checked} arms checked"
 
 
 @test
