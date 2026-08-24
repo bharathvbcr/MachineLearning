@@ -1,0 +1,1767 @@
+Short-horizon architecture and optimizer comparisons are the default currency of empirical
+language-model research. We report a controlled attempt to replicate one such comparison ---
+our own --- and show that the headline result was a property of the measurement recipe rather
+than of the architectures being compared.
+
+A single-seed run on an RTX 3070 Ti at batch size 8 placed the point where softmax attention
+overtakes minGRU between \textbf{6.6M and 7.4M} training tokens on a 12-layer / 768-dim model.
+Re-running the same matched pair on an NVIDIA GH200 at \textbf{n = 5 seeds} through a 50M-token
+horizon does not reproduce that location. Instead the mean validation-loss curves cross
+\textbf{twice}: minGRU overtakes attention at \textbf{1.05M} tokens and attention overtakes minGRU for
+good at \textbf{12.35M} tokens, holding a \textbf{-0.227} {[}-0.244, -0.211{]} advantage at 50M. Within the
+original 6.6--8.2M window minGRU leads by \textbf{0.13--0.18} nats on every seed.
+
+We then isolate the confounds one at a time, each with five seeds. Truncating the run to 20M
+tokens while letting the cosine schedule follow the truncated step count moves the late crossing
+from 12.34M to \textbf{14.58M}; restoring the 50M cosine horizon and stopping at the same 20M budget
+recovers \textbf{12.34M} (per-seed 11.93--12.58M) and reproduces the 19.7M gap to within 0.001. Holding
+batch size at the original 8 on the new hardware produces \textbf{no crossing at all} through 7.38M
+tokens on any seed. A matched-batch 50M ranking of ten mixer configurations places attention
+first at \textbf{4.222} {[}4.204, 4.240{]} but statistically tied with a 10$\times$minGRU + 2$\times$attention hybrid at
+\textbf{4.232} {[}4.210, 4.254{]}.
+
+We observe the same phenomenon on an independent axis. In a five-stage optimizer funnel on Apple
+silicon, MONA ranks first at 16M parameters and \textbf{last of four} at the \texttt{exact\_128m} configuration (128,367,988 parameters) --- ``exact'' there names the funnel's bit-exactness resume gate, recorded in
+\path{research/exact-128m-gate-polar.json}, not a round parameter count;
+the eventual 128M champion, Polar Express Muon, ranked third in the initial learning-rate screen
+and loses to Muon NS5 when run back down at small scale. We also correct the confidence intervals
+originally computed for that funnel: with the correct two-seed Student-\emph{t} multiplier, the
+champion-selection intervals \textbf{overlap}, and the selection rests on a sign-consistent 2-of-2
+ordering rather than on separated intervals.
+
+The transferable claim is not ``attention wins late.'' It is that \textbf{the crossing token is a
+function of batch size, learning-rate horizon, hardware and evaluation protocol}, and that a
+ranking measured at one recipe carries no license to be reported as a property of the
+architectures.
+
+One limitation is large enough to state in the abstract. Every run here uses standard
+parametrization with a single global Muon learning rate, so we cannot yet separate ``the ranking
+depends on the recipe'' from ``the arms were unequally well tuned at each recipe.'' \S8 states that
+competing explanation, gives the evidence that partially bounds it, and specifies the $\mu$P arm ---
+a 2 $\times$ 2 over parametrization and architecture on the suite 24 recipe, plus two cheaper ablations ---
+that would settle it, with a pre-registered reading of each possible outcome.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{1. Introduction}\label{introduction}
+
+A large fraction of practical architecture and optimizer selection happens on short runs. The
+reasoning is economic: a screen that costs 1\% of a full run and preserves the ordering of
+candidates is worth more than the full run. The assumption doing the work is that the ordering is
+preserved.
+
+That assumption has been challenged before, along several independent axes, and it has usually
+lost. Melis et al.~re-evaluated a sequence of LSTM successors under large-scale black-box tuning
+and found that properly regularized standard LSTMs outperformed the newer architectures that had
+been reported to beat them \cite{ref6}. Musgrave et al.~audited four years of deep metric learning and
+found the accumulated gains to be marginal once experimental methodology was controlled \cite{ref38}.
+Henderson et al.~showed that non-determinism and intrinsic variance in deep reinforcement learning
+make published comparisons difficult to interpret without seed discipline and significance
+reporting \cite{ref8}. Dodge et al.~made the dependence explicit: test-set scores alone are insufficient
+for model comparison, and several published comparisons \textbf{invert} when the computation budget
+spent on hyperparameter search changes \cite{ref7}. Hooker's \emph{hardware lottery} names the systems version
+of the same problem --- an idea can win because it suits the available hardware and software rather
+than because it is better \cite{ref26}.
+
+The specific variable this paper is about --- \textbf{training horizon} --- is less often treated as a
+ranking confound, even though the pieces needed to predict that it would be are individually well
+established. Optimal learning rate depends strongly on token horizon, with longer training
+requiring smaller learning rates and the optimal value following its own scaling law \cite{ref31}. The
+number of steps required to reach a target loss varies enormously with batch size and workload,
+and much of the historical disagreement about whether batch size affects final quality is
+attributable to differences in metaparameter tuning at different batch sizes \cite{ref27}. The largest
+useful batch size is itself a moving target predicted by the gradient noise scale, which changes
+\emph{over the course of a run} as loss decreases \cite{ref28}, and critical batch size scales primarily with
+data size rather than model size \cite{ref29}. Small batches are not merely a scaled-down version of large
+ones: they require different optimizer hyperparameters, and holding Adam's second-moment decay
+fixed rather than its token half-life mis-specifies them \cite{ref30}. Compute-optimal scaling work
+established that conclusions drawn at fixed data are systematically misleading \cite{ref9,ref10}, and
+Choshen et al.~found enough seed-level variability in scaling-law estimation that training several
+small models is sometimes more informative than training one large one \cite{ref37}.
+
+Put together, these say that batch size, learning-rate schedule and horizon jointly determine
+where a training curve is at any given token count. What they do not say --- and what we could not
+find measured directly --- is what that does to the \textbf{ordering} of two architectures whose curves
+cross, and specifically to the \emph{token at which they cross}, which is the quantity that short-run
+comparisons implicitly report.
+
+This paper reports what happened when we tested that against a result we had previously published
+ourselves.
+
+\textbf{The original observation.} In June 2026 we ran three 12-layer / 768-dim mixers --- minGRU,
+softmax attention, and Mamba-2 \cite{ref1,ref2} --- on FineWeb-Edu \cite{ref25} for 8.192M tokens on an RTX 3070 Ti
+Laptop (batch size 8, sequence length 512, Muon, one seed). minGRU led at every early checkpoint;
+attention closed the gap monotonically and overtook between 6.6M and 7.4M tokens (suite 14). Two
+follow-up pairs at a smaller model and a longer horizon preserved the \emph{shape} --- early recurrent
+lead, late attention overtake --- with the flip landing near 8.19M and 7.37M tokens respectively
+(suite 15). We described this as ``bias wins early, capacity wins late'' and treated the \textasciitilde7M token
+location as the finding.
+
+That interpretation was not unreasonable in isolation. It is consistent with the broader picture
+in which pure state-space and recurrent stacks match Transformers on many tasks but lag on those
+requiring copying or in-context retrieval \cite{ref5}, and with the general expectation that an
+architecture's inductive bias should matter most when data is scarce. What made it a mistake was
+not the story. It was that we reported a \textbf{number} --- the crossing token --- from a single seed on a
+single recipe, and treated it as a property of the architectures.
+
+\textbf{What this paper adds.} Access to an NVIDIA GH200 made a five-seed replication affordable. We
+ran the matched attention/minGRU pair plus eight additional mixer configurations to 50M tokens,
+then ran three targeted isolates that each change exactly one factor. The specific contributions:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{A failed location replication with a measured alternative.} At n = 5 on the GH200 the
+  6.6--7.4M crossing does not appear; two crossings appear instead, at 1.05M and 12.35M
+  (\S4.2). Every seed agrees on the sign at every marker except the 12.3M tie.
+\item
+  \textbf{Learning-rate horizon is a first-order confound for the crossing token, not only for final
+  loss.} Truncating the token budget without holding the cosine horizon fixed moves the late
+  crossing by 2.248M tokens --- 18\% of its location --- and the effect is measurable in the learning
+  rate itself, which at the crossing marker is \textasciitilde47\% of its long-horizon value (\S4.3). This is the
+  ranking-level consequence of the horizon-dependence of optimal LR reported in \cite{ref31}.
+\item
+  \textbf{Batch size, not just hardware, changes the early ordering.} At batch size 32 attention
+  leads the first evaluation on all five seeds; at batch size 8 on the \emph{same} GPU minGRU leads
+  the first evaluation on all five seeds and never surrenders it through 7.38M tokens (\S4.4).
+  Both batch sizes are far below any plausible critical batch size at this scale \cite{ref29}, so this is
+  not a large-batch degradation effect.
+\item
+  \textbf{A matched-batch 50M mixer ranking} in which the previously reported ordering of hybrids is
+  substantially rearranged once batch and evaluation count are held fixed (\S4.5), and in which
+  the best hybrid is statistically indistinguishable from pure attention.
+\item
+  \textbf{An independent replication of the phenomenon on the optimizer axis}, including a
+  statistical correction to our own previously reported selection intervals (\S5). Zhao et al.
+  found that most modern optimizers perform comparably at their own optimal hyperparameters
+  \cite{ref36}; our funnel is a case study in what happens when the tuning budget is too short to find
+  those hyperparameters.
+\item
+  \textbf{A protocol} (\S9) and an explicit list of claims we withdraw (\S7.3).
+\item
+  \textbf{A named, designed follow-up} (\S8): the single most likely explanation we did \emph{not} control
+  for is parametrization, and we specify the $\mu$P arm that would test it.
+\end{enumerate}
+
+We deliberately do not claim a mechanism. ``Recurrent inductive bias helps early, attention
+capacity wins late'' remains a plausible story that fits these curves; it is not established by
+them, and it does not predict the crossing token, which is the quantity that actually moved.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{2. Background and related work}\label{background-and-related-work}
+
+\textbf{Sequence mixers.} minGRU is a minimal gated recurrent unit whose recurrence is
+parallelizable over sequence length, proposed as evidence that heavily simplified RNNs remain
+competitive with Transformers at moderate scale \cite{ref1}. Mamba-2 recasts selective state-space models
+and attention variants inside a shared structured-semiseparable-matrix framework, yielding a
+core layer 2--8$\times$ faster than Mamba while remaining competitive on language modeling \cite{ref2}. Gated
+DeltaNet combines gated adaptive memory control with the delta update rule to improve
+retrieval-limited behavior in linear Transformers \cite{ref3}. Multi-head Latent Attention compresses the
+KV cache into a latent vector and was introduced with DeepSeek-V2 \cite{ref4}. All four, plus attention
+and six hybrid interleavings, are implemented in the \texttt{nanolab} codebase used here.
+
+\textbf{Hybrids.} Interleaving a small number of attention layers into an otherwise recurrent or
+state-space stack is now a standard recipe. At 8B parameters and 3.5T tokens, a 43\% Mamba-2 / 7\%
+attention / 50\% MLP hybrid exceeded a matched Transformer on all twelve standard tasks evaluated,
+while pure SSMs lagged on copying and in-context-learning tasks \cite{ref5}. Our \S4.5 board is a
+small-scale, matched-recipe version of the same question, and reaches a compatible conclusion:
+the best hybrid is statistically indistinguishable from pure attention, and pure recurrent stacks
+are clearly behind.
+
+\textbf{Benchmark validity and budget-dependent conclusions.} The methodological literature
+summarized in \S1 \cite{ref6,ref7,ref8,ref38} establishes that measured rankings depend on the resources spent
+measuring them. That work is almost always framed around \emph{hyperparameter search} budget or
+implementation variance. The closest precedent to our framing is Dodge et al.'s expected
+validation performance as a function of budget, which makes the budget an explicit axis of the
+reported result rather than an implicit constant \cite{ref7}. We adopt the same posture for the training
+horizon: if two curves cross, the crossing token is part of the result and must be reported with
+the recipe that produced it.
+
+\textbf{Horizon, batch size and schedule.} Optimal learning rate depends on the token horizon, with
+longer runs requiring smaller learning rates and the optimal value obeying its own scaling law
+that permits transfer from short horizons to long \cite{ref31}. This is the mechanism behind \S4.3: when a
+run is truncated and the cosine schedule follows the truncated step count, the two runs are on
+materially different learning rates at every shared token marker, and we measure the ratio at
+\textasciitilde47\% at the crossing point. On the batch axis, Shallue et al.~characterized steps-to-target as a
+function of batch size across 35 workloads and attributed much of the literature's disagreement
+about batch-size effects on quality to differences in metaparameter tuning \cite{ref27}; McCandlish et al.
+introduced the gradient noise scale as a predictor of the largest useful batch size and noted that
+it \emph{increases as loss decreases within a run} \cite{ref28}; Zhang et al.~measured how critical batch size
+scales in pre-training from 85M to 1.2B parameters and found it scales primarily with data size
+rather than model size \cite{ref29}. Marek et al.~revisited very small batches and proposed holding Adam's
+second-moment half-life fixed in tokens rather than holding its decay rate fixed, finding small
+batches stable and more robust to hyperparameter choice than conventional wisdom holds \cite{ref30}. Our
+batch-8 and batch-32 recipes (\S4.4) sit well below any critical batch size at this scale, which is
+why we read the batch effect there as an ordering effect rather than a large-batch quality
+penalty.
+
+\textbf{Parametrization and hyperparameter transfer.} $\mu$P makes many optimal hyperparameters
+approximately invariant to width, enabling a tune-small / transfer-large workflow \cite{ref12}; Depth-$\mu$P
+extends the analysis to depthwise transfer and identifies fundamental limitations when each
+residual block is itself deep, as in modern Transformers \cite{ref33}; u-$\mu$P combines $\mu$P with unit scaling
+so that default values are near-optimal and FP8 training works out of the box \cite{ref34}. The picture is
+not settled in $\mu$P's favor: Everett et al.~trained tens of thousands of models across four
+parameterizations, three optimizers and fourteen model sizes to 26.8B parameters, and found that
+\emph{all} parameterizations can achieve hyperparameter transfer, with a per-layer learning-rate
+prescription for standard parametrization outperforming $\mu$P \cite{ref32}. Kalra and Barkeshli localized
+$\mu$P's apparent advantage over standard parametrization under AdamW to a single factor --- maximizing
+the embedding-layer learning rate, which in standard parametrization acts as a bottleneck that
+induces instability \cite{ref35}. Our runs use standard parametrization with a global Muon learning rate
+and no per-layer prescription; \S8 is about what that leaves untested.
+
+\textbf{Scale as a confound.} Compute-optimal scaling established that model size and token count must
+be scaled together and that conclusions at fixed data mislead \cite{ref9,ref10}. Wortsman et al.~reproduced
+large-scale instabilities in small models at high learning rates and studied how warm-up, weight
+decay and $\mu$Param change loss sensitivity to learning rate \cite{ref11} --- the same class of interaction we
+measure at the ranking level in \S4.3. Choshen et al.~derived best practices for estimating scaling
+laws from 485 pretrained models and over 1000 fitted laws, finding that fitting to intermediate
+checkpoints substantially improves accuracy and that seed variability can make several small
+models more useful than one large one \cite{ref37}. Schaeffer et al.~argued that apparently sharp
+scale-dependent transitions can be artifacts of the chosen metric \cite{ref13}; our crossings are measured
+on a continuous metric (held-out cross-entropy), which removes that particular explanation but not
+the recipe dependence.
+
+\textbf{Optimizers.} The optimizer arm of this work compares Muon-family matrix-orthogonalizing
+methods against full-parameter baselines. Muon has been shown to scale to large LLM training with
+weight decay and per-parameter update-scale adjustment, reporting roughly 2$\times$ computational
+efficiency versus AdamW under compute-optimal training \cite{ref14}. Polar Express replaces Newton--Schulz
+with a minimax-optimal polynomial iteration for the polar decomposition and reports consistent
+validation-loss improvements when integrated into Muon on GPT-2-scale FineWeb training \cite{ref15}.
+NorMuon adds neuron-wise adaptive second moments on top of orthogonalized updates \cite{ref16}. MONA adds
+a curvature-aware Nesterov acceleration term inside Muon's gradient pipeline and reports gains at
+1B--68B MoE scale \cite{ref17}. Muown treats the row-magnitude vector as an explicit optimizer variable and
+reports improved perplexity over Muon, SOAP, AdamW and Lion on FineWeb-Edu from 124M to 2.7B \cite{ref18}.
+Baselines and controls include AdamW \cite{ref19}, Lion \cite{ref20}, Sophia \cite{ref21}, Schedule-Free AdamW \cite{ref22}, and
+Prodigy \cite{ref23}. Two results frame \S5. Zhao et al.~compared SGD, Adafactor, Adam, Lion and Sophia
+across model sizes and hyperparameter settings and found that --- SGD aside --- they perform
+comparably both at their optima and in robustness to hyperparameter misspecification, suggesting
+optimizer choice can be driven by memory and implementation considerations \cite{ref36}. Community
+benchmarking efforts such as AlgoPerf exist precisely because optimizer comparisons are so
+sensitive to tuning protocol \cite{ref24}. If optimizers are largely comparable \emph{when each is properly
+tuned}, then a short screen that cannot tune them is measuring something else --- which is what \S5.4
+reports.
+
+\textbf{Data.} All runs in this paper train on FineWeb-Edu, the educational subset of FineWeb \cite{ref25}.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{3. Experimental setup}\label{experimental-setup}
+
+\subsection{3.1 Model and training}\label{model-and-training}
+
+The mixer experiments use a fixed 12-layer / 768-dim decoder (``124M shape'') with sequence length
+512, trained with Muon at learning rate 6e-4 on FineWeb-Edu, \texttt{mixer\_chunk\ =\ 32}, \texttt{compile\ =\ False},
+GPU-resident data, and \texttt{eval\_train\ =\ False}. The only lever that varies across arms is the layer
+mixer. Seeds are \texttt{1337,\ 42,\ 100,\ 2026,\ 777} for every five-seed suite.
+
+Hardware for suites 22--26 is a Lambda Cloud GH200 (97,871 MiB HBM, aarch64, PyTorch 2.7.0 +
+CUDA 12.8). Suites 14--16 ran earlier on an RTX 3070 Ti Laptop (8 GB). \texttt{torch.compile} stalled in
+Inductor for attention on GH200 aarch64, so every job in suites 22--26 ran uncompiled; this is a
+uniform choice across arms, not a per-arm difference.
+
+Warm-up, evaluation and checkpoint cadences are expressed in \textbf{tokens}, not steps, so that a
+wider microbatch still lands evaluations near the original suite-14 markers (batch 8 $\times$ sequence
+512 = 4,096 tokens/step; evaluation every 200 such steps, i.e.~every 0.8192M tokens).
+
+\subsection{3.2 Evaluation and statistics}\label{evaluation-and-statistics}
+
+Validation loss is reported at the nearest logged evaluation to each named token marker, with
+\texttt{eval\_iters\ =\ 20} for every arm in the matched suites. For a marker with five seeds we report the
+mean and a 95\% Student-\emph{t} interval with four degrees of freedom (t$_4$ = 2.776). The gap is defined
+as attention - minGRU, so a negative gap means attention is better.
+
+Crossing points are obtained by linear interpolation of the two \textbf{mean} curves on attention's
+evaluation grid; per-seed crossings are computed the same way on individual curves and reported as
+a range so that a mean crossing cannot be mistaken for a single-seed artifact.
+
+Three rules were applied throughout and are worth stating because they cost us results:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{No cross-recipe tables.} Cells measured at batch 8 never appear in the same table as cells
+  measured at batch 32, even when the token markers match.
+\item
+  \textbf{A \texttt{best\_val} field is not a paired snapshot.} Minimum-over-all-evaluations is not a ranking
+  and is never reported as one.
+\item
+  \textbf{An auto-generated intersection over mixed token grids is not a source of truth.} When arms
+  ran at different batch sizes their eval grids do not align, and a naive intersection produces
+  flat, wrong early markers.
+\end{itemize}
+
+\subsection{3.3 Suites}\label{suites}
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Suite
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Question
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Hardware / batch
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Seeds
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Budget
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+14 & Does the 2M-token mixer ranking survive to 8.2M? & 3070 Ti / bs8 & 1 & 8.192M \\
+15 & Does the crossover shape survive a smaller model and a longer run? & 3070 Ti / bs16 & 1 & 16.4M, 30.3M \\
+22 & Does the 6.6--7.4M location replicate at n = 5 to 50M? & GH200 / bs32 (+bs96 drift) & 5 & 50M \\
+23 & Independent 20M pair, cosine following \texttt{max\_steps} & GH200 / bs32 & 5 & 20M \\
+24 & Same, with the 50M cosine horizon held & GH200 / bs32 & 5 & 20M \\
+25 & Original batch size 8, on the new hardware & GH200 / bs8 & 5 & 8.192M \\
+26 & Matched-batch 50M ranking of the eight drifted arms & GH200 / bs32 & 5 & 50M \\
+\end{longtable}}
+}
+
+Suites 24, 25 and 26 are \emph{isolates}: each changes exactly one factor relative to suite 22 and
+verifies the recipe fingerprint (\texttt{batch\_size}, \texttt{eval\_iters}, \texttt{max\_steps}, \texttt{lr\_max\_steps}) on every
+individual job config before the results are read.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{4. Results: the mixer axis}\label{results-the-mixer-axis}
+
+\subsection{4.1 The original observation (suite 14)}\label{the-original-observation-suite-14}
+
+RTX 3070 Ti, batch 8, sequence 512, 2,000 steps = 8.192M tokens, seed 1337, one seed per arm.
+
+{%
+{\small\begin{longtable}[]{@{}lllll@{}}
+\toprule\noalign{}
+Tokens & minGRU & Attention & Mamba-2 & gap (A-G) \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+0.8M & \textbf{6.334} & 6.516 & 6.493 & +0.182 \\
+4.1M & \textbf{5.549} & 5.624 & 5.769 & +0.075 \\
+6.6M & \textbf{5.353} & 5.358 & 5.560 & +0.005 (tied) \\
+7.4M & 5.249 & \textbf{5.239} & 5.469 & -0.010 $\leftarrow$ overtakes \\
+8.2M & 5.155 & \textbf{5.136} & 5.383 & -0.019 \\
+\end{longtable}}
+}
+
+Suite 15 preserved the shape at two other configurations: a 6L/384d model at batch 16 crossed near
+\textbf{8.19M} tokens (step 1000 of 2000), and the full 12L/768d model at batch 16 crossed near
+\textbf{7.37M} tokens (step 900 of 3700). Each of those four arms is a single seed.
+
+The crossing locations above are read from paired evaluation curves. The end-of-run figures for
+these four arms --- 4.852 / 5.021 at 16.4M and 4.260 / 4.575 at 30.3M --- are \texttt{best\_val} fields, i.e.
+minimum-over-all-evaluations, and by the rule we set out in \S3.2 they are \textbf{not} paired snapshots
+and \textbf{not} a ranking. An earlier version of this section reported them as though they were, which
+is exactly the failure \S3.2 is meant to prevent. We state them here only as run summaries, and no
+ordering in this paper depends on them. The same caveat applies to the 8.2M row of the suite-14
+table above, which is that run's \texttt{done} record rather than a matched-token evaluation.
+
+This is the entire evidential basis for the ``\textasciitilde7M crossover'' claim: \textbf{one seed} at the headline
+configuration, and two single-seed pairs whose crossings land at 8.19M and 7.37M --- already a
+1.1M-token spread that we under-weighted at the time.
+
+\subsection{4.2 The n = 5 replication (suite 22)}\label{the-n-5-replication-suite-22}
+
+Attention and minGRU share one recipe from step 0: batch 32, \texttt{eval\_iters\ =\ 20}, 50M-token cosine,
+five seeds. Means are nearest-evaluation; intervals are 95\% Student-\emph{t} on five seeds.
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Actual tokens
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Attention {[}95\%{]}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+minGRU {[}95\%{]}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+gap A-G {[}95\%{]}
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+0.836M & 6.775 {[}6.755, 6.794{]} & 6.831 {[}6.819, 6.844{]} & \textbf{-0.056} {[}-0.065, -0.048{]} \\
+4.112M & 5.888 {[}5.863, 5.914{]} & 5.661 {[}5.637, 5.684{]} & \textbf{+0.228} {[}+0.216, +0.239{]} \\
+6.570M & 5.581 {[}5.573, 5.589{]} & 5.402 {[}5.390, 5.414{]} & \textbf{+0.179} {[}+0.169, +0.189{]} \\
+7.389M & 5.504 {[}5.489, 5.519{]} & 5.350 {[}5.330, 5.370{]} & \textbf{+0.154} {[}+0.145, +0.162{]} \\
+8.208M & 5.434 {[}5.405, 5.462{]} & 5.299 {[}5.267, 5.332{]} & \textbf{+0.134} {[}+0.126, +0.143{]} \\
+12.304M & 5.122 {[}5.104, 5.141{]} & 5.120 {[}5.097, 5.144{]} & +0.002 {[}-0.009, +0.013{]} (tie) \\
+19.677M & \textbf{4.743} {[}4.733, 4.754{]} & 4.936 {[}4.924, 4.947{]} & \textbf{-0.193} {[}-0.201, -0.185{]} \\
+49.988M & \textbf{4.222} {[}4.204, 4.240{]} & 4.449 {[}4.423, 4.476{]} & \textbf{-0.227} {[}-0.244, -0.211{]} \\
+\end{longtable}}
+}
+
+Interpolated mean-curve crossings: \textbf{1.049M} (minGRU overtakes attention) and \textbf{12.353M}
+(attention overtakes minGRU and stays ahead through 50M). Per-seed late crossings are
+\textbf{12.031, 12.216, 12.453, 12.474, 12.579M} --- a 0.55M band, so the mean crossing is not one lucky
+seed. The sign of the gap agrees across all five seeds at every marker except the 12.3M tie.
+
+Three things follow.
+
+\textbf{The location did not replicate.} Suite 14's 6.6--7.4M window sits squarely inside the
+minGRU-lead region on this recipe, with minGRU ahead by 0.13--0.18.
+
+\textbf{There are two crossings, not one.} Attention leads the \emph{first} evaluation (0.836M) on every
+seed here --- the opposite of suite 14, where minGRU led from its first logged point. The early
+crossing at 1.05M is a phenomenon suite 14 could not have seen: its first evaluation was at 0.82M,
+essentially on top of the crossing, and it had one seed.
+
+\textbf{Absolute losses are not comparable across the two boxes.} At \textasciitilde8.2M, attention is 5.434 here
+against 5.136 on the 3070 Ti --- a \textasciitilde0.3 nat gap. The curves are not vertically interchangeable, and
+no table in this paper stacks them.
+
+\subsection{4.3 The learning-rate horizon is a first-order confound (suites 23 and 24)}\label{the-learning-rate-horizon-is-a-first-order-confound-suites-23-and-24}
+
+Suite 23 asked for an independent 20M-token pair on the same batch and evaluation recipe. It
+recovered the early crossing exactly --- \textbf{1.047M}, per-seed 1.03--1.09M --- and moved the late one to
+\textbf{14.582M} (per-seed 13.709, 14.490, 14.929, 15.058, 15.193M). At 12.3M, minGRU still led by
+\textbf{+0.051} on every seed; at 19.677M attention led by only \textbf{-0.065} {[}-0.081, -0.050{]}, against
+suite 22's -0.193 at the same marker.
+
+The cause is mechanical and was verified in the configs rather than inferred: the cosine schedule
+followed \texttt{max\_steps} (1220) instead of the 50M horizon (3051). At the 12.3M marker the
+20M-horizon learning rate is approximately \textbf{47\%} of the 50M-horizon learning rate at the same
+token count. Two runs that are identical in architecture, data, batch, seed set and evaluation
+protocol are on materially different learning rates at the token where the ranking flips.
+
+Suite 24 is the corrected prefix: identical to suite 23 except \texttt{lr\_max\_steps\ =\ 3051}.
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Actual tokens
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Attention {[}95\%{]}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+minGRU {[}95\%{]}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+gap A-G {[}95\%{]}
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+0.836M & 6.778 {[}6.765, 6.791{]} & 6.831 {[}6.819, 6.844{]} & \textbf{-0.053} {[}-0.055, -0.051{]} \\
+4.112M & 5.888 {[}5.863, 5.914{]} & 5.661 {[}5.637, 5.684{]} & \textbf{+0.227} {[}+0.214, +0.241{]} \\
+6.570M & 5.580 {[}5.572, 5.589{]} & 5.402 {[}5.390, 5.414{]} & \textbf{+0.178} {[}+0.168, +0.189{]} \\
+7.389M & 5.504 {[}5.489, 5.518{]} & 5.350 {[}5.330, 5.370{]} & \textbf{+0.153} {[}+0.141, +0.166{]} \\
+8.208M & 5.432 {[}5.401, 5.464{]} & 5.299 {[}5.267, 5.332{]} & \textbf{+0.133} {[}+0.125, +0.141{]} \\
+12.304M & 5.122 {[}5.099, 5.144{]} & 5.120 {[}5.097, 5.144{]} & +0.001 {[}-0.010, +0.013{]} (tie) \\
+19.677M & \textbf{4.744} {[}4.734, 4.754{]} & 4.936 {[}4.924, 4.947{]} & \textbf{-0.192} {[}-0.199, -0.185{]} \\
+\end{longtable}}
+}
+
+Crossings: \textbf{1.038M} and \textbf{12.335M}; per-seed late crossings 11.930, 12.287, 12.365, 12.564,
+12.579M. This is an independent ten-job draw that lands on suite 22's crossing to within 0.02M and
+reproduces the 19.677M gap to within \textbf{0.001}. Suite 23's 14.6M was the schedule, not seed noise.
+
+This is, to us, the most actionable single finding in the paper. \textbf{Truncating a run for a cheaper
+comparison silently retunes the learning rate at every token you are comparing at.} A study that
+stops a 50M-token recipe at 20M to save compute is not measuring a prefix of that recipe.
+
+\subsection{4.4 Batch size changes the early ordering (suite 25)}\label{batch-size-changes-the-early-ordering-suite-25}
+
+Suite 22 changed GPU and batch size together. Suite 25 holds batch at suite 14's value of 8 on the
+GH200, at suite 14's 8.192M budget, with the cosine horizon matching the run (2000 steps).
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Actual tokens
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Attention {[}95\%{]}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+minGRU {[}95\%{]}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+gap A-G {[}95\%{]}
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+0.823M & 6.736 {[}6.698, 6.774{]} & 6.567 {[}6.521, 6.614{]} & \textbf{+0.168} {[}+0.160, +0.177{]} \\
+4.100M & 5.834 {[}5.799, 5.868{]} & 5.721 {[}5.686, 5.755{]} & \textbf{+0.113} {[}+0.102, +0.124{]} \\
+6.558M & 5.507 {[}5.474, 5.539{]} & 5.462 {[}5.420, 5.504{]} & \textbf{+0.045} {[}+0.028, +0.062{]} \\
+7.377M & 5.425 {[}5.391, 5.459{]} & 5.395 {[}5.359, 5.431{]} & \textbf{+0.030} {[}+0.017, +0.043{]} \\
+\end{longtable}}
+}
+
+\textbf{No crossing occurs in any logged evaluation, on the mean curves or on any individual seed.}
+minGRU leads from the first evaluation on all five seeds and the gap shrinks monotonically ---
+0.168 $\rightarrow$ 0.113 $\rightarrow$ 0.045 $\rightarrow$ 0.030 --- without changing sign through 7.38M tokens.
+
+This isolates batch size from hardware. At batch 32 on this GPU, attention leads the first
+evaluation on every seed; at batch 8 on the \emph{same} GPU, minGRU leads the first evaluation on
+every seed. Suite 25 reproduces suite 14's \emph{early shape}, which suite 22 does not, while failing
+to reproduce suite 14's 6.6--7.4M overtake, which suite 22 also does not.
+
+One honest gap: the final 8.192M \texttt{evaluate()} is written to \texttt{done.best\_val} and not logged as an
+eval row, so the last \textbf{paired} marker here is 7.377M. \texttt{best\_val} (attention 5.371 {[}5.330,
+5.412{]}, minGRU 5.353 {[}5.319, 5.387{]}) is a minimum over all evaluations, not a paired snapshot,
+and we do not rank on it. Confidence is \textbf{High} for ``no flip through 7.38M'' and \textbf{Medium} for
+any statement about 8.2M.
+
+\subsection{4.5 A matched-batch 50M ranking (suite 26)}\label{a-matched-batch-50m-ranking-suite-26}
+
+Suite 22's ten-arm 50M board mixed batch 32 / \texttt{eval\_iters\ =\ 20} with batch 96 / \texttt{eval\_iters\ =\ 4},
+because the token budget was drained by repacking leftover jobs at a wider microbatch. That makes
+it a record of what finished, not a bakeoff. Suite 26 reruns the eight drifted arms at batch 32
+and \texttt{eval\_iters\ =\ 20} from step 0, 40 jobs, 40/40 completed.
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Rank
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Arm
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Source
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Mean val {[}95\%{]}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Seed range
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+1 & attention & s22 & \textbf{4.222} {[}4.204, 4.240{]} & 4.204--4.237 \\
+2 & hybrid\_mingru10\_attn2 & s26 & \textbf{4.232} {[}4.210, 4.254{]} & 4.210--4.249 \\
+3 & hybrid\_gdn\_periodic & s26 & 4.290 {[}4.271, 4.309{]} & 4.271--4.308 \\
+4 & hybrid\_gdn\_bookend & s26 & 4.301 {[}4.278, 4.324{]} & 4.277--4.319 \\
+5 & hybrid\_gdn10\_attn2 & s26 & 4.314 {[}4.292, 4.336{]} & 4.290--4.331 \\
+6 & hybrid\_mamba10\_attn2 & s26 & 4.333 {[}4.312, 4.353{]} & 4.313--4.353 \\
+7 & gdn & s26 & 4.441 {[}4.419, 4.462{]} & 4.422--4.461 \\
+8 & mingru & s22 & 4.449 {[}4.423, 4.476{]} & 4.430--4.473 \\
+9 & mamba2 & s26 & 4.596 {[}4.562, 4.630{]} & 4.572--4.633 \\
+10 & mla & s26 & 4.627 {[}4.604, 4.650{]} & 4.609--4.647 \\
+\end{longtable}}
+}
+
+\begin{quote}
+\textbf{Horizon and a rejected correction (2026-08-24).} Every row above is measured at the same
+evaluation point, \textbf{49,987,584 tokens}: the forty \texttt{crossover50m\_matched32} runs and the
+\texttt{crossover50m} attention and minGRU arms all carry that point. Where this section compares
+movement against suite 22 below, those suite-22 values are measured at \textbf{49,594,368} tokens
+instead --- a 0.8\% shorter horizon --- because four \texttt{crossover50m} arms end on the shorter grid.
+That difference is smaller than every rank gap discussed, but it is a cross-horizon comparison
+and is labelled as one.
+
+A later rebuild of this manuscript (\S7.4 item 8) replaced row 2 with \textbf{4.275 {[}4.245, 4.305{]}}
+and reported its interval as disjoint from attention's, on the grounds that ``the 4.232 figure
+appears in no surviving run''. \textbf{We have restored 4.232 and reject that correction.} The figure
+is \texttt{hybrid\_mingru10\_attn2} in \texttt{crossover50m\_matched32}, and recomputing it from those five runs
+gives 4.2319 {[}4.2099, 4.2539{]} at 49,987,584 tokens --- the same point as the attention row it is
+compared against. The replacement 4.275 is the same arm in \texttt{crossover50m}, where its seeds end
+at 49,594,368. The correction therefore swapped a matched-horizon comparison for a mismatched
+one, in the course of documenting horizon mismatch as a defect.
+
+The genuine weakness of this row is the one we already state: it is a \textbf{cross-suite} comparison,
+because suite 26 never reran attention or minGRU at 50M. That is gap E2, and it caps this board
+at Medium-High confidence until those ten jobs are run.
+\end{quote}
+
+Two arms moved substantially relative to the mixed-recipe board, and both are arms that had
+trained at batch 96: \texttt{hybrid\_mamba10\_attn2} improved from 4.604 to \textbf{4.333} (-0.271) and
+\texttt{hybrid\_mingru10\_attn2} from 4.275 to \textbf{4.232}. GDN-family arms were already at batch 32 and moved
+only at seed scale (e.g.~\texttt{hybrid\_gdn\_periodic} 4.280 $\rightarrow$ 4.290).
+
+The matched conclusions are narrower than the drifted board suggested:
+
+\begin{itemize}
+\tightlist
+\item
+  Attention has the \textbf{best mean}, but is \textbf{not separable} from a 10$\times$minGRU + 2$\times$attention hybrid
+  at n = 5; the intervals overlap.
+\item
+  Adding two attention layers to a recurrent stack is worth roughly \textbf{0.22} nats over the pure
+  recurrent stack (minGRU 4.449 $\rightarrow$ hybrid 4.232) and roughly \textbf{0.26} over pure Mamba-2
+  (4.596 $\rightarrow$ 4.333). This is the largest single effect on the board.
+\item
+  Pure Mamba-2 and MLA are last, clearly separated from everything above them.
+\item
+  Nothing here is a throughput claim. Quality ranking and tokens-per-second are separate outcomes
+  and are never combined in this paper.
+\end{itemize}
+
+Confidence is \textbf{High} for the eight rerun arms and \textbf{Medium-High} for the combined ranking,
+because the attention and minGRU cells are suite 22's sample rather than a fresh 50M draw.
+
+\subsection{4.6 Summary: what moved the crossing}\label{summary-what-moved-the-crossing}
+
+Every row below is n = 5 except the first.
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Configuration
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Suite
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Early crossing
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Late crossing
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+RTX 3070 Ti, bs8, 8.192M budget, \textbf{1 seed} & 14 & not observed (minGRU leads eval 1) & \textbf{6.6--7.4M} \\
+GH200, bs32, 50M cosine, 50M budget & 22 & \textbf{1.049M} & \textbf{12.353M} \\
+GH200, bs32, 50M cosine, 20M budget (independent draw) & 24 & \textbf{1.038M} & \textbf{12.335M} \\
+GH200, bs32, \textbf{20M cosine}, 20M budget & 23 & \textbf{1.047M} & \textbf{14.582M} \\
+GH200, \textbf{bs8}, own cosine, 8.192M budget & 25 & not observed (minGRU leads eval 1) & \textbf{none through 7.38M} \\
+\end{longtable}}
+}
+
+Reading down the table: the early crossing is stable at \textasciitilde1.04--1.05M across every batch-32 recipe
+and absent at batch 8. The late crossing moves by 2.248M tokens on a change to the learning-rate
+horizon alone, and does not occur at all within the original budget at the original batch size.
+The one quantity that was reported as the finding --- the token of the flip --- is the one quantity
+that is not stable.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{5. The same phenomenon on the optimizer axis}\label{the-same-phenomenon-on-the-optimizer-axis}
+
+The mixer study varied architecture with everything else fixed. The obvious next axis is the
+optimizer, and it is a well-posed target precisely because optimizer papers are so often
+introduced on short curves.
+
+\subsection{5.1 Funnel design}\label{funnel-design}
+
+Sixteen candidates, one engine, one equal-token protocol, on an Apple M5 Pro. Fourteen are
+implemented natively in Rust and Metal with parity fixtures: Muon NS5, Muon NS3, Polar Express
+Muon, NorMuon, Muown, MONA, AdamW, Cautious AdamW, Lion, Cautious Lion, momentum SGD, Sophia,
+Schedule-Free AdamW, and Prodigy.
+
+Two are recorded as \textbf{systems-blocked exclusions} rather than dropped: MiMuon (\texttt{mimuon\_adamw}) requires exact
+singular-gap routing, which requires a per-matrix SVD; SOAP (\texttt{soap\_adamw}) requires a periodic symmetric
+eigendecomposition. Metal/MPS exposes neither, and an Accelerate fallback would force a host
+synchronization on every refresh, converting the arm into a measurement of the fallback. They are
+not silent substitutions and they are \textbf{not evidence about those methods}.
+
+The funnel is five stages on an atomic, resumable job ledger, written down before the runs:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  Five-point logarithmic learning-rate sweep at 16M parameters, 100 steps, seed 1337.
+\item
+  Every stable LR winner for 500 steps, seed 1337.
+\item
+  The best of those, plus mandatory AdamW and Muon NS5 anchors, for 1,000 steps at seeds 42 and 2026.
+\item
+  The top four at the \texttt{exact\_128m} configuration (128,367,988 parameters) for 500 steps, seed 1337.
+\item
+  The top two at 128M for 1,000 steps, seeds 42 and 2026.
+\end{enumerate}
+
+Selection is by mean equal-token validation bits-per-byte, with time-to-loss, memory footprint
+and step time as tie-breakers \emph{only} when intervals overlap.
+
+\subsection{5.2 The reversal}\label{the-reversal}
+
+Stage 3 --- 16M parameters, 1,000 steps, two seeds. We report both seeds and two intervals: the
+$\pm$1.96$\cdot$SE interval originally computed, and the correct Student-\emph{t} interval for n = 2 (t$_1$ = 12.706).
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 10\tabcolsep) * \real{0.1667}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 10\tabcolsep) * \real{0.1667}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Candidate
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Seed 42
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Seed 2026
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Mean BPB
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+$\pm$1.96$\cdot$SE
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+95\% \emph{t}$_1$ interval
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+MONA & 2.183040 & 2.178756 & \textbf{2.180898} & 0.004198 & {[}2.1537, 2.2081{]} \\
+Polar Muon & 2.179047 & 2.185596 & \textbf{2.182322} & 0.006418 & {[}2.1407, 2.2239{]} \\
+NorMuon & 2.236222 & 2.228217 & 2.232220 & 0.007845 & {[}2.1814, 2.2831{]} \\
+Muon NS5 & 2.225931 & 2.239343 & 2.232637 & 0.013144 & {[}2.1474, 2.3178{]} \\
+Muon NS3 & 2.262745 & 2.255586 & 2.259166 & 0.007016 & {[}2.2137, 2.3046{]} \\
+Muown & 2.583694 & 2.585490 & 2.584592 & 0.001760 & {[}2.5732, 2.5960{]} \\
+AdamW (control) & 11.378829 & 11.179040 & 11.278935 & 0.195790 & {[}10.010, 12.548{]} \\
+\end{longtable}}
+}
+
+The same four candidates at the \texttt{exact\_128m} configuration (128,367,988 parameters), 500 steps, seed 1337 (n = 1, no
+interval):
+
+{%
+{\small\begin{longtable}[]{@{}ll@{}}
+\toprule\noalign{}
+Candidate & Val BPB \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+Polar Muon & \textbf{2.420958} \\
+NorMuon & 2.567474 \\
+Muon NS5 & 2.601096 \\
+MONA & \textbf{2.950696} \\
+\end{longtable}}
+}
+
+\textbf{MONA goes from first to last}, by more than half a bit per byte, on the same data, the same
+schedule and the same tuned learning rate that won at 16M.
+
+Stage 5, 128M, 1,000 steps, seeds 42 and 2026:
+
+{%
+{\small\begin{longtable}[]{@{}lllll@{}}
+\toprule\noalign{}
+Candidate & Seed 42 & Seed 2026 & Mean BPB & 95\% \emph{t}$_1$ interval \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+Polar Muon & 2.167282 & 2.172555 & \textbf{2.169919} & {[}2.1364, 2.2034{]} \\
+NorMuon & 2.202106 & 2.200184 & 2.201145 & {[}2.1889, 2.2134{]} \\
+\end{longtable}}
+}
+
+Polar Express Muon is the champion. The locked winner passed an exact checkpoint-and-replay gate:
+loss delta 1.43e-6, gradient-norm delta 0.0, sampled master-weight max delta 2.56e-6, 1,707
+dispatches, 13,483 MB resident, on a model of exactly \textbf{128,367,988} parameters, with no swap
+pressure and no recorded failures.
+
+\subsection{5.3 A correction to our own statistics}\label{a-correction-to-our-own-statistics}
+
+Our earlier write-up of this funnel stated that at stage 5 ``the intervals do not overlap, so the
+champion is decided without ever reaching for a systems tie-breaker.'' That was computed with a
+normal (z = 1.96) multiplier on a two-seed standard error. With the correct t$_1$ = 12.706 multiplier,
+Polar's interval {[}2.1364, 2.2034{]} and NorMuon's {[}2.1889, 2.2134{]} \textbf{do overlap}.
+
+What survives is weaker but still real: \textbf{both} Polar seeds (2.167282, 2.172555) are below
+\textbf{both} NorMuon seeds (2.200184, 2.202106), a sign-consistent 2-of-2 ordering with a mean
+separation of 0.031 BPB. The correct statement is that the selection rests on a consistent
+ordering at n = 2, not on separated 95\% intervals. The same correction applies at stage 3, where
+under t$_1$ intervals the top four candidates are \textbf{mutually inseparable} --- which makes the
+subsequent 128M reversal less surprising and more damning of the screen.
+
+The defect was in the funnel tooling, not only in the write-up, and it had teeth: the interval
+also gated \texttt{confidence\_interval\_overlaps\_best}, which decides whether the declared systems
+tie-breakers (time-to-loss, footprint, step time) are invoked at all. A single-seed arm was
+additionally recorded with a \textbf{zero-width} interval --- infinite precision for an arm measured
+once --- so it could be declared separated from every rival. \path{nanolab/native_funnel.py} now uses a
+Student-t multiplier with df = n - 1, reports an \textbf{undefined} (infinite) interval at n = 1, and
+\textbf{skips} the systems tie-breakers entirely when any arm has fewer than three seeds, recording
+\texttt{confidence\_interval\_overlaps\_best\ =\ None} rather than \texttt{False} so that a check which could not run
+is not recorded as a check that ran. Stored rankings were recomputed with the original values
+preserved under \texttt{ci95\_legacy\_z}. The recorded champion is unchanged. Full detail in
+\path{docs/ISSUES_AND_GAPS_2026-08-22.md} \S2.3.
+
+\subsection{5.4 The control that failed loudly}\label{the-control-that-failed-loudly}
+
+AdamW appears at 11.28 BPB in the stage-3 table. It is worth explaining rather than hiding.
+
+At the 100-step LR sweep, AdamW at lr 0.0012 finished at 3.593993 --- behind the five Muon-family
+arms (3.353--3.376) but ahead of Muown (3.642), Sophia (3.643), Cautious Lion (3.739), momentum SGD
+(3.754), Lion (3.755) and Schedule-Free AdamW (3.778). It looked like a healthy control. At 500 steps it was 8.489102. At 1,000 steps across two seeds it was 11.278935.
+
+Nothing broke: no NaN, no divergence, finite telemetry throughout. The learning rate that looked
+best over 100 steps simply does not survive 1,000, and short-horizon EMA lag hid that completely
+at the point where the decision was made. The narrow, transferable version: \textbf{a 100-step
+learning-rate selection is not a learning-rate selection.} It is a measurement of which method
+has the least EMA lag at 100 steps.
+
+This does not overturn independent evidence that AdamW is quality-competitive. A separate
+one-seed, 4.096M-token, width-768 bake-off on the 3070 Ti ranked Lion first at 5.557 and AdamW
+second at 5.565, ahead of Muon at 5.643 --- which is exactly why AdamW is a \emph{mandatory} anchor in
+this funnel rather than an optional arm. In the same bake-off Prodigy soft-diverged to 20.16 and
+Schedule-Free AdamW plateaued at 7.918 at their defaults. In the native funnel Prodigy is a
+recorded numerical exclusion rather than a missing result: two of its five learning-rate sweep
+points terminated non-finite after two logged steps, its best finite screen result was 11.889982
+BPB at lr 0.25 --- an order of magnitude behind every other candidate --- and its stage-2 500-step job
+at that same learning rate also terminated non-finite.
+
+\subsection{5.5 The mirror image: downward transfer fails too}\label{the-mirror-image-downward-transfer-fails-too}
+
+If the story were ``small-scale rankings underestimate the eventual winner,'' it would be a tidy
+lesson and half true. We ran the 128M champion back down against Muon NS5 on the small \texttt{sota}
+model, 3,000 steps, two seeds, at matched throughput on the quality-oriented flash path:
+
+{%
+{\small\begin{longtable}[]{@{}llll@{}}
+\toprule\noalign{}
+Seed & NS5 & Polar & $\Delta$ \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+1337 & \textbf{2.122381} & 2.127708 & +0.005327 \\
+42 & \textbf{2.127647} & 2.131005 & +0.003358 \\
+mean & \textbf{2.125014} & 2.129357 & \textbf{+0.004342} \\
+\end{longtable}}
+}
+
+The 128M champion loses at small scale, on both seeds. The champion's tuned learning rate of 0.05
+applied at the small scale was worse still. So the ranking is not a biased-but-monotone estimate of
+the large-scale ranking; it is \textbf{a property of the scale}, with no safe direction of
+extrapolation. In this funnel the eventual champion was third at the LR sweep and second at 1,000
+steps --- a shortlist of two would have discarded it at stage 1 had the LR screen been the only cut.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{6. The pattern is not confined to these two axes}\label{the-pattern-is-not-confined-to-these-two-axes}
+
+\S4 and \S5 each show one axis on which a ranking moves with the measurement recipe. If those were
+the only two, the honest reading would be that we found two awkward special cases. They are not.
+Assembling the rest of our own record --- suites that predate this paper, and a second hardware
+backend --- turns up the same structure on six further axes. We set the catalogue out here because a
+reader is entitled to ask how often this happens before accepting \S8's recommendations, and
+because several of these results were sitting unreported in our own artifacts until we audited
+them for this draft.
+
+The evidence in this section is \textbf{weaker than in \S4}, and uniformly so: most of it is n = 1 at
+seed 1337 on a single 8 GB laptop GPU, with no confidence intervals anywhere. We label each entry
+accordingly and we draw no quantitative conclusion from any of them. The claim this section
+supports is qualitative and, we think, the more important one: \emph{rank reversal under a change of
+measurement recipe is the common case, not a curiosity of the attention/minGRU pair.}
+
+\subsection{6.1 Token budget alone reorders a five-arm board}\label{token-budget-alone-reorders-a-five-arm-board}
+
+Suite 13 ranked five mixers at 2.048M tokens; suite 14 extended three of them to 8.192M under a
+byte-identical configuration --- same 12L/768d shape, block 512, batch 8, Muon at 6e-4, FineWeb-edu,
+seed 1337, \texttt{mixer\_chunk\ =\ 32}. Only the budget changed.
+
+{%
+{\small\begin{longtable}[]{@{}lll@{}}
+\toprule\noalign{}
+arm & 2.048M (suite 13) & 8.192M (suite 14) \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+minGRU & \textbf{5.8374} (1st of 5) & 5.1545 (2nd of 3) \\
+Gated DeltaNet & 5.9939 (2nd) & --- \\
+Mamba-2 & 6.0404 (3rd) & 5.3831 (3rd of 3) \\
+attention & 6.0733 (\textbf{4th}) & \textbf{5.1362} (\textbf{1st}) \\
+MLA & 6.1556 (5th) & --- \\
+\end{longtable}}
+}
+
+Attention --- the default the other four are proposed as alternatives to --- is fourth of five at the
+short budget and first at the long one. This is the cleanest statement of the paper's thesis we
+have, because nothing but the number of tokens differs, and it is a \emph{board} reordering rather than
+a single crossing. It is also n = 1 per arm, and the 8.192M values are \texttt{best\_val} fields rather
+than paired snapshots, so it should be read as a demonstration of the phenomenon and not as a
+measurement of its size. \S4's n = 5 replication exists precisely because this one does not carry
+an interval.
+
+\subsection{6.2 The choice of metric reorders the same arms}\label{the-choice-of-metric-reorders-the-same-arms}
+
+The five mixers of suite 13 were separately benchmarked for throughput at fixed shape (suite 17,
+batch 8, context 512, 124M parameters, same GPU):
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 6\tabcolsep) * \real{0.2500}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+arm
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+quality rank (suite 13)
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+throughput (suite 17)
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+throughput rank
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+MLA & \textbf{5th} (6.1556, worst) & 9,334.57 tok/s & \textbf{1st} \\
+attention & 4th (6.0733) & 7,923.37 tok/s & 2nd \\
+minGRU & \textbf{1st} (5.8374, best) & 6,674.23 tok/s & 3rd \\
+Mamba-2 & 3rd (6.0404) & 333.23 tok/s & 4th \\
+Gated DeltaNet & 2nd (5.9939) & 238.18 tok/s & 5th \\
+\end{longtable}}
+}
+
+MLA is last on quality and first on throughput; minGRU is first on quality and third on
+throughput. The two orderings are close to inverted at the top. Neither metric is wrong --- they
+answer different questions --- but a screen that reports one and is read as if it ranked the other
+will select the opposite arm. Note also the scale of the throughput spread: Mamba-2 and Gated
+DeltaNet are 24$\times$ and 33$\times$ slower than attention here, which is a difference in kind rather than
+degree and is what motivated \S6.5.
+
+\subsection{6.3 Within a single suite, speed rank and quality rank invert}\label{within-a-single-suite-speed-rank-and-quality-rank-invert}
+
+Suite 18 stacked memory-residency optimizations on a 124M attention model and ranked the arms by
+throughput. Its \texttt{best\_val} figures run the other way:
+
+{%
+{\small\begin{longtable}[]{@{}llll@{}}
+\toprule\noalign{}
+arm & peak tok/s & MFU & \texttt{best\_val} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+\texttt{gpu\_opt\_bs32} & \textbf{13.7K} (1st) & 25.5\% & \textbf{4.9065} (3rd) \\
+\texttt{gpu\_opt\_validate} & 13.6K (2nd) & 25.3\% & 4.8084 (2nd) \\
+\texttt{gpu\_max} & 11.9K (3rd) & 22.1\% & \textbf{4.8001} (1st) \\
+\end{longtable}}
+}
+
+The ordering is exactly reversed. The three arms differ in batch size (16 / 24 / 32) at a fixed
+step count, so they do not see equal token budgets and this is emphatically \emph{not} a controlled
+quality comparison --- which is the point. The suite was built to answer a systems question, its
+throughput conclusion is sound, and reading its ladder as a recipe ladder selects the worst of the
+three models. We flag this one with some embarrassment: \texttt{gpu\_opt\_bs32}'s \texttt{best\_val} was the single
+cell absent from that suite's own results table until this audit, and its absence is what made the
+inversion invisible for two months.
+
+\subsection{6.4 Batch size reorders throughput among mixers}\label{batch-size-reorders-throughput-among-mixers}
+
+Suites 22 and 26 ran overlapping hybrid arms at batch 96 and batch 32 respectively on the GH200,
+with \texttt{mixer\_chunk\ =\ 32} in both. Median per-step throughput across five seeds:
+
+{%
+{\small\begin{longtable}[]{@{}lll@{}}
+\toprule\noalign{}
+arm & batch 96 & batch 32 \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+\texttt{hybrid\_mamba10\_attn2} & \textbf{43,941 tok/s} & 17,753 tok/s \\
+\texttt{hybrid\_gdn10\_attn2} & 31,333 tok/s & \textbf{24,279 tok/s} \\
+\end{longtable}}
+}
+
+At batch 96 the Mamba-2 hybrid is \textasciitilde1.4$\times$ faster than the GDN hybrid, with disjoint seed ranges
+(43,913--43,946 against 31,330--31,383). At batch 32 the ordering reverses. Mamba-2's chunked scan
+needs batch parallelism to fill the device; the delta-rule kernel degrades more gracefully. Two
+caveats matter. First, the quality comparison between these two suites is confounded --- batch size
+and \texttt{lr\_max\_steps} both change --- but the \emph{throughput} comparison is not, because the learning-rate
+schedule cannot affect tokens per second. Second, these suites ran two jobs per GPU (measured
+concurrency 1.97$\times$), so the absolute figures are contended and one \texttt{mamba2} seed spans
+15,493--38,365 tok/s. We therefore report the reversal and not the magnitudes, and a single-tenant
+re-measurement is on the list in \S8.4.
+
+\subsection{6.5 The kernel implementation decides feasibility, not just speed}\label{the-kernel-implementation-decides-feasibility-not-just-speed}
+
+Suite 19 replaced the O(T) sequential scans for Mamba-2 and Gated DeltaNet with chunk-parallel
+kernels, verified against the sequential reference for output and input-gradient parity at 1e-5
+with fp32 accumulation and non-divisible-length coverage:
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 4\tabcolsep) * \real{0.3333}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 4\tabcolsep) * \real{0.3333}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 4\tabcolsep) * \real{0.3333}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+arm
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+before
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+after
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+Mamba-2 @ bs8/ctx512 & 333 tok/s & 3,224 tok/s (9.7$\times$) \\
+Gated DeltaNet @ bs8/ctx512 & 238 tok/s & 482 tok/s, later \textasciitilde1,600 tok/s vectorized \\
+Gated DeltaNet @ bs16/ctx1024 & \textbf{OOM} & \textbf{1,100 tok/s @ 4.0 GB} \\
+\end{longtable}}
+}
+
+The last row is the one that matters for ranking: a configuration that was \emph{unrunnable} becomes
+competitive, purely from an implementation change with no effect on the mathematics. Any board
+compiled before this work would have recorded GDN at that shape as an absence rather than a
+number. Kernel maturity is a property of the software, not the architecture, yet it silently
+determines which arms appear on the board at all.
+
+This section also carries the paper's most consequential bug: the first version of the chunked
+scan accumulated in bf16 under autocast, and CPU-only tests did not catch the drift. Every SSM
+quality number downstream would have been wrong. The fix is to force fp32 inside the scan.
+
+\subsection{6.6 The hardware backend reorders both quality and throughput}\label{the-hardware-backend-reorders-both-quality-and-throughput}
+
+We maintain a second, independent implementation of the same architecture in Rust and Metal on an
+M5 Pro. Comparing it against the CUDA reference at the same \texttt{sota} shape gives a quality crossover
+in the training horizon:
+
+{%
+{\small\begin{longtable}[]{@{}llll@{}}
+\toprule\noalign{}
+horizon & Metal-native (f32) & 3070 Ti CUDA (bf16) & leader \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+3k steps & 2.0222 & \textbf{1.9944} & CUDA \\
+20k, no warmdown & \textbf{1.9178} & 1.9944 & Metal \\
+20k + warmdown, seed 1337 & \textbf{1.8969} & 1.9944 & Metal \\
+20k + warmdown, seed 42 & \textbf{1.8876} & \textasciitilde1.9860 & Metal \\
+100k WSD & \textbf{1.8828} & --- & --- \\
+\end{longtable}}
+}
+
+The backends swap places somewhere between 3k and 20k steps. This comparison is confounded in
+several ways we cannot remove --- different precision (f32 vs bf16), different flash-attention
+implementations, and no matched CUDA arm at 20k or 100k --- so we present it as a demonstration that
+``which implementation is better'' is horizon-dependent, not as a measurement of either backend.
+
+The backend also reorders the mixers themselves. On CUDA at 124M (suite 17) attention is 1.19$\times$
+faster than minGRU; on Metal at \texttt{sota} scale, measured over 40 FineWeb steps with real kernels,
+minGRU is \textbf{2.17$\times$ faster than attention} (144,367 vs 66,382 tok/s), and Mamba-2 closes from 24$\times$
+slower than attention to 2.0$\times$ slower (33,321 tok/s). The mixer throughput ranking is a property of
+the kernel library available on the device.
+
+Most striking, the Metal track independently reproduces \S4's headline shape. At 3k steps with
+matched seeded initialization, minGRU leads attention 2.085016 to 2.123010 (and 2.076374 on a
+second seed); at 20k steps attention leads 1.89688 to 1.993295. Bias early, capacity late --- the
+same direction as \S4, on a different backend, precision, kernel stack and data pipeline. We
+report this as suggestive rather than as a replication, because the 20k attention arm uses
+\path{-\/-golden-init} while the minGRU arm is seeded (the golden banks contain no \texttt{mingru\_*} tensors),
+so the crossing itself is confounded with initialization. One seeded attention run at 20k would
+close that gap, and it is the cheapest experiment named anywhere in this paper.
+
+\subsection{6.7 What this catalogue is and is not}\label{what-this-catalogue-is-and-is-not}
+
+Counting \S4, \S5 and this section, we have observed a ranking change places under a change of:
+token budget, learning-rate horizon, batch size, model scale, training horizon at fixed scale,
+learning rate, evaluation metric, kernel implementation, and hardware backend. In no case did the
+architectures, the optimizers or the data change.
+
+We are \textbf{not} claiming that all rankings are arbitrary, that these effects are of comparable size,
+or that any particular arm is secretly better. Several entries above are single-seed observations
+on one laptop GPU and would not survive a careful replication; \S4 exists because we know the
+difference. What the catalogue establishes is narrower and sufficient for \S8: the recipe-dependence
+in \S4 is not an anomaly of one architecture pair, so a screening protocol that does not pin and
+report its recipe is not measuring a property of the methods it claims to rank. The practices in
+\S8 follow from the pattern, not from any single row above.
+
+\section{7. Threats to validity and limitations}\label{threats-to-validity-and-limitations}
+
+\subsection{7.1 What these results do not establish}\label{what-these-results-do-not-establish}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{No universal crossing token.} The claim is the opposite. Nothing here supports ``attention
+  overtakes minGRU at \emph{X} tokens'' for any \emph{X} outside the exact recipe measured.
+\item
+  \textbf{No 3070 Ti vs GH200 quality ranking.} The two boxes differ in batch size, evaluation count
+  and kernel versions simultaneously. Absolute losses differ by \textasciitilde0.18--0.3 nats at matched token
+  markers and the tables are never stacked.
+\item
+  \textbf{No throughput claim.} Every number in \S4 is held-out cross-entropy. Quality and
+  tokens-per-second are separate outcomes.
+\item
+  \textbf{No mechanism.} ``Bias early, capacity late'' fits the curves and does not predict the crossing
+  token, which is what moved. It remains an explanation, not a theorem.
+\item
+  \textbf{Suite 26 does not rerun attention or minGRU.} Its top two rows are suite 22's sample.
+\item
+  \textbf{Suite 25 cannot locate a late crossing.} Its horizon ends before any batch-32 recipe crosses.
+\end{itemize}
+
+\subsection{7.2 Known limitations}\label{known-limitations}
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Single data distribution, single model shape.} Everything is FineWeb-Edu at 12L/768d,
+  sequence 512. Whether the schedule sensitivity in \S4.3 persists at other widths, depths or
+  sequence lengths is untested.
+\item
+  \textbf{No $\mu$P, and a single global learning rate.} Runs use standard parametrization with Muon at a
+  fixed 6e-4 across every arm, batch size and schedule. This is the largest uncontrolled factor in
+  the paper and the one most capable of offering a competing explanation for \S4.3 and \S4.4; it is
+  treated at length in \textbf{\S8}, together with the 2 $\times$ 2 follow-up that would settle it and the
+  pre-registered reading of each outcome.
+\item
+  \textbf{Two seeds on the optimizer axis.} \S5's stage-3 and stage-5 intervals are two-seed intervals
+  and are, correctly computed, wide. The rank \emph{reversal} is robust (a 0.53 BPB swing at 128M is
+  far outside any plausible two-seed noise band); the \emph{ordering within the top four} is not.
+\item
+  \textbf{\texttt{compile\ =\ False} throughout suites 22--26.} Forced by an Inductor stall on GH200 aarch64.
+  Uniform across arms, but a compiled recipe is a different recipe and might move the crossings
+  again.
+\item
+  \textbf{Recipe drift in suite 22's ten-arm board.} Documented in \S4.5 and repaired by suite 26; the
+  original board should be read only as ``what finished.''
+\item
+  \textbf{A kernel bug mid-grid.} Gated DeltaNet produced NaN gradients at finite loss (batch 96
+  step 39; batch 32 step 55) because \texttt{gdn\_chunked} exponentiated the full C$\times$C log-ratio grid and
+  \texttt{j\ \textgreater{}\ t} entries overflowed, with \texttt{.tril()} masking it in the forward pass. Fixed by taking the
+  lower triangle before the exponential, clamping log-ratios at max 0, and clamping alpha. All GDN
+  rows in this paper are post-fix. This was a kernel defect, not a mixer-quality result.
+\item
+  \textbf{A number we reconciled, and the wrong reconciliation we tried first.} The champion run's
+  final EMA sliding BPB is \textbf{2.010659} (seed 1337) in \path{research/champion-run.json}, while other
+  workspace documents recorded \textbf{2.015756}. We first concluded that 2.015756 was a \texttt{57}$\leftrightarrow$\texttt{75}
+  transposition of the audit-7 artifact's 2.015576, on the reasoning that it matched no artifact
+  on disk. That was wrong, and acting on it would have deleted a real measurement from four
+  documents. There were \textbf{three} champion runs, not two: \texttt{DECISIONS.md} M15, written 2026-07-19
+  before Audit 7 existed, independently records the champion at \textbf{2.0158} --- which 2.015756 rounds
+  to and 2.015576 does not. 2.015756 is the pre-Audit-7 run's own value; its artifact was
+  superseded and deleted, which makes the figure \emph{unverifiable}, not mistyped. ``Matches no
+  artifact on disk'' and ``was fabricated'' are different claims, and we conflated them. The citable
+  value is unchanged at 2.010659, and no comparison in this paper uses either figure.
+  \texttt{champion-run.json} additionally carries \texttt{"locked":\ false} --- see \S8.3 for why it stays that way.
+\end{itemize}
+
+\subsection{7.3 Claims withdrawn}\label{claims-withdrawn}
+
+Stating these explicitly is part of the result.
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{``The \textasciitilde7M attention/minGRU crossover, replicated.''} Withdrawn as a general claim. Suite 14
+  stands as a valid RTX 3070 Ti / batch 8 / one-seed observation and nothing more.
+\item
+  \textbf{``Metal trainer BPB 2.038 vs CUDA 1.994 confirms numerical correctness.''} Withdrawn. The two
+  figures come from different flash implementations and the comparison to the 1.9944 CUDA
+  reference is cross-scale, not matched-shape; the same-shape CUDA 128M reference is still
+  unrun. Numerical correctness of the Metal trainer rests on what was actually done --- exact
+  checkpoint-and-replay to 1e-6 (\S5.2), 57/57 \path{cargo\ test\ -\/-release\ -\/-lib} gates covering the
+  native optimizer, checkpoint, telemetry and NaN paths, and an independent MLX oracle for the
+  manual GEMM attention backward --- not on that comparison. The claim was attached to the wrong
+  evidence. (An ``29/29 oracle tests'' figure circulated in earlier internal write-ups. A previous
+  version of this section stated that we could not locate its source; that was wrong. It is
+  recorded at \path{experiment-notes/arch-metal/51-m5-128m-optimizer-funnel-preflight.md}, line 291:
+  ``Python correctness/orchestration oracle: \textbf{29/29} tests pass (includes induced-swap unlock
+  rejection).'' It is a Python orchestration oracle, not a numerical-parity gate, and it is
+  distinct from the 57/57 \texttt{cargo} gates above.)
+\item
+  \textbf{Mixer throughput of \textasciitilde238,000 tok/s (Mamba-2) and \textasciitilde240,000 tok/s (minGRU).} Withdrawn as
+  measurement artifacts: the training graph ran the MLP and stem while the mixer path was a
+  zero-tensor stub with flash attention skipped, so the figure measured everything except the
+  thing being compared. Re-baselined honestly on FineWeb at sequence length 256, the same three
+  arms are \textbf{144,367 tok/s} (minGRU), \textbf{66,382} (attention) and \textbf{33,321} (Mamba-2). minGRU is
+  genuinely fast; it is not 240,000-fast, and Mamba-2 at this sequence length is \emph{slower} than
+  attention rather than several times faster.
+\item
+  \textbf{``Stage-5 intervals do not overlap.''} Withdrawn and replaced by \S5.3.
+\item
+  \textbf{A documented \textasciitilde4$\times$ headroom claim in the quantized GEMV inference kernels.} Withdrawn. Measured
+  properly, those kernels already run at 62--100\% of the \textasciitilde273 GB/s memory-bandwidth ceiling; the
+  4$\times$ came from a microbenchmark that re-uploaded weights on every call, measuring an upload that
+  does not happen in production. About 77\% of a quiet decode token is dispatch and barrier
+  overhead, not arithmetic. The kernels were not the bottleneck; the number of kernel launches
+  was.
+\end{enumerate}
+
+\subsection{7.4 Corrections found by auditing our own record}\label{corrections-found-by-auditing-our-own-record}
+
+The claims in \S7.3 were withdrawn as we discovered them, over months. Preparing this draft we did
+something different and more uncomfortable: a systematic audit of every number in our own suite
+notes, lock files and ledgers against the raw run directories they were derived from. It found
+nine defects. We record them here rather than silently fixing them, because a paper arguing that
+measurement protocol determines conclusions has no standing to hide its own protocol failures ---
+and because the \emph{kind} of error is instructive. None of these was a bad measurement. Every one was
+a correct measurement that was then mis-recorded, partially reported, or lost.
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\item
+  \textbf{A results table omitted the one cell that contradicted its ranking.} Suite 18 ranked three
+  arms by throughput and reported \texttt{best\_val} for two of them. The missing third,
+  \texttt{gpu\_opt\_bs32} at \textbf{4.9065}, is the fastest arm and the worst model, and its absence is the
+  only reason the speed/quality inversion in \S6.3 went unnoticed for two months.
+\item
+  \textbf{A headline ranking depended on undocumented restarts.} \texttt{run128m\_20k} is not one run: its
+  \texttt{metrics.jsonl} holds \textbf{nine \texttt{start} and eight \texttt{done} events}, with per-segment \texttt{best\_val}
+  from 3.6279 down to 3.5806 and back to 3.6109. The global minimum, \textbf{3.5806}, is \emph{better} than
+  the 10k-step run's 3.621 that we declared the winner --- so that suite's ranking inverts
+  depending on which number a reader takes, and we reported only the reading that supported our
+  conclusion without knowing we were choosing. Token accounting for that run is also wrong: every
+  \texttt{done} records 98,304,000 tokens for a run that reached step 19,990, where the correct figure is
+  655,360,000. \textbf{We withdraw any horizon claim from that suite in either direction.}
+\item
+  \textbf{We reported a source as unlocatable while it sat in the repository.} \S7.3 item 2 previously
+  stated that we could not find the artifact behind a ``29/29 oracle tests'' figure. It is at
+  \path{experiment-notes/arch-metal/51-m5-128m-optimizer-funnel-preflight.md}, line 291.
+\item
+  \textbf{A ledger lost three completed jobs, and they were the ones that mattered.} The exact-128M
+  LR spot-check ledger recorded one job as \texttt{"running"} and omitted three others entirely, although
+  all four had finished on the same afternoon. Those three runs are what opened \S8.3.
+\item
+  \textbf{We broke our own reporting rule two sections after stating it.} \S3.2 says a \texttt{best\_val} field
+  is not a paired snapshot and is never reported as a ranking. \S4.1 then reported four \texttt{best\_val}
+  figures as end-of-run comparisons.
+\item
+  \textbf{Our knowledge base stopped recording results four weeks before we wrote this.} The project's
+  \texttt{MASTER\_ARCHITECTURAL\_KB.md} changelog ended at 2026-07-20, so every suite in \S4 --- 120 runs at
+  five seeds --- was absent from the document nominally serving as the project's verified record.
+\item
+  \textbf{A summary artifact reported one arm at 80\% of the horizon of the others.} In
+  \texttt{crossover50m}, three of Mamba-2's five seeds ran on a 49.17M-token evaluation grid and two on
+  a 49.99M one --- the only arm anywhere in these suites whose seeds end on different grids. The
+  \texttt{summary.json} was generated by an aligner taking the \emph{exact intersection} of the two grids,
+  which for that arm ends at \textbf{40.16M tokens}, and the figure it produced was 4.759; on the
+  fixed aligner it is \textbf{4.656}. To be precise about scope, since we are auditing ourselves and
+  not only the artifact: \textbf{this defect is not in the \S4.5 board.} That board's Mamba-2 row is
+  \texttt{crossover50m\_matched32}, whose forty runs all end at 49,987,584 tokens, and it reproduces at
+  4.596 on recomputation. The stale figure reached a \emph{different} rendering of this paper (see
+  item 8). What the defect does touch here is \S4.5's comparison of arm movement against suite 22,
+  which quotes suite-22 values measured at 49,594,368 tokens against suite-26 values at
+  49,987,584 --- a 0.8\% horizon difference, now stated in that section.
+\item
+  \textbf{The source file of this manuscript was destroyed, and the reconstruction introduced a new
+  error while fixing a real one.} A history rewrite of this repository stripped the Markdown
+  source from the working tree and from every commit. The paper was rebuilt from the run
+  artifacts. That rebuild correctly caught defect 7 above and a mis-stated parameter count, and
+  correctly reported a normal-quantile interval bug in its own checking script. It also
+  ``corrected'' the \S4.5 tie between attention and the 10$\times$minGRU + 2$\times$attention hybrid, on the
+  grounds that the 4.232 figure ``appears in no surviving run''. That correction is itself wrong,
+  and \S4.5 records why: 4.232 is the hybrid in \texttt{crossover50m\_matched32}, measured at the same
+  49,987,584-token point as the attention row, while the replacement figure of 4.275 comes from
+  \texttt{crossover50m}, where that arm's seeds end at 49,594,368 --- a different horizon. The
+  reconstruction replaced a matched-horizon comparison with a mismatched one, in the same section
+  where it documented horizon mismatch as the defect.
+\item
+  \textbf{A correction of ours was itself wrong, and a concurrent audit caught it.} We diagnosed the
+  two champion BPB figures in \S7.2 as a digit transposition, because 2.015756 matched no artifact
+  on disk. A separate audit of the same repository found \texttt{DECISIONS.md} M15 --- written before the
+  audit pass we compared against --- independently recording 2.0158, which corroborates the figure
+  as a third run's real value rather than a typo. Acting on our diagnosis would have deleted a
+  real measurement from four documents. We had reasoned from absence of evidence, on exactly the
+  axis this paper warns about, while writing the section that warns about it.
+\end{enumerate}
+
+The pattern across all nine is that \textbf{the failure mode is bookkeeping, not experimentation.} Runs
+were executed carefully, gated, and seeded; they were then summarised into notes, ledgers, tables
+and --- in the last case --- an entire replacement manuscript, and the summaries drifted from the
+artifacts in ways invisible from the summaries alone. Recommendation 3 in \S9 (fingerprint every
+job) addresses the input side of this. It does not address the output side, and on the evidence
+above the output side is where our failures actually occurred. We now regard \emph{``re-derive every
+reported number from the raw run directory before publication''} as a required step rather than a
+diligence nicety, and \S10 states which numbers in this paper were and were not produced that way.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{8. The tuning confound: an alternative reading, and direct evidence that it bites}\label{the-tuning-confound-an-alternative-reading-and-direct-evidence-that-it-bites}
+
+Every result in \S4 was produced under \textbf{standard parametrization} with a single global Muon
+learning rate of 6e-4, held fixed across every mixer, every batch size and every schedule. This is
+the largest uncontrolled factor in the paper, and it deserves its own section rather than a bullet
+in \S7.2, because it admits an alternative reading of our central finding that we cannot currently
+rule out.
+
+The section runs in four steps: the competing explanation (\S8.1); what our seed structure does and
+does not already bound (\S8.2); a measured instance of the same defect on our own optimizer axis,
+where an inherited learning rate cost nearly twice the deciding margin (\S8.3); and the arm we
+specify to settle it (\S8.4).
+
+\subsection{8.1 The alternative explanation we cannot exclude}\label{the-alternative-explanation-we-cannot-exclude}
+
+Our claim is that the crossing token moves with batch size and learning-rate horizon. A competing
+explanation is narrower and less interesting:
+
+\begin{quote}
+A single global learning rate cannot be simultaneously near-optimal for a 12-layer attention
+stack and a 12-layer minGRU stack, nor for the same stack at batch 8 and batch 32. What we
+measured as ``the ranking depends on the recipe'' may be partly ``one arm was closer to its own
+optimum than the other, and which arm that was changed with the recipe.''
+\end{quote}
+
+This is not a hypothetical concern. Three independent results make it concrete:
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{Optimal learning rate is horizon-dependent.} Bjorck et al.~show optimal LR falls as the token
+  horizon grows and follows its own scaling law \cite{ref31}. Our suite 22/24 runs use a 50M-token cosine
+  and our suite 23 run a 20M-token cosine; a single fixed peak LR of 6e-4 cannot be optimal for
+  both, independently of the schedule-shape effect we attribute the 12.34M $\rightarrow$ 14.58M shift to.
+\item
+  \textbf{Optimal hyperparameters are batch-dependent in ways beyond the learning rate.} Marek et al.
+  show that scaling to small batches correctly requires holding Adam's second-moment half-life
+  fixed in tokens, not its decay rate \cite{ref30}. We changed batch size by 4$\times$ between suites 22 and 25
+  and adjusted nothing.
+\item
+  \textbf{Parametrization determines how much of this matters.} Kalra and Barkeshli localize $\mu$P's
+  advantage over standard parametrization under AdamW to maximizing the embedding-layer learning
+  rate, which in standard parametrization acts as a bottleneck that induces instability \cite{ref35}. Our
+  embedding layer is trained at the same global rate as everything else.
+\end{enumerate}
+
+If the competing explanation is right in full, the correct statement of our result weakens to
+``under-tuned arms reorder unpredictably,'' which is a much less useful claim. If it is right only
+in part --- our current expectation --- the crossing token still moves, but by less, and the honest
+error bar on ``12.35M'' widens beyond the seed-derived interval we report.
+
+\subsection{8.2 What the existing evidence does and does not already constrain}\label{what-the-existing-evidence-does-and-does-not-already-constrain}
+
+Two things partially bound the concern, and we state them without overclaiming.
+
+\textbf{Sign consistency across seeds does not help here.} All five seeds agreeing on the sign of the
+gap constrains \emph{seed} noise. It says nothing about a systematic mis-tuning that is shared by all
+five seeds of an arm, which is exactly what a wrong global learning rate would be.
+
+\textbf{The 6e-4 value is not arbitrary, but it was tuned on neither arm at these recipes.} It was
+inherited from the earlier 3070 Ti suites. That makes it, at best, a value tuned for one
+architecture at one batch size at one horizon --- precisely the transfer that \cite{ref31} and \cite{ref30} say
+should not be assumed.
+
+\subsection{8.3 The concern is not hypothetical: the ordering it hides crosses over}\label{the-concern-is-not-hypothetical-the-ordering-it-hides-crosses-over}
+
+The argument in \S8.1 was an appeal to the literature. We can do better. Our own optimizer axis
+contains the failure \S8.1 describes, and measuring it properly produced a result stronger and
+stranger than the concern we set out to test.
+
+The \S5 funnel selected \texttt{muon\_polar\_adamw} at a matrix learning rate of \textbf{0.05} over
+\texttt{normuon\_adamw} at \textbf{0.1}, by 0.031226 BPB. Both values were tuned at \texttt{arch02-16m} and \textbf{neither
+was re-tuned at 128M}, the scale at which the selection was made. We re-ran both candidates across
+a matched eight-point learning-rate grid at the \emph{exact} protocol that produced the selection ---
+\texttt{arch02-128m}, 1,000 steps, seeds 42, 2026 and 1337, argv byte-identical to the recorded
+\texttt{exact\_128m\_1000} jobs apart from the output path. \textbf{Fifty-two jobs, about 30 GPU-hours.}
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 8\tabcolsep) * \real{0.2000}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+matrix LR
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+\texttt{muon\_polar\_adamw}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+\texttt{normuon\_adamw}
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+gap (Polar - NorMuon)
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+leader
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+0.0035 & 2.138058 & 2.144220 & -0.006162 & \textbf{Polar} \\
+0.005 & 2.125631 & 2.128408 & -0.002778 & \textbf{Polar} \\
+0.008 & \textbf{2.125430} & \textbf{2.121334} & +0.004097 & NorMuon \\
+0.0125 & 2.139372 & 2.121866 & +0.017505 & NorMuon \\
+0.018 & 2.141161 & 2.129755 & +0.011406 & NorMuon \\
+0.025 & 2.152357 & 2.135230 & +0.017127 & NorMuon \\
+0.035 & 2.158727 & 2.146234 & +0.012493 & NorMuon \\
+0.05 & 2.171450 & 2.155408 & +0.016042 & NorMuon \\
+\end{longtable}}
+}
+
+Means over three seeds; gaps paired by seed. \textbf{Every row is sign-consistent across all three
+seeds} --- twenty-four paired comparisons, none dissenting from its side.
+
+\textbf{The ordering crosses over between lr 0.005 and lr 0.008.} \texttt{muon\_polar\_adamw} leads at the two
+lowest learning rates, \texttt{normuon\_adamw} at the six highest, each unanimously. The mechanism is
+visible in the table: the two have \textbf{offset flat basins} --- Polar's minimum region spans
+0.005--0.008, NorMuon's spans 0.008--0.0125 --- so each wins inside its own and loses inside the
+other's. Neither basin has a resolvable interior point at n = 3; both are flat to within the
+per-cell seed spread of roughly 0.006.
+
+\textbf{There is therefore no recipe-independent answer to which of these two optimizers is better at
+this scale.} The question the funnel asked does not have one.
+
+What the funnel did was pick a side of that crossing without knowing it existed. It compared Polar
+at 0.05 against NorMuon at 0.1 --- both far up the high-LR wall, in the region where NorMuon leads.
+Measured against their own optima at this protocol, the inherited values cost:
+
+\begin{verbatim}
+muon_polar_adamw   selected 0.05, best 0.008   penalty 0.046020 +/- 0.003175   = 1.47x the margin
+normuon_adamw      selected 0.1,  best 0.008   penalty 0.080400 (n = 2)        = 2.57x
+\end{verbatim}
+
+The Polar figure is a paired three-seed interval that excludes zero. Both inherited learning rates
+were 6--12$\times$ too high, unequally so, and the difference between those two penalties exceeds the
+margin that decided the outcome.
+
+\textbf{What we claim.} The selection recorded in \S5 is \textbf{retired}: \path{research/champion-run.json}
+remains \texttt{"locked":\ false}. We do \textbf{not} crown \texttt{normuon\_adamw}; that would repeat the original
+error with the sign flipped, since it loses at the low end and at each candidate's own best cell
+the gap is +0.004097 $\pm$ 0.005085, which spans zero.
+
+\textbf{Limits.} Sign tests carry this result: only three of eight matched cells have an interval
+excluding zero, because the effects sit at or below the per-cell seed spread. Neither optimum is a
+located point. This is one protocol --- 128M, 1,000 steps, Metal on an M5 Pro. Four cells were
+re-run against their recorded funnel values as a drift check and moved by -0.0019, +0.0003,
+-0.0058 and +0.0021, at most 0.26\%, far below the effects above.
+
+\textbf{What this section is really reporting.} \S4 shows a ranking between two architectures crossing
+over as a function of \emph{token budget}. This section shows a ranking between two optimizers crossing
+over as a function of \emph{learning rate} --- the same structure, on an axis we had treated as a nuisance
+parameter rather than a variable. The funnel's error was not that it tuned badly. It was that it
+reported a ranking measured at one point on an axis along which the ranking reverses.
+
+The grid history is part of the result and we state it rather than presenting the final design as
+if it were the plan. This began as twelve jobs to re-tune one learning rate. It became fifty-two,
+across five rounds, because each round revealed the previous one had compared something unequal: a
+truncated grid, then a boundary minimum, then one candidate given lower learning rates than the
+other. Three times we drew a conclusion from two seeds that a third seed overturned. That
+trajectory is the honest cost of controlling this confound once, on one axis, for two candidates,
+and it is the strongest argument we can make that the confound is not second-order.
+
+Full grid, per-seed values, drift checks and limits: \path{research/d7-lr-retune.json}, regenerated by
+\path{scripts/d7_analyze.py} from the run ledger rather than transcribed. Runner:
+\path{scripts/d7_lr_retune.py}.
+
+\subsection{8.4 The follow-up, specified}\label{the-follow-up-specified}
+
+We name the arm rather than gesture at it, so that it can be run or criticized.
+
+\textbf{Design.} Repeat the suite 24 recipe --- 12L/768d, batch 32, \texttt{eval\_iters\ =\ 20}, 50M-token cosine
+horizon, 20M-token stop, seeds \texttt{1337,\ 42,\ 100,\ 2026,\ 777} --- as a 2 $\times$ 2:
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 4\tabcolsep) * \real{0.3333}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 4\tabcolsep) * \real{0.3333}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 4\tabcolsep) * \real{0.3333}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+attention
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+minGRU
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+\textbf{standard parametrization, global LR} & suite 24 (already run) & suite 24 (already run) \\
+\textbf{$\mu$P, per-arm LR swept at a narrow proxy width} & new & new \\
+\end{longtable}}
+}
+
+with the $\mu$P cells parametrized per \cite{ref12} and the proxy sweep run at a reduced width, transferring
+the tuned LR to the 768-dim target. Depth is held fixed at 12 layers throughout, which sidesteps
+the depthwise limitations Depth-$\mu$P identifies for stacks whose residual blocks are themselves deep
+\cite{ref33}. Two secondary arms are worth the marginal cost:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{A per-layer standard-parametrization prescription} as in Everett et al.~\cite{ref32}, since their
+  result is that this can outperform $\mu$P and that all parameterizations admit transfer --- if the
+  crossing token is stable under \emph{both} $\mu$P and per-layer SP but not under a global LR, the finding
+  is about tuning quality, not about $\mu$P specifically.
+\item
+  \textbf{An embedding-layer-LR-only ablation} as in Kalra and Barkeshli \cite{ref35}: raise only the embedding
+  learning rate by a factor of width under standard parametrization. This is the cheapest possible
+  probe, and if it moves the crossing token materially it localizes the confound to one layer.
+\end{itemize}
+
+\textbf{Pre-registered readouts.} The follow-up answers a yes/no question, and we state the decision
+rule before running it:
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 2\tabcolsep) * \real{0.5000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 2\tabcolsep) * \real{0.5000}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Outcome
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Reading
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+Both $\mu$P crossings land within the suite 22/24 per-seed bands (early 1.03--1.09M, late 11.93--12.58M) & Recipe dependence is not a tuning artifact. \S4.3's schedule effect stands as stated. \\
+Crossings move but the \textbf{ordering of recipes} is preserved --- 20M cosine still crosses later than 50M cosine & The schedule effect is real; its magnitude in \S4.3 is inflated by mis-tuning and should be restated as an upper bound. \\
+$\mu$P crossings collapse onto a single token across schedules & The schedule effect is a tuning artifact. \S4.3 must be withdrawn and \S4.4's batch result re-examined. \\
+The batch-8 arm (suite 25) develops a crossing under $\mu$P within 7.4M tokens & The batch effect is a tuning artifact, and suite 14's original 6.6--7.4M window is partially rehabilitated. \\
+\end{longtable}}
+}
+
+\textbf{Cost.} Twenty jobs at 20M tokens for the main 2 $\times$ 2, plus a proxy-width LR sweep, plus ten jobs
+for each secondary ablation. On the GH200 configuration used for suites 23--25 this is roughly the
+cost of suite 24 plus suite 25 together --- a small fraction of the 50-job suite 22 grid, and the
+highest-value single experiment remaining in this line of work.
+
+\textbf{Until it is run}, every crossing token in this paper should be read as ``the crossing token for
+this architecture pair \emph{at a global 6e-4 Muon learning rate under standard parametrization},'' and
+the \S9 recommendations should be read as conditional on the same. We consider recommendation 2
+(pin the schedule when truncating) robust to the outcome, because it is a statement about
+comparing a prefix to its parent recipe rather than about either being correctly tuned; we
+consider the specific figure ``2.2M tokens, 18\% of the location'' provisional.
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{9. Recommendations}\label{recommendations}
+
+These are the rules we now apply, each earned by a specific failure above.
+
+\begin{enumerate}
+\def\labelenumi{\arabic{enumi}.}
+\tightlist
+\item
+  \textbf{Report the crossing, not just the endpoint.} If two curves cross, the crossing token is a
+  result and belongs in the paper with per-seed values. If they cross twice, say so.
+\item
+  \textbf{Never truncate a run without pinning the schedule.} Fix the learning-rate horizon to the
+  \emph{reference} budget and stop early, rather than letting the cosine follow the truncated step
+  count. Otherwise the prefix is a different recipe (\S4.3). Record \texttt{lr\_max\_steps} alongside
+  \texttt{max\_steps} in every config, and verify it per job before reading results.
+\item
+  \textbf{Fingerprint the recipe on every job and verify before aggregating.} Suite 22's mixed
+  batch / \texttt{eval\_iters} board would have been read as a bakeoff without that check. At minimum:
+  batch size, evaluation count, max steps, LR horizon, compile flag, and kernel version.
+\item
+  \textbf{Never table cells from different recipes together.} Even when the token markers match.
+\item
+  \textbf{Five seeds for a sign, two for nothing.} A two-seed 95\% interval carries a t$_1$ = 12.706
+  multiplier and will almost never separate close candidates. If you only have two seeds, report
+  both values and claim only a consistent ordering.
+\item
+  \textbf{A short learning-rate screen is not a learning-rate selection.} Screen at a horizon within
+  the same order of magnitude as the target, or accept that you are ranking EMA lag.
+\item
+  \textbf{A minimum-over-evaluations field is not a ranking.} Compare paired snapshots at matched
+  token counts.
+\item
+  \textbf{Record systems-blocked arms as exclusions with the blocking reason}, never as silent
+  substitutions or omissions.
+\item
+  \textbf{Assume no safe direction of extrapolation.} Small-scale screens under-rank the eventual
+  large-scale champion \emph{and} the large-scale champion under-performs at small scale (\S5.5). Both
+  directions failed here.
+\end{enumerate}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{10. Reproduction and artifacts}\label{reproduction-and-artifacts}
+
+\textbf{Repository.} \url{https://github.com/bharathvbcr/MachineLearning} (public). Every path below is
+relative to that repository root, at commit \texttt{a83257a} or later. Two directories referenced by
+these instructions are deliberately not committed because they are build outputs with in-repo
+generators: \path{nanolab/out/} (raw per-job run directories) and
+\path{Rust_MLKit/arch_02_value_resid/metal-native/golden/fwd/} (parity activations; regenerate with
+\path{python3\ metal-native/scripts/export_goldens.py\ -\/-out\ metal-native/golden}).
+
+All mixer suites run through one entry point:
+
+\begin{verbatim}
+python -m nanolab.crossover_replicate list
+python -m nanolab.crossover_replicate smoke            # 40-step GPU/CPU check
+python -m nanolab.crossover_replicate launch --workers 4
+python -m nanolab.crossover_replicate isolates         # matched20 -> bs8 -> matched32
+python -m nanolab.crossover_replicate status --out <run-dir>
+python -m nanolab.crossover_replicate timing --out <run-dir> --json
+python -m nanolab.crossover_replicate plot
+\end{verbatim}
+
+\textbf{A note on timing.} No suite in this paper reports GPU hours, because the trainer computed the
+elapsed time of every run, printed it, and discarded it --- the \texttt{done} record carried only
+\texttt{best\_val} and \texttt{tokens}. That is fixed as of 2026-08-22 (\texttt{Logger.done} now persists \texttt{elapsed\_s}),
+but it is not retroactive: the \texttt{timing} command back-estimates suites 22--26 from median \path{tok/s}
+and labels those rows \texttt{estimated\_from\_median\_tok\_s}, separately from \texttt{measured}. Treat any GPU-hour
+figure for suites 22--26 as an estimate.
+
+Per-suite output roots, each containing \texttt{metrics.jsonl} + \texttt{config.json} per job plus \texttt{queue.json}:
+
+{%
+{\small\begin{longtable}[]{@{}llll@{}}
+\toprule\noalign{}
+Suite & Output root & Job prefix & Jobs \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+22 & \path{nanolab/out/crossover50m/} & \texttt{cx50\_} & 50 \\
+23 & \path{nanolab/out/crossover20m_locked/} & \texttt{cx20\_} & 10 \\
+24 & \path{nanolab/out/crossover20m_matched_lr/} & \texttt{cx20h\_} & 10 \\
+25 & \path{nanolab/out/crossover8m_bs8/} & \texttt{cx8\_} & 10 \\
+26 & \path{nanolab/out/crossover50m_matched32/} & \texttt{cx32\_} & 40 \\
+\end{longtable}}
+}
+
+Locked summary statistics --- the numbers in \S4 are read from these, not retyped from logs:
+
+\begin{itemize}
+\tightlist
+\item
+  \path{experiment-notes/nanolab/artifacts/22-suite22_lock.json}
+\item
+  \path{experiment-notes/nanolab/artifacts/23-locked20_lock.json}
+\item
+  \path{experiment-notes/nanolab/artifacts/24-matched20_lock.json}
+\item
+  \path{experiment-notes/nanolab/artifacts/25-bs8_lock.json}
+\item
+  \path{experiment-notes/nanolab/artifacts/26-matched32_lock.json}
+\end{itemize}
+
+Figures: \texttt{experiment-notes/nanolab/figures/\{22-attn-mingru-crossover,\ 23-locked20-crossover,\ 24-matched20-crossover,\ 25-bs8-crossover,\ 26-matched32-ranking\}.\{png,svg,pdf\}}.
+
+Optimizer funnel: manifest \path{research/optimizer-study.json} (candidate list, stage definitions,
+hard gates, required metrics, and the two blocked-candidate reasons); results
+\path{research/native-optimizer-funnel.json} (106 jobs); champion record \path{research/champion-run.json};
+exact-resume gates \path{research/exact-128m-gate-polar.json} and \path{research/exact-128m-gate.json}.
+
+Full lab notes with per-suite failure logs, evidence grades and interpretation boundaries:
+\path{experiment-notes/nanolab/14}, \texttt{15}, \texttt{16}, \texttt{22}, \texttt{23}, \texttt{24}, \texttt{25}, \texttt{26}.
+
+\textbf{Non-nanolab sources this paper depends on.} An earlier version of this section listed only the
+\path{nanolab/} and \path{research/} paths above, while \S5 and \S7.3 in fact rest on the Metal/Rust tracks.
+Those paths are:
+
+{%
+{\small\begin{longtable}[]{@{}
+  >{\raggedright\arraybackslash}p{(\linewidth - 2\tabcolsep) * \real{0.5000}}
+  >{\raggedright\arraybackslash}p{(\linewidth - 2\tabcolsep) * \real{0.5000}}@{}}
+\toprule\noalign{}
+\begin{minipage}[b]{\linewidth}\raggedright
+Used by
+\end{minipage} & \begin{minipage}[b]{\linewidth}\raggedright
+Path
+\end{minipage} \\
+\midrule\noalign{}
+\endhead
+\bottomrule\noalign{}
+\endlastfoot
+\S5.1 funnel design, stage definitions, the 29/29 orchestration oracle & \path{experiment-notes/arch-metal/51-m5-128m-optimizer-funnel-preflight.md} \\
+\S5.5 downward-transfer table (Polar vs NS5 at \texttt{sota}, 3k, seeds 1337/42) & \path{experiment-notes/arch-metal/53-loop-research-soft-fatiled-2026-07-23.md} and its machine-readable board \path{Rust_MLKit/arch_02_value_resid/metal-native/out/loop_research_2026-07-23/RESULTS.json} \\
+\S7.3 withdrawal 2 (the retracted Metal-vs-CUDA BPB comparison) & \path{experiment-notes/arch-metal/50-*}, \path{Rust_MLKit/arch_02_value_resid/metal-native/README.md}, \path{metal-native/DECISIONS.md} \\
+\S7.3 withdrawal 3 (the retracted \textasciitilde238k/\textasciitilde240k tok/s figures and their re-baseline) & withdrawn values in \path{experiment-notes/arch-metal/52-context-crossover-metal.md}; honest re-baseline in \path{\ldots/53-\ldots}, \S``mixer honesty'' \\
+\S7.3 withdrawal 5 (62--100\% of \textasciitilde273 GB/s; \textasciitilde77\% dispatch overhead) & \path{Rust_MLKit/gemma-metal/bench/results/kernel_roofline_finding.json}, \path{Rust_MLKit/gemma-metal/docs/bottleneck.md} \\
+\S8 LR-transfer evidence (new; see \S8.2) & \path{research/champion-run.json} $\rightarrow$ \texttt{lr\_transfer\_finding}; raw runs in \path{out/funnel/polar_exact_lr_spot/} (not committed --- \path{out/} is a build output; \texttt{ledger.json} in that directory carries the reconciled record) \\
+\end{longtable}}
+}
+
+\textbf{Two scope caveats on the re-baselined throughput figures.} The 144,367 / 66,382 / 33,321 tok/s
+values in \S7.3 are Metal measurements at sequence length 256 on 0.78M--1.05M-parameter models, over
+40 steps. Every quality result in \S4 is CUDA at sequence length 512 on 124M-parameter models. ``The
+same three arms'' refers to the mixer \emph{type} only; the two sets of numbers share no shape, scale,
+backend or sequence length and must not be placed in one table.
+
+\textbf{What the lock files do and do not contain.} \path{experiment-notes/nanolab/artifacts/*_lock.json}
+carry the crossing points, the 19.677M gap, and the 50M ranking board (\texttt{arm}, \texttt{mean}, \texttt{lo}, \texttt{hi}).
+They do \textbf{not} carry the per-marker tables of \S4.2--\S4.4, their confidence intervals, or the
+per-seed ranges shown in the \S4.5 board. Those are recomputed from the per-job \texttt{metrics.jsonl}
+under \path{nanolab/out/}, which is not committed (see the note on build outputs above, and gap B3 in
+\path{docs/ISSUES_AND_GAPS_2026-08-22.md}). Reproducing the \S4 tables therefore requires re-running the
+suites or obtaining the run directories; reproducing the crossings and the 50M board does not.
+
+Two reproduction caveats, stated rather than buried:
+
+\begin{itemize}
+\tightlist
+\item
+  \textbf{Suites 14, 15 and 16 have no preserved replay command.} The closest runner is
+  \texttt{python\ -m\ nanolab.train}; every recorded field in the relevant \texttt{config.json} must be
+  reconstructed before comparing outputs. This is why those suites are cited as observations and
+  never as the basis for a shipped claim.
+\item
+  \textbf{Suite 23's artifacts are the short-cosine run and were not regenerated.} The runner now sets
+  \texttt{CROSSOVER\_LR\_HORIZON=50000000} so a future launch preserves the long cosine; reproducing
+  suite 23 as recorded requires the old behavior, and a schedule-matched prefix must use a new
+  output directory.
+\end{itemize}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\section{11. Conclusion}\label{conclusion}
+
+We tried to replicate a crossover we had measured ourselves, at five seeds instead of one, on
+better hardware, and over six times the token budget. The shape survived. The number did not.
+
+The token at which attention overtakes minGRU on this model is 12.35M under a 50M-token cosine,
+14.58M under a 20M-token cosine, and does not exist within 7.4M tokens at batch size 8 --- and the
+originally reported 6.6--7.4M window turns out to sit inside a region where minGRU leads by
+0.13--0.18 nats on every seed of every batch-32 recipe we ran. On an entirely separate axis, an
+optimizer that won a two-seed 16M-parameter stage finished last of four at 128M, and the eventual
+128M champion loses when run back down to small scale.
+
+The uncomfortable version of the lesson is that the cheap screen cannot be trusted even as a
+shortlist. The useful version is narrower and actionable: \textbf{the ranking is a property of the
+measurement recipe as much as of the method, so the recipe must be pinned, fingerprinted,
+reported, and never silently varied between the screen and the run it is screening for.}
+
+\begin{center}\rule{0.5\linewidth}{0.5pt}\end{center}
+
+\subsection{Provenance of this draft}\label{provenance-of-this-draft}
+
+All 38 literature identifiers cited in \S1, \S2 and \S8 were resolved through the ScholarLM / WisDev
+MCP (\texttt{wisdevSearchPapers}, \texttt{wisdevPaperLookup}) against arXiv, OpenAlex, Semantic Scholar and
+Crossref. Every arXiv ID in the reference list was fetched individually and its title, authors,
+year and abstract confirmed against the claim made about it in the text; the discovery searches
+that surfaced \cite{ref29}--\cite{ref32} and \cite{ref35} were run in \texttt{methodology} research mode. No citation was written
+from recall, and no claim is attributed to a paper whose abstract was not read.
+
+Every experimental number in \S4 and \S5 is read from the locked artifacts listed in \S10. Suite
+statistics come from the \texttt{*\_lock.json} files; optimizer-funnel figures are recomputed directly
+from \path{research/native-optimizer-funnel.json}, which is also the source of the interval correction
+in \S5.3.
+
+ScholarDoc's drafting pipeline was \textbf{not} used for the prose. Its retrieval tools were, as
+described above. The local stdio server initially returned only a section scaffold because the
+MCP child process was launched without \texttt{GOOGLE\_CLOUD\_PROJECT} and so could not reach the Vertex
+backend that the orchestrator was already using; that was fixed, and DocGen was then run three
+times against a healthy backend. All three runs failed to ground: the best grounded on a single
+source on an unrelated topic (information-retrieval ranking-model distillation, reached by
+semantic drift on the word ``ranking''), and the last grounded on \textbf{zero} sources while still
+emitting a seven-section draft and a numeric review score. None of that output was merged. The
+tooling defects are recorded in \path{docs/ISSUES_AND_GAPS_2026-08-22.md} \S1.
+
