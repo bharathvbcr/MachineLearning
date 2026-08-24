@@ -1,9 +1,6 @@
 # Recipe-Dependent Rankings: Method Orderings in Language-Model Screens Are Properties of the Measurement, Not the Methods
 
-**Bharath V.** <bharath.vbcr@gmail.com> · independent researcher
-
-<!-- TODO before submission: full legal name and affiliation. The repository's git
-     author field reads "BHARATH CHANDRA VADDARAM"; confirm the form you want on record. -->
+**Bharath Chandra Vaddaram** <bharath.vbcr@gmail.com> · independent researcher
 
 `parameter_golf` / `nanolab` · Draft 2026-08-24
 
@@ -47,17 +44,38 @@ originally computed for that funnel: with the correct two-seed Student-*t* multi
 champion-selection intervals **overlap**, and the selection rests on a sign-consistent 2-of-2
 ordering rather than on separated intervals.
 
-The transferable claim is not "attention wins late." It is that **the crossing token is a
-function of batch size, learning-rate horizon, hardware and evaluation protocol**, and that a
-ranking measured at one recipe carries no license to be reported as a property of the
-architectures.
+Auditing the rest of our own record turns up the same structure on six further axes (§6).
+Holding the architectures, optimizers and data fixed, an ordering changes places under a change
+of: token budget — attention is **fourth of five** at 2.05M tokens and **first** at 8.19M on a
+byte-identical configuration; evaluation metric — MLA is last on quality and first on throughput
+among those same five arms; batch size, on throughput; kernel implementation, where a
+chunk-parallel rewrite moves one arm from out-of-memory to 1,100 tok/s at an unchanged shape; and
+hardware backend, where a second Rust/Metal implementation of the same architecture trails the
+CUDA reference at 3k steps and leads it at 20k. Most of §6 is single-seed and we treat it as
+qualitative.
 
-One limitation is large enough to state in the abstract. Every run here uses standard
-parametrization with a single global Muon learning rate, so we cannot yet separate "the ranking
-depends on the recipe" from "the arms were unequally well tuned at each recipe." §8 states that
-competing explanation, gives the evidence that partially bounds it, and specifies the µP arm —
-a 2 × 2 over parametrization and architecture on the suite 24 recipe, plus two cheaper ablations —
-that would settle it, with a pre-registered reading of each possible outcome.
+The transferable claim is therefore not "attention wins late," and not only that the crossing
+token moves. It is that **method orderings in short screens are functions of batch size,
+learning-rate horizon, learning rate, model scale, evaluation metric, kernel maturity and
+hardware**, and that a ranking measured at one recipe carries no license to be reported as a
+property of the methods.
+
+We then measured the confound we had named as our own largest limitation, and it proved worse
+than the concern. Both finalists of the §5 optimizer funnel carried learning rates tuned at 16M
+parameters and never re-tuned at the 128M scale where the selection was made. Re-running both
+across a matched eight-point learning-rate grid at that exact protocol — **52 jobs, three seeds** —
+shows the ordering **crosses over**: `muon_polar_adamw` leads at the two lowest learning rates and
+`normuon_adamw` at the six highest, every row sign-consistent across all three seeds. The two have
+offset flat basins, so each wins inside its own. **There is no recipe-independent answer to which
+of the two is better at this scale**, and the funnel had compared them at 0.05 and 0.1 — one side
+of a crossing it could not see. Its selection is retired, not reversed. The winner's inherited
+learning rate alone cost **1.47×** [1.37, 1.58] the margin that selected it (§8.3).
+
+What remains unmeasured is the parametrization arm on the *mixer* axis: every run in §4 uses
+standard parametrization with a single global learning rate. §8.4 specifies it, with a
+pre-registered reading of each outcome. §8.3 is the reason to run it rather than assume the effect
+is second-order — on the one axis where we did control the learning rate, controlling it reversed
+the answer.
 
 ---
 
