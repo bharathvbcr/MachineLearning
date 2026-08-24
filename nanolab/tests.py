@@ -743,20 +743,31 @@ def paper_matched_batch_board_uses_student_t_not_the_normal_quantile():
     # error from the reported half-width instead would make this test a
     # tautology: half/(half/t) == t for any half, so it would pass against the
     # very z-quantile code it exists to catch.
+    #
+    # Read the FINAL EVALUATION, not the `done` record's best_val.  This test
+    # originally sampled best_val, which is the minimum over all evaluations --
+    # the quantity the manuscript's own section 3.2 rule says is not a paired
+    # snapshot and is never reported as a ranking.  The board was corrected to
+    # stop using it (it disagreed with the eval-aligned main board by 0.018 BPB
+    # on the same arm), so a test still sampling best_val compares the board's
+    # interval against the standard error of a different sample and fails for
+    # the wrong reason.
     src = Path(df.OUT) / "crossover50m_matched32"
     samples: dict[str, list[float]] = {}
     for run_dir in sorted(src.iterdir()):
         if not run_dir.is_dir() or "_s" not in run_dir.name:
             continue
         arm = run_dir.name.rsplit("_s", 1)[0].replace("cx32_", "")
-        last = None
+        evals: dict[int, float] = {}
         for line in (run_dir / "metrics.jsonl").open():
             try:
-                last = json.loads(line)
+                row = json.loads(line)
             except json.JSONDecodeError:
-                pass
-        if last and last.get("event") == "done" and last.get("best_val") is not None:
-            samples.setdefault(arm, []).append(last["best_val"])
+                continue
+            if row.get("event") == "eval" and row.get("val_loss") is not None:
+                evals[row["tokens"]] = row["val_loss"]
+        if evals:
+            samples.setdefault(arm, []).append(evals[max(evals)])
 
     checked = 0
     for row in board["rows"]:
@@ -764,6 +775,13 @@ def paper_matched_batch_board_uses_student_t_not_the_normal_quantile():
         assert row["df"] == n - 1, row
         xs = samples[row["arm"]]
         assert len(xs) == n, f"{row['arm']}: board n={n}, disk n={len(xs)}"
+        # Pin the QUANTITY as well as the multiplier: if the board regresses to
+        # best_val the mean moves and this fires, rather than only the interval
+        # silently changing shape.
+        assert abs(row["final"] - statistics.fmean(xs)) < 1e-9, (
+            f"{row['arm']}: board mean {row['final']:.6f} is not the mean of the "
+            f"final evaluations {statistics.fmean(xs):.6f} -- the board is "
+            f"tabulating a different quantity (best_val?)")
         sem = statistics.stdev(xs) / math.sqrt(n)
         half = (row["ci"][1] - row["ci"][0]) / 2
         multiplier = half / sem
