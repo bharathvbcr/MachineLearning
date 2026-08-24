@@ -1,7 +1,7 @@
 # GPU bundle — E1, E2, D10
 
 One runner, `scripts/gpu_bundle.py`, covering the three outstanding rented-GPU suites.
-52 jobs. Resumable: finished runs are detected and skipped, so an interrupted session
+54 jobs. Resumable: finished runs are detected and skipped, so an interrupted session
 costs time and no data.
 
 ## Instance: 8× A100 40 GB, $15.92/hr
@@ -28,7 +28,7 @@ $3.20 per A100-equivalent hour — the worst value of the three options.
 768-dim target at batch 32 / context 512, ~124M parameters, ~15 GB including
 optimizer state and activations. The proxy sweep runs narrower still, at 256 dim.
 
-**Estimate: ~30–35 A100-GPU-hours → ~4–4.5 h wall on 8 GPUs, plus ~1 h setup ≈ $88.**
+**Estimate: ~32–37 A100-GPU-hours → ~4–4.5 h wall on 8 GPUs, plus ~1 h setup ≈ $88.**
 Derived from suite 22–26 timings scaled by the A100/GH200 ratio; treat it as an
 estimate, not a measurement. The `d10_horizon` pair dominates: 655M + 328M tokens at
 context 1024 is roughly a third of the total.
@@ -56,11 +56,22 @@ read as a measured run.
 | suite | jobs | closes |
 |---|---|---|
 | `e1_mup` | 10 | µP cells of PAPER §8.4's 2×2. The SP cells are suite 24 and are **not** rerun. |
-| `e1_proxy` | 10 | Proxy-width LR sweep at `mup_base_width`, 1 seed. Locates a peak to transfer; it does not rank arms. |
+| `e1_proxy` | 12 | Proxy-width **matrix-LR** sweep at `mup_base_width`, **per arm**, 1 seed. Locates a peak to transfer; it does not rank arms. |
 | `e1_perlayer_sp` | 10 | Per-layer SP prescription (Everett et al.). **An approximation — see caveats.** |
 | `e1_embed_lr` | 10 | Embedding-LR-only ablation (Kalra & Barkeshli): `embed_lr_mult = 768/256 = 3`. |
 | `e2_matched32_50m` | 10 | Suite 26's missing attention/minGRU cells at 50M, batch 32. Lifts that board from Medium-High. |
 | `d10_horizon` | 2 | Matched 10k vs 20k at **one** learning rate, uninterrupted. |
+
+**Run `e1_proxy` first, and read its output before launching `e1_mup`.** Under
+`muon_ns5_adamw` the 2-D hidden matrices are driven by `cfg.matrix_lr`, not
+`cfg.lr` -- an earlier version of this sweep varied `cfg.lr` and would have left
+the hidden LR, the quantity muP exists to transfer, pinned at an inherited 0.025
+across every point. The sweep now varies `matrix_lr` over 0.0016..0.05, per arm,
+and the runner refuses to call a grid edge an optimum: if either arm's minimum
+lands at an end of the range, extend `PROXY_MATRIX_LRS` and re-run before
+spending anything on the 2x2. `cfg.lr` stays at the suite value, which is correct
+under muP's width-constant embedding rule but is itself inherited rather than
+tuned -- a stated limitation of this arm.
 
 Every `e1_*` and `e2_*` job takes its cadence from
 `crossover_replicate.scale_to_token_budget`, so eval markers line up with suites 22–26
