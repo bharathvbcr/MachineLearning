@@ -35,6 +35,7 @@ below.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import os
@@ -334,6 +335,33 @@ def optimizer_funnel():
     }
 
 
+def d7_lr_retune():
+    """Section 8.3's learning-rate re-tune, imported rather than recomputed.
+
+    scripts/d7_analyze.py owns this arithmetic and regenerates
+    research/d7-lr-retune.json from the run ledger. Reimplementing it here would
+    give the repository two independent derivations of the same published
+    numbers, which is precisely how the record drifts -- the failure section 7.4
+    catalogues nine times over. So this imports build_report() and reshapes its
+    output; if the two ever disagree, there is nothing to disagree with.
+    """
+    src = ROOT / "scripts" / "d7_analyze.py"
+    if not src.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("_d7_analyze", src)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+        report, _ = mod.build_report()
+    except SystemExit:
+        return None          # ledger absent: the run has not been made here
+    except Exception:
+        return None
+    if not report.get("matched_lr"):
+        return None
+    return report
+
+
 def collect():
     return {
         "headline": headline(),
@@ -341,6 +369,7 @@ def collect():
         "mixer_board": mixer_board(),
         "matched_batch_board": matched_batch_board(),
         "optimizer_funnel": optimizer_funnel(),
+        "d7_lr_retune": d7_lr_retune(),
     }
 
 
@@ -514,6 +543,38 @@ def expected_figures(f):
             # a claim about the parameter count rather than about the resume gate.
             want.append((f"{p:,}", "funnel: exact_128m parameter count"))
 
+    # --- section 8.3: the D7 learning-rate re-tune -------------------------
+    d7 = f.get("d7_lr_retune")
+    if d7:
+        for lr, row in d7["matched_lr"].items():
+            want.append((f"{row['mean']:+.6f}".replace("+", ""),
+                         f"d7 matched lr {lr}: gap"))
+        for cand, c in d7["candidates"].items():
+            short = "Polar" if "polar" in cand else "NorMuon"
+            for lr, cell in c["cells"].items():
+                # Only the eight matched learning rates are tabulated in the
+                # manuscript; NorMuon's 0.07 and 0.1 are discussed but not in the
+                # table, and are n=2 so they carry no interval.
+                if lr in d7["matched_lr"]:
+                    want.append((f"{cell['mean']:.6f}", f"d7 {short} lr {lr}: mean"))
+            pen = c.get("inherited_lr_penalty")
+            if pen and pen.get("ci95_half_width") is not None:
+                want.append((f"{pen['mean']:.6f}", f"d7 {short}: inherited-LR penalty"))
+                want.append((f"{pen['ci95_half_width']:.6f}",
+                             f"d7 {short}: penalty CI half-width"))
+            if c.get("penalty_x_selection_margin") is not None:
+                want.append((f"{c['penalty_x_selection_margin']:.2f}",
+                             f"d7 {short}: penalty / selection margin"))
+        bt = d7.get("best_tested_comparison") or {}
+        if bt.get("paired"):
+            want.append((f"{bt['paired']['mean']:.6f}", "d7 best-tested: gap"))
+            if bt["paired"].get("ci95_half_width") is not None:
+                want.append((f"{bt['paired']['ci95_half_width']:.6f}",
+                             "d7 best-tested: CI half-width"))
+        n_jobs = (d7.get("provenance") or {}).get("jobs")
+        if n_jobs:
+            want.append((str(n_jobs), "d7: job count"))
+
     # De-duplicate while preserving order; several figures repeat by design
     # (the headline finals are also board rows 1 and 7).
     seen, out = set(), []
@@ -559,6 +620,16 @@ def check(f):
         print(f"FAIL: {MANUSCRIPT.name} does not exist")
         return 1
     body = MANUSCRIPT.read_text()
+    # The manuscript sets negative numbers with a typographic minus (U+2212),
+    # which is correct typography and is not the ASCII hyphen a derived token
+    # carries. Normalise before substring matching, or every negative result
+    # reads as drift. Same for the non-breaking and figure spaces that can creep
+    # into pasted tables.
+    body = (body.replace("\u2212", "-")
+                .replace("\u2013", "-")
+                .replace("\u00a0", " ")
+                .replace("\u2007", " ")
+                .replace("\u202f", " "))
 
     wanted = expected_figures(f)
     missing = [(token, why) for token, why in wanted if token not in body]
@@ -568,6 +639,9 @@ def check(f):
     # figures were present, which never reads the prose's own numbers.
     derived = {token for token, _ in wanted}
     derived |= {t[:-1] for t in derived if t.endswith("M")}
+    # The figure regex captures magnitudes without their sign, so a derived
+    # "-0.002778" would leave the manuscript's "0.002778" looking unaccounted.
+    derived |= {t.lstrip("-+") for t in derived}
     stated = sorted(set(_FIGURE_RE.findall(body)))
     unaccounted = [s for s in stated
                    if s not in derived and s not in STATED_NOT_DERIVED]
@@ -602,7 +676,7 @@ def check(f):
     print(f"COVERAGE: {covered} of {len(stated)} figures stated in the manuscript "
           f"are derived here or documented ({pct:.0f}%). "
           f"{len(unaccounted)} come from artifacts this script does not read "
-          f"(lab notes, Metal tracks, the D7 ledger); see manuscript section 10 "
+          f"(lab notes and the Metal tracks); see manuscript section 10 "
           f"for their provenance.")
     if unaccounted:
         print(f"  first 10 uncovered: {', '.join(repr(x) for x in unaccounted[:10])}")

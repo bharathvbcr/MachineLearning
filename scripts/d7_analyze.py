@@ -109,11 +109,14 @@ def bracketed(cells: dict[float, dict[int, float]], lr: float) -> dict:
     return res
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--write", action="store_true", help="regenerate research/d7-lr-retune.json")
-    args = ap.parse_args()
+def build_report() -> tuple[dict, dict]:
+    """Compute the whole D7 report from the ledger. Returns (report, raw cells).
 
+    Split out of main() so paper/derive_figures.py can import the computation
+    rather than reimplement it. Two scripts deriving the same published numbers
+    independently is how they drift apart, which is the failure this repository
+    keeps finding in its own record.
+    """
     data = load()
     cands = sorted(data)
     report: dict = {"candidates": {}, "matched_lr": {}, "notes": []}
@@ -176,50 +179,6 @@ def main() -> int:
             "biased_by_unequal_depth": bool(lo_a != lo_b and at_low_edge),
         }
 
-    # Console summary
-    for c in cands:
-        r = report["candidates"][c]
-        print(f"\n=== {c} ===")
-        print(f"{'lr':>9} {'mean':>10} {'n':>3} {'sd':>10} {'ci95':>10}")
-        for lr, row in r["cells"].items():
-            sd = f"{row['sd']:.6f}" if row["sd"] is not None else "-"
-            ci = f"{row['ci95_half_width']:.6f}" if row["ci95_half_width"] is not None else "n<3"
-            print(f"{lr:>9} {row['mean']:>10.6f} {row['n']:>3} {sd:>10} {ci:>10}")
-        print(f"  best tested lr {r['best_tested_lr']:g} -> {r['best_tested_mean']:.6f}"
-              f"   bracketed: {r['bracket']['bracketed']}")
-        if r["inherited_lr_penalty"]:
-            p = r["inherited_lr_penalty"]
-            ci = f" +/- {p['ci95_half_width']:.6f}" if p["ci95_half_width"] else " (n<3)"
-            print(f"  inherited lr {r['selected_lr']:g} penalty: {p['mean']:.6f}{ci}"
-                  f"  = {r['penalty_x_selection_margin']}x the {SELECTION_MARGIN} margin")
-
-    if report["matched_lr"]:
-        s = report["matched_lr_summary"]
-        print(f"\n=== matched-LR comparison (Polar - NorMuon) ===")
-        print(f"{'lr':>9} {'gap':>11} {'ci95':>11} {'signs':>8} {'sep?':>5}")
-        for lr, p in report["matched_lr"].items():
-            ci = f"+/-{p['ci95_half_width']:.6f}" if p["ci95_half_width"] else "n<3"
-            print(f"{lr:>9} {p['mean']:>+11.6f} {ci:>11} "
-                  f"{('%d-of-%d' % (p['n'], p['n'])) if p['sign_consistent'] else 'SPLIT':>8} "
-                  f"{'YES' if p['excludes_zero'] else 'no':>5}")
-        print(f"  NorMuon leads sign-consistently at {s['normuon_leads_sign_consistent']}"
-              f"/{s['points']}; intervals exclude zero at {s['intervals_excluding_zero']}/{s['points']}")
-        bt = report["best_tested_comparison"]
-        p = bt["paired"]
-        ci = f" +/- {p['ci95_half_width']:.6f}" if p["ci95_half_width"] else " (n<3)"
-        print(f"\n  best-tested: Polar@{bt['muon_polar_adamw_lr']:g} vs "
-              f"NorMuon@{bt['normuon_adamw_lr']:g}: {p['mean']:+.6f}{ci}"
-              f"  {'separated' if p['excludes_zero'] else 'SPANS ZERO'}")
-        if bt["biased_by_unequal_depth"]:
-            lo = bt["lowest_lr_swept"]
-            print(f"  WARNING: unequal tuning depth on the low side. Lowest LR swept: "
-                  f"{a} {lo[a]:g}, {b} {lo[b]:g}, and at least one minimum sits at its "
-                  f"grid's low edge. Comparing best-tested points across grids of "
-                  f"different depth is the same error this experiment documents. "
-                  f"Report the matched-LR rows, or extend the shallower grid.")
-        elif bt["equal_depth_on_the_low_side"]:
-            print("  (grids are equally deep on the low side; best-tested comparison is fair)")
-
     # Self-describing artifact: the numbers above plus what they do and do not support.
     if report.get("matched_lr"):
         pol = [lr for lr, q in report["matched_lr"].items() if q and q["mean"] < 0]
@@ -271,6 +230,61 @@ def main() -> int:
             "note": ("Regenerate with `python3 scripts/d7_analyze.py --write` rather "
                      "than editing by hand."),
         }
+
+    return report, data
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--write", action="store_true", help="regenerate research/d7-lr-retune.json")
+    args = ap.parse_args()
+
+    report, data = build_report()
+    cands = sorted(data)
+
+    # Console summary
+    for c in cands:
+        r = report["candidates"][c]
+        print(f"\n=== {c} ===")
+        print(f"{'lr':>9} {'mean':>10} {'n':>3} {'sd':>10} {'ci95':>10}")
+        for lr, row in r["cells"].items():
+            sd = f"{row['sd']:.6f}" if row["sd"] is not None else "-"
+            ci = f"{row['ci95_half_width']:.6f}" if row["ci95_half_width"] is not None else "n<3"
+            print(f"{lr:>9} {row['mean']:>10.6f} {row['n']:>3} {sd:>10} {ci:>10}")
+        print(f"  best tested lr {r['best_tested_lr']:g} -> {r['best_tested_mean']:.6f}"
+              f"   bracketed: {r['bracket']['bracketed']}")
+        if r["inherited_lr_penalty"]:
+            p = r["inherited_lr_penalty"]
+            ci = f" +/- {p['ci95_half_width']:.6f}" if p["ci95_half_width"] else " (n<3)"
+            print(f"  inherited lr {r['selected_lr']:g} penalty: {p['mean']:.6f}{ci}"
+                  f"  = {r['penalty_x_selection_margin']}x the {SELECTION_MARGIN} margin")
+
+    if report["matched_lr"]:
+        s = report["matched_lr_summary"]
+        print(f"\n=== matched-LR comparison (Polar - NorMuon) ===")
+        print(f"{'lr':>9} {'gap':>11} {'ci95':>11} {'signs':>8} {'sep?':>5}")
+        for lr, p in report["matched_lr"].items():
+            ci = f"+/-{p['ci95_half_width']:.6f}" if p["ci95_half_width"] else "n<3"
+            print(f"{lr:>9} {p['mean']:>+11.6f} {ci:>11} "
+                  f"{('%d-of-%d' % (p['n'], p['n'])) if p['sign_consistent'] else 'SPLIT':>8} "
+                  f"{'YES' if p['excludes_zero'] else 'no':>5}")
+        print(f"  NorMuon leads sign-consistently at {s['normuon_leads_sign_consistent']}"
+              f"/{s['points']}; intervals exclude zero at {s['intervals_excluding_zero']}/{s['points']}")
+        bt = report["best_tested_comparison"]
+        p = bt["paired"]
+        ci = f" +/- {p['ci95_half_width']:.6f}" if p["ci95_half_width"] else " (n<3)"
+        print(f"\n  best-tested: Polar@{bt['muon_polar_adamw_lr']:g} vs "
+              f"NorMuon@{bt['normuon_adamw_lr']:g}: {p['mean']:+.6f}{ci}"
+              f"  {'separated' if p['excludes_zero'] else 'SPANS ZERO'}")
+        if bt["biased_by_unequal_depth"]:
+            lo = bt["lowest_lr_swept"]
+            print(f"  WARNING: unequal tuning depth on the low side. Lowest LR swept: "
+                  f"{a} {lo[a]:g}, {b} {lo[b]:g}, and at least one minimum sits at its "
+                  f"grid's low edge. Comparing best-tested points across grids of "
+                  f"different depth is the same error this experiment documents. "
+                  f"Report the matched-LR rows, or extend the shallower grid.")
+        elif bt["equal_depth_on_the_low_side"]:
+            print("  (grids are equally deep on the low side; best-tested comparison is fair)")
 
     if args.write:
         ARTIFACT.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
