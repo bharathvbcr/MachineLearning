@@ -17,7 +17,7 @@ work = W GPU-hours
 
 Both are $1.99 per GPU-hour, so the 8× box costs the same and finishes eight times
 sooner. The only premium is roughly one hour of setup billed at the 8× rate, ~$14.
-This workload is 52 independent jobs with no cross-job communication, so there is
+This workload is 54 independent jobs with no cross-job communication, so there is
 nothing for a single fast GPU to win.
 
 **Do not use the 1× A10.** 24 GB will not hold the 768-dim µP target with optimizer
@@ -36,7 +36,7 @@ context 1024 is roughly a third of the total.
 ## Run it
 
 ```bash
-python3 scripts/gpu_bundle.py --plan       # 52 jobs by suite, no work
+python3 scripts/gpu_bundle.py --plan       # 54 jobs by suite, no work
 python3 scripts/gpu_bundle.py --smoke      # 40-step check, one job per suite
 python3 scripts/gpu_bundle.py --only e1_mup
 python3 scripts/gpu_bundle.py              # everything
@@ -100,9 +100,10 @@ Report this as a new measurement, not a replication.
 width and transfers, which is the µP contract. But the D7 re-tune (`research/
 d7-lr-retune.json`) found *both* optimizer finalists 4–8× above their optima at 128M,
 with neither optimum bracketed. If the proxy sweep's peak lands at the edge of
-`PROXY_LRS`, the transferred LR is a boundary value, not an optimum, and §8.4's
-pre-registered readouts should be read with that stated — the same failure the D7 grid
-hit twice.
+`PROXY_MATRIX_LRS`, the transferred LR is a boundary value, not an optimum. The runner
+now detects this and says so rather than leaving it to be noticed — see the note under
+the suite table — but the decision to extend the grid and re-run is yours to make
+before launching the 2×2.
 
 ## Pre-registered readouts
 
