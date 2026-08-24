@@ -107,7 +107,15 @@ GRID = {
         0.008: SEEDS_N3, 0.0125: SEEDS_N3, 0.018: SEEDS_N3,
         0.025: SEEDS_N3, 0.035: SEEDS_N3, 0.05: SEEDS_N3,
     },
+    #   Round 5 (2026-08-23, after job 42).  muon_polar_adamw's optimum turned out to
+    #   be 0.005 -- an interior minimum, but BELOW normuon_adamw's grid floor of 0.008.
+    #   Round 4 had given the low points to Polar only, on the strength of a seed-42
+    #   reading that job 28 later overturned. Comparing a candidate swept over
+    #   {0.0035..0.05} against one swept over {0.008..0.1} is unequal tuning depth --
+    #   the exact error this experiment exists to document. The grids are made
+    #   symmetric here rather than arguing that the difference is probably small.
     "normuon_adamw": {
+        0.0035: SEEDS_N3, 0.005: SEEDS_N3,
         0.008: SEEDS_N3, 0.0125: SEEDS_N3, 0.018: SEEDS_N3,
         0.025: SEEDS_N3, 0.035: SEEDS_N3, 0.05: SEEDS_N3,
         0.07: SEEDS, 0.1: SEEDS,

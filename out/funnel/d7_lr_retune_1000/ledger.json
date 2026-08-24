@@ -16,6 +16,16 @@
   },
   "grid": {
     "muon_polar_adamw": {
+      "0.0035": [
+        42,
+        2026,
+        1337
+      ],
+      "0.005": [
+        42,
+        2026,
+        1337
+      ],
       "0.008": [
         42,
         2026,
@@ -48,6 +58,16 @@
       ]
     },
     "normuon_adamw": {
+      "0.0035": [
+        42,
+        2026,
+        1337
+      ],
+      "0.005": [
+        42,
+        2026,
+        1337
+      ],
       "0.008": [
         42,
         2026,
@@ -103,10 +123,38 @@
     "spot_check_500step_optimum_lr": 0.035,
     "spot_check_champion_penalty_bpb": 0.060996
   },
-  "started_at": "2026-08-23T08:50:52",
-  "jobs_total": 40,
-  "jobs_done": 36,
+  "started_at": "2026-08-23T22:40:52",
+  "jobs_total": 52,
+  "jobs_done": 52,
   "jobs": [
+    {
+      "id": "muon_polar_adamw_lr0p0035_seed42_128m",
+      "candidate": "muon_polar_adamw",
+      "lr": 0.0035,
+      "seed": 42,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/muon_polar_adamw_lr0p0035_seed42_128m",
+      "status": "done",
+      "validation_bpb": 2.129107,
+      "started_at": "2026-08-23T19:08:28",
+      "elapsed_s": 2855.1,
+      "returncode": 0,
+      "finished_at": "2026-08-23T19:56:03"
+    },
+    {
+      "id": "muon_polar_adamw_lr0p005_seed42_128m",
+      "candidate": "muon_polar_adamw",
+      "lr": 0.005,
+      "seed": 42,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/muon_polar_adamw_lr0p005_seed42_128m",
+      "status": "done",
+      "validation_bpb": 2.117122,
+      "started_at": "2026-08-23T19:56:03",
+      "elapsed_s": 2041.2,
+      "returncode": 0,
+      "finished_at": "2026-08-23T20:30:04"
+    },
     {
       "id": "muon_polar_adamw_lr0p008_seed42_128m",
       "candidate": "muon_polar_adamw",
@@ -184,6 +232,34 @@
       "validation_bpb": 2.165343,
       "elapsed_s": 3330.0,
       "elapsed_s_source": "recovered_from_runner_log"
+    },
+    {
+      "id": "normuon_adamw_lr0p0035_seed42_128m",
+      "candidate": "normuon_adamw",
+      "lr": 0.0035,
+      "seed": 42,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/normuon_adamw_lr0p0035_seed42_128m",
+      "status": "done",
+      "validation_bpb": 2.138956,
+      "started_at": "2026-08-23T22:40:52",
+      "elapsed_s": 2727.0,
+      "returncode": 0,
+      "finished_at": "2026-08-23T23:26:19"
+    },
+    {
+      "id": "normuon_adamw_lr0p005_seed42_128m",
+      "candidate": "normuon_adamw",
+      "lr": 0.005,
+      "seed": 42,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/normuon_adamw_lr0p005_seed42_128m",
+      "status": "done",
+      "validation_bpb": 2.121899,
+      "started_at": "2026-08-23T23:26:19",
+      "elapsed_s": 2659.2,
+      "returncode": 0,
+      "finished_at": "2026-08-24T00:10:38"
     },
     {
       "id": "normuon_adamw_lr0p008_seed42_128m",
@@ -292,6 +368,34 @@
       "elapsed_s_source": "recovered_from_runner_log"
     },
     {
+      "id": "muon_polar_adamw_lr0p0035_seed2026_128m",
+      "candidate": "muon_polar_adamw",
+      "lr": 0.0035,
+      "seed": 2026,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/muon_polar_adamw_lr0p0035_seed2026_128m",
+      "status": "done",
+      "validation_bpb": 2.139531,
+      "started_at": "2026-08-23T20:30:04",
+      "elapsed_s": 2035.7,
+      "returncode": 0,
+      "finished_at": "2026-08-23T21:04:00"
+    },
+    {
+      "id": "muon_polar_adamw_lr0p005_seed2026_128m",
+      "candidate": "muon_polar_adamw",
+      "lr": 0.005,
+      "seed": 2026,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/muon_polar_adamw_lr0p005_seed2026_128m",
+      "status": "done",
+      "validation_bpb": 2.127404,
+      "started_at": "2026-08-23T21:04:00",
+      "elapsed_s": 1891.4,
+      "returncode": 0,
+      "finished_at": "2026-08-23T21:35:32"
+    },
+    {
       "id": "muon_polar_adamw_lr0p008_seed2026_128m",
       "candidate": "muon_polar_adamw",
       "lr": 0.008,
@@ -368,6 +472,34 @@
       "validation_bpb": 2.172826,
       "elapsed_s": 2088.0,
       "elapsed_s_source": "recovered_from_runner_log"
+    },
+    {
+      "id": "normuon_adamw_lr0p0035_seed2026_128m",
+      "candidate": "normuon_adamw",
+      "lr": 0.0035,
+      "seed": 2026,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/normuon_adamw_lr0p0035_seed2026_128m",
+      "status": "done",
+      "validation_bpb": 2.144957,
+      "started_at": "2026-08-24T00:10:38",
+      "elapsed_s": 2768.4,
+      "returncode": 0,
+      "finished_at": "2026-08-24T00:56:46"
+    },
+    {
+      "id": "normuon_adamw_lr0p005_seed2026_128m",
+      "candidate": "normuon_adamw",
+      "lr": 0.005,
+      "seed": 2026,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/normuon_adamw_lr0p005_seed2026_128m",
+      "status": "done",
+      "validation_bpb": 2.127897,
+      "started_at": "2026-08-24T00:56:46",
+      "elapsed_s": 2665.3,
+      "returncode": 0,
+      "finished_at": "2026-08-24T01:41:11"
     },
     {
       "id": "normuon_adamw_lr0p008_seed2026_128m",
@@ -476,6 +608,34 @@
       "elapsed_s_source": "recovered_from_runner_log"
     },
     {
+      "id": "muon_polar_adamw_lr0p0035_seed1337_128m",
+      "candidate": "muon_polar_adamw",
+      "lr": 0.0035,
+      "seed": 1337,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/muon_polar_adamw_lr0p0035_seed1337_128m",
+      "status": "done",
+      "validation_bpb": 2.145536,
+      "started_at": "2026-08-23T21:35:32",
+      "elapsed_s": 1865.3,
+      "returncode": 0,
+      "finished_at": "2026-08-23T22:06:37"
+    },
+    {
+      "id": "muon_polar_adamw_lr0p005_seed1337_128m",
+      "candidate": "muon_polar_adamw",
+      "lr": 0.005,
+      "seed": 1337,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/muon_polar_adamw_lr0p005_seed1337_128m",
+      "status": "done",
+      "validation_bpb": 2.132366,
+      "started_at": "2026-08-23T22:06:37",
+      "elapsed_s": 2026.8,
+      "returncode": 0,
+      "finished_at": "2026-08-23T22:40:24"
+    },
+    {
       "id": "muon_polar_adamw_lr0p008_seed1337_128m",
       "candidate": "muon_polar_adamw",
       "lr": 0.008,
@@ -560,6 +720,34 @@
       "finished_at": "2026-08-23T15:00:31"
     },
     {
+      "id": "normuon_adamw_lr0p0035_seed1337_128m",
+      "candidate": "normuon_adamw",
+      "lr": 0.0035,
+      "seed": 1337,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/normuon_adamw_lr0p0035_seed1337_128m",
+      "status": "done",
+      "validation_bpb": 2.148747,
+      "started_at": "2026-08-24T01:41:11",
+      "elapsed_s": 2651.0,
+      "returncode": 0,
+      "finished_at": "2026-08-24T02:25:22"
+    },
+    {
+      "id": "normuon_adamw_lr0p005_seed1337_128m",
+      "candidate": "normuon_adamw",
+      "lr": 0.005,
+      "seed": 1337,
+      "steps": 1000,
+      "output": "out/funnel/d7_lr_retune_1000/normuon_adamw_lr0p005_seed1337_128m",
+      "status": "done",
+      "validation_bpb": 2.135429,
+      "started_at": "2026-08-24T02:25:22",
+      "elapsed_s": 2744.3,
+      "returncode": 0,
+      "finished_at": "2026-08-24T03:11:07"
+    },
+    {
       "id": "normuon_adamw_lr0p008_seed1337_128m",
       "candidate": "normuon_adamw",
       "lr": 0.008,
@@ -594,9 +782,12 @@
       "seed": 1337,
       "steps": 1000,
       "output": "out/funnel/d7_lr_retune_1000/normuon_adamw_lr0p018_seed1337_128m",
-      "status": "running",
-      "validation_bpb": null,
-      "started_at": "2026-08-23T16:29:32"
+      "status": "done",
+      "validation_bpb": 2.132031,
+      "started_at": "2026-08-23T16:29:32",
+      "elapsed_s": 3368.3,
+      "returncode": 0,
+      "finished_at": "2026-08-23T17:25:40"
     },
     {
       "id": "normuon_adamw_lr0p025_seed1337_128m",
@@ -605,8 +796,12 @@
       "seed": 1337,
       "steps": 1000,
       "output": "out/funnel/d7_lr_retune_1000/normuon_adamw_lr0p025_seed1337_128m",
-      "status": "pending",
-      "validation_bpb": null
+      "status": "done",
+      "validation_bpb": 2.135596,
+      "started_at": "2026-08-23T17:25:40",
+      "elapsed_s": 2166.3,
+      "returncode": 0,
+      "finished_at": "2026-08-23T18:01:46"
     },
     {
       "id": "normuon_adamw_lr0p035_seed1337_128m",
@@ -615,8 +810,12 @@
       "seed": 1337,
       "steps": 1000,
       "output": "out/funnel/d7_lr_retune_1000/normuon_adamw_lr0p035_seed1337_128m",
-      "status": "pending",
-      "validation_bpb": null
+      "status": "done",
+      "validation_bpb": 2.149395,
+      "started_at": "2026-08-23T18:01:46",
+      "elapsed_s": 1860.7,
+      "returncode": 0,
+      "finished_at": "2026-08-23T18:32:47"
     },
     {
       "id": "normuon_adamw_lr0p05_seed1337_128m",
@@ -625,8 +824,12 @@
       "seed": 1337,
       "steps": 1000,
       "output": "out/funnel/d7_lr_retune_1000/normuon_adamw_lr0p05_seed1337_128m",
-      "status": "pending",
-      "validation_bpb": null
+      "status": "done",
+      "validation_bpb": 2.158444,
+      "started_at": "2026-08-23T18:32:47",
+      "elapsed_s": 2132.9,
+      "returncode": 0,
+      "finished_at": "2026-08-23T19:08:20"
     }
   ],
   "note": "This ledger is rewritten after every job. Its predecessor (out/funnel/polar_exact_lr_spot/) was written once at launch and lost three completed runs; see D8 in docs/ISSUES_AND_GAPS_2026-08-22.md."
