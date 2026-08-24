@@ -92,10 +92,19 @@ Hyperparameter tweaks alone were insufficient for the sprint quality target. Arc
 **Grade:** A (quality), B (throughput on quality path)  
 **Systems:** `Rust_MLKit/arch_02_value_resid/metal-native/`  
 **Primary artifacts** (under `metal-native/out/`):
-- `sota_f32_clipsoft_seed1337_20k_fa_tiled_softsplit_warmdown/metrics.jsonl` → FINAL EMA **1.89688**
+- `sota_f32_clipsoft_seed1337_20k_fa_tiled_softfix_warmdown/metrics.jsonl` → FINAL EMA **1.89688**
 - `sota_f32_clipsoft_seed1337_100k_fa_tiled_softsplit_wsd/metrics.jsonl` → FINAL EMA **1.882767**
-- `sota_f32_clipsoft_seed42_20k_fa_tiled_softsplit_warmdown_reseed/metrics.jsonl` → **1.887607**
+- `sota_f32_clipsoft_seed42_20k_fa_tiled_softfix_warmdown_reseed/metrics.jsonl` → **1.887607**
 - Contrast speed path: `sota_f32_clipsoft_seed1337_harden/metrics.jsonl` → ~**72k tok/s**, FINAL EMA **2.050** (not quality)
+
+> **Path correction, 2026-08-23.** The three 20k runs above were cited as
+> `..._softsplit_warmdown`. No such directory exists; the runs are
+> `..._softfix_warmdown`, which is also the name the metal-native README uses
+> in the command that produces them. Every BPB value here was verified against
+> the `metrics.jsonl` at the corrected path and is unchanged — it was the
+> citations that did not resolve, not the numbers. The 100k WSD run genuinely
+> is `softsplit`, so this section legitimately spans both variants and cannot
+> be renamed wholesale to either.
 
 #### Context
 CUDA sprint quality (~1.99 BPB class) and Apple Silicon training throughput had to coexist on one native stack. Soft-split + tiled FlashAttention is the locked quality operating point.
@@ -109,9 +118,9 @@ CUDA sprint quality (~1.99 BPB class) and Apple Silicon training throughput had 
 #### Locked metrics
 | Run | FINAL EMA BPB | Approx last-20 tok/s | Notes |
 |-----|---------------|----------------------|-------|
-| 20k softsplit warmdown (seed 1337) | **1.89688** | ~56.6k | Quality |
-| 20k softsplit warmdown (seed 42) | **1.892465** | ~56.6k | Quality |
-| 20k softsplit warmdown reseed (42) | **1.887607** | ~58.4k | Quality |
+| 20k **softfix** warmdown (seed 1337) | **1.89688** | ~56.6k | Quality |
+| 20k **softfix** warmdown (seed 42) | **1.892465** | ~56.6k | Quality |
+| 20k **softfix** warmdown reseed (42) | **1.887607** | ~58.4k | Quality |
 | 100k softsplit WSD (seed 1337) | **1.882767** | ~**60.4k** | Best Soft EMA found |
 | harden (short) | 2.050173 | ~**72k** (peak 72473) | Speed-only; not quality claim |
 
@@ -192,11 +201,34 @@ Bank-batched NS5 removed the optimizer dispatch bottleneck, but which Muon-famil
 > | `research/champion-run.json` | 2.010659 ✓ matches audit8 |
 > | this table, previously | 2.0157**56** ✗ matches no artifact |
 >
-> `2.015756` is a `57`↔`75` transposition of audit7's `2.015576`. There were never two
-> conflicting measurements — there was one superseded audit pass and one mistyped digit.
 > The citable number is **2.010659** (audit8, current kernel stack); audit7's 2.015576 is
 > the same run before the Audit-8 forward-flash fix and is a speed result, not a quality
 > regression (the two tie on quality; audit7 ran at 2005.1 ms/step, audit8 at ~1580–1683).
+>
+> **Diagnosis corrected 2026-08-23 — `2.015756` is not a typo.** This block previously
+> read "`2.015756` is a `57`↔`75` transposition of audit7's `2.015576`. There were never
+> two conflicting measurements." That is wrong, and acting on it would have deleted a real
+> measurement from four files. There were **three** champion runs, not two:
+>
+> | run | artifact | ms/step | FINAL EMA BPB |
+> |---|---|---|---|
+> | pre-Audit-7 | `out/champion_128m_seed1337` — **no longer on disk** | ~2895 | 2.015756 |
+> | Audit 7 | `out/champion_128m_seed1337_audit7` | 2005.1 | 2.015576 |
+> | Audit 8 | `out/champion_128m_seed1337_audit8` | ~1580–1683 | **2.010659** |
+>
+> `DECISIONS.md` §M15, written 2026-07-19 *before* Audit 7 existed, records the champion
+> at **2.0158** with ~2.94–3.07 s/step and 1392 tok/s. `2.015756` rounds to 2.0158;
+> `2.015576` rounds to 2.0156. So M15 corroborates 2.015756 as the pre-Audit-7 run's own
+> number, and the four documents that pair it with 2895 ms/step and 1431 tok/s are
+> describing that run correctly, not repeating a slip.
+>
+> What was actually wrong was narrower: **this table** carried the pre-Audit-7 run's value
+> where it should have carried the current champion's. The resolution above stands — cite
+> **2.010659**. What does not stand is calling the older figure a typo. It is unverifiable
+> rather than wrong: its artifact was superseded and deleted, so nothing on disk can confirm
+> or refute it, and "matches no artifact on disk" is not the same claim as "was mistyped".
+> `optimization_map.md`, `DECISIONS.md`, `blog_results.sh` and `ab_flags.rs` were left
+> unchanged, because they are right.
 > `Rust_MLKit/docs/optimization_map.md` and `metal-native/DECISIONS.md` carry the same
 > typo and need the same correction.
 
@@ -612,6 +644,7 @@ E4B ladder:      4.78 → ~25.1 peak / ~23.9 quiet
 |------|--------|
 | 2026-07-20 | Initial artifact-verified master KB after deep audit (code + JSON/metrics, not docs alone). Replaces earlier narrative “Ten Achievements” drafts that mixed peak/median, QAT causality, and unmet native DFlash gates. |
 | 2026-08-22 | **D4 resolved as a typo.** Champion FINAL EMA sliding BPB was recorded here as 2.015756 and graded DISPUTED. The artifacts read 2.015576 (audit7) and 2.010659 (audit8); 2.015756 matches neither and is a `57`↔`75` transposition of audit7. Citable value is now **2.010659**, grade restored to A. `Rust_MLKit/docs/optimization_map.md` and `metal-native/DECISIONS.md` carry the same typo. |
+| 2026-08-23 | **D4 diagnosis corrected.** The "typo" call was wrong. `2.015756` is the **pre-Audit-7** champion's own FINAL EMA BPB (`out/champion_128m_seed1337`, ~2895 ms/step), corroborated by DECISIONS §M15's independent "2.0158" — which `2.015576` does not round to. Its artifact was superseded and deleted, so the value is *unverifiable*, not mistyped. The citable champion number is still **2.010659**. `optimization_map.md`, `DECISIONS.md`, `blog_results.sh` and `ab_flags.rs` do **not** carry a typo and were left alone. |
 | 2026-08-22 | **New LR-transfer caveat on the Polar champion (§3).** An exact-128M LR spot-check (`out/funnel/polar_exact_lr_spot/`, 5 points, n=1, 500 steps) puts the LR optimum near **0.035**, not the selected **0.05**. *(Superseded 2026-08-23 — see next row. Both figures were artifacts of a 500-step horizon and a truncated grid.)* |
 | 2026-08-23 | **The Polar champion is retired (§3).** A 24-job matched-LR re-tune at the exact `exact_128m_1000` protocol (`research/d7-lr-retune.json`, 15.6 GPU-h) finds **`normuon_adamw` ahead of `muon_polar_adamw` at all five matched learning rates on both seeds**, and at each candidate's best tested LR by **0.016317 BPB** (2-of-2). Both LRs were inherited from `arch02-16m`: Polar's 0.05 costs 0.032507 BPB (1.04× the selection margin), NorMuon's 0.1 costs 0.079048 (2.53×). The funnel's 0.031226 margin measured which inherited LR was less wrong. **Neither candidate may be cited as champion**; `champion-run.json` stays `locked: false`. Grade for any Polar-vs-NorMuon ordering: **RETIRED**. |
 | 2026-08-22 | **Funnel CI method corrected (D1).** `ci95` used the normal quantile at n=2 (correct `t₁ = 12.706`, interval ~6.5× too narrow) and `0.0` at n=1. Post-fix, Polar vs NorMuon at `exact_128m_1000` goes from `overlaps_best = False` to `None`. Legacy values preserved under `ci95_legacy_z`. |

@@ -92,6 +92,6 @@
       "This does not crown normuon_adamw. It retires the recorded selection."
     ]
   },
-  "champion_final_ema_sliding_bpb_provenance": "audit8, last line of champion_artifact/metrics.jsonl. audit7 recorded 2.015576 for the same run under the pre-Audit-8 kernel stack. MASTER_ARCHITECTURAL_KB.md previously carried 2.015756, which is a digit transposition of the audit7 value and matches no artifact; corrected 2026-08-22.",
+  "champion_final_ema_sliding_bpb_provenance": "audit8, last line of champion_artifact/metrics.jsonl. audit7 recorded 2.015576 for the same run under the pre-Audit-8 kernel stack. MASTER_ARCHITECTURAL_KB.md previously carried 2.015756 in this slot, which is the wrong run: 2.015756 is the PRE-Audit-7 champion's value (out/champion_128m_seed1337, ~2895 ms/step), corroborated by DECISIONS.md M15's independent '2.0158' -- a figure 2.015576 does not round to. That artifact was superseded and deleted, so 2.015756 is unverifiable rather than mistyped; a 2026-08-22 note here called it a digit transposition, which is withdrawn 2026-08-23. The citable champion value is unchanged: 2.010659.",
   "tuned_lr_provenance": "Selected at arch02-16m (stage lr_sweep_16m, 100 steps, seed 1337) and never re-tuned at 128M. Measured 3-4x too high for muon_polar_adamw and ~8x too high for normuon_adamw."
 }
