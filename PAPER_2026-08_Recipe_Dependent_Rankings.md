@@ -131,7 +131,7 @@ then ran three targeted isolates that each change exactly one factor. The specif
    (§4.2). Every seed agrees on the sign at every marker except the 12.3M tie.
 2. **Learning-rate horizon is a first-order confound for the crossing token, not only for final
    loss.** Truncating the token budget without holding the cosine horizon fixed moves the late
-   crossing by ~2.2M tokens — 18% of its location — and the effect is measurable in the learning
+   crossing by 2.248M tokens — 18% of its location — and the effect is measurable in the learning
    rate itself, which at the crossing marker is ~47% of its long-horizon value (§4.3). This is the
    ranking-level consequence of the horizon-dependence of optimal LR reported in [31].
 3. **Batch size, not just hardware, changes the early ordering.** At batch size 32 attention
@@ -355,7 +355,7 @@ five seeds. Means are nearest-evaluation; intervals are 95% Student-*t* on five 
 | 8.208M | 5.434 [5.405, 5.462] | 5.299 [5.267, 5.332] | **+0.134** [+0.126, +0.143] |
 | 12.304M | 5.122 [5.104, 5.141] | 5.120 [5.097, 5.144] | +0.002 [−0.009, +0.013] (tie) |
 | 19.677M | **4.743** [4.733, 4.754] | 4.936 [4.924, 4.947] | **−0.193** [−0.201, −0.185] |
-| 49.988M | **4.222** [4.204, 4.240] | 4.449 [4.423, 4.475] | **−0.227** [−0.244, −0.211] |
+| 49.988M | **4.222** [4.204, 4.240] | 4.449 [4.423, 4.476] | **−0.227** [−0.244, −0.211] |
 
 Interpolated mean-curve crossings: **1.049M** (minGRU overtakes attention) and **12.353M**
 (attention overtakes minGRU and stays ahead through 50M). Per-seed late crossings are
@@ -453,7 +453,7 @@ and `eval_iters = 20` from step 0, 40 jobs, 40/40 completed.
 | 5 | hybrid_gdn10_attn2 | s26 | 4.314 [4.292, 4.336] | 4.290–4.331 |
 | 6 | hybrid_mamba10_attn2 | s26 | 4.333 [4.312, 4.353] | 4.313–4.353 |
 | 7 | gdn | s26 | 4.441 [4.419, 4.462] | 4.422–4.461 |
-| 8 | mingru | s22 | 4.449 [4.423, 4.475] | 4.430–4.473 |
+| 8 | mingru | s22 | 4.449 [4.423, 4.476] | 4.430–4.473 |
 | 9 | mamba2 | s26 | 4.596 [4.562, 4.630] | 4.572–4.633 |
 | 10 | mla | s26 | 4.627 [4.604, 4.650] | 4.609–4.647 |
 
@@ -510,7 +510,7 @@ Every row below is n = 5 except the first.
 | GH200, **bs8**, own cosine, 8.192M budget | 25 | not observed (minGRU leads eval 1) | **none through 7.38M** |
 
 Reading down the table: the early crossing is stable at ~1.04–1.05M across every batch-32 recipe
-and absent at batch 8. The late crossing moves by 2.2M tokens on a change to the learning-rate
+and absent at batch 8. The late crossing moves by 2.248M tokens on a change to the learning-rate
 horizon alone, and does not occur at all within the original budget at the original batch size.
 The one quantity that was reported as the finding — the token of the flip — is the one quantity
 that is not stable.
@@ -530,8 +530,8 @@ implemented natively in Rust and Metal with parity fixtures: Muon NS5, Muon NS3,
 Muon, NorMuon, Muown, MONA, AdamW, Cautious AdamW, Lion, Cautious Lion, momentum SGD, Sophia,
 Schedule-Free AdamW, and Prodigy.
 
-Two are recorded as **systems-blocked exclusions** rather than dropped: MiMuon requires exact
-singular-gap routing, which requires a per-matrix SVD; SOAP requires a periodic symmetric
+Two are recorded as **systems-blocked exclusions** rather than dropped: MiMuon (`mimuon_adamw`) requires exact
+singular-gap routing, which requires a per-matrix SVD; SOAP (`soap_adamw`) requires a periodic symmetric
 eigendecomposition. Metal/MPS exposes neither, and an Accelerate fallback would force a host
 synchronization on every refresh, converting the arm into a measurement of the fallback. They are
 not silent substitutions and they are **not evidence about those methods**.
@@ -864,12 +864,18 @@ report its recipe is not measuring a property of the methods it claims to rank. 
   `j > t` entries overflowed, with `.tril()` masking it in the forward pass. Fixed by taking the
   lower triangle before the exponential, clamping log-ratios at max 0, and clamping alpha. All GDN
   rows in this paper are post-fix. This was a kernel defect, not a mixer-quality result.
-- **One unreconciled number.** The 2,000-step champion run's final EMA sliding BPB is recorded as
-  **2.010659** (seed 1337) and 2.040352 (seed 2026) in `research/champion-run.json`, while three
-  other workspace documents record **2.015756** for the same run. The two figures come from
-  different audit passes and we have not reconciled them. Neither is used in any comparison in
-  this paper. `champion-run.json` additionally carries `"locked": false`, so the champion row
-  should be treated as provisional.
+- **A number we reconciled, and the wrong reconciliation we tried first.** The champion run's
+  final EMA sliding BPB is **2.010659** (seed 1337) in `research/champion-run.json`, while other
+  workspace documents recorded **2.015756**. We first concluded that 2.015756 was a `57`↔`75`
+  transposition of the audit-7 artifact's 2.015576, on the reasoning that it matched no artifact
+  on disk. That was wrong, and acting on it would have deleted a real measurement from four
+  documents. There were **three** champion runs, not two: `DECISIONS.md` M15, written 2026-07-19
+  before Audit 7 existed, independently records the champion at **2.0158** — which 2.015756 rounds
+  to and 2.015576 does not. 2.015756 is the pre-Audit-7 run's own value; its artifact was
+  superseded and deleted, which makes the figure *unverifiable*, not mistyped. "Matches no
+  artifact on disk" and "was fabricated" are different claims, and we conflated them. The citable
+  value is unchanged at 2.010659, and no comparison in this paper uses either figure.
+  `champion-run.json` additionally carries `"locked": false` — see §8.3 for why it stays that way.
 
 ### 7.3 Claims withdrawn
 
@@ -910,7 +916,7 @@ Stating these explicitly is part of the result.
 The claims in §7.3 were withdrawn as we discovered them, over months. Preparing this draft we did
 something different and more uncomfortable: a systematic audit of every number in our own suite
 notes, lock files and ledgers against the raw run directories they were derived from. It found
-eight defects. We record them here rather than silently fixing them, because a paper arguing that
+nine defects. We record them here rather than silently fixing them, because a paper arguing that
 measurement protocol determines conclusions has no standing to hide its own protocol failures —
 and because the *kind* of error is instructive. None of these was a bad measurement. Every one was
 a correct measurement that was then mis-recorded, partially reported, or lost.
@@ -971,7 +977,15 @@ a correct measurement that was then mis-recorded, partially reported, or lost.
    reconstruction replaced a matched-horizon comparison with a mismatched one, in the same section
    where it documented horizon mismatch as the defect.
 
-The pattern across all eight is that **the failure mode is bookkeeping, not experimentation.** Runs
+9. **A correction of ours was itself wrong, and a concurrent audit caught it.** We diagnosed the
+   two champion BPB figures in §7.2 as a digit transposition, because 2.015756 matched no artifact
+   on disk. A separate audit of the same repository found `DECISIONS.md` M15 — written before the
+   audit pass we compared against — independently recording 2.0158, which corroborates the figure
+   as a third run's real value rather than a typo. Acting on our diagnosis would have deleted a
+   real measurement from four documents. We had reasoned from absence of evidence, on exactly the
+   axis this paper warns about, while writing the section that warns about it.
+
+The pattern across all nine is that **the failure mode is bookkeeping, not experimentation.** Runs
 were executed carefully, gated, and seeded; they were then summarised into notes, ledgers, tables
 and — in the last case — an entire replacement manuscript, and the summaries drifted from the
 artifacts in ways invisible from the summaries alone. Recommendation 3 in §9 (fingerprint every
