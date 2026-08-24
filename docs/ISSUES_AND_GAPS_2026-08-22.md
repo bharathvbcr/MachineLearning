@@ -163,14 +163,14 @@ grounding. DocGen's *structure* (section flow, revision tasks, lineage critique)
 |---|---|---|
 | B1 | No LaTeX package; figures exist as PDF/SVG but are unembedded | ~1 day |
 | B2 | No author/affiliation/license metadata | minutes |
-| B3 | `nanolab/out/` is gitignored, so the per-job `metrics.jsonl` that §9 lists as required artifacts are not published. Either publish a reduced curve export or restate §9 | ~2 h |
+| B3 | ~~`nanolab/out/` is gitignored, so the per-job `metrics.jsonl` that §9 lists as required artifacts are not published~~ | **CLOSED 2026-08-24.** The ignore rule carries explicit exceptions (`metrics.jsonl`, `config.json`, `queue.json`, `recipe.json`, `ledger.json`, `summary.json` at any depth), published in commit `2d540b7`. 128 run directories behind §4 are tracked — the 120 jobs of suites 22–26 plus the eight `wave0_bs8/` drift runs — along with 165 files under `out/funnel/` covering the whole D7 grid. Every §4 table and the entire §8.3 grid now recompute from the repository alone. Paper §10 said the opposite until 2026-08-24 and has been corrected. |
 
 ### 2.2 Experimental
 
 | # | Gap | Cost |
 |---|---|---|
-| E1 | **The µP arm (§7)** — specified with a pre-registered outcome table, not run | ~40 jobs @ 20M + LR sweep |
-| E2 | **Suite 26 never reran attention/minGRU at 50M** — its top-2 rows are suite 22's sample, capping the combined ranking at Medium-High | 10 jobs @ 50M |
+| E1 | **The µP arm (PAPER §8.4)** — specified with a pre-registered outcome table, not run. Runner is `scripts/gpu_bundle.py`; see `docs/GPU_BUNDLE.md`. | 52 jobs (`e1_proxy` 12 → `e1_sp_rerun` 10 → `e1_mup` 10 → `e1_perlayer_sp` 10 → `e1_embed_lr` 10) |
+| E2 | **Suite 26 never reran attention/minGRU at 50M** — its top and eighth rows are suite 22's sample (`26-matched32_lock.json` marks both `"source": "suite22"`), capping the combined ranking at Medium-High | 10 jobs @ 50M (`e2_matched32_50m`) |
 | E3 | **Optimizer axis is n=2** at `advance_1000` and `exact_128m_1000` | Metal/M5 only, not CUDA |
 | E4 | **Suites 14/15 are single-seed with no preserved replay command**; suite 15's two follow-up scales are n=1 | needs 3070 Ti |
 | E5 | **Hardware is never isolated** — suite 25 isolated batch on GH200 only | needs 3070 Ti |
@@ -200,11 +200,11 @@ the µP arm.
 |---|---|---|
 | D1 | `ci95` computed with the normal quantile, and `0.0` for n=1 | **FIXED 2026-08-22** — see below |
 | D2 | `winner_exact_gate: "pending"` in `research/native-optimizer-funnel.json` while `research/exact-128m-gate-polar.json` records `passed: true` | **CLOSED 2026-08-22** — set to `"passed"` with the gate evidence inlined (`loss_delta` 1.43e-6, `grad_norm_delta` 0.0, 128,367,988 params, 1707 dispatches). Systems gate only; says nothing about the selection. |
-| D3 | `research/champion-run.json` has `"locked": false` | **open, and must stay open.** D7 closed against the recorded candidate: at matched LR the runner-up wins 2-of-2. `lock_reason` now records this. Do **not** lock on `muon_polar_adamw`, and do not re-lock on `normuon_adamw` either — locking either on n=2 evidence would repeat the original error with the sign flipped. A lock needs n>=3 and a bracketed optimum for both. |
+| D3 | `research/champion-run.json` has `"locked": false` | **open, and must stay open.** The 52-job / three-seed D7 grid finds the ordering **crosses over** in learning rate rather than settling: `muon_polar_adamw` leads at lr 0.0035 and 0.005, `normuon_adamw` at the six higher points, and at each candidate's own best cell the paired gap is +0.004097 ± 0.005085 — spanning zero. Do **not** lock on `muon_polar_adamw`, and do **not** lock on `normuon_adamw` either. A lock now needs a **bracketed** optimum for both at a shared protocol; neither is bracketed today (both minima sit in flat basins unresolvable at n=3). `lock_reason` and `lr_transfer_finding` are **generated** by `scripts/d7_analyze.py --write` from the run ledger — an earlier hand-written version of both survived the round that superseded it and asserted the opposite conclusion; `--check` now fails on that drift. |
 | D4 | Champion final EMA BPB recorded as **2.010659** in `champion-run.json` vs **2.015756** in `MASTER_ARCHITECTURAL_KB.md`, `Rust_MLKit/docs/optimization_map.md` and `metal-native/DECISIONS.md` | **RESOLVED 2026-08-22 — it was a typo.** Artifacts read **2.015576** (audit7) and **2.010659** (audit8); `2.015756` matches neither and is a `57`↔`75` transposition of audit7. Citable value **2.010659**. KB corrected and grade restored to A. **Diagnosis corrected 2026-08-23:** `2.015756` is *not* a typo — it is the pre-Audit-7 champion's own value (`out/champion_128m_seed1337`, ~2895 ms/step), corroborated by DECISIONS §M15's independent "2.0158", which `2.015576` does not round to. That artifact was superseded and deleted, so the figure is unverifiable rather than mistyped. `optimization_map.md`, `DECISIONS.md`, `blog_results.sh` and `ab_flags.rs` describe that earlier run correctly and were left unchanged. |
 | D5 | Same-shape CUDA 128M reference still `null` — the matched control behind withdrawal #2 in §6.3 | open |
 | D6 | Suite 25's 8.192M final eval is not logged as `event=eval`, so the last paired marker is 7.377M | open |
-| **D7** | **CLOSED 2026-08-23 — and it closed against the recorded champion.** Both finalists' LRs were tuned at `arch02-16m` and never re-tuned at 128M. A 24-job matched-grid re-tune at the exact `exact_128m_1000` protocol (`research/d7-lr-retune.json`, 15.6 GPU-h, argv byte-identical to the recorded stage) finds **`normuon_adamw` ahead of `muon_polar_adamw` at all five matched LRs on both seeds** (mean gaps 0.0126–0.0163) and at each candidate's best tested LR by **0.016317 BPB**, sign-consistent 2-of-2. Inherited-LR penalties: Polar 0.032507 (1.04× the 0.031226 selection margin), NorMuon 0.079048 (2.53×). The funnel's margin measured which inherited LR was *less wrong*, not which optimizer was better. The 500-step figures that opened D7 (optimum ≈0.035, penalty 1.95×) were artifacts of the wrong horizon and a truncated grid and are withdrawn. **The recorded selection is retired; `normuon_adamw` is not crowned in its place** — n=2 supports a sign, not a magnitude. | **CLOSED** |
+| **D7** | **CLOSED 2026-08-23 — the ordering CROSSES OVER in learning rate.** Both funnel finalists' LRs were tuned at `arch02-16m` and never re-tuned at 128M. A **52-job, three-seed** matched eight-point grid at the exact `exact_128m_1000` protocol (`research/d7-lr-retune.json`, argv byte-identical apart from `--out`) finds `muon_polar_adamw` ahead at lr 0.0035 and 0.005 and `normuon_adamw` ahead at 0.008, 0.0125, 0.018, 0.025, 0.035 and 0.05 — **every row sign-consistent across all three seeds**, 24 paired comparisons with no dissent. The mechanism is offset flat basins (Polar 0.005–0.008, NorMuon 0.008–0.0125), so each wins inside its own. Inherited-LR penalties: Polar 0.046020 ± 0.003175 (**1.47×** the 0.031226 selection margin), NorMuon 0.080400 (n=2, 2.57×). The funnel compared 0.05 against 0.1 — both on the high-LR wall, one side of a crossing it could not see. **The selection is retired, not reversed**: `normuon_adamw` is not crowned, because at each candidate's own best cell the gap is +0.004097 ± 0.005085, which spans zero. **Superseded readings of this row:** an earlier 24-job / two-seed round recorded here read "normuon ahead at all five matched LRs" and a best-cell gap of 0.016317, and a 500-step round before that put the optimum at ≈0.035 with a 1.95× penalty. Both were measured on truncated grids that did not reach below the crossing; both are withdrawn. Paper §8.3 and `research/d7-lr-retune.json` are the current record and this row is derived from them. | **CLOSED** |
 | **D8** | **`out/funnel/polar_exact_lr_spot/ledger.json` had lost three completed jobs.** It recorded lr 0.025 as `"running"` and omitted 0.035, 0.07 and 0.1, though all four finished 2026-07-16. Reconstructed from the run directories. | **CLOSED 2026-08-22** |
 | **D9** | **Suite 18's results table omitted the one cell that showed a rank inversion.** `gpu_opt_bs32` `best_val` = **4.9065** (fastest arm, worst model) was never reported; `gpu_max` at 11.9K tok/s has the best loss at 4.8001. Note corrected; now paper §6.3. | **CLOSED 2026-08-22** |
 | **D10** | **`run128m_20k` is eight resumed segments, undocumented.** 9 `start` / 8 `done`; per-segment `best_val` 3.6279…3.6109 with global min **3.5806**, which beats `run128m_10k`'s 3.621 — so suite 20's ranking inverts depending on which number is read. Token accounting is also wrong: every `done` records 98,304,000 tokens (3000 steps' worth) for a run that reached step 19,990 (expected 655,360,000). Note corrected. | **open — suite 20 supports no horizon claim as run** |
@@ -244,61 +244,118 @@ history rankings were recomputed with the originals preserved under `ci95_legacy
 
 ## Part 3 — Compute plan
 
+**Everything in this part is derived, not typed.** Regenerate it with:
+
+```bash
+python3 scripts/gpu_bundle.py --cost
+```
+
+That reads the committed per-job `metrics.jsonl` of suites 22–26, takes the median
+`tok_s` per (mixer, batch, context), and prices the 64-job matrix against it. E6 notes
+that the trainer discarded elapsed time; it never discarded per-step throughput.
+
 ### 3.1 What actually needs a GPU
 
 Only the CUDA `nanolab` work. E3 is Rust/Metal on the M5 Pro; E4/E5 need the RTX 3070 Ti.
 
-| Item | Jobs | Tokens/job |
-|---|---|---|
-| E1 µP 2×2 (all four cells, see 3.3) | 20 | 20M |
-| E1 proxy-width LR sweep | ~10 short | ≪20M |
-| E1 per-layer-SP arm (§7.3) | 10 | 20M |
-| E1 embedding-LR ablation (§7.3) | 10 | 20M |
-| E2 suite 26 completion | 10 | 50M |
+| suite | jobs | tokens/job | GH200-hours |
+|---|---|---|---|
+| `e1_proxy` (width-256 matrix-LR sweep, per arm) | 12 | 19.99M | 0.42 |
+| `e1_sp_rerun` (SP cells of the 2×2, hardware control) | 10 | 19.99M | 1.06 |
+| `e1_mup` (µP cells) | 10 | 19.99M | 1.06 |
+| `e1_perlayer_sp` | 10 | 19.99M | 1.06 |
+| `e1_embed_lr` | 10 | 19.99M | 1.06 |
+| `e2_matched32_50m` | 10 | 49.99M | 2.65 |
+| `d10_horizon` | 2 | 327.7M / 655.4M | 6.56 |
+| **total** | **64** | | **≈ 13.9** |
 
-**Estimated** ~10–14 H100-equivalent GPU-hours of compute, plus 1–2 h for data prep. This is an
-estimate, not a measurement — see E6. Once the first jobs land, replace it with the real number:
-
-```bash
-python -m nanolab.crossover_replicate timing --out nanolab/out/<suite> --json
-```
+6.98 of those hours are **extrapolated, not measured**: no committed run covers
+context 1024 or width 256, so `--cost` applies labelled factors (×0.7 for ctx1024,
+×3 for the narrow proxy) to a measured rate.
 
 ### 3.2 Instance recommendation
 
-The workload is 50–60 **independent** jobs; `crossover_replicate launch --workers N` already
-parallelises across them. So the figure that matters is **$ per GPU-hour**, and the multi-GPU
-boxes cost the same per unit work while finishing sooner.
+The old version of this section optimised **$/GPU-hour** and recommended the 8× A100
+40 GB. That is wrong for this matrix, and the reason is worth stating because it is a
+scheduling fact rather than a price fact.
 
-| Option | $/GPU/hr | Verdict |
-|---|---|---|
-| **8× A100 40 GB SXM4** — $22.32/hr | **$1.99** | **Recommended.** Cheapest GPU-hour on the list, 40 GB is ample for a 124M model at bs32×512, 124 vCPU / 1800 GiB feeds 8 workers comfortably. ~3–4 h wall-clock, **≈ $70–90 total**. |
-| 1× A100 40 GB SXM4 — $1.99/hr | $1.99 | Same unit cost, ~28 h wall-clock. Only if you can babysit it; idle-billing between sessions is the real risk. **≈ $55–70.** |
-| 1× H100 80 GB PCIe — $3.29/hr | $3.29 | Cheapest H100, but 65% more per unit work than A100 and a 124M model does not exploit H100's bandwidth. |
-| 2× H100 SXM5 — $8.38/hr | $4.19 | Worst value here. |
-| 1× H100 SXM5 — $4.29/hr | $4.29 | Worst value here. |
-| 1× A10 24 GB — $1.29/hr | $1.29 | **Avoid.** Cheapest per hour but slowest, and bs32×512 activations on a 12L/768d model are likely to exceed 24 GB. |
+`d10_horizon`'s 20k job is a single serial run of ≈ 4.4 GH200-hours — **47% of the
+bundle's compute in 2 of its 64 jobs**, and no number of GPUs shortens it. On an
+8-GPU box you rent eight GPUs while one job monopolises one of them, so the cheapest
+box per GPU-hour becomes one of the most expensive per bundle.
 
-### 3.3 The consideration that dominates price
+| instance | $/GPU-hr | full bundle | E1+E2 only |
+|---|---|---|---|
+| 8× A100 40 GB — $15.92/hr | 1.99 | $132–171 / 8.3–10.7 h | **$41–49 / 2.6–3.1 h** |
+| 1× A100 40 GB — $1.99/hr | 1.99 | **$48–63** / 24–32 h | $26–34 / 13–17 h |
+| 8× A100 80 GB — $22.32/hr | 2.79 | $166–217 / 7.4–9.7 h | $53–64 / 2.4–2.9 h |
+| 1× H100 PCIe — $3.29/hr | 3.29 | $57–69 / 17–21 h | $32–38 / 9.6–11.5 h |
+| 4× H100 SXM5 — $16.36/hr | 4.09 | $84–92 / **5.2–5.6 h** | $45–48 / 2.8–2.9 h |
+| 2× H100 SXM5 — $8.38/hr | 4.19 | $64–70 / 7.6–8.3 h | $38–41 / 4.5–4.9 h |
+| 1× H100 SXM5 — $4.29/hr | 4.29 | $61–67 / 14–16 h | $34–37 / 8.0–8.7 h |
+| 1× A10 24 GB — $1.29/hr | 1.29 | $61–91 / 47–70 h | $33–49 / 25–38 h |
+
+Ranges come from an **assumed** throughput ratio against the GH200 (H100 SXM5
+0.95–1.05×, since GH200 carries an H100 die; A100 40 GB 0.45–0.60×). The
+assumption-free form of the same question is the break-even multiple: an H100 SXM5 at
+$4.29/hr must beat **2.16×** an A100 40 GB, per GPU, to cost less for the same work;
+4× H100 needs **2.06×**; 8× A100 80 GB needs **1.40×** over its own 40 GB sibling,
+which it will not deliver on the same silicon generation.
+
+**Run it as two decisions, not one:**
+
+1. **E1 + E2 on 8× A100 40 GB — $41–49, under 3 hours.** 62 jobs, none longer than
+   18 minutes, fully independent: the case the 8-GPU box exists for. This is the
+   work PAPER §8.4's pre-registered readouts depend on, and it is the whole of E1
+   and E2.
+2. **`d10_horizon` separately, or not at all.** On **2× H100 SXM5** the whole bundle
+   is $64–70 in 7.6–8.3 h; alone on **1× A100 40 GB** the pair is ~$25 over a day.
+   Suite 20's horizon claim is already withdrawn in *both* directions (D10), so this
+   pair adds a new measurement rather than settling a live question — and it is the
+   only part that needs an enlarged corpus.
+
+40 GB is ample: weights + gradients + optimizer state is **1.07 GiB** (attention) and
+**1.33 GiB** (minGRU) at the 768-dim target, computed exactly from the parameter
+split. Activations are the rest and are not measurable without a GPU; `--smoke` on
+the rented box is the check. `d10_horizon` runs at context 1024, double every other
+job, and is the memory high-water mark.
+
+### 3.3 The hardware control is now in the matrix
 
 **Changing hardware changes the recipe — which is this paper's own finding.**
 
-The §7.3 design has two of its four cells (standard-parametrization attention and minGRU) already
-run on the GH200. If the µP cells run on an A100 or H100, the 2×2 is confounded by hardware and
-proves nothing — the exact error §4.2 documents, where the same pair differs by ~0.3 nats at
-matched token markers across two GPUs.
+§8.4's 2×2 puts new µP cells against suite 24's SP cells, and suite 24 ran on a
+GH200. On any other box that comparison is confounded by hardware, which PAPER §7.1
+refuses explicitly: the same architecture pair differs by ~0.18–0.3 nats at matched
+token markers across two GPUs.
 
-So on any non-GH200 box, **re-run all four cells there**: +10 jobs at 20M, roughly +1 GPU-hour.
-That is cheap, and it is not optional.
+This section said so, and said the +10 re-run jobs were "not optional." `docs/GPU_BUNDLE.md`
+and `scripts/gpu_bundle.py` said the SP cells "are **not** rerun." **The two documents
+disagreed and the code followed the wrong one.** Closed 2026-08-24: `e1_sp_rerun` is a
+first-class suite in the matrix, on by default, and `--sp-cells suite24` is the
+explicit opt-out for a GH200 launch.
 
-Also keep `compile=False`. It was forced on GH200 aarch64 by an Inductor stall; on x86 it would
-work, and enabling it would be one more recipe change.
+Also keep `compile=False`. It was forced on GH200 aarch64 by an Inductor stall; on x86
+it would work, and enabling it would be one more recipe change.
 
-### 3.4 Wait for the GH200 if you can
+### 3.4 Data preparation is a required, billed step
 
-The out-of-capacity **ARM64 + H100 (GH200) at $2.29/GPU/hr** is the right instance on both axes:
-it is the second-cheapest GPU-hour on the list, *and* it is the box suites 22–26 ran on, so the
-already-completed SP cells stay valid and E2 becomes a true same-hardware completion of suite 26.
-Using it saves the 10 re-run jobs from 3.3 and removes a threat to validity that no amount of
-compute buys back.
+`nanolab/data/` is gitignored, so a fresh box has no tokenized corpus:
 
-If the µP arm is not urgent, poll for GH200 capacity before booking an A100 box.
+```bash
+python -m nanolab.prep_fineweb --config sample-10BT --max_tokens 50000000
+```
+
+E1 and E2 fit in the existing 497.5M-token corpus with room to spare. **`d10_horizon`
+does not**: its 20k arm requests 655.4M tokens, so it would revisit training data at
+1.32 epochs while its 10k partner sits at 0.66 — a second variable moving alongside
+the one the pair exists to isolate. `--preflight` fails closed on this and prints the
+prep command for a larger corpus; `--allow-data-repeat` accepts it instead and records
+`data_epochs` per job so the repeat cannot go unreported.
+
+### 3.5 GH200 capacity is no longer the deciding factor
+
+An earlier version of this section advised waiting for an out-of-capacity GH200,
+because that was the box suites 22–26 ran on and using it would save the SP re-run.
+That saving is 10 jobs ≈ 1.1 GPU-hours ≈ $2–5. It is not worth waiting for. Run the
+control.

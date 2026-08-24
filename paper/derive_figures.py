@@ -683,6 +683,48 @@ def check(f):
     return 0
 
 
+def d7_published_artifacts_in_sync() -> tuple[bool, str]:
+    """Do the D7-derived files on disk still match what the ledger produces?
+
+    ``research/d7-lr-retune.json`` and the ``lr_transfer_finding`` /
+    ``lock_reason`` fields of ``research/champion-run.json`` are both generated
+    by scripts/d7_analyze.py. The champion record's copy was written by hand,
+    outlived the round that superseded it, and ended up asserting the OPPOSITE
+    conclusion from section 8.3 -- in a machine-readable file this manuscript
+    cites. Nothing caught it, because --check only ever compared the manuscript
+    against the runs, never the other published artifacts against them.
+    """
+    src = ROOT / "scripts" / "d7_analyze.py"
+    if not src.exists():
+        return True, "scripts/d7_analyze.py absent"
+    spec = importlib.util.spec_from_file_location("_d7_sync", src)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+        report, _ = mod.build_report()
+    except SystemExit:
+        return True, "D7 ledger absent; nothing to check"
+    except Exception as e:                       # a broken checker must say so
+        return False, f"could not run d7_analyze: {type(e).__name__}: {e}"
+    stale = []
+    want = json.dumps(report, indent=2) + "\n"
+    art = ROOT / "research/d7-lr-retune.json"
+    if not art.exists() or art.read_text(encoding="utf-8") != want:
+        stale.append("research/d7-lr-retune.json")
+    try:
+        if not mod.sync_champion(report, write=False):
+            stale.append("research/champion-run.json (lr_transfer_finding / lock_reason)")
+    except SystemExit as e:
+        return False, str(e)
+    except AttributeError:
+        return False, "d7_analyze has no sync_champion; the champion record is unguarded"
+    if stale:
+        return False, ("drifted from out/funnel/d7_lr_retune_1000/ledger.json: "
+                       + ", ".join(stale)
+                       + " -- regenerate with `python3 scripts/d7_analyze.py --write`")
+    return True, "research/d7-lr-retune.json and research/champion-run.json match the ledger"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -699,7 +741,10 @@ def main():
         print(json.dumps(f, indent=2))
         return 0
     if args.check:
-        return check(f)
+        rc = check(f)
+        ok, why = d7_published_artifacts_in_sync()
+        print(("OK: " if ok else "FAIL: ") + why)
+        return rc or (0 if ok else 1)
     render(f)
     return 0
 

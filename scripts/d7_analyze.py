@@ -234,9 +234,117 @@ def build_report() -> tuple[dict, dict]:
     return report, data
 
 
+CHAMPION = ROOT / "research/champion-run.json"
+
+
+def build_champion_sync(report: dict) -> tuple[dict, str]:
+    """Derive champion-run.json's D7 fields from the same report as the artifact.
+
+    ``research/champion-run.json`` carried a hand-written ``lr_transfer_finding``
+    and ``lock_reason`` describing an earlier, truncated round of this grid. It
+    survived the round that superseded it and ended up asserting the OPPOSITE
+    conclusion from paper section 8.3 -- in a machine-readable file the paper
+    cites. Two documents deriving the same result independently is how they drift;
+    this makes the report the single owner of both.
+
+    Returns (lr_transfer_finding, lock_reason). Never touches ``locked``: whether
+    to lock is a judgement, and D3 says it stays open.
+    """
+    v = report["verdict"]
+    a, b = "muon_polar_adamw", "normuon_adamw"
+    ca, cb = report["candidates"][a], report["candidates"][b]
+    bt = report["best_tested_comparison"]
+    ptd = bt["paired"]
+    sm = report["matched_lr_summary"]
+
+    def _pen(c: dict) -> str:
+        pen = c["inherited_lr_penalty"]
+        if not pen:
+            return "not measured"
+        ci = (f" +/- {pen['ci95_half_width']:.6f}" if pen["ci95_half_width"] is not None
+              else f" (n={pen['n']}, sign test only)")
+        return (f"{pen['mean']:.6f}{ci} = {c['penalty_x_selection_margin']}x "
+                f"the {SELECTION_MARGIN} selection margin")
+
+    finding = {
+        "id": "d7-lr-retune-2026-08-23",
+        "generated_by": "scripts/d7_analyze.py --write (do not edit by hand)",
+        "artifact": "research/d7-lr-retune.json",
+        "supersedes": v["supersedes"] + [
+            "the 24-job / two-seed round of this same grid, which read 'normuon_adamw "
+            "ahead at all five matched LRs' and a best-cell gap of 0.016317. Its grid "
+            "stopped above the crossing, so it saw only NorMuon's side of it."],
+        "protocol": report["provenance"]["protocol"],
+        "jobs": report["provenance"]["jobs"],
+        "seeds_per_cell_max": max(row["n"] for c in (ca, cb) for row in c["cells"].values()),
+        "headline": v["headline"],
+        "matched_lr_result": (
+            f"{len(v['polar_leads_at_lr'])} of {sm['points']} matched cells favour "
+            f"{a} (lr {', '.join(v['polar_leads_at_lr'])}) and "
+            f"{sm['normuon_leads_sign_consistent']} favour {b} "
+            f"(lr {', '.join(v['normuon_leads_at_lr'])}); every cell is "
+            f"sign-consistent across all seeds tested."),
+        "best_tested_result": (
+            f"{a} at lr {bt[a + '_lr']:g} -> {ca['best_tested_mean']:.6f}; "
+            f"{b} at lr {bt[b + '_lr']:g} -> {cb['best_tested_mean']:.6f}; "
+            f"paired gap {ptd['mean']:+.6f}"
+            + (f" +/- {ptd['ci95_half_width']:.6f}" if ptd["ci95_half_width"] is not None else "")
+            + (", separated" if ptd["excludes_zero"] else ", SPANS ZERO -- no separation")),
+        "crossover": {"polar_leads_at_lr": v["polar_leads_at_lr"],
+                      "normuon_leads_at_lr": v["normuon_leads_at_lr"],
+                      "mechanism": v["mechanism"]},
+        "inherited_lr_penalty_bpb": {
+            a: (ca["inherited_lr_penalty"] or {}).get("mean"),
+            b: (cb["inherited_lr_penalty"] or {}).get("mean"),
+        },
+        "penalty_x_selection_margin": {
+            a: ca["penalty_x_selection_margin"], b: cb["penalty_x_selection_margin"]},
+        "penalty_detail": {a: _pen(ca), b: _pen(cb)},
+        "optimum_bracketed": {a: ca["bracket"]["bracketed"], b: cb["bracket"]["bracketed"]},
+        "why_the_funnel_got_it_wrong": v["what_the_funnel_did"],
+        "selection_status": v["selection_status"],
+        "limits": report["limits"],
+    }
+
+    reason = (
+        "Not locked, and the recorded selection is RETIRED rather than reversed. "
+        + v["headline"] + " " + v["what_the_funnel_did"] + " "
+        f"Inherited-LR penalties: {a} {_pen(ca)}; {b} {_pen(cb)}. "
+        f"Do not lock on {a}, and do not lock on {b} either: at each candidate's own "
+        f"best tested cell the paired gap is {ptd['mean']:+.6f}"
+        + (f" +/- {ptd['ci95_half_width']:.6f}" if ptd["ci95_half_width"] is not None else "")
+        + (", which spans zero. " if not ptd["excludes_zero"] else ". ")
+        + "A lock needs a bracketed optimum for both candidates at a shared protocol; "
+        f"bracketed is {a}={ca['bracket']['bracketed']}, {b}={cb['bracket']['bracketed']}. "
+        "Derived by scripts/d7_analyze.py from research/d7-lr-retune.json; do not edit by hand.")
+    return finding, reason
+
+
+def sync_champion(report: dict, write: bool) -> bool:
+    """Write (or check) champion-run.json's D7 fields. True = already in sync."""
+    if not CHAMPION.exists():
+        sys.exit(f"no champion record at {CHAMPION}")
+    rec = json.loads(CHAMPION.read_text(encoding="utf-8"))
+    finding, reason = build_champion_sync(report)
+    in_sync = (rec.get("lr_transfer_finding") == finding
+               and rec.get("lock_reason") == reason)
+    if rec.get("locked") is not False:
+        sys.exit("refusing to touch a champion record whose `locked` is not false "
+                 "(D3: this selection is retired and must stay open)")
+    if write and not in_sync:
+        rec["lr_transfer_finding"] = finding
+        rec["lock_reason"] = reason
+        CHAMPION.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
+        print(f"synced {CHAMPION.relative_to(ROOT)} lr_transfer_finding + lock_reason")
+    return in_sync
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--write", action="store_true", help="regenerate research/d7-lr-retune.json")
+    ap.add_argument("--write", action="store_true",
+                    help="regenerate research/d7-lr-retune.json and sync champion-run.json")
+    ap.add_argument("--check", action="store_true",
+                    help="exit non-zero if either published artifact has drifted from the ledger")
     args = ap.parse_args()
 
     report, data = build_report()
@@ -278,17 +386,40 @@ def main() -> int:
               f"  {'separated' if p['excludes_zero'] else 'SPANS ZERO'}")
         if bt["biased_by_unequal_depth"]:
             lo = bt["lowest_lr_swept"]
+            # `a`/`b` are locals of build_report(); read the names off the payload
+            # instead. This branch previously raised NameError -- a guard that
+            # crashes instead of warning is worse than no guard.
+            depths = ", ".join(f"{k} {v:g}" for k, v in sorted(lo.items()))
             print(f"  WARNING: unequal tuning depth on the low side. Lowest LR swept: "
-                  f"{a} {lo[a]:g}, {b} {lo[b]:g}, and at least one minimum sits at its "
+                  f"{depths}, and at least one minimum sits at its "
                   f"grid's low edge. Comparing best-tested points across grids of "
                   f"different depth is the same error this experiment documents. "
                   f"Report the matched-LR rows, or extend the shallower grid.")
         elif bt["equal_depth_on_the_low_side"]:
             print("  (grids are equally deep on the low side; best-tested comparison is fair)")
 
+    if args.check:
+        stale = []
+        want = json.dumps(report, indent=2) + "\n"
+        if not ARTIFACT.exists() or ARTIFACT.read_text(encoding="utf-8") != want:
+            stale.append(str(ARTIFACT.relative_to(ROOT)))
+        if not sync_champion(report, write=False):
+            stale.append(str(CHAMPION.relative_to(ROOT)) + " (lr_transfer_finding / lock_reason)")
+        if stale:
+            print("\nDRIFT: these published artifacts disagree with the ledger:",
+                  file=sys.stderr)
+            for x in stale:
+                print(f"  {x}", file=sys.stderr)
+            print("  regenerate with `python3 scripts/d7_analyze.py --write`", file=sys.stderr)
+            return 1
+        print("\ncheck: research/d7-lr-retune.json and research/champion-run.json "
+              "both match the ledger")
+        return 0
+
     if args.write:
         ARTIFACT.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print(f"\nwrote {ARTIFACT.relative_to(ROOT)}")
+        sync_champion(report, write=True)
     return 0
 
 

@@ -1159,11 +1159,19 @@ horizon, 20M-token stop, seeds `1337, 42, 100, 2026, 777` — as a 2 × 2:
 
 | | attention | minGRU |
 |---|---|---|
-| **standard parametrization, global LR** | suite 24 (already run) | suite 24 (already run) |
+| **standard parametrization, global LR** | suite 24, **re-measured on the box that runs the µP cells** | same |
 | **µP, per-arm LR swept at a narrow proxy width** | new | new |
 
 with the µP cells parametrized per [12] and the proxy sweep run at a reduced width, transferring
-the tuned LR to the 768-dim target. Depth is held fixed at 12 layers throughout, which sidesteps
+the tuned LR to the 768-dim target.
+
+**The SP row is re-run unless the µP cells run on the GH200 that produced suite 24.** An earlier
+version of this table read "suite 24 (already run)" in both SP cells, which would set new µP
+measurements against measurements from a different GPU — the comparison §7.1 refuses, on a pair
+whose absolute losses differ by ~0.18–0.3 nats at matched token markers across two boxes. The cost
+paragraph below always counted twenty jobs for the 2 × 2, i.e. both rows; the table was the half
+that was wrong. The runner (`scripts/gpu_bundle.py`) now carries the SP cells as a first-class arm
+and requires an explicit flag to drop them. Depth is held fixed at 12 layers throughout, which sidesteps
 the depthwise limitations Depth-µP identifies for stacks whose residual blocks are themselves deep
 [33]. Two secondary arms are worth the marginal cost:
 
@@ -1185,10 +1193,12 @@ rule before running it:
 | µP crossings collapse onto a single token across schedules | The schedule effect is a tuning artifact. §4.3 must be withdrawn and §4.4's batch result re-examined. |
 | The batch-8 arm (suite 25) develops a crossing under µP within 7.4M tokens | The batch effect is a tuning artifact, and suite 14's original 6.6–7.4M window is partially rehabilitated. |
 
-**Cost.** Twenty jobs at 20M tokens for the main 2 × 2, plus a proxy-width LR sweep, plus ten jobs
-for each secondary ablation. On the GH200 configuration used for suites 23–25 this is roughly the
-cost of suite 24 plus suite 25 together — a small fraction of the 50-job suite 22 grid, and the
-highest-value single experiment remaining in this line of work.
+**Cost.** Twenty jobs at 20M tokens for the main 2 × 2, plus a twelve-job proxy-width LR sweep at
+one seed, plus ten jobs for each secondary ablation: **52 jobs**. Priced against the median
+per-step throughput of the committed suite-22–26 run records, that is **≈ 4.7 GH200-hours**, and
+the arm's longest single job is seven minutes. It is a small fraction of the 50-job suite 22 grid
+and the highest-value single experiment remaining in this line of work. The estimate is
+regenerated rather than quoted: `python3 scripts/gpu_bundle.py --cost`.
 
 **Until it is run**, every crossing token in this paper should be read as "the crossing token for
 this architecture pair *at a global 6e-4 Muon learning rate under standard parametrization*," and
@@ -1231,11 +1241,25 @@ These are the rules we now apply, each earned by a specific failure above.
 ## 10. Reproduction and artifacts
 
 **Repository.** <https://github.com/bharathvbcr/MachineLearning> (public). Every path below is
-relative to that repository root, at commit `a83257a` or later. Two directories referenced by
-these instructions are deliberately not committed because they are build outputs with in-repo
-generators: `nanolab/out/` (raw per-job run directories) and
+relative to that repository root, at commit `a83257a` or later.
+
+**The per-job run records of §4 are committed.** `nanolab/out/` is otherwise a build-output tree
+and is gitignored, but the ignore rule carries explicit exceptions for the files a reader needs:
+`metrics.jsonl`, `config.json`, `queue.json`, `recipe.json`, `ledger.json` and `summary.json` are
+tracked at any depth. That publishes the full per-job evaluation curve and the full per-job
+configuration for all **128** run directories behind §4 — the 120 jobs of suites 22–26 plus the
+eight `wave0_bs8/` runs that §4.5 discusses as recipe drift. Checkpoints (`best.pt`), console logs
+and tokenized data shards are *not* tracked; they are regenerable and large. One directory
+referenced below is genuinely absent for the same reason:
 `Rust_MLKit/arch_02_value_resid/metal-native/golden/fwd/` (parity activations; regenerate with
 `python3 metal-native/scripts/export_goldens.py --out metal-native/golden`).
+
+An earlier version of this section stated that `nanolab/out/` was not committed and that
+reproducing the §4 tables therefore required re-running the suites. That was true when it was
+written and stopped being true when the run records were published; the section was not updated.
+We record the drift rather than silently correcting it, because it is the §7.4 failure mode —
+a correct statement that outlived the state it described — occurring in the section whose subject
+is provenance.
 
 All mixer suites run through one entry point:
 
@@ -1296,7 +1320,8 @@ Those paths are:
 | §7.3 withdrawal 2 (the retracted Metal-vs-CUDA BPB comparison) | `experiment-notes/arch-metal/50-*`, `Rust_MLKit/arch_02_value_resid/metal-native/README.md`, `metal-native/DECISIONS.md` |
 | §7.3 withdrawal 3 (the retracted ~238k/~240k tok/s figures and their re-baseline) | withdrawn values in `experiment-notes/arch-metal/52-context-crossover-metal.md`; honest re-baseline in `…/53-…`, §"mixer honesty" |
 | §7.3 withdrawal 5 (62–100% of ~273 GB/s; ~77% dispatch overhead) | `Rust_MLKit/gemma-metal/bench/results/kernel_roofline_finding.json`, `Rust_MLKit/gemma-metal/docs/bottleneck.md` |
-| §8 LR-transfer evidence (new; see §8.2) | `research/champion-run.json` → `lr_transfer_finding`; raw runs in `out/funnel/polar_exact_lr_spot/` (not committed — `out/` is a build output; `ledger.json` in that directory carries the reconciled record) |
+| §8 LR-transfer evidence (see §8.2) | `research/champion-run.json` → `lr_transfer_finding`; raw runs and the reconciled `ledger.json` in `out/funnel/polar_exact_lr_spot/` (committed, 5 files — the ledger plus the four D8 jobs) |
+| §8.3 the 52-job LR re-tune | `research/d7-lr-retune.json`, regenerated by `scripts/d7_analyze.py --write` from `out/funnel/d7_lr_retune_1000/ledger.json`; that ledger and all 52 per-job `metrics.jsonl` are committed, so the grid, the per-seed values and the drift checks recompute from this repository alone |
 
 **Two scope caveats on the re-baselined throughput figures.** The 144,367 / 66,382 / 33,321 tok/s
 values in §7.3 are Metal measurements at sequence length 256 on 0.78M–1.05M-parameter models, over
@@ -1308,9 +1333,10 @@ backend or sequence length and must not be placed in one table.
 carry the crossing points, the 19.677M gap, and the 50M ranking board (`arm`, `mean`, `lo`, `hi`).
 They do **not** carry the per-marker tables of §4.2–§4.4, their confidence intervals, or the
 per-seed ranges shown in the §4.5 board. Those are recomputed from the per-job `metrics.jsonl`
-under `nanolab/out/`, which is not committed (see the note on build outputs above, and gap B3 in
-`docs/ISSUES_AND_GAPS_2026-08-22.md`). Reproducing the §4 tables therefore requires re-running the
-suites or obtaining the run directories; reproducing the crossings and the 50M board does not.
+under `nanolab/out/`, which is committed (see the note above). **Every table in §4 is therefore
+reproducible from this repository alone**, without re-running a job and without obtaining the run
+directories from us. Gap B3 in `docs/ISSUES_AND_GAPS_2026-08-22.md`, which recorded the opposite,
+is closed.
 
 Two reproduction caveats, stated rather than buried:
 
