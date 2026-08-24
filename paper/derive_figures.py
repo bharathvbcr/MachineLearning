@@ -47,6 +47,12 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "nanolab" / "out"
 MANUSCRIPT = ROOT / "PAPER_2026-08_Recipe_Dependent_Rankings.md"
 
+# How far apart the ten board arms' horizons may sit before the board stops
+# being a ranking "at 50M tokens". The two eval cadences in crossover50m differ
+# by 1.6%; the stale-artifact bug that hid an arm at 40.16M was a 20% gap. Any
+# spread that large is a measurement difference, not a rounding detail.
+HORIZON_SPREAD_LIMIT_PCT = 5.0
+
 sys.path.insert(0, str(ROOT))
 # The one 95% multiplier in this repository, table and fallback included.  This
 # script used to carry its own 1.96 for the matched-batch board, which is the
@@ -194,12 +200,27 @@ def mixer_board():
         ({"arm": name,
           "final": a["mean"][-1],
           "ci": [a["lo"][-1], a["hi"][-1]],
-          "n": a["n"]}
+          "n": a["n"],
+          # Each arm's own last evaluated token count. Carried per row because
+          # this board once listed an arm measured at 40.16M beside nine at
+          # 49.99M and read as a single-horizon ranking: the seeds had run on
+          # two eval grids, and the aligner that built summary.json took their
+          # exact intersection. A board that does not carry its horizon cannot
+          # show you that.
+          "horizon": a["tokens"][-1]}
          for name, a in d["arms"].items()),
         key=lambda r: r["final"],
     )
     tied = rows[1]["ci"][0] <= rows[0]["ci"][1] if len(rows) > 1 else False
-    return {"rows": rows, "top_two_overlap": tied}
+    horizons = [r["horizon"] for r in rows]
+    lo, hi = min(horizons), max(horizons)
+    return {
+        "rows": rows,
+        "top_two_overlap": tied,
+        "horizon_min": lo,
+        "horizon_max": hi,
+        "horizon_spread_pct": 100.0 * (hi - lo) / hi if hi else 0.0,
+    }
 
 
 def matched_batch_board():
@@ -280,6 +301,13 @@ def optimizer_funnel():
         "bpb128_mona": dict(at128).get("mona_adamw"),
         "champion": (d.get("champion") or {}).get("candidate"),
         "champion_bpb": dict(champ).get("muon_polar_adamw"),
+        # The stage is named `exact_128m`, where "exact" is the bit-exactness
+        # resume gate, not the parameter count -- which is 128.37M, not 128M.
+        # §6 stated it as "an exact 128M-parameter model" until this was read
+        # off the gate artifact instead of off the stage name.
+        "exact_128m_params": ((d.get("champion") or {})
+                              .get("winner_exact_gate_evidence") or {})
+                             .get("parameter_count"),
         "ci_correction": any("Student-t" in json.dumps(c)
                              for c in (d.get("corrections") or [])),
     }
@@ -333,8 +361,15 @@ def render(f):
     print("MIXER BOARD — ten arms at 50M tokens")
     print("=" * 72)
     for r in b["rows"]:
-        print(f"  {r['arm']:<24}{r['final']:7.3f}  [{r['ci'][0]:.3f}, {r['ci'][1]:.3f}]")
+        print(f"  {r['arm']:<24}{r['final']:7.3f}  [{r['ci'][0]:.3f}, {r['ci'][1]:.3f}]"
+              f"   @ {r['horizon']/1e6:.2f}M")
     print(f"  top two intervals overlap: {b['top_two_overlap']}")
+    print(f"  horizons: {b['horizon_min']/1e6:.2f}M-{b['horizon_max']/1e6:.2f}M "
+          f"({b['horizon_spread_pct']:.1f}% spread)")
+    if b["horizon_spread_pct"] > HORIZON_SPREAD_LIMIT_PCT:
+        print(f"  !! WARNING: arms differ by more than "
+              f"{HORIZON_SPREAD_LIMIT_PCT}% in horizon; this is not a "
+              f"single-horizon ranking and must not be reported as one")
 
     mb = f["matched_batch_board"]
     if mb:
@@ -416,6 +451,14 @@ def expected_figures(f):
         want.append((f"{row['ci'][0]:.3f}", f"board rank {i}: CI low"))
         want.append((f"{row['ci'][1]:.3f}", f"board rank {i}: CI high"))
 
+    # The board spans two eval cadences. Both ends and the spread are stated in
+    # §5 so the table cannot be read as a single-horizon ranking again.
+    want += [
+        (f"{b['horizon_min']/1e6:.2f}M", "board: shortest arm horizon"),
+        (f"{b['horizon_max']/1e6:.2f}M", "board: longest arm horizon"),
+        (f"{b['horizon_spread_pct']:.1f}", "board: horizon spread, percent"),
+    ]
+
     if mb and mb["rows"]:
         r = mb["rows"][0]
         want.append((f"{r['final']:.3f}", "matched batch-32: leader mean"))
@@ -432,6 +475,10 @@ def expected_figures(f):
         ]
         want += [(name, f"funnel: blocked candidate {name}")
                  for name in o["blocked"]]
+        if o.get("exact_128m_params"):
+            p = o["exact_128m_params"]
+            want.append((f"{p:,}", "funnel: exact_128m parameter count"))
+            want.append((f"{p/1e6:.2f}M", "funnel: exact_128m params, millions"))
 
     # De-duplicate while preserving order; several figures repeat by design
     # (the headline finals are also board rows 1 and 7).
@@ -462,6 +509,11 @@ STATED_NOT_DERIVED = {
     "4.232": "pre-loss figure §5 corrects; appears in no surviving run",
     "4.210": "pre-loss figure §5 corrects; appears in no surviving run",
     "4.254": "pre-loss figure §5 corrects; appears in no surviving run",
+    "4.759": "stale Mamba-2 mean from the pre-regeneration summary.json, §5",
+    "4.680": "stale Mamba-2 CI bound from the pre-regeneration summary.json, §5",
+    "4.837": "stale Mamba-2 CI bound from the pre-regeneration summary.json, §5",
+    "40.16M": "horizon the stale Mamba-2 figure was actually measured at, §5",
+    "0.37M": "128.37M minus the 128M an earlier draft claimed, §6",
 }
 
 _FIGURE_RE = re.compile(r"(?<![\w.])\d+\.\d+M?(?![\w])")

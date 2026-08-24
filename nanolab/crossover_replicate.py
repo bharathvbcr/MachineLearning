@@ -63,8 +63,14 @@ EVAL_EVERY_TOKENS = SUITE14_EVAL_TOKENS
 # Original suite-14 checkpoints, in millions of tokens.
 SUITE14_MARKERS_M = (0.8, 4.1, 6.6, 7.4, 8.2)
 
-# Student-t two-sided 95% critical values (df = n-1). n>=7 falls back to 1.96.
-_T_CRIT_95 = {2: 12.706, 3: 4.303, 4: 3.182, 5: 2.776, 6: 2.571}
+# Student-t multipliers come from native_funnel, which is the one table in this
+# package: tabulated to df=30 at six decimals and covered by its own tests.
+# This module used to keep a second copy keyed by n instead of df, rounded to
+# three decimals, and falling back to the normal quantile from n>=7 -- so an
+# eight-seed arm would silently have been given 1.96 where t_7 = 2.365 applies,
+# a 21% understatement, and every interval it did compute sat ~1e-5 off the
+# canonical value.
+from .native_funnel import _t_critical_95
 
 DEFAULT_OUT = Path("nanolab/out/crossover50m")
 QUEUE_NAME = "queue.json"
@@ -316,8 +322,7 @@ def mean_ci(xs: list[float]) -> tuple[float, float, float]:
         return mu, mu, mu
     sd = statistics.stdev(xs)
     sem = sd / math.sqrt(n)
-    t = _T_CRIT_95.get(n, 1.96)
-    half = t * sem
+    half = _t_critical_95(n - 1) * sem
     return mu, mu - half, mu + half
 
 

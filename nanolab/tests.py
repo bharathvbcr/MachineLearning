@@ -30,7 +30,7 @@ from .optim import (
 )
 from .schedules import apply_lr, make_schedule
 from .optimizer_funnel import CANDIDATES
-from .crossover_replicate import load_run_timing, timing_summary
+from .crossover_replicate import _collect, load_run_timing, timing_summary
 from .native_funnel import (
     _mean_ci95, _rank_candidates, _read_result, _t_critical_95, advance,
     champion_argv, unlock_from_gate, write_champion,
@@ -678,6 +678,46 @@ def native_funnel_ci95_uses_student_t_not_the_normal_quantile():
     assert abs(_t_critical_95(4) - 2.776445) < 1e-6
     # Past the tabulated range the normal quantile is the documented fallback.
     assert abs(_t_critical_95(500) - 1.959964) < 1e-6
+
+
+@test
+def crossover50m_summary_is_not_stale_against_its_runs():
+    # summary.json is an intermediate: the manuscript's ten-arm board is built
+    # from it, not from the runs.  It went stale once and nothing noticed.  An
+    # older aligner took the *exact intersection* of seed token-grids; three of
+    # mamba2's five seeds ran a 49.17M eval cadence and two ran 49.99M, so the
+    # intersection collapsed to three points and the arm's published "50M"
+    # figure was measured at 40.16M -- 80% of the horizon of the other nine.
+    # `_align_at_or_after` fixed the aligner, but the committed artifact was
+    # never regenerated, so the paper kept quoting the stale file.
+    #
+    # This asserts the committed summary is what the current aligner produces
+    # from the committed runs.  Regenerate summary.json when this fails.
+    root = Path(__file__).resolve().parents[1]
+    out = root / "nanolab" / "out" / "crossover50m"
+    stored = json.loads((out / "summary.json").read_text())
+    fresh = _collect(out)
+
+    assert set(stored["arms"]) == set(fresh["arms"]), "arm set differs"
+    for name, want in fresh["arms"].items():
+        got = stored["arms"][name]
+        assert got["n"] == want["n"], f"{name}: n {got['n']} != {want['n']}"
+        assert len(got["tokens"]) == len(want["tokens"]), (
+            f"{name}: {len(got['tokens'])} grid points stored, "
+            f"{len(want['tokens'])} derived from the runs -- summary.json is stale")
+        for i, (a, b) in enumerate(zip(got["tokens"], want["tokens"])):
+            assert abs(a - b) < 1.0, f"{name}[{i}]: token grid drift {a} != {b}"
+        for key in ("mean", "lo", "hi"):
+            for i, (a, b) in enumerate(zip(got[key], want[key])):
+                assert abs(a - b) < 1e-6, f"{name}[{i}]: {key} {a} != {b}"
+
+    # And the board must stay close to a single horizon; the stale artifact put
+    # one arm 20% short of the rest while the table read "at 50M tokens".
+    horizons = [a["tokens"][-1] for a in stored["arms"].values()]
+    spread = (max(horizons) - min(horizons)) / max(horizons)
+    assert spread < 0.05, (
+        f"board arms span {spread:.1%} of horizon; that is a measurement "
+        f"difference, not a ranking at one token count")
 
 
 @test
