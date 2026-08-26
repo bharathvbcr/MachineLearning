@@ -6,11 +6,11 @@
   "tuned_lr": 0.05,
   "selection_mean_validation_bpb": 2.1699185,
   "tokens": 8192000,
-  "champion_artifact": "/Users/bharath/Code/parameter_golf/out/champion_128m_seed1337_audit8",
+  "champion_artifact": "/Users/bharath/Code/research/MLSystemsLab/out/champion_128m_seed1337_audit8",
   "champion_final_ema_sliding_bpb": 2.010659,
-  "champion_seed2_artifact": "/Users/bharath/Code/parameter_golf/out/champion_128m_seed2026_audit8",
+  "champion_seed2_artifact": "/Users/bharath/Code/research/MLSystemsLab/out/champion_128m_seed2026_audit8",
   "champion_seed2_final_ema_sliding_bpb": 2.040352,
-  "long20k_artifact": "/Users/bharath/Code/parameter_golf/out/long20k_128m_audit8",
+  "long20k_artifact": "/Users/bharath/Code/research/MLSystemsLab/out/long20k_128m_audit8",
   "long20k_final_ema_sliding_bpb": 1.8155,
   "win_env_note": "Audit 8 WIN measured with CAST_ONCE+FA_FAST+FA_BF16+FA_FWD_FAST. After Audit 9A these are code defaults; GLUE_ROWBLOCK removed from WIN (A/B noise). Bare train --preset arch02-128m should match without env archaeology.",
   "required_gates": [
@@ -24,12 +24,12 @@
     "no silent fallback"
   ],
   "preflight_command": [
-    "/Users/bharath/Code/parameter_golf/Rust_MLKit/arch_02_value_resid/metal-native/target/release/exact_gate",
+    "/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/arch_02_value_resid/metal-native/target/release/exact_gate",
     "--optimizer",
     "muon_polar_adamw"
   ],
   "command_argv": [
-    "/Users/bharath/Code/parameter_golf/Rust_MLKit/arch_02_value_resid/metal-native/target/release/train",
+    "/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/arch_02_value_resid/metal-native/target/release/train",
     "--preset",
     "arch02-128m",
     "--optimizer",
@@ -53,17 +53,17 @@
     "--ema-decay",
     "0.997",
     "--research-manifest",
-    "/Users/bharath/Code/parameter_golf/research/optimizer-study.json",
+    "/Users/bharath/Code/research/MLSystemsLab/research/optimizer-study.json",
     "--data-dir",
-    "/Users/bharath/Code/parameter_golf/parameter-golf/data/datasets/fineweb10B_sp1024",
+    "/Users/bharath/Code/research/MLSystemsLab/parameter-golf/data/datasets/fineweb10B_sp1024",
     "--token-bytes",
-    "/Users/bharath/Code/parameter_golf/Rust_MLKit/arch_02_value_resid/burn-port/token_bytes.json",
+    "/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/arch_02_value_resid/burn-port/token_bytes.json",
     "--out",
-    "/Users/bharath/Code/parameter_golf/out/champion_128m_seed1337_audit8",
+    "/Users/bharath/Code/research/MLSystemsLab/out/champion_128m_seed1337_audit8",
     "--matrix-lr",
     "0.05"
   ],
-  "winner_exact_gate_artifact": "/Users/bharath/Code/parameter_golf/research/exact-128m-gate-polar.json",
+  "winner_exact_gate_artifact": "/Users/bharath/Code/research/MLSystemsLab/research/exact-128m-gate-polar.json",
   "lr_transfer_finding": {
     "id": "d7-lr-retune-2026-08-23",
     "generated_by": "scripts/d7_analyze.py --write (do not edit by hand)",

@@ -476,7 +476,7 @@ truth: `docs/optimization_map.md` Audit 9.
 Funnel machinery (kept for reruns):
 
 ```bash
-cd /Users/bharath/Code/parameter_golf
+cd /Users/bharath/Code/research/MLSystemsLab
 python3 -m nanolab.native_funnel --status
 python3 -m nanolab.native_funnel --dry-run-next
 python3 -m nanolab.native_funnel --run-next   # repeat until stage complete

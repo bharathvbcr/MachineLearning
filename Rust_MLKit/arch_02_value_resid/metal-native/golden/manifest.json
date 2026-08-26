@@ -45,7 +45,7 @@
     "5. Run 3 full optimizer steps (tok AdamW \u2192 scalar AdamW \u2192 Muon) on batches 0,1,2.",
     "6. Save Muon momentum buffers + AdamW moments after step 3."
   ],
-  "reference": "/Users/bharath/Code/parameter_golf/Rust_MLKit/arch_02_value_resid/train_gpt_sprint_native.py",
+  "reference": "/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/arch_02_value_resid/train_gpt_sprint_native.py",
   "seed": 1337,
   "tensors": {
     "fwd/final_norm": {

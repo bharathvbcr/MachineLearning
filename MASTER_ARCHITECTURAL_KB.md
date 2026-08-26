@@ -656,20 +656,20 @@ E4B ladder:      4.78 → ~25.1 peak / ~23.9 quiet
 ## Appendix — key absolute paths
 
 ```
-/Users/bharath/Code/parameter_golf/Rust_MLKit/reference/ablation_results/champion_arch_ladder.json
-/Users/bharath/Code/parameter_golf/research/champion-run.json
-/Users/bharath/Code/parameter_golf/research/exact-128m-gate-polar.json
-/Users/bharath/Code/parameter_golf/out/champion_128m_seed1337_audit8/metrics.jsonl
-/Users/bharath/Code/parameter_golf/out/champion_128m_seed1337_audit7/metrics.jsonl
-/Users/bharath/Code/parameter_golf/out/funnel/polar_exact_lr_spot/ledger.json
-/Users/bharath/Code/parameter_golf/Rust_MLKit/arch_02_value_resid/metal-native/out/sota_f32_clipsoft_seed1337_100k_fa_tiled_softsplit_wsd/metrics.jsonl
-/Users/bharath/Code/parameter_golf/Rust_MLKit/arch_02_value_resid/metal-native/src/optim.rs
-/Users/bharath/Code/parameter_golf/nanolab/out/gpu_sweep_mixer.json
-/Users/bharath/Code/parameter_golf/nanolab/out/ab_gdn/metrics.jsonl
-/Users/bharath/Code/parameter_golf/Rust_MLKit/gemma-metal/bench/results/hazard_ab_e4b_20260719T065759Z.json
-/Users/bharath/Code/parameter_golf/Rust_MLKit/gemma-metal/bench/results/run_20260713_152543_dflash_31b_mlx.json
-/Users/bharath/Code/parameter_golf/Rust_MLKit/gemma-metal/bench/results/mlx032_nax_ab_31b.json
-/Users/bharath/Code/parameter_golf/Rust_MLKit/gemma-metal/bench/results/latest_dflash_parity_gates.json
-/Users/bharath/Code/parameter_golf/Rust_MLKit/gemma-metal/docs/architecture.md
-/Users/bharath/Code/parameter_golf/MASTER_ARCHITECTURAL_KB.md  (this file)
+/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/reference/ablation_results/champion_arch_ladder.json
+/Users/bharath/Code/research/MLSystemsLab/research/champion-run.json
+/Users/bharath/Code/research/MLSystemsLab/research/exact-128m-gate-polar.json
+/Users/bharath/Code/research/MLSystemsLab/out/champion_128m_seed1337_audit8/metrics.jsonl
+/Users/bharath/Code/research/MLSystemsLab/out/champion_128m_seed1337_audit7/metrics.jsonl
+/Users/bharath/Code/research/MLSystemsLab/out/funnel/polar_exact_lr_spot/ledger.json
+/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/arch_02_value_resid/metal-native/out/sota_f32_clipsoft_seed1337_100k_fa_tiled_softsplit_wsd/metrics.jsonl
+/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/arch_02_value_resid/metal-native/src/optim.rs
+/Users/bharath/Code/research/MLSystemsLab/nanolab/out/gpu_sweep_mixer.json
+/Users/bharath/Code/research/MLSystemsLab/nanolab/out/ab_gdn/metrics.jsonl
+/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/gemma-metal/bench/results/hazard_ab_e4b_20260719T065759Z.json
+/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/gemma-metal/bench/results/run_20260713_152543_dflash_31b_mlx.json
+/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/gemma-metal/bench/results/mlx032_nax_ab_31b.json
+/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/gemma-metal/bench/results/latest_dflash_parity_gates.json
+/Users/bharath/Code/research/MLSystemsLab/Rust_MLKit/gemma-metal/docs/architecture.md
+/Users/bharath/Code/research/MLSystemsLab/MASTER_ARCHITECTURAL_KB.md  (this file)
 ```
