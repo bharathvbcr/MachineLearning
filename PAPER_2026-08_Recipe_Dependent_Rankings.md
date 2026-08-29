@@ -2,7 +2,7 @@
 
 **Bharath Chandra Vaddaram** <bharath.vbcr@gmail.com> · independent researcher
 
-`parameter_golf` / `nanolab` · Draft 2026-08-24
+`parameter_golf` / `nanolab` · Draft 2026-08-24, revised 2026-08-29
 
 **Code and artifacts:** <https://github.com/bharathvbcr/MachineLearning>
 **License:** text CC BY 4.0; code and data artifacts MIT.
@@ -44,7 +44,9 @@ originally computed for that funnel: with the correct two-seed Student-*t* multi
 champion-selection intervals **overlap**, and the selection rests on a sign-consistent 2-of-2
 ordering rather than on separated intervals.
 
-Auditing the rest of our own record turns up the same structure on six further axes (§6).
+Auditing the rest of our own record, and then extending it, turns up the same structure on nine
+further axes (§6) — including one where a single metric yields a decisive win for either arm, and
+a tie, depending only on task difficulty and training budget.
 Holding the architectures, optimizers and data fixed, an ordering changes places under a change
 of: token budget — attention is **fourth of five** at 2.05M tokens and **first** at 8.19M on a
 byte-identical configuration; evaluation metric — MLA is last on quality and first on throughput
@@ -515,6 +517,32 @@ The matched conclusions are narrower than the drifted board suggested:
 Confidence is **High** for the eight rerun arms and **Medium-High** for the combined ranking,
 because the attention and minGRU cells are suite 22's sample rather than a fresh 50M draw.
 
+> **Update (2026-08-29): E2 is run, and the cap is lifted to High.** The two imported cells were
+> re-measured on the GH200 at batch 32 / 50M, `e2_matched32_50m`, five seeds, read at the same
+> **49,987,584**-token marker as every row above — so this is now a matched-horizon,
+> single-hardware board with no imported cells:
+>
+> | arm | as tabled (suite 22) | re-measured (E2, GH200) | n |
+> |---|---|---|---|
+> | `attention` | 4.222 [4.204, 4.240] | **4.2213** [4.2022, 4.2403] | 5 |
+> | `mingru` | 4.449 [4.423, 4.476] | **4.4491** [4.4228, 4.4755] | 5 |
+>
+> The re-measurement reproduces the imported values to within 0.001 nats on both arms. The
+> cross-suite import was, in the event, sound — but it is now measured rather than assumed, which
+> is the whole of the difference. Paired, minGRU is +0.2279 [+0.2119, +0.2438] behind attention on
+> 5 of 5 seeds. **Row 1 vs row 2 is unchanged: attention and `hybrid_mingru10_attn2` remain
+> statistically indistinguishable**, and E2 does not speak to that pair, because it runs neither
+> hybrid.
+>
+> **The tie has since been probed on three further axes, and it survives one, is untested on a
+> second, and dissolves confusingly on the third.** Sequence length: at `block_size` 2048 the two
+> arms sit at 4.2004 [4.1628, 4.2379] and 4.2022 [4.1681, 4.2362] — still tied (§6.7). Recurrent:
+> attention ratio: a five-arm within-suite sweep is in flight at the time of writing. Metric: on
+> in-context recall the pair separates in *either* direction depending on task difficulty and
+> training budget, and ties again once both arms are adequately trained (§6.8). We therefore
+> report the §4.5 tie as robust to sequence length and to the choice of held-out CE horizon, and
+> **explicitly not** as a claim about in-context recall, where it is not a stable quantity.
+
 ### 4.6 Summary: what moved the crossing
 
 Every row below is n = 5 except the first.
@@ -680,16 +708,23 @@ steps — a shortlist of two would have discarded it at stage 1 had the LR scree
 §4 and §5 each show one axis on which a ranking moves with the measurement recipe. If those were
 the only two, the honest reading would be that we found two awkward special cases. They are not.
 Assembling the rest of our own record — suites that predate this paper, and a second hardware
-backend — turns up the same structure on six further axes. We set the catalogue out here because a
+backend — turns up the same structure on nine further axes. We set the catalogue out here because a
 reader is entitled to ask how often this happens before accepting §8's recommendations, and
 because several of these results were sitting unreported in our own artifacts until we audited
 them for this draft.
 
-The evidence in this section is **weaker than in §4**, and uniformly so: most of it is n = 1 at
-seed 1337 on a single 8 GB laptop GPU, with no confidence intervals anywhere. We label each entry
-accordingly and we draw no quantitative conclusion from any of them. The claim this section
-supports is qualitative and, we think, the more important one: *rank reversal under a change of
-measurement recipe is the common case, not a curiosity of the attention/minGRU pair.*
+The evidence in this section is **not of uniform strength, and we split it explicitly.** Entries
+6.1–6.6 are the archival ones: mostly n = 1 at seed 1337 on a single 8 GB laptop GPU, with no
+confidence intervals anywhere. We label each accordingly and draw no quantitative conclusion from
+any of them; they are qualitative support. Entries **6.7–6.9 are not archival**. They were run on
+the GH200 for this paper at n = 5 (6.7, 6.9) and n = 15 per cell (6.8), single-tenant, with
+confidence intervals throughout, and 6.8 and 6.9 carry pre-registered readouts written before the
+runs. Where those entries make a quantitative claim, it is meant to be load-bearing.
+
+The claim this section supports is, either way, the same one: *rank reversal under a change of
+measurement recipe is the common case, not a curiosity of the attention/minGRU pair.* §6.7 is
+included precisely because it is a negative result — the board does **not** move with sequence
+length — and a catalogue containing only the axes that moved would be its own selection effect.
 
 ### 6.1 Token budget alone reorders a five-arm board
 
@@ -804,8 +839,9 @@ in the training horizon:
 |---|---|---|---|
 | 3k steps | 2.0222 | **1.9944** | CUDA |
 | 20k, no warmdown | **1.9178** | 1.9944 | Metal |
-| 20k + warmdown, seed 1337 | **1.8969** | 1.9944 | Metal |
-| 20k + warmdown, seed 42 | **1.8876** | ~1.9860 | Metal |
+| 20k + warmdown, seed 1337, golden init | **1.8969** | 1.9944 | Metal |
+| 20k + warmdown, seed 42, golden init | **1.8925** | ~1.9860 | Metal |
+| 20k + warmdown, seed 42, seeded init | **1.8876** | ~1.9860 | Metal |
 | 100k WSD | **1.8828** | — | — |
 
 The backends swap places somewhere between 3k and 20k steps. This comparison is confounded in
@@ -821,14 +857,164 @@ the kernel library available on the device.
 
 Most striking, the Metal track independently reproduces §4's headline shape. At 3k steps with
 matched seeded initialization, minGRU leads attention 2.085016 to 2.123010 (and 2.076374 on a
-second seed); at 20k steps attention leads 1.89688 to 1.993295. Bias early, capacity late — the
-same direction as §4, on a different backend, precision, kernel stack and data pipeline. We
-report this as suggestive rather than as a replication, because the 20k attention arm uses
-`--golden-init` while the minGRU arm is seeded (the golden banks contain no `mingru_*` tensors),
-so the crossing itself is confounded with initialization. One seeded attention run at 20k would
-close that gap, and it is the cheapest experiment named anywhere in this paper.
+second seed); at 20k steps attention leads 1.887607 to 1.993295, again with both arms seeded.
+Bias early, capacity late — the same direction as §4, on a different backend, precision, kernel
+stack and data pipeline.
 
-### 6.7 What this catalogue is and is not
+The 20k half of that comparison needs one note. The golden initialization banks contain no
+`mingru_*` tensors, so the minGRU arm has to be seeded, and for a time we compared it against
+the `--golden-init` attention arm (1.89688) and withheld the replication claim as confounded
+with initialization. The matching seeded attention arm turned out to already exist in the run
+archive — `sota_f32_clipsoft_seed42_20k_fa_tiled_softfix_warmdown_reseed`, FINAL EMA BPB
+**1.887607**, on the same 20k FA_TILED / Soft-split / `--warmdown 3500` recipe — logged eleven
+days before the mixer comparison that needed it, as a seed check on the Soft ladder. Golden
+arms are identifiable from the logs alone: the banks are seed-agnostic, so the seed-1337 and
+seed-42 golden runs share `bank_qo = 22.612141133495648` and every other step-0 field exactly,
+while seeded arms carry seed-dependent weight statistics.
+
+That also prices both nuisance effects on their own terms. Initialization is worth 0.0049 BPB at
+fixed seed (golden 1.892465 versus seeded 1.887607, both seed 42). Backend nondeterminism is
+worth 0.0044 BPB: the two golden arms are bit-identical at step 0 in every logged field — under
+`METAL_NATIVE_DATA_SEED=0` and seed-agnostic banks the `--seed` flag changes nothing about where
+they start — and they still land 1.896880 versus 1.892465 apart after 20k steps of
+non-deterministic GPU reduction order. Against those, the minGRU-to-attention gap is 0.1057 BPB,
+roughly 22× either nuisance, and the initialization effect points the wrong way: seeding *helps*
+attention, so the confound was suppressing the crossing rather than manufacturing it.
+
+Two caveats keep this short of a clean replication. The 20k seeded pair is cross-seed (attention
+at seed 42, minGRU at seed 1337), bounded by the 0.0044 BPB figure just measured. And the arms
+are not parameter-matched, at 0.780M for attention against 0.977M for minGRU. The parameter gap
+works against minGRU at 20k, so it cannot explain away the crossing — but it does weaken
+minGRU's 3k lead, which leaves the early half of the shape resting on the softer evidence.
+
+### 6.7 Sequence length does not reorder the board, and that is worth reporting
+
+Every entry above is an ordering that moved. This one did not, and a catalogue of only the
+positive cases would be its own selection effect.
+
+`crossover50m_ctx2048` reruns the §4.5 board's five distinct families at `block_size` 2048 —
+4× the context — with batch 8, so that 8 × 2048 = 16,384 tokens per step exactly matches suite
+26's 32 × 512 cadence and the evaluation markers land on identical token counts. Sequence length
+is the only variable that moves. Five seeds, 50M tokens, reported on `final_val`:
+
+| arm | final val [95%] | n |
+|---|---|---|
+| `hybrid_mingru10_attn2` | 4.2022 [4.1681, 4.2362] | 5 |
+| `attention` | 4.2004 [4.1628, 4.2379] | 5 |
+| `hybrid_gdn_periodic` | 4.2677 [4.2338, 4.3015] | 5 |
+| `gdn` | 4.4772 [4.4395, 4.5149] | 5 |
+| `mingru` | 4.4915 [4.4563, 4.5268] | 5 |
+
+The §4.5 ordering survives intact, and the top pair remains tied at 0.0018 nats. The two arms in
+fact swap places between `best_val` (4.1668 vs 4.1659) and `final_val` (4.2004 vs 4.2022); both
+margins are far inside seed noise, so this cell supports a tie and licenses no ranking between
+them. The recurrent/attention separation is the unambiguous part: both pure recurrent stacks sit
+~0.28 nats behind every attention-containing arm, intervals disjoint.
+
+This is the first evidence in our record that any part of the §4.5 board is a property of the
+architectures rather than of the recipe it was measured at. It is also the axis on which the
+hybrid literature has the strongest prior — recurrent mixers are advocated *for* long context —
+and at 4× context, at this scale, that advantage does not appear.
+
+### 6.8 Task difficulty and training budget reorder the same pair on a single metric
+
+The sharpest entry in this catalogue needs no comparison across suites, hardware or metrics. It
+is one probe, one metric, two architectures, and two knobs that belong to the measurement.
+
+Held-out CE at 512 tokens barely exercises in-context recall, which is the documented failure mode
+of recurrent mixers and the stated reason hybrids retain attention layers at all [5]. We therefore
+built a multi-query associative recall probe (MQAR-style, after the Zoology line of work) over the
+§4.5 families: synthetic key–value sequences, exact-match recall at the query positions, answers
+supervised through the existing `ignore_index` path so the training loss *is* recall loss.
+
+Two properties of the probe had to be established before it could be read, and both are §6 entries
+in their own right. **The board's own default makes it blind**: with `tie_embeddings=True` — what
+every suite in §4 runs — attention caps near 0.555 and no amount of training moves it, because the
+readout matrix *is* the input embedding and the residual at a query position projects onto the
+queried key itself; untied, the identical configuration reaches 0.990. **Outcomes are bimodal per
+seed**: the induction head either forms inside the budget or it does not, so the readout is the
+*fraction of seeds forming the head* with a binomial interval, not a mean over a bimodal sample.
+
+`attention` vs `hybrid_mingru10_attn2` — the §4.5 tied pair — at 15 seeds per cell, batch 256,
+untied, 360 runs:
+
+| key–value pairs | 3000 steps | 9000 steps |
+|---|---|---|
+| 4 | 15/15 vs 5/15 — **disjoint, attention ahead** | 15/15 vs 12/15 — overlapping |
+| 6 | 9/15 vs 8/15 — overlapping | 15/15 vs 12/15 — overlapping |
+| 8 | 2/15 vs 12/15 — **disjoint, reversed** | 12/15 vs 13/15 — overlapping |
+
+At the shorter budget, difficulty alone carries the pair from a decisive attention win, through a
+tie, to a decisive *hybrid* win. Both endpoints have disjoint 95% Wilson intervals; either would
+be publishable in isolation; they contradict each other. At the longer budget every cell is a tie,
+agreeing with the held-out-CE result in §4.5.
+
+**The ordering is a function of where training stops.** Attention is the arm most sensitive to
+budget, not the least: 2/15 → 12/15 at eight pairs is the largest single move in the grid. A recall
+board read at 3000 steps reports attention as the *worst* arm at that difficulty, which the
+9000-step cell shows to be a statement about the budget.
+
+**What does survive the budget control is a coarser, genuinely architectural split.** At eight
+pairs and 9000 steps:
+
+| arm | 3000 steps | 9000 steps |
+|---|---|---|
+| `hybrid_gdn_periodic` | 6/15 | 13/15 [0.62, 0.96] |
+| `hybrid_mingru10_attn2` | 12/15 | 13/15 [0.62, 0.96] |
+| `attention` | 2/15 | 12/15 [0.55, 0.93] |
+| `gdn` | 2/15 | 6/15 [0.20, 0.64] |
+| `mingru` | 0/15 | **0/15** [0.00, 0.20] |
+
+A pure minGRU stack forms the head on zero of thirty runs across both budgets, with recall pinned
+in a 0.358–0.383 band: 3× the compute does not move it. `gdn` is intermediate — budget lifts it
+2/15 → 6/15, still short of every attention-containing arm. Adding three attention layers to GDN
+takes 6/15 → 13/15 at the same budget and difficulty.
+
+So the durable statement is two-part, and neither part is the one we first drew from this probe:
+**architecture decides whether the arm can do the task at all**, and **budget decides the ordering
+among the arms that can**. The first is the hybrid literature's own premise, reproduced. The
+second is this paper's thesis, reproduced on the instrument we built to escape it.
+
+### 6.9 The cost basis reorders the board, and the usual argument for hybrids does not survive it
+
+Every quality ranking so far is **token-matched**: each arm sees the same number of tokens.
+Practitioners rarely buy tokens. They buy time, and adopt hybrids precisely because at matched
+wall-clock a faster arm sees more tokens. That is a recipe axis, and we had never measured it.
+
+`crossover_wallclock32` gives each arm the same *minutes* rather than the same tokens: five seeds,
+single-tenant, per-arm token budgets sized from measured effective rate so that every arm lands on
+a 691-second target. Realised clocks came in between −1.0% and +2.2% of target, inside the 5%
+tolerance the runner enforces before it will emit a board at all.
+
+| # | arm | budget | elapsed | final val [95%] |
+|---|---|---|---|---|
+| 1 | `attention` | 73.2M tok | 684.1s (−1.0%) | **4.1045** [4.0727, 4.1363] |
+| 2 | `hybrid_mingru10_attn2` | 60.2M | 686.5s (−0.6%) | 4.1640 [4.1489, 4.1791] |
+| 3 | `hybrid_gdn_periodic` | 22.0M | 704.3s (+1.9%) | 4.8413 [4.8206, 4.8620] |
+| 4 | `hybrid_gdn_bookend` | 20.0M | 706.2s (+2.2%) | 4.9312 [4.9146, 4.9479] |
+
+Attention wins every pairing 5 of 5 on paired seeds and beats the best hybrid by 0.0595 with
+disjoint intervals. **This is the opposite of the usual case made for hybrids**, which is that they
+win once the budget is time rather than tokens. At this scale, on this recipe, single-tenant, the
+minGRU hybrid's 1.19× throughput does not pay for its worse loss per token, and the GDN arms are
+not close — they buy 22.0M and 20.0M tokens against attention's 73.2M in the same 691 seconds.
+Note the direction of the §4.5 change: the pair that is *tied* on tokens is *separated* on
+wall-clock. The cost basis is not a presentational choice.
+
+Two defects had to be closed before this board could be believed, and both are recipe effects in
+their own right. **Tenancy is a recipe field.** A first attempt sized budgets from throughput
+scraped from suites that had run three-to-a-GPU, then executed single-tenant, and missed its
+target by 1.70× — because arms do not recover from contention uniformly: attention and
+`hybrid_mingru10_attn2` gained 1.78× and 1.72× when given the GPU alone, the two GDN arms only
+1.04× and 1.05×. A rate measured at one tenancy does not transfer to another. **Step rate is not
+wall-clock rate.** Sizing from per-step `tok_s` ignores evaluation, checkpointing and startup, and
+that overhead is arm-specific: single-tenant, attention realises 81.0% of its step rate over a
+whole run against `hybrid_gdn_bookend`'s 89.4%. Budgets are now sized from tokens ÷ elapsed
+seconds, and the failed attempt is retained rather than deleted, because it is the only
+tenancy-1 measurement we had with which to size the retry. The third defect this board surfaced —
+the `best_val` selection bias — is §7.4 item 10.
+
+### 6.10 What this catalogue is and is not
 
 Counting §4, §5 and this section, we have observed a ranking change places under a change of:
 token budget, learning-rate horizon, batch size, model scale, training horizon at fixed scale,
@@ -929,12 +1115,26 @@ Stating these explicitly is part of the result.
    overhead, not arithmetic. The kernels were not the bottleneck; the number of kernel launches
    was.
 
+6. **"On in-context recall, attention beats the best hybrid with disjoint intervals."**
+   Withdrawn. Drawn from the four-pair / 3000-step cell of the recall probe, where the separation
+   is real (15/15 vs 5/15) and reproduces. What is false is the reading that it is a property of
+   the *metric*. It is a property of the *budget*: at 9000 steps the same cell is a tie, and at
+   eight pairs the ordering reverses outright. The probe was built to test whether §4.5's tie was
+   metric-dependent, and it answered a question we had not asked. §6.8 reports the grid.
+
+7. **"A pure minGRU stack cannot do in-context recall."** Withdrawn as stated, and replaced by a
+   located claim. minGRU forms the head on 0 of 30 runs at eight key–value pairs across both
+   budgets, which is what the strong wording rested on — but it reached 1/15 at four pairs, so the
+   limit has a boundary in difficulty and the blanket claim overstates the evidence. The
+   experiment that locates it (four pairs at the higher budget) is specified and priced; until it
+   runs, the claim is "minGRU does not form the head at eight pairs at either budget tested."
+
 ### 7.4 Corrections found by auditing our own record
 
 The claims in §7.3 were withdrawn as we discovered them, over months. Preparing this draft we did
 something different and more uncomfortable: a systematic audit of every number in our own suite
 notes, lock files and ledgers against the raw run directories they were derived from. It found
-nine defects. We record them here rather than silently fixing them, because a paper arguing that
+eleven defects, the last two of them during the release audit that closed this work out. We record them here rather than silently fixing them, because a paper arguing that
 measurement protocol determines conclusions has no standing to hide its own protocol failures —
 and because the *kind* of error is instructive. None of these was a bad measurement. Every one was
 a correct measurement that was then mis-recorded, partially reported, or lost.
@@ -1008,6 +1208,37 @@ were executed carefully, gated, and seeded; they were then summarised into notes
 and — in the last case — an entire replacement manuscript, and the summaries drifted from the
 artifacts in ways invisible from the summaries alone. Recommendation 3 in §9 (fingerprint every
 job) addresses the input side of this. It does not address the output side, and on the evidence
+10. **A selection statistic was biased by the very effect it was being used to measure.** Our
+    wall-clock-matched board (§6.9) read `best_val` — the running minimum over however many
+    evaluations happened to fire. Evaluation fires on a fixed *step* interval, so a faster arm
+    takes more steps, draws more evaluations, and wins a lower minimum for nothing. The bias is
+    monotone in evaluation count and points the same way as the result being claimed:
+
+    | arm | evals | `best_val` − `final_val` |
+    |---|---|---|
+    | `attention` | 89 | −0.0133 |
+    | `hybrid_mingru10_attn2` | 73 | −0.0087 |
+    | `hybrid_gdn_periodic` | 26 | −0.0039 |
+    | `hybrid_gdn_bookend` | 24 | −0.0032 |
+
+    It cost 0.0046 of a 0.0640 gap, so the ranking survived — but the statistic was not
+    defensible, and in a suite whose entire purpose is to vary throughput it is the worst possible
+    choice. The end-of-schedule evaluation had always been computed and written to the final
+    checkpoint without being logged; it is now recorded, and the analysis path raises rather than
+    silently substituting `best_val`. **This generalizes beyond us**: any speed-versus-quality
+    comparison reporting a best-checkpoint number carries this bias.
+
+11. **Our end-of-schedule losses were, for months, recoverable only from inside 869 GB of
+    checkpoints on a rented machine.** 471 completed runs across eleven suites predate the logging
+    fix in item 10. Preparing to release the instance we extracted the value from every surviving
+    final checkpoint — 479 of 479, validated against the published wall-clock board, whose five
+    attention seeds reproduce its 4.1045 exactly. Six suites had neither a logged value nor a
+    surviving checkpoint, and **§4.5's own board is among them**: its arms all fire 61 evaluations,
+    so its `best_val` bias is common-mode and its published *deltas* stand, but its absolute
+    end-of-schedule losses cannot now be produced without re-running it. The lesson is item 10's
+    one level up: a number that exists only inside an artifact you are not preserving is a number
+    you have already lost.
+
 above the output side is where our failures actually occurred. We now regard *"re-derive every
 reported number from the raw run directory before publication"* as a required step rather than a
 diligence nicety, and §10 states which numbers in this paper were and were not produced that way.
@@ -1154,26 +1385,69 @@ Full grid, per-seed values, drift checks and limits: `research/d7-lr-retune.json
 
 We name the arm rather than gesture at it, so that it can be run or criticized.
 
-**Design.** Repeat the suite 24 recipe — 12L/768d, batch 32, `eval_iters = 20`, 50M-token cosine
-horizon, 20M-token stop, seeds `1337, 42, 100, 2026, 777` — as a 2 × 2:
+**Design.** A 2 × 2 in parametrization × mixer, repeated at **each of the three recipes whose
+crossings this paper reports**, because three of the four readouts below are statements about the
+other two:
 
-| | attention | minGRU |
-|---|---|---|
-| **standard parametrization, global LR** | suite 24, **re-measured on the box that runs the µP cells** | same |
-| **µP, per-arm LR swept at a narrow proxy width** | new | new |
+| recipe | batch | stop | cosine horizon | SP crossing as measured |
+|---|---|---|---|---|
+| **s24** (§4.3) | 32 | 20M | 50M | late 12.34M |
+| **s23** (§4.3) | 32 | 20M | 20M | late 14.58M |
+| **s25** (§4.4) | 8 | 8.19M | own | **none through 7.38M** |
 
-with the µP cells parametrized per [12] and the proxy sweep run at a reduced width, transferring
-the tuned LR to the 768-dim target.
+Each recipe carries both parametrization rows — SP with the global 6e-4, and µP per [12] with a
+per-arm hidden learning rate swept at a narrow proxy width and transferred to the 768-dim target —
+at seeds `1337, 42, 100, 2026, 777`, `eval_iters = 20`, depth fixed at 12 layers.
 
-**The SP row is re-run unless the µP cells run on the GH200 that produced suite 24.** An earlier
-version of this table read "suite 24 (already run)" in both SP cells, which would set new µP
-measurements against measurements from a different GPU — the comparison §7.1 refuses, on a pair
-whose absolute losses differ by ~0.18–0.3 nats at matched token markers across two boxes. The cost
-paragraph below always counted twenty jobs for the 2 × 2, i.e. both rows; the table was the half
-that was wrong. The runner (`scripts/gpu_bundle.py`) now carries the SP cells as a first-class arm
-and requires an explicit flag to drop them. Depth is held fixed at 12 layers throughout, which sidesteps
-the depthwise limitations Depth-µP identifies for stacks whose residual blocks are themselves deep
-[33]. Two secondary arms are worth the marginal cost:
+**The SP row is re-measured at every recipe**, not read from suites 23/24/25, unless the µP cells
+run on the GH200 that produced them. An earlier version of this table read "suite 24 (already
+run)", which would set new µP measurements against measurements from a different GPU — the
+comparison §7.1 refuses, on a pair whose absolute losses differ by ~0.18–0.3 nats at matched token
+markers across two boxes. On the GH200 the re-run is kept anyway, as the drift check: it converts
+an assumption that the environment has not moved into a measured number.
+
+**Two things the first version of this design could not have shown, and this one can.** Both are
+lessons from §8.3 applied to its own successor:
+
+- *The transferred learning rate was to be decided by a single seed.* It is the upstream
+  dependency of every µP cell, so a wrong value mis-tunes both arms on the exact axis this arm
+  exists to control — §8.3's failure one axis over, whose record is that three separate two-seed
+  conclusions were overturned by a third seed, at a per-cell spread the same size as the basin
+  being resolved. The proxy sweep now runs at **three seeds**, and a minimum is transferred only
+  if it is bracketed by the grid **and** beats both its neighbours on every seed.
+- *Each µP arm was to be measured at one learning rate.* §8.3's mechanism is **offset flat
+  basins**: two arms each measured at a single point can sit on opposite sides of their own optima,
+  and the ordering that falls out is an artifact of where they were measured. That is precisely the
+  defect this arm exists to remove, and a single-point design reproduces it with a different
+  number. Each arm is therefore run at **five learning rates at the target width** — the
+  transferred value and 0.25/0.5/2/4× it, a 16× span — so the reported crossing token carries an
+  LR-sensitivity band rather than a point estimate.
+
+**Both parametrizations are tuned at the target width, not one.** The µP row is
+anchored by the sweep above; the SP row gets its own `matrix_lr` sweep at 768, per arm, spanning
+64× around the inherited 0.025. Setting a tuned µP cell against an inherited SP cell would measure
+tuning quality and report it as parametrization — this arm's own error, committed on the other side
+of the table. That sweep also converts §8.1 from a stated concern into a number: it prices the
+inherited global learning rate against SP's own optimum at the width and recipe §4's headline
+result was measured at, paired per seed, the way §8.3 priced the funnel's inherited rates.
+
+That curve also **measures the transfer instead of assuming it**. µP transfer here rests on
+`matrix_lr / (d_model / mup_base_width)`, which is the *Adam* µP hidden-layer rule applied to a
+**Muon** group — an optimizer whose update is orthogonalized and RMS-matched by construction, and
+which is reported to transfer across width without a 1/width factor. We do not adjudicate that in
+code; §8.3 is a cautionary tale about acting on an argument where a measurement was available. If
+the transferred value is the interior minimum of the target-width curve, transfer is verified. If
+it is an end point, the transfer failed, and the arm is reported as a failed transfer rather than
+as a µP measurement, with its own optimum located and used in its place. The arm's µP cells are
+therefore run twice: once at the transferred value, which is the pre-registered cell and is kept
+whatever it shows, and once at the measured target-width optimum, which is what the readouts are
+read against. Reading a pre-registered decision rule off an arm known to be mis-tuned would report
+mis-tuning as the parametrization's answer — this section's own error, one level down.
+
+Two secondary arms are worth the marginal cost:
+
+Depth is held fixed at 12 layers throughout, which sidesteps the depthwise limitations Depth-µP
+identifies for stacks whose residual blocks are themselves deep [33].
 
 - **A per-layer standard-parametrization prescription** as in Everett et al. [32], since their
   result is that this can outperform µP and that all parameterizations admit transfer — if the
@@ -1193,14 +1467,134 @@ rule before running it:
 | µP crossings collapse onto a single token across schedules | The schedule effect is a tuning artifact. §4.3 must be withdrawn and §4.4's batch result re-examined. |
 | The batch-8 arm (suite 25) develops a crossing under µP within 7.4M tokens | The batch effect is a tuning artifact, and suite 14's original 6.6–7.4M window is partially rehabilitated. |
 
-**Cost.** Twenty jobs at 20M tokens for the main 2 × 2, plus a twelve-job proxy-width LR sweep at
-one seed, plus ten jobs for each secondary ablation: **52 jobs**. Priced against the median
-per-step throughput of the committed suite-22–26 run records, that is **≈ 4.7 GH200-hours**, and
-the arm's longest single job is seven minutes. It is a small fraction of the 50-job suite 22 grid
-and the highest-value single experiment remaining in this line of work. The estimate is
-regenerated rather than quoted: `python3 scripts/gpu_bundle.py --cost`.
+**Status (2026-08-29): the arm was run; these four rows are unanswered.** 250 jobs,
+33.21 GH200-hours. Rows 1-4 are unanswered not because the experiment was inconclusive but
+because our own µP implementation was defective, and the defect is arm-asymmetric in exactly
+the way that would have manufactured a result. We report it in full, because a paper arguing
+that measurements mislead has no standing to bury one of its own.
 
-**Until it is run**, every crossing token in this paper should be read as "the crossing token for
+**Every µP cell failed this arm's own comparator check.** Each suite's penalty is measured
+against its matched standard-parametrization control:
+
+| suite | control | Δ attention | Δ minGRU | spread | comparator |
+|---|---|---|---|---|---|
+| `e1_mup` | `e1_sp_rerun` | +0.5446 | +0.0810 | 0.4636 | **invalid** |
+| `e1_mup_tuned` | `e1_sp_rerun` | +0.3537 | +0.0524 | 0.3014 | **invalid** |
+| `e1_mup_sched20` | `e1_sp_sched20` | +0.5724 | +0.3101 | 0.2623 | **invalid** |
+| `e1_mup_bs8` | `e1_sp_bs8` | +0.2721 | +0.0991 | 0.1730 | **invalid** |
+| `e1_perlayer_sp` | `e1_sp_rerun` | −0.0754 | −0.0688 | 0.0066 | ok |
+| `e1_embed_lr` | `e1_sp_rerun` | −0.0634 | −0.0375 | 0.0258 | ok |
+
+Every µP suite hurts attention 4–7× more than minGRU. The two non-µP parametrizations are
+even-handed to within 0.03, so the asymmetry belongs to µP as we implemented it, not to the
+harness.
+
+**The cause is the attention temperature, and it is not the learning rate.** µP prescribes
+`1/d` attention logits where standard parametrization uses `1/sqrt(d)`. That prescription is
+correct only when `q·k` grows as Θ(d), which requires a companion initialization we did not
+have: every `nn.Linear` here initializes at a fixed `std = 0.02`, so `q·k` grows as Θ(sqrt(d))
+and the `1/d` rule over-cools by exactly `sqrt(head_dim)`. Measured through a full forward
+pass at `d_model = 768`, `head_dim = 64`:
+
+| | logit scale | logit std | attention entropy |
+|---|---|---|---|
+| SP | 0.12500 | 1.000 | 89.0% of uniform |
+| µP | 0.01562 | 0.125 | **99.8% of uniform** |
+
+µP attention begins training as very nearly an averaging layer. minGRU has no attention
+logits, so the term is arm-asymmetric by construction — which is the shape of the table
+above. A learning-rate explanation is excluded by the arm's own design: `e1_mup_tuned`
+re-tunes at the target width off a five-point basin and attention is still +0.354.
+
+**A one-term ablation confirms the attribution.** `e1_mup_spattn` is µP at the transferred
+learning rate with SP's `1/sqrt(d)` temperature — one term changed:
+
+| suite | Δ attention | Δ minGRU | spread | comparator |
+|---|---|---|---|---|
+| `e1_mup` | +0.5446 | +0.0810 | 0.4636 | invalid |
+| **`e1_mup_spattn`** | **+0.1299** | **+0.0810** | **0.0489** | **ok** |
+
+Attention recovers 0.4147 of its 0.5446 deficit (76%) and the arm asymmetry falls 9.5×.
+minGRU is unchanged to four decimals, +0.0810 → +0.0810: it has no attention logits, so it
+cannot move, and it does not. That is the control that makes this an attribution rather than
+a correlation.
+
+**Rows 1–4 stay unanswered, deliberately.** They are worded *under µP*, and `*_spattn` is
+µP-with-SP's-attention-temperature — a different parametrization. Mapping a modified arm onto
+a row written for a different one is precisely the error this section commits elsewhere and
+which §7.4 records us correcting. The rows remain open.
+
+**What the corrected arms do show, reported as a separate result.** With the temperature
+corrected, the µP arms cross at both schedules, where the uncorrected ones never crossed on
+any seed:
+
+| cell | n | seeds crossing | last crossing (M tokens) |
+|---|---|---|---|
+| `e1_mup` (s24) | 5 | **0** | — |
+| `e1_mup_sched20` (s23) | 5 | **0** | — |
+| `e1_mup_spattn` (s24) | 5 | 5 | 10.12 [9.93, 10.30] |
+| `e1_mup_sched20_spattn` (s23) | 5 | 5 | 3.58 [3.47, 3.70] |
+
+So "µP never crosses" was a statement about the temperature, not about µP.
+
+**The objection-level conclusion, which is separable from rows 1–4.** §8.1's competing
+explanation was that our recipe dependence might be mis-tuning in disguise. Under standard
+parametrization the 20M cosine crosses *later* than the 50M cosine (14.74M vs 12.37M); under
+µP-with-SP-attention it crosses *earlier* (3.58M vs 10.12M). Two parametrizations, one tuned
+at the target width and one corrected: **the schedule moves the crossing token substantially
+under both, and collapses it under neither.** The strong form of §8.1 — that the schedule
+effect is an artifact of a single global learning rate — is therefore not supported. What
+better tuning changes is the magnitude and, here, the direction; what it does not change is
+that the schedule moves the crossing at all. We state this as an objection-level reading
+rather than as one of rows 1–4, because the arm that would answer those rows has not been run.
+
+**The tuning premise was nonetheless correct, and we price it rather than dismiss it.** The
+target-width SP sweep locates attention's own optimum and prices the inherited `matrix_lr` of
+0.025 at **+0.2055** [+0.1990, +0.2119] nats, paired, n = 5. minGRU's argmin does not resolve
+— 0.003125 and 0.00625 sit 0.0024 apart on a 4-of-5 sign test — but both tied candidates beat
+the inherited value on every seed, so the inherited rate costs minGRU **at least +0.1232**
+[+0.1207, +0.1257] nats. §8.1's concern was real: the inherited learning rate was materially
+wrong for both arms. It is now a measured quantity rather than an unbounded worry.
+
+**A positive result on transfer, which survives the correction.** Re-measuring the
+target-width basin with the corrected temperature moves attention's whole curve down ~0.42
+nats while leaving its argmin where it was. The transfer rule in `optim.py` applies the
+*Adam*-derived µP hidden-layer divisor to a **Muon** group:
+
+| rule | error vs measured optimum | verdict |
+|---|---|---|
+| `matrix_lr / width_mult` (Adam-derived) | off by [4×, 2×] | same direction on every arm — **systematically wrong** |
+| Muon, no divisor | off by [1.333×, 0.667×] | straddles 1.0 — unbiased within a factor-2 grid |
+
+Muon's update is orthogonalized and RMS-matched by construction, and the no-divisor rule
+predicts the target-width optimum where the Adam divisor does not. This is a transferable
+finding independent of whether rows 1–4 are ever answered.
+
+**What remains unrun, named and priced.** A correct µP arm requires pairing the `1/d` rule
+with an initialization under which `q·k` grows Θ(d), and then re-measuring *both* the proxy
+sweep and the target-width basin — because a transfer measured through a broken temperature
+is not evidence about transfer. Estimated ~126 jobs, ~13 GH200-hours, ~\$30 at \$2.29/GPU-hour.
+We name it rather than claim it.
+
+**Cost.** A proxy-width LR sweep at three seeds, fifty-four jobs after one grid extension; twenty
+jobs at 20M tokens for the s24 2 × 2 and forty-two more for its target-width basin; twenty jobs
+for the s23 2 × 2 and twenty for the s25 one; ten jobs for each secondary ablation; and ten to
+close §4.5's board; thirty-six for the SP target-width sweep; and ten for µP at its own
+measured optimum: **232 jobs**. Priced against the
+median per-step throughput of the committed suite-22–26 run records, that is **≈ 22.0
+GH200-hours**, of which 1.9 h is extrapolated rather than measured, and the longest single job is
+eighteen minutes. On the GH200 the suites ran on, at \$2.29/GPU-hour, the whole arm is
+**≈ \$53** — within a few dollars of what the 64-job design it replaces would have cost on any other instance, because that
+design spent 47% of its compute on a single-seed horizon pair that answers a different question.
+The estimate is regenerated rather than quoted: `python3 scripts/gpu_bundle.py --cost`.
+
+The GH200 is not merely the cheapest option; on the current price list it is the only correct one.
+Suites 22–26 ran on a Lambda GH200 (97,871 MiB HBM, aarch64, PyTorch 2.7.0 + CUDA 12.8), the
+§4.5 board this arm completes is a GH200 board, and every throughput figure in the cost model was
+recorded on that hardware — so its price/performance carries no assumed ratio, while every other
+instance's does.
+
+**Until a corrected µP arm is run**, every crossing token in this paper should be read as "the crossing token for
 this architecture pair *at a global 6e-4 Muon learning rate under standard parametrization*," and
 the §9 recommendations should be read as conditional on the same. We consider recommendation 2
 (pin the schedule when truncating) robust to the outcome, because it is a statement about
@@ -1260,6 +1654,41 @@ written and stopped being true when the run records were published; the section 
 We record the drift rather than silently correcting it, because it is the §7.4 failure mode —
 a correct statement that outlived the state it described — occurring in the section whose subject
 is provenance.
+
+**Artifacts added after the 2026-08-24 draft.** The following suites back §4.5's update and §6.7–6.9
+and were run on the rented GH200 after the draft was first assembled. Their per-job records are
+tracked under the same exception rules:
+
+| suite | backs | jobs |
+|---|---|---|
+| `gpu_bundle` (incl. `e2_matched32_50m`) | §4.5 update, §8.4 status | 250 |
+| `crossover50m_ctx2048` | §6.7 sequence length | 25 |
+| `crossover50m_ratio32` | recurrent:attention ratio | 20 |
+| `crossover_wallclock32` | §6.9 cost basis | 20 |
+| `crossover_wallclock32_unmatched` | §6.9's retained failed attempt | 20 |
+| `mqar_e8` | §6.8 difficulty × budget | 360 |
+
+**End-of-schedule losses.** Runs completed before the logging fix in §7.4 item 10 do not carry
+`final_val` in their `done` record. It was recovered from the final checkpoint of every run that
+still had one — 479 of 479 — and is published as `nanolab/out/final_vals_recovered.json` plus a
+per-run `final_val.json`. §7.4 item 11 lists the six suites for which no checkpoint survived and
+the value is therefore unrecoverable; **§4.5's board is one of them**, so its rows are curve-at-marker
+values (49,987,584 tokens) and are labelled as such wherever they are compared.
+
+**Which numbers were re-derived from raw run directories.** Every figure in §4.5's update, §6.7,
+§6.8, §6.9 and §8.4's status block was recomputed from `metrics.jsonl` or from recovered checkpoint
+values during the release audit, not copied from prior notes. Two errors were caught that way and
+are recorded rather than quietly fixed: the withdrawn recall claim (§7.3 item 6) and a placement
+comparison that turned out to be cross-suite *and* cross-statistic, and is withdrawn pending a
+within-suite re-measurement.
+
+**Cold storage.** The corpus the entire paper is measured against (`fineweb-edu`, 954 MB) is
+gitignored and existed in one place. It, the full result tree, the recovered end-of-schedule
+values, and the final checkpoints of the four published suites above (44.7 GiB) are archived to
+private, versioned, encrypted object storage, verified byte-exact. The remaining ~824 GB of
+intermediate checkpoints were deliberately **not** retained: at this model scale re-running a suite
+costs less than storing its weights, and every input needed to do so — code, corpus, seeds — is
+preserved.
 
 All mixer suites run through one entry point:
 
