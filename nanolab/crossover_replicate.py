@@ -45,6 +45,30 @@ SUITE14_TOKEN_BUDGET = 8_192_000  # 2000 steps × bs8 × ctx512
 MATCHED20_OUT = Path("nanolab/out/crossover20m_matched_lr")
 BS8_OUT = Path("nanolab/out/crossover8m_bs8")
 MATCHED32_OUT = Path("nanolab/out/crossover50m_matched32")
+# E10 gets its own out dir rather than joining matched32's: `current_recipe()`
+# records the arm list and prefix, and `lock_recipe` refuses to mix two recipes in
+# one directory. Sharing the directory would either trip that guard or, worse,
+# silently blend two arm sets under one recipe.json.
+RATIO32_OUT = Path("nanolab/out/crossover50m_ratio32")
+# E9: the same board at 4x the context. batch 8 x ctx 2048 = 16,384 tokens/step,
+# which is exactly suite 26's bs32 x ctx512 cadence, so eval markers land on the
+# same token counts and the loss-vs-token curves are directly comparable. The only
+# variable that moves is sequence length.
+CTX2048_OUT = Path("nanolab/out/crossover50m_ctx2048")
+# The five distinct families of the section 4.5 board, one per mixer story.
+CTX_ARMS = ("attention", "mingru", "gdn",
+            "hybrid_mingru10_attn2", "hybrid_gdn_periodic")
+# E11 phase 2: the board's top four by token-matched loss, run for the same
+# WALL CLOCK rather than the same tokens. Each arm therefore gets its OWN token
+# budget, and -- this is the part phase 1 could not do -- its own cosine over that
+# budget. Phase 1 re-read curves that were annealed over 50M and stopped early,
+# which penalises slow arms exactly as PAPER 4.3 measures; these runs anneal over
+# the budget they actually get.
+WALLCLOCK_OUT = Path("nanolab/out/crossover_wallclock32")
+WALLCLOCK_ARMS = ("attention", "hybrid_mingru10_attn2",
+                  "hybrid_gdn_periodic", "hybrid_gdn_bookend")
+# Chosen as phase 1's budget: what the fastest arm needs for the 50M board.
+WALLCLOCK_SECONDS = 691.0
 DRIFTED_ARMS = (
     "mamba2", "gdn", "mla",
     "hybrid_gdn10_attn2", "hybrid_gdn_periodic", "hybrid_gdn_bookend",
@@ -62,6 +86,9 @@ MAX_STEPS = TOKEN_BUDGET // TOKENS_PER_STEP  # 12207 at bs8
 EVAL_EVERY_TOKENS = SUITE14_EVAL_TOKENS
 # Original suite-14 checkpoints, in millions of tokens.
 SUITE14_MARKERS_M = (0.8, 4.1, 6.6, 7.4, 8.2)
+# Floor for the marker window when an arm has too few evals to measure its own
+# spacing. The real bound is one eval interval -- see `_marker_window`.
+MARKER_TOLERANCE = 0.02
 
 # Student-t multipliers come from native_funnel, which is the one table in this
 # package: tabulated to df=30 at six decimals and covered by its own tests.
@@ -75,7 +102,17 @@ from .native_funnel import _t_critical_95
 DEFAULT_OUT = Path("nanolab/out/crossover50m")
 QUEUE_NAME = "queue.json"
 # GH200 Hopper dense BF16 tensor peak (no sparsity). Override with PEAK_FLOPS.
-GH200_PEAK_FLOPS = 494.7e12
+#
+# Was 494.7e12 until 2026-08-27, which disagreed 2x with
+# scripts/gpu_bundle.py's DEVICE_PEAK_FLOPS["gh200"] and was settled by
+# measurement rather than by picking: a dense BF16 8192^3 matmul on the box
+# sustains 786.6 TFLOP/s, which is 159% of 494.7e12 -- impossible -- and 79.5%
+# of this value, which is an ordinary large-matmul efficiency. Every GH200 MFU
+# this module printed before that date was 2x too high. No published table used
+# one (paper 6.3's MFU column is the 3070 Ti laptop: back-solving its logged
+# tok_s and mfu gives a 40.0e12 peak).
+GH200_PEAK_FLOPS = 989.5e12
+MEASURED_GH200_DENSE_BF16 = 786.6e12   # 8192^3 matmul, 2026-08-27, torch 2.7.0
 
 
 @dataclass(frozen=True)
@@ -105,7 +142,25 @@ ARMS: tuple[Arm, ...] = (
         "minGRU inductive bias + last-2 attention"),
     Arm("hybrid_mamba10_attn2", "mamba2", "mamba2*10,attention*2",
         "Mamba-2 SSD + last-2 attention"),
+    # E10 (backlog 2026-08-26): the board's best hybrid family exists at exactly
+    # ONE ratio and placement (10+2, last-2) while GDN got three variants, so
+    # "the best hybrid ties attention" is a claim about one point on the
+    # ratio/placement axis. These four vary that axis and nothing else. The
+    # field's converged 3:1 periodic ratio has never been run on the family that
+    # actually ties attention.
+    Arm("hybrid_mingru11_attn1", "mingru", "mingru*11,attention",
+        "how little attention is enough: 11+1"),
+    Arm("hybrid_mingru_periodic", "mingru",
+        "mingru*3,attention,mingru*3,attention,mingru*3,attention",
+        "Qwen-style every-4th-layer attention (9 minGRU + 3 Attn)"),
+    Arm("hybrid_mingru_bookend", "mingru", "attention,mingru*10,attention",
+        "attention at first and last layer"),
+    Arm("hybrid_mingru8_attn4", "mingru", "mingru*8,attention*4",
+        "1:2 ratio upper arm"),
 )
+# The four E10 arms, as one name so a launcher cannot list three of them.
+RATIO_ARMS = ("hybrid_mingru11_attn1", "hybrid_mingru_periodic",
+              "hybrid_mingru_bookend", "hybrid_mingru8_attn4")
 
 
 def scale_to_token_budget(batch_size: int, block_size: int = 512,
@@ -145,6 +200,230 @@ def cluster_batch() -> int:
     return int(os.environ.get("CROSSOVER_BATCH", "96"))
 
 
+def cluster_workers() -> int:
+    """How many jobs share the GPU. Set by ``cmd_launch``; 1 when unset.
+
+    This is a RECIPE field, not a scheduling detail, because throughput is only
+    interpretable together with it -- see ``_suite_tenancy``.
+    """
+    return max(1, int(os.environ.get("CROSSOVER_WORKERS", "1")))
+
+
+def _suite_tenancy(suite_dir: Path) -> int | None:
+    """Jobs per GPU while this suite ran, or None when that is unknowable.
+
+    A tok/s number means nothing on its own. The same arm runs ~1.8x faster
+    single-tenant than three-to-a-GPU, and the speedup is *not* uniform across
+    arms: compute-bound mixers recover most of the contention loss, latency-bound
+    ones barely move. Sizing a budget from a rate measured at another tenancy is
+    exactly what silently broke the first wall-clock suite (1.70x spread on a
+    board whose whole claim was equal wall clock).
+
+    Recorded in recipe.json from now on. For suites predating that, the number of
+    worker_N.log files is a real artifact of the last launch -- ``cmd_launch``
+    unlinks logs with id >= workers -- so it is derived, not assumed. Returns
+    None when neither signal exists; callers must fail closed on that rather
+    than defaulting to 1.
+    """
+    rec = Path(suite_dir) / "recipe.json"
+    if rec.exists():
+        try:
+            recorded = json.loads(rec.read_text(encoding="utf-8")).get("workers")
+        except json.JSONDecodeError:
+            recorded = None
+        if isinstance(recorded, int) and recorded > 0:
+            return recorded
+    n = len(list(Path(suite_dir).glob("worker_*.log")))
+    return n or None
+
+
+RATE_SUITES = (
+    "nanolab/out/crossover50m",
+    "nanolab/out/crossover50m_matched32",
+    "nanolab/out/crossover50m_ratio32",
+    # The first wall-clock attempt missed its target badly and is archived rather
+    # than deleted: its runs are the only SINGLE-TENANT throughput measurement in
+    # the repo, which is exactly what sizing the retry requires.
+    "nanolab/out/crossover_wallclock32_unmatched",
+    "nanolab/out/crossover_wallclock32",
+)
+
+
+def measured_rate_by_arm(root: Path | None = None, tenancy: int | None = None,
+                         suites: tuple[str, ...] = RATE_SUITES) -> dict[str, float]:
+    """Median tok/s per arm at ``tenancy`` jobs per GPU, from committed records.
+
+    Derived from this repository, never typed. Same source the GPU-bundle cost
+    model uses, so the two price the same hardware the same way.
+
+    ``tenancy=None`` keeps the tenancy-blind behaviour and is for *reporting only*
+    -- it mixes rates measured under different contention and must never size a
+    budget. Anything that sizes a budget passes the tenancy it will really run at;
+    suites whose tenancy cannot be established are skipped rather than assumed.
+    """
+    base = Path(root) if root else Path(__file__).resolve().parents[1]
+    per: dict[str, list[float]] = {}
+    for suite in suites:
+        if tenancy is not None and _suite_tenancy(base / suite) != tenancy:
+            continue
+        for cfgp in sorted((base / suite).glob("*/config.json")):
+            mp = cfgp.with_name("metrics.jsonl")
+            if not mp.exists():
+                continue
+            try:
+                cfg = json.loads(cfgp.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if cfg.get("batch_size") != 32 or cfg.get("block_size") != 512:
+                continue
+            arm = cfgp.parent.name.split("_s")[0].split("_", 1)[-1]
+            ts = []
+            for line in mp.read_text(encoding="utf-8").splitlines():
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if r.get("event") == "train" and r.get("tok_s"):
+                    ts.append(float(r["tok_s"]))
+            if ts:
+                per.setdefault(arm, []).append(statistics.median(ts))
+    return {a: statistics.median(v) for a, v in per.items()}
+
+
+def effective_rate_by_arm(root: Path | None = None, tenancy: int | None = None,
+                          suites: tuple[str, ...] = RATE_SUITES) -> dict[str, float]:
+    """Median tokens per WALL-CLOCK second per arm, from terminal run records.
+
+    Not the same thing as ``measured_rate_by_arm``, and the difference is what
+    sizes a wall-clock budget correctly. That one reports instantaneous step
+    throughput; this one is tokens/elapsed_s, so it also carries eval, checkpoint
+    and startup time. The overhead is not a constant factor across arms --
+    measured single-tenant, attention realises 81% of its step rate over the whole
+    run while gdn_bookend realises 89% -- so sizing from step rate alone reinstates
+    a several-percent mismatch in the one quantity the suite holds constant.
+    """
+    base = Path(root) if root else Path(__file__).resolve().parents[1]
+    per: dict[str, list[float]] = {}
+    for suite in suites:
+        if tenancy is not None and _suite_tenancy(base / suite) != tenancy:
+            continue
+        for mp in sorted((base / suite).glob("*/metrics.jsonl")):
+            name = mp.parent.name
+            if "_s" not in name:
+                continue
+            arm = name.split("_s")[0].split("_", 1)[-1]
+            for line in mp.read_text(encoding="utf-8").splitlines():
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (rec.get("event") == "done" and rec.get("elapsed_s")
+                        and rec.get("tokens")):
+                    per.setdefault(arm, []).append(
+                        float(rec["tokens"]) / float(rec["elapsed_s"]))
+    return {a: statistics.median(v) for a, v in per.items() if v}
+
+
+def wallclock_budgets(seconds: float, arms: tuple[str, ...],
+                      batch: int = 32, block: int = 512,
+                      rates: dict[str, float] | None = None,
+                      tenancy: int | None = None) -> dict[str, int]:
+    """{arm: token budget} such that every arm trains for the same wall clock.
+
+    ``tenancy`` is the number of jobs that will share the GPU during the run, and
+    it is REQUIRED unless explicit ``rates`` are supplied. Rates are only valid at
+    the tenancy they were measured under: the first attempt at this suite sized
+    budgets from three-to-a-GPU rates and then ran single-tenant, so attention got
+    387.8s and gdn_bookend 661.1s against a 691s target -- a 1.70x spread in the
+    one quantity the suite exists to hold constant.
+
+    Floored to a whole number of steps, because a partial step is not trained and
+    a budget that is not a step multiple silently rounds differently per arm --
+    which would put the wall clock back out of match.
+    """
+    if rates is None:
+        if tenancy is None:
+            raise SystemExit(
+                "wallclock_budgets needs the tenancy it will run at; a tok/s "
+                "measured at another tenancy does not transfer across arms.")
+        rates = effective_rate_by_arm(tenancy=tenancy)
+    missing = [a for a in arms if a not in rates]
+    if missing:
+        raise SystemExit(
+            f"no throughput for {missing} at tenancy={tenancy}; cannot match "
+            f"wall clock without it. Run those arms at bs{batch}/ctx{block} "
+            f"with --workers {tenancy} first.")
+    tps = batch * block
+    return {a: max(tps, int(rates[a] * seconds) // tps * tps) for a in arms}
+
+
+# Equal wall clock is this suite's entire claim, so it is verified against the
+# artifacts rather than trusted from the budgets that were requested.
+WALLCLOCK_TOLERANCE = 0.05
+
+
+def verify_wallclock(out_root: Path, target_s: float,
+                     tolerance: float = WALLCLOCK_TOLERANCE) -> dict:
+    """Did the runs actually train for the same wall clock? Measured, not assumed.
+
+    Reads ``elapsed_s`` out of each run's terminal metrics record. Returns the
+    per-arm means, the observed spread, and an ``ok`` flag. The first wall-clock
+    suite missed by 1.70x and still emitted a board that looked publishable;
+    nothing in the code objected, which is why this exists.
+    """
+    per: dict[str, list[float]] = {}
+    for mp in sorted(Path(out_root).glob("*/metrics.jsonl")):
+        arm = None
+        cfgp = mp.with_name("config.json")
+        if cfgp.exists():
+            try:
+                arm = json.loads(cfgp.read_text(encoding="utf-8")).get("mixer")
+            except json.JSONDecodeError:
+                arm = None
+        name = mp.parent.name
+        arm = name.split("_s")[0].split("_", 1)[-1] or arm
+        for line in mp.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("event") == "done" and rec.get("elapsed_s"):
+                per.setdefault(arm, []).append(float(rec["elapsed_s"]))
+    rows = {a: statistics.mean(v) for a, v in per.items() if v}
+    if not rows:
+        return {"ok": False, "reason": "no elapsed_s in any run record",
+                "arms": {}, "target_s": target_s, "spread": None}
+    worst = max(abs(v - target_s) / target_s for v in rows.values())
+    return {
+        "ok": worst <= tolerance,
+        "reason": None if worst <= tolerance else
+                  f"worst arm is {worst:.1%} off the {target_s:.0f}s target "
+                  f"(tolerance {tolerance:.0%})",
+        "arms": rows,
+        "target_s": target_s,
+        "spread": max(rows.values()) / min(rows.values()),
+        "n": {a: len(v) for a, v in per.items() if v},
+    }
+
+
+def budget_by_arm() -> dict[str, int]:
+    raw = os.environ.get("CROSSOVER_BUDGET_BY_ARM", "").strip()
+    if not raw:
+        return {}
+    return {k: int(v) for k, v in json.loads(raw).items()}
+
+
+def cluster_block() -> int:
+    """Context length. 512 is every committed suite; E9 varies it.
+
+    This is a RECIPE field, so `current_recipe()` records it and `lock_recipe`
+    refuses to mix two context lengths in one out dir. Without that, a 2048-context
+    run dropped into a 512-context directory would be averaged into the same board
+    -- the exact class of error this paper is about.
+    """
+    return int(os.environ.get("CROSSOVER_BLOCK", "512"))
+
+
 def cluster_eval_iters() -> int:
     return int(os.environ.get("CROSSOVER_EVAL_ITERS", "4"))
 
@@ -179,6 +458,14 @@ def selected_arms() -> tuple[Arm, ...]:
 def current_recipe() -> dict:
     return {
         "batch_size": cluster_batch(),
+        "block_size": cluster_block(),
+        # Tenancy is a recipe field, not a scheduling detail: throughput measured
+        # at one jobs-per-GPU does not transfer to another, and a suite that
+        # silently mixed the two would produce rates nothing could interpret.
+        "workers": cluster_workers(),
+        # Recorded so `lock_recipe` refuses to mix two wall-clock budgets, or a
+        # wall-clock-matched run and a token-matched one, in one directory.
+        "budget_by_arm": budget_by_arm() or None,
         "eval_iters": cluster_eval_iters(),
         "token_budget": cluster_token_budget(),
         "lr_horizon": cluster_lr_horizon(),
@@ -195,13 +482,42 @@ def lock_recipe(out_root: Path) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         old = json.loads(path.read_text(encoding="utf-8"))
-        if old != rec:
+        # A field added after a suite ran is unrecorded, not conflicting. Backfill
+        # it when everything actually recorded agrees; a real disagreement on any
+        # shared field still refuses, which is the point of the lock.
+        conflicts = {k: (old[k], rec[k]) for k in old.keys() & rec.keys()
+                     if old[k] != rec[k]}
+        if conflicts:
             raise SystemExit(
-                f"refusing to mix recipes in {path}:\n  have {old}\n  want {rec}")
+                f"refusing to mix recipes in {path}:\n  have {old}\n  want {rec}"
+                f"\n  conflicting fields: {sorted(conflicts)}")
+        if old.keys() != rec.keys():
+            merged = {**rec, **old}
+            if "workers" not in old:
+                # Never backfill tenancy from the CURRENT launch -- that would
+                # write a guess about a run that already happened into its own
+                # record. The worker-log count is the suite's own artifact; when
+                # it disagrees with this launch, that is a real conflict.
+                prior = _suite_tenancy(path.parent)
+                if prior is None:
+                    merged.pop("workers", None)
+                elif prior != rec["workers"]:
+                    raise SystemExit(
+                        f"refusing to mix tenancies in {path}: suite ran at "
+                        f"workers={prior}, this launch is workers={rec['workers']}")
+                else:
+                    merged["workers"] = prior
+            path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+            return merged
         return old
     path.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
     return rec
 
+
+# What `isolates` runs, in order. Named explicitly, because it used to iterate the
+# whole ISOLATE_STAGES tuple: adding a stage for a different experiment silently
+# enlarged an existing command and would have run 20 unrelated jobs under it.
+ISOLATE_SEQUENCE: tuple[str, ...] = ("matched20", "bs8", "matched32")
 
 ISOLATE_STAGES: tuple[dict, ...] = (
     {
@@ -237,11 +553,65 @@ ISOLATE_STAGES: tuple[dict, ...] = (
         "prefix": "cx32",
         "workers": 2,
     },
+    # E10: identical to `matched32` in every recipe field -- batch 32,
+    # eval_iters 20, 50M budget, 50M cosine -- so its rows drop straight into the
+    # section 4.5 board. Only the arm list differs, which is the point.
+    # E11 phase 2: every arm trains the SAME WALL CLOCK, each with its own token
+    # budget and its own cosine over that budget. Single-tenant by design -- the
+    # artifact is `elapsed_s`, and a co-located job measures the scheduler.
+    {
+        "name": "wallclock32",
+        "out": WALLCLOCK_OUT,
+        "batch": 32,
+        "eval_iters": 20,
+        "token_budget": TOKEN_BUDGET,      # overridden per arm; kept for the record
+        "wall_clock_s": WALLCLOCK_SECONDS,
+        "lr_horizon": None,
+        "arms": ",".join(WALLCLOCK_ARMS),
+        "prefix": "cxwc",
+        "workers": 1,
+    },
+    {
+        "name": "ctx2048",
+        "out": CTX2048_OUT,
+        "batch": 8,
+        "block": 2048,
+        "eval_iters": 20,
+        "token_budget": TOKEN_BUDGET,
+        "lr_horizon": None,
+        "arms": ",".join(CTX_ARMS),
+        "prefix": "cx2k",
+        "workers": 2,
+    },
+    {
+        "name": "ratio32",
+        "out": RATIO32_OUT,
+        "batch": 32,
+        "eval_iters": 20,
+        "token_budget": TOKEN_BUDGET,
+        "lr_horizon": None,
+        "arms": ",".join(RATIO_ARMS),
+        "prefix": "cx32r",
+        "workers": 2,
+    },
 )
 
 
 def apply_isolate(stage: dict) -> None:
+    # Exported before budgets are sized: the tenancy the stage will run at is the
+    # same tenancy its throughput must have been measured at.
+    os.environ["CROSSOVER_WORKERS"] = str(stage["workers"])
+    if stage.get("wall_clock_s"):
+        arms = tuple(stage["arms"].split(","))
+        budgets = wallclock_budgets(stage["wall_clock_s"], arms,
+                                    batch=stage["batch"],
+                                    block=stage.get("block", 512),
+                                    tenancy=stage["workers"])
+        os.environ["CROSSOVER_BUDGET_BY_ARM"] = json.dumps(budgets, sort_keys=True)
+    else:
+        os.environ.pop("CROSSOVER_BUDGET_BY_ARM", None)
     os.environ["CROSSOVER_BATCH"] = str(stage["batch"])
+    os.environ["CROSSOVER_BLOCK"] = str(stage.get("block", 512))
     os.environ["CROSSOVER_EVAL_ITERS"] = str(stage["eval_iters"])
     os.environ["CROSSOVER_TOKEN_BUDGET"] = str(stage["token_budget"])
     if stage.get("lr_horizon"):
@@ -278,10 +648,16 @@ def expand_grid(seeds: tuple[int, ...] = SEEDS) -> list[dict]:
 
 
 def job_config(job: dict, out_root: Path, smoke: bool = False):
+    # A wall-clock-matched stage gives each arm its OWN token budget, and with
+    # lr_horizon unset the cosine spans that same budget -- so every arm anneals
+    # over the tokens it actually gets. That is the whole difference from E11
+    # phase 1, which re-read curves annealed over 50M and stopped early.
+    per_arm = budget_by_arm().get(job.get("arm", ""))
     scaled = scale_to_token_budget(
         job_batch(job),
-        token_budget=cluster_token_budget(),
-        lr_horizon_tokens=cluster_lr_horizon(),
+        block_size=cluster_block(),
+        token_budget=per_arm if per_arm else cluster_token_budget(),
+        lr_horizon_tokens=None if per_arm else cluster_lr_horizon(),
     )
     overrides = dict(
         run_name=job["id"],
@@ -590,14 +966,27 @@ def cmd_list(_args) -> None:
     for arm in ARMS:
         print(f"{arm.name:<28} {arm.mixer:<12} {arm.layer_mixers:<48} {arm.note}")
     n = len(ARMS) * len(SEEDS)
-    scaled = scale_to_token_budget(cluster_batch())
+    scaled = scale_to_token_budget(cluster_batch(), block_size=cluster_block())
     print(f"\n{len(ARMS)} arms × {len(SEEDS)} seeds = {n} jobs")
     print(f"token budget {TOKEN_BUDGET:,}  CROSSOVER_BATCH={cluster_batch()}  "
           f"tok/step {scaled['tokens_per_step']}  steps {scaled['max_steps']}")
 
 
 def cmd_smoke(args) -> None:
-    out_root = Path(args.out)
+    # Smoke runs land in their own subtree, NOT in the suite directory.
+    #
+    # They are 40-step runs that write a real metrics.jsonl with a real `done`
+    # record and a real best_val, and `_collect` reads every directory it finds.
+    # Writing them beside the suite put `smoke_attention_s1337` next to 50 real
+    # cx50 runs, which broke the aligner outright: the committed summary said
+    # n=5 for attention and a fresh _collect found 0, because the smoke runs'
+    # token grid shares no marker with the real ones. The paper's ten-arm board is
+    # built from that summary.
+    #
+    # `docs/GPU_BUNDLE.md` records this same defect in `scripts/gpu_bundle.py`,
+    # where "following the documented procedure corrupted the matrix". It was
+    # fixed there and left here.
+    out_root = Path(args.out) / "_smoke"
     seed = SEEDS[0]
     arms = [a for a in ARMS if a.name in ("attention", "mingru")]
     for arm in arms:
@@ -676,6 +1065,9 @@ def cmd_launch(args) -> None:
     env.setdefault("CROSSOVER_EVAL_ITERS", str(cluster_eval_iters()))
     env.setdefault("CROSSOVER_TOKEN_BUDGET", str(cluster_token_budget()))
     env.setdefault("CROSSOVER_JOB_PREFIX", job_prefix())
+    # Workers is exported, not defaulted: the recipe every job records must say
+    # how many jobs actually shared the GPU with it.
+    env["CROSSOVER_WORKERS"] = str(args.workers)
     if os.environ.get("CROSSOVER_ARMS"):
         env["CROSSOVER_ARMS"] = os.environ["CROSSOVER_ARMS"]
     if os.environ.get("CROSSOVER_LR_HORIZON"):
@@ -794,8 +1186,15 @@ def cmd_status(args) -> None:
     if queue.exists():
         state = json.loads(queue.read_text(encoding="utf-8"))
         jobs = state["jobs"]
+    elif not out_root.exists():
+        # Falling back to the default grid here printed 70 pending jobs of a
+        # different suite for a directory that did not exist -- a suite nobody
+        # had launched read as a suite fully queued.
+        raise SystemExit(f"{out_root} does not exist; nothing has been launched")
     else:
         jobs = expand_grid()
+        print(f"note: no {QUEUE_NAME} in {out_root}; showing the default grid, "
+              "which may not be this suite's")
     for job in jobs:
         st = job.get("status", "pending")
         if job_done(out_root, job["id"]):
@@ -1017,25 +1416,46 @@ def _stage_launch(args, stage: dict) -> None:
     cmd_launch(args)
 
 
-def cmd_matched20(args) -> None:
-    if not getattr(args, "detach", False):
-        args.detach = True
-    args.workers = getattr(args, "workers", None) or 2
-    _stage_launch(args, ISOLATE_STAGES[0])
+def stage_by_name(name: str) -> dict:
+    """Look a stage up by name.
+
+    These were indexed positionally -- ISOLATE_STAGES[0], [1], [2] -- so inserting
+    a stage anywhere but the end silently re-pointed a subcommand at someone
+    else's recipe. A name is what the caller actually means.
+    """
+    for stage in ISOLATE_STAGES:
+        if stage["name"] == name:
+            return stage
+    raise SystemExit(f"unknown stage {name!r}; have "
+                     + ", ".join(s["name"] for s in ISOLATE_STAGES))
 
 
-def cmd_bs8(args) -> None:
-    if not getattr(args, "detach", False):
-        args.detach = True
-    args.workers = getattr(args, "workers", None) or 2
-    _stage_launch(args, ISOLATE_STAGES[1])
+def _stage_cmd(name: str):
+    def run(args) -> None:
+        stage = stage_by_name(name)
+        if not getattr(args, "detach", False):
+            args.detach = True
+        # The stage's own tenancy is the default, not a hardcoded 2. A wall-clock
+        # stage sizes its budgets for a specific jobs-per-GPU, so launching it at
+        # any other tenancy silently invalidates the run -- refuse rather than
+        # quietly honour the flag.
+        asked = getattr(args, "workers", None)
+        args.workers = asked or stage["workers"]
+        if stage.get("wall_clock_s") and args.workers != stage["workers"]:
+            raise SystemExit(
+                f"{name} sizes its token budgets for workers={stage['workers']}; "
+                f"running it at workers={args.workers} would put the arms back "
+                "out of wall-clock match. Re-size for that tenancy or drop the flag.")
+        _stage_launch(args, stage)
+    return run
 
 
-def cmd_matched32(args) -> None:
-    if not getattr(args, "detach", False):
-        args.detach = True
-    args.workers = getattr(args, "workers", None) or 2
-    _stage_launch(args, ISOLATE_STAGES[2])
+cmd_matched20 = _stage_cmd("matched20")
+cmd_bs8 = _stage_cmd("bs8")
+cmd_matched32 = _stage_cmd("matched32")
+cmd_ratio32 = _stage_cmd("ratio32")
+cmd_ctx2048 = _stage_cmd("ctx2048")
+cmd_wallclock32 = _stage_cmd("wallclock32")
 
 
 def _launch_blocking(args, stage: dict) -> None:
@@ -1076,13 +1496,43 @@ def cmd_isolates(args) -> None:
         return
     ns = argparse.Namespace(arm=None, seed=None, unhold=False, detach=False, workers=2,
                             out=str(MATCHED20_OUT))
-    for stage in ISOLATE_STAGES:
-        _launch_blocking(ns, stage)
+    for name in ISOLATE_SEQUENCE:
+        _launch_blocking(ns, stage_by_name(name))
     print("isolates complete")
+
+
+def _marker_window(tokens: list[float], target: float) -> float:
+    """How far from a marker an eval may sit and still be a reading of it.
+
+    One eval interval. The marker set is inherited from suite 14 and is
+    approximate by construction; an eval cadence that steps in whole batches
+    will rarely land on a round number, and blanking those cells would throw
+    away real measurements. What it must still reject is an arm whose curve
+    ended well short of the marker.
+    """
+    if len(tokens) < 2:
+        return MARKER_TOLERANCE * target
+    gaps = [b - a for a, b in zip(tokens, tokens[1:]) if b > a]
+    if not gaps:
+        return MARKER_TOLERANCE * target
+    return max(statistics.median(gaps), MARKER_TOLERANCE * target)
 
 
 def cmd_table(args) -> None:
     out_root = Path(args.out)
+    rec_path = out_root / "recipe.json"
+    if rec_path.exists():
+        try:
+            rec = json.loads(rec_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            rec = {}
+        if rec.get("budget_by_arm"):
+            raise SystemExit(
+                f"{out_root} matches arms on WALL CLOCK, so its arms stop at "
+                "different token counts and a token-grid table cannot compare "
+                "them -- the shared columns would be reading different amounts "
+                "of training.\n  use: python -m nanolab.crossover_replicate "
+                f"wcboard --out {out_root}")
     summary = _collect(out_root)
     (out_root / "summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8")
@@ -1103,9 +1553,22 @@ def cmd_table(args) -> None:
             if payload.get("n", 0) == 0 or not payload["tokens"]:
                 cells.append("--")
                 continue
-            # nearest eval at or after the marker
+            # An arm that never reached the marker has no value there. Taking
+            # its nearest eval printed a short arm's FINAL loss under a column
+            # header it never trained to -- a fabricated cell that looked like
+            # a measurement.
             idx = min(range(len(payload["tokens"])),
                       key=lambda i: abs(payload["tokens"][i] - target))
+            # An arm that never reached the marker has no value there. Taking its
+            # nearest eval printed a short arm's FINAL loss under a column header
+            # it never trained to -- a fabricated cell that read as a measurement.
+            # The window is one eval interval: a grid that steps 0.819M at a time
+            # answers a 0.8M marker with its 0.836M eval and cannot do better,
+            # whereas an arm that stopped at 18.9M is not answering 50M at all.
+            if abs(payload["tokens"][idx] - target) > _marker_window(
+                    payload["tokens"], target):
+                cells.append("--")
+                continue
             mu = payload["mean"][idx]
             lo = payload["lo"][idx]
             hi = payload["hi"][idx]
@@ -1125,6 +1588,131 @@ def cmd_table(args) -> None:
     table_dir.mkdir(exist_ok=True)
     (table_dir / "crossover.tex").write_text(tex, encoding="utf-8")
     print(tex)
+
+
+def _final_checkpoint_val(run_dir: Path) -> float | None:
+    """Loss at the end of the schedule, recovered from ``final.pt``.
+
+    Runs from before ``final_val`` was logged still carry the number: train.py
+    has always written the end-of-schedule eval into the final checkpoint. Read
+    it rather than reruning 4 GPU-hours, and rather than silently substituting
+    ``best_val``.
+    """
+    fp = Path(run_dir) / "final.pt"
+    if not fp.exists():
+        return None
+    try:
+        import torch
+    except ImportError:
+        return None
+    try:
+        blob = torch.load(fp, map_location="cpu", mmap=True, weights_only=False)
+    except Exception:
+        return None
+    val = blob.get("val_loss")
+    return None if val is None else float(val)
+
+
+def _final_by_seed(out_root: Path) -> dict[str, dict[str, float]]:
+    """{arm: {seed: final_val}} -- the loss at the end of each arm's schedule.
+
+    Every arm anneals its own cosine over its own budget, so the end of the
+    curve is where the arms are comparable. Deliberately NOT ``best_val``: that
+    is a minimum over however many evals fired, and a minimum over more draws
+    sits lower. In a wall-clock suite the fast arm takes more steps and so gets
+    more draws, which biases the board toward exactly the arm the design is
+    trying to measure. Measured on the 2026-08-27 suite the gap between
+    best_val and final_val ran -0.0133 for attention (89 evals) against -0.0032
+    for hybrid_gdn_bookend (24) -- monotone in eval count, and pointing the
+    same way as the throughput advantage.
+
+    Prefers the logged ``final_val``; falls back to ``final.pt`` for runs that
+    predate that field. Raises rather than falling back to ``best_val``.
+    """
+    per: dict[str, dict[str, float]] = {}
+    missing: list[str] = []
+    for mp in sorted(Path(out_root).glob("*/metrics.jsonl")):
+        name = mp.parent.name
+        if "_s" not in name:
+            continue
+        arm = name.split("_s")[0].split("_", 1)[-1]
+        seed = name.rsplit("_s", 1)[1]
+        val = None
+        for line in mp.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("event") == "done" and rec.get("final_val") is not None:
+                val = float(rec["final_val"])
+        if val is None:
+            val = _final_checkpoint_val(mp.parent)
+        if val is None:
+            missing.append(name)
+            continue
+        per.setdefault(arm, {})[seed] = val
+    if missing:
+        raise SystemExit(
+            f"{len(missing)} run(s) record no end-of-schedule loss and have no "
+            f"final.pt to recover it from: {', '.join(sorted(missing)[:5])}"
+            + (" ..." if len(missing) > 5 else "")
+            + "\nRefusing to substitute best_val: it is a minimum over an "
+              "arm-dependent number of evals and would bias the board toward "
+              "whichever arm ran the most steps.")
+    return per
+
+
+def cmd_wcboard(args) -> None:
+    """Final loss at equal wall clock, with the clock itself verified first."""
+    out_root = Path(args.out)
+    rec = {}
+    if (out_root / "recipe.json").exists():
+        rec = json.loads((out_root / "recipe.json").read_text(encoding="utf-8"))
+    target = args.seconds or rec.get("wall_clock_s") or WALLCLOCK_SECONDS
+
+    v = verify_wallclock(out_root, target)
+    print(f"wall-clock check against {target:.0f}s target")
+    for arm, el in sorted(v["arms"].items(), key=lambda kv: kv[1]):
+        off = (el - target) / target
+        print(f"  {arm:<24}{el:>9.1f}s  {off:+6.1%}  n={v['n'][arm]}")
+    if v["spread"]:
+        print(f"  spread {v['spread']:.2f}x")
+    if not v["ok"]:
+        msg = (f"REFUSING to emit a wall-clock board: {v['reason']}.\n"
+               "  Equal wall clock is the claim; these runs did not train for "
+               "equal wall clock, so the board would not mean what it says.\n"
+               "  Re-size budgets from rates measured at this tenancy, or pass "
+               "--allow-unmatched to print it as a diagnostic only.")
+        if not args.allow_unmatched:
+            raise SystemExit(msg)
+        print(f"\n!! {msg}\n")
+
+    per = _final_by_seed(out_root)
+    if not per:
+        raise SystemExit(f"no finished runs under {out_root}")
+    print(f"\nfinal loss at equal wall clock ({target:.0f}s)")
+    ranked = []
+    for arm, by_seed in per.items():
+        mu, lo, hi = mean_ci(list(by_seed.values()))
+        ranked.append((mu, lo, hi, arm, by_seed))
+    ranked.sort()
+    for i, (mu, lo, hi, arm, by_seed) in enumerate(ranked, 1):
+        ci = f"[{lo:.4f},{hi:.4f}]" if lo is not None else "[n=1, no interval]"
+        print(f"  {i}. {arm:<24}{mu:.4f}  {ci}  n={len(by_seed)}")
+
+    print("\npaired per-seed sign tests")
+    for i in range(len(ranked)):
+        for j in range(i + 1, len(ranked)):
+            a, da = ranked[i][3], ranked[i][4]
+            b, db = ranked[j][3], ranked[j][4]
+            shared = sorted(set(da) & set(db))
+            if not shared:
+                print(f"  {a} vs {b}: no shared seeds")
+                continue
+            wins = sum(1 for sd in shared if da[sd] < db[sd])
+            delta = statistics.mean(db[sd] - da[sd] for sd in shared)
+            print(f"  {a:<24} beats {b:<24} "
+                  f"delta={delta:+.4f}  {wins}/{len(shared)} seeds")
 
 
 def _nv_query() -> dict:
@@ -1263,7 +1851,7 @@ def _mfu_from_toks(mixer: str, tok_s: float, cfg) -> float:
     return (flops * tok_s) / peak
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--out", default=str(DEFAULT_OUT))
@@ -1298,6 +1886,13 @@ def main():
     probe.add_argument("--steps", type=int, default=30)
     sub.add_parser("plot", parents=[common])
     sub.add_parser("table", parents=[common])
+    wc = sub.add_parser("wcboard", parents=[common],
+                        help="E11 p2 board: final loss at equal wall clock")
+    wc.add_argument("--seconds", type=float, default=None,
+                    help="target wall clock; defaults to the suite recipe")
+    wc.add_argument("--allow-unmatched", action="store_true",
+                    help="print the board even when the clock did not match "
+                         "(diagnostic only, never for publication)")
     locked = sub.add_parser("locked20", parents=[common],
                             help="redirects to matched20; short-cosine artifacts stay put")
     locked.add_argument("--workers", type=int, default=2)
@@ -1306,16 +1901,25 @@ def main():
         ("matched20", "attn vs minGRU, 20M stop, 50M cosine, bs32, n=5"),
         ("bs8", "attn vs minGRU, suite-14 8.192M tokens, bs8, n=5"),
         ("matched32", "8 drifted arms, 50M, bs32, eval_iters=20, n=5"),
+        ("ratio32", "E10: 4 minGRU hybrid ratios/placements, 50M, bs32, n=5"),
+        ("ctx2048", "E9: 5 families at context 2048, 50M, bs8, n=5"),
+        ("wallclock32", "E11 p2: top-4 arms matched on WALL CLOCK, own cosine, n=5"),
     ):
         sp = sub.add_parser(name, parents=[common], help=help_txt)
-        sp.add_argument("--workers", type=int, default=2)
+        # No default: a stage carries its own tenancy, and "unspecified" must be
+        # distinguishable from an explicit flag so the wall-clock guard can tell
+        # an operator override from its own default.
+        sp.add_argument("--workers", type=int, default=None)
         sp.add_argument("--detach", action="store_true")
     iso = sub.add_parser("isolates", parents=[common],
                          help="run matched20, then bs8, then matched32")
     iso.add_argument("--wait", action="store_true",
                      help="run in the foreground (used by the detached supervisor)")
+    return p
 
-    args = p.parse_args()
+
+def main():
+    args = build_parser().parse_args()
     {
         "list": cmd_list,
         "smoke": cmd_smoke,
@@ -1333,7 +1937,11 @@ def main():
         "matched20": cmd_matched20,
         "bs8": cmd_bs8,
         "matched32": cmd_matched32,
+        "ratio32": cmd_ratio32,
+        "ctx2048": cmd_ctx2048,
+        "wallclock32": cmd_wallclock32,
         "isolates": cmd_isolates,
+        "wcboard": cmd_wcboard,
     }[args.cmd](args)
 
 

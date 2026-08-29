@@ -100,6 +100,11 @@ class Attention(nn.Module):
         self.n_kv_head = cfg.n_kv_head
         self.head_dim = cfg.head_dim
         self.mup = cfg.mup
+        # muP prescribes 1/d attention logits; mup_sqrt_attn_scale keeps SP's
+        # 1/sqrt(d) so the term can be ablated on its own.
+        self.attn_scale = (1.0 / cfg.head_dim
+                           if cfg.mup and not cfg.mup_sqrt_attn_scale
+                           else 1.0 / math.sqrt(cfg.head_dim))
         d = cfg.d_model
         self.q_proj = nn.Linear(d, cfg.n_head * cfg.head_dim, bias=False)
         self.k_proj = nn.Linear(d, cfg.n_kv_head * cfg.head_dim, bias=False)
@@ -158,7 +163,7 @@ class Attention(nn.Module):
             k = k.repeat_interleave(rep, dim=1)
             v = v.repeat_interleave(rep, dim=1)
 
-        scale = (1.0 / self.head_dim) if self.mup else (1.0 / math.sqrt(self.head_dim))
+        scale = self.attn_scale
         if self.block_attn > 0:                  # semi-AR: causal across blocks, dense within
             mask = block_causal_mask(T, self.block_attn, x.device, self._mask_cache)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
@@ -215,7 +220,7 @@ class Attention(nn.Module):
             rep = self.n_head // self.n_kv_head
             kk = kk.repeat_interleave(rep, dim=1)
             vv = vv.repeat_interleave(rep, dim=1)
-        scale = (1.0 / self.head_dim) if self.mup else (1.0 / math.sqrt(self.head_dim))
+        scale = self.attn_scale
         attn_mask = None
         if causal:                                # full to cache, causal within block
             Lk = k_full.shape[2]

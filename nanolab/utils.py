@@ -99,7 +99,8 @@ class Logger:
         self._emit(rec)
         print(f"  step {step:>6} | loss {kw['loss']:.4f} | lr {kw['lr']:.2e} | "
               f"gnorm {kw['grad_norm']:.2f} | {format_count(kw['tok_s'])} tok/s | "
-              f"mfu {kw['mfu']*100:.1f}%")
+              + (f"mfu {kw['mfu']*100:.1f}%" if kw.get("mfu") is not None
+                 else "mfu n/a (set PEAK_FLOPS)"))
 
     def eval(self, step, **kw):
         rec = {"event": "eval", "step": step, **kw}
@@ -109,17 +110,27 @@ class Logger:
         print(f"  -------- eval @ {step}: {train_bit}"
               f"val {kw['val_loss']:.4f}  ppl {kw['val_ppl']:.2f}{bpc} --------")
 
-    def done(self, best_val, elapsed, tokens, elapsed_s=None):
+    def done(self, best_val, elapsed, tokens, elapsed_s=None, final_val=None):
         # elapsed is a human string for the console; elapsed_s is the machine
         # readable wall clock.  Emitting only the former is why no suite before
         # 2026-08-22 has a recoverable run time.
+        #
+        # final_val is the loss at the end of the schedule.  best_val is a
+        # minimum over however many evals happened to fire, so it is biased
+        # down by an amount that grows with the eval count -- across arms that
+        # run different numbers of steps for the same wall clock that bias is
+        # differential, and it points the same way as the throughput advantage.
+        # Recording both is what lets a board pick the honest one.
         record = {"event": "done", "best_val": best_val, "tokens": tokens}
+        if final_val is not None:
+            record["final_val"] = float(final_val)
         if elapsed_s is not None:
             record["elapsed_s"] = float(elapsed_s)
             record["mean_tok_s"] = float(tokens) / max(float(elapsed_s), 1e-9)
         self._emit(record)
         print("=" * 70)
-        print(f"  DONE  best_val_loss={best_val:.4f}  "
+        tail = "" if final_val is None else f"  final_val_loss={final_val:.4f}"
+        print(f"  DONE  best_val_loss={best_val:.4f}{tail}  "
               f"tokens={format_count(tokens)}  time={elapsed}")
         print("=" * 70)
         self.f.close()
