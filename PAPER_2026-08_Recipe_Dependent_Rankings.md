@@ -537,11 +537,48 @@ because the attention and minGRU cells are suite 22's sample rather than a fresh
 > **The tie has since been probed on three further axes, and it survives one, is untested on a
 > second, and dissolves confusingly on the third.** Sequence length: at `block_size` 2048 the two
 > arms sit at 4.2004 [4.1628, 4.2379] and 4.2022 [4.1681, 4.2362] — still tied (§6.7). Recurrent:
-> attention ratio: a five-arm within-suite sweep is in flight at the time of writing. Metric: on
+> attention ratio: **the tie does not survive it, and "the best hybrid" was itself a
+> single-recipe claim** — see the ratio and placement board below. Metric: on
 > in-context recall the pair separates in *either* direction depending on task difficulty and
 > training budget, and ties again once both arms are adequately trained (§6.8). We therefore
 > report the §4.5 tie as robust to sequence length and to the choice of held-out CE horizon, and
 > **explicitly not** as a claim about in-context recall, where it is not a stable quantity.
+>
+> **Ratio and placement (2026-08-29, `crossover50m_ratioplace32`).** Row 2 of the board above is
+> `hybrid_mingru10_attn2` — ten minGRU layers with attention in the last two. That is one point in
+> a design space, and §4.5 reports it as *the* best hybrid. Five arms at the identical recipe, in
+> one suite, five seeds, on `final_val`:
+>
+> | arm | layout | attn layers | final val [95%] |
+> |---|---|---|---|
+> | `hybrid_mingru_periodic` | 9 + 3, every 4th | 3 | **4.1939** [4.1672, 4.2206] |
+> | `hybrid_mingru8_attn4` | 8 + 4 | 4 | 4.2016 [4.1732, 4.2299] |
+> | `hybrid_mingru10_attn2` | 10 + 2, last two | 2 | 4.2313 [4.2010, 4.2617] |
+> | `hybrid_mingru11_attn1` | 11 + 1 | 1 | 4.2530 [4.2257, 4.2802] |
+> | `hybrid_mingru_bookend` | attn first and last | 2 | 4.2596 [4.2306, 4.2887] |
+>
+> Seed variance is common-mode across arms here, so the powered test is paired per seed. Every
+> comparison below is 5 of 5 seeds with an interval disjoint from zero:
+>
+> | comparison | paired Δ |
+> |---|---|
+> | 9+3 vs 10+2 | −0.0375 [−0.0426, −0.0323] |
+> | 9+3 vs 8+4 | −0.0077 [−0.0118, −0.0036] |
+> | 9+3 vs 11+1 | −0.0591 [−0.0641, −0.0541] |
+> | 10+2 vs bookend (**both 2 attention layers**) | −0.0283 [−0.0307, −0.0259] |
+>
+> Three findings. **The field's converged 3:1 periodic ratio is the best arm on this board**, and
+> beats §4.5's row 2 by 0.0375 on every seed — so "the best hybrid is indistinguishable from pure
+> attention" was a claim about *one* ratio, and the ratio was not the best one available.
+> **Attention count is not monotone**: three attention layers beat four, 5 of 5. **Placement is a
+> real variable independent of count**: `hybrid_mingru10_attn2` and `hybrid_mingru_bookend` spend
+> exactly two attention layers each and differ by 0.0283 nats on every seed, purely in where those
+> layers sit. Concentrating them at the end beats splitting them across the stack's ends.
+>
+> The four previously-run arms were re-measured here rather than imported, and reproduce their
+> original suite to within **0.0006 nats** — an unplanned reproducibility check on the whole
+> pipeline. That re-run was not optional: `lock_recipe` refuses to add a fifth arm to a suite whose
+> `recipe.json` records four, precisely so that two arm sets cannot be blended under one recipe.
 
 ### 4.6 Summary: what moved the crossing
 
@@ -1679,8 +1716,12 @@ values (49,987,584 tokens) and are labelled as such wherever they are compared.
 §6.8, §6.9 and §8.4's status block was recomputed from `metrics.jsonl` or from recovered checkpoint
 values during the release audit, not copied from prior notes. Two errors were caught that way and
 are recorded rather than quietly fixed: the withdrawn recall claim (§7.3 item 6) and a placement
-comparison that turned out to be cross-suite *and* cross-statistic, and is withdrawn pending a
-within-suite re-measurement.
+comparison that turned out to be cross-suite *and* cross-statistic. That re-measurement has since
+been run within one suite (`crossover50m_ratioplace32`, §4.5), and the placement effect is
+confirmed at −0.0283 nats on 5 of 5 paired seeds. Worth recording that the withdrawn cross-suite
+estimate was 0.029 — numerically almost identical to the valid one. It was withdrawn because the
+comparison was invalid, not because the number was wrong, and a right answer obtained by an
+invalid route is not a result.
 
 **Cold storage.** The corpus the entire paper is measured against (`fineweb-edu`, 954 MB) is
 gitignored and existed in one place. It, the full result tree, the recovered end-of-schedule

@@ -402,9 +402,32 @@ layers are doing here saturates by three of twelve.
 positions -- and called the 0.029 gap a placement effect. That comparison is invalid: the
 10+2 cell lives in `crossover50m_matched32`, whose checkpoints were pruned, so its
 `final_val` is unrecoverable and only its `best_val` exists. The two numbers were a
-cross-suite *and* cross-statistic pair. Within this suite, `bookend` (2 attn) and `11+1`
-(1 attn) are 4.2590 and 4.2529 -- indistinguishable -- so placement is unresolved here, not
-measured. Settling it needs 10+2 re-run inside this suite.
+cross-suite *and* cross-statistic pair.
+
+**RESOLVED 2026-08-29 (`crossover50m_ratioplace32`, 5 arms x 5 seeds, within-suite,
+`final_val`).** `lock_recipe` refuses a fifth arm in `ratio32` -- its `recipe.json` records a
+four-arm list and the guard exists to stop two arm sets being blended -- so all five arms were
+re-run in a fresh suite at the identical recipe. Seed variance is common-mode, so the powered
+test is paired; every row is 5/5 seeds, interval disjoint from zero:
+
+| comparison | paired delta |
+|---|---|
+| 9+3 vs 10+2 | -0.0375 [-0.0426, -0.0323] |
+| 9+3 vs 8+4 | -0.0077 [-0.0118, -0.0036] |
+| 9+3 vs 11+1 | -0.0591 [-0.0641, -0.0541] |
+| 10+2 vs bookend (both 2 attn layers) | **-0.0283** [-0.0307, -0.0259] |
+
+Placement is real and independent of count: two arms spending exactly two attention layers
+differ by 0.0283 nats on every seed, purely in where the layers sit. Count is not monotone:
+3 attention layers beat 4. The pre-registered readout fired in its second branch -- ratio
+reorders the family, so §4.5's row 2 needs a ratio qualifier.
+
+*The withdrawn estimate was 0.029; the valid one is 0.0283.* It was withdrawn because the
+comparison was invalid, not because the number was wrong. A right answer by an invalid route
+is not a result, and the near-match is luck rather than vindication.
+
+*Free reproducibility check.* The four previously-run arms reproduce their `ratio32` values to
+within 0.0006 nats (periodic 4.1942 -> 4.1939, 11+1 4.2529 -> 4.2530).
 
 
 ### E11 — wall-clock-matched board: the cost basis practitioners actually use
