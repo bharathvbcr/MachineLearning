@@ -1,0 +1,15 @@
+{
+  "batch_size": 32,
+  "eval_iters": 20,
+  "token_budget": 50000000,
+  "lr_horizon": null,
+  "arms": [
+    "hybrid_mingru11_attn1",
+    "hybrid_mingru_periodic",
+    "hybrid_mingru_bookend",
+    "hybrid_mingru8_attn4"
+  ],
+  "prefix": "cx32r",
+  "compile": false,
+  "workers": 3
+}

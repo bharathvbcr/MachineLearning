@@ -1,0 +1,22 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "budget_by_arm": {
+    "attention": 41074688,
+    "hybrid_gdn_bookend": 19185664,
+    "hybrid_gdn_periodic": 20889600,
+    "hybrid_mingru10_attn2": 34963456
+  },
+  "eval_iters": 20,
+  "token_budget": 50000000,
+  "lr_horizon": null,
+  "arms": [
+    "attention",
+    "hybrid_mingru10_attn2",
+    "hybrid_gdn_periodic",
+    "hybrid_gdn_bookend"
+  ],
+  "prefix": "cxwc",
+  "compile": false,
+  "workers": 1
+}
