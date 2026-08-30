@@ -767,11 +767,17 @@ still gated on restoring `fineweb10B_sp1024` from an external copy, not on compu
    and deliberately is not mapped onto rows written for µP. Either fix µP properly (pair the
    `1/d` rule with the q/k init that makes it correct) or restate the rows in terms of the
    arm actually run. Costs nothing to decide; blocks the paper's headline caveat.
-2. **E8 option C — where minGRU's recall limit actually sits.** `mingru` is 0/15 at p=8 at
-   both budgets but scored 1/15 at p=4/3000, so the boundary is unlocated. p=4 @ 9000 for
-   `mingru`/`gdn`/`hybrid_gdn_periodic`: 45 runs, 8.6 GH200-h, ~$20 (priced from measured
-   medians x3.02 scaling). Converts "minGRU cannot do recall" -- which overstates the
-   evidence -- into a located boundary.
+2. ~~**E8 option C**~~ **DONE 2026-08-30** (45 runs, arm-parallel, 3.7 h wall-clock instead of
+   the 8.6 h serial estimate; the arms are independent and E8's readout is a rate over steps,
+   not wall-clock, so contention cannot affect it). **minGRU is the only arm budget does not
+   move:** 1/15 -> 1/15 at p=4 and 0/15 -> 0/15 at p=8, while attention goes 2/15 -> 12/15,
+   gdn 7/15 -> 13/15 and hybrid_mingru10_attn2 5/15 -> 12/15.
+
+   *This refuted a claim we had already written into the paper.* Section 6.8 read the surviving
+   effect as attention-containing vs not. `gdn` has no attention layers and reaches 13/15 at
+   p=4/9000 -- above the minGRU hybrid's 12/15 -- so recurrence is not the problem and the
+   limit is specific to minGRU's gating. Both the section and its withdrawn predecessor are
+   now recorded (paper section 7.3 items 7-8).
 3. **A scale ladder.** The loudest reviewer objection is that everything here is one small
    scale. Two or three model sizes would convert it into a measured quantity. Unpriced.
 4. **E10 placement, properly.** Re-run `hybrid_mingru10_attn2` inside `crossover50m_ratio32`

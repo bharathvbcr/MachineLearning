@@ -991,26 +991,36 @@ budget, not the least: 2/15 → 12/15 at eight pairs is the largest single move 
 board read at 3000 steps reports attention as the *worst* arm at that difficulty, which the
 9000-step cell shows to be a statement about the budget.
 
-**What does survive the budget control is a coarser, genuinely architectural split.** At eight
-pairs and 9000 steps:
+**Exactly one thing survives the budget control, and it is narrower than the split we first drew
+from it.** The full grid, all five families at both difficulties and both budgets:
 
-| arm | 3000 steps | 9000 steps |
-|---|---|---|
-| `hybrid_gdn_periodic` | 6/15 | 13/15 [0.62, 0.96] |
-| `hybrid_mingru10_attn2` | 12/15 | 13/15 [0.62, 0.96] |
-| `attention` | 2/15 | 12/15 [0.55, 0.93] |
-| `gdn` | 2/15 | 6/15 [0.20, 0.64] |
-| `mingru` | 0/15 | **0/15** [0.00, 0.20] |
+| arm | attn layers | p=4: 3000 → 9000 | p=8: 3000 → 9000 |
+|---|---|---|---|
+| `attention` | 12 | 15/15 → 15/15 | 2/15 → 12/15 |
+| `hybrid_gdn_periodic` | 3 | 9/15 → 15/15 | 6/15 → 13/15 |
+| `hybrid_mingru10_attn2` | 2 | 5/15 → 12/15 | 12/15 → 13/15 |
+| `gdn` | 0 | 7/15 → **13/15** | 2/15 → 6/15 |
+| `mingru` | 0 | 1/15 → **1/15** | 0/15 → **0/15** |
 
-A pure minGRU stack forms the head on zero of thirty runs across both budgets, with recall pinned
-in a 0.358–0.383 band: 3× the compute does not move it. `gdn` is intermediate — budget lifts it
-2/15 → 6/15, still short of every attention-containing arm. Adding three attention layers to GDN
-takes 6/15 → 13/15 at the same budget and difficulty.
+**`mingru` is the only arm on the board that budget does not move.** Every other family gains
+substantially from 3× the compute — attention 2/15 → 12/15, GDN 7/15 → 13/15, the minGRU hybrid
+5/15 → 12/15 — while minGRU is unchanged at 1/15 at four pairs and 0/15 at eight, with recall
+pinned in a 0.358–0.383 band. Its failure to form the induction head is therefore not a budget
+artifact; it is the single quantity in this grid that the budget control leaves standing.
 
-So the durable statement is two-part, and neither part is the one we first drew from this probe:
-**architecture decides whether the arm can do the task at all**, and **budget decides the ordering
-among the arms that can**. The first is the hybrid literature's own premise, reproduced. The
-second is this paper's thesis, reproduced on the instrument we built to escape it.
+**It is a fact about minGRU, not about recurrence.** We initially read this split as
+attention-containing versus not, and the four-pair cell refutes that: `gdn` carries no attention
+layers at all and reaches 13/15, *above* the minGRU hybrid's 12/15 at the same cell. A pure
+recurrent stack does in-context recall perfectly well here given enough steps. What fails is one
+specific gating mechanism, and the difference between the two recurrent families — 13/15 against
+1/15 at identical difficulty, budget, width and depth — is far larger than anything the
+recurrent/attention distinction predicts.
+
+So the durable statement is two-part, and neither part is what we first drew from this probe:
+**one architecture in five cannot do the task at any budget we tested**, and **for every arm that
+can, the ordering is decided by where training stops**. The first is narrower than the hybrid
+literature's premise and does not support it as usually stated — recurrence is not the problem.
+The second is this paper's thesis, reproduced on the instrument we built to escape it.
 
 ### 6.9 The cost basis reorders the board, and the usual argument for hybrids does not survive it
 
@@ -1159,12 +1169,21 @@ Stating these explicitly is part of the result.
    eight pairs the ordering reverses outright. The probe was built to test whether §4.5's tie was
    metric-dependent, and it answered a question we had not asked. §6.8 reports the grid.
 
-7. **"A pure minGRU stack cannot do in-context recall."** Withdrawn as stated, and replaced by a
-   located claim. minGRU forms the head on 0 of 30 runs at eight key–value pairs across both
-   budgets, which is what the strong wording rested on — but it reached 1/15 at four pairs, so the
-   limit has a boundary in difficulty and the blanket claim overstates the evidence. The
-   experiment that locates it (four pairs at the higher budget) is specified and priced; until it
-   runs, the claim is "minGRU does not form the head at eight pairs at either budget tested."
+7. **"A pure minGRU stack cannot do in-context recall."** Withdrawn as stated, then re-established
+   on better evidence — and the route matters more than the destination. The strong wording
+   originally rested on 0 of 30 runs at eight key–value pairs, but minGRU had reached 1/15 at four
+   pairs, so the blanket claim outran its evidence and we narrowed it to "does not form the head at
+   eight pairs at either budget tested," naming the missing experiment. That experiment has since
+   run: at four pairs, 3× the budget leaves minGRU at **1/15 → 1/15**, while every other family on
+   the board gains substantially. The limit is now supported as a budget-invariant property rather
+   than assumed from a single difficulty.
+
+8. **"What survives the budget control is an attention-versus-recurrence split."** Withdrawn. It
+   was drawn from the eight-pair cells, where `gdn` sits at 6/15 behind every attention-containing
+   arm, and it does not survive the four-pair cells, where `gdn` reaches 13/15 — above the minGRU
+   hybrid. The surviving effect is specific to minGRU, not to recurrent mixers as a class (§6.8).
+   We record this because the withdrawn version is the more quotable claim and the one a reader
+   would expect a hybrid paper to make.
 
 ### 7.4 Corrections found by auditing our own record
 
