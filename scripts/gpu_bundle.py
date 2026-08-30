@@ -1827,19 +1827,56 @@ PROXY_SPEEDUP = 3.0     # 256-wide vs 768-wide: 8.9x fewer matrix FLOPs, but a
 CTX1024_FACTOR = 0.7    # ctx 512 -> 1024: attention is the only quadratic term
 
 
-def measured_rates() -> dict[tuple[str, int, int], float]:
-    """Median tok/s per (mixer, batch, ctx) from the committed suite-22..26 runs.
+def rate_basis_tenancy() -> dict[object, int]:
+    """{tenancy: runs} across the suites `measured_rates` reads.
+
+    Exists so the mixing below is stated rather than laundered. `None` counts
+    runs whose jobs-per-GPU cannot be established from either recipe.json or the
+    worker logs.
+    """
+    from nanolab.crossover_replicate import _suite_tenancy
+    out: dict[object, int] = {}
+    for cfgp in sorted((ROOT / "nanolab/out").glob("crossover*/**/config.json")):
+        if not cfgp.with_name("metrics.jsonl").exists():
+            continue
+        t = _suite_tenancy(cfgp.parent.parent)
+        out[t] = out.get(t, 0) + 1
+    return out
+
+
+def measured_rates(tenancy: int | None = None) -> dict[tuple[str, int, int], float]:
+    """Median tok/s per (mixer, batch, ctx) from the committed crossover runs.
 
     PAPER section 10 notes that no suite reports GPU hours because the trainer
     discarded elapsed time. The per-step `tok_s` was never discarded, and those
     run records ARE committed -- so the estimate below is derived from this
     repository rather than recalled.
+
+    TENANCY. `tok_s` is per-step throughput, so it falls with jobs-per-GPU, and
+    it does NOT fall uniformly across arms -- attention and the minGRU hybrid
+    recover 1.78x and 1.72x single-tenant against the GDN arms' 1.04x and 1.05x.
+    Mixing tenancies in one median therefore produces a rate that describes no
+    achievable configuration. This was measured, not feared: publishing a
+    3-tenant suite into this basis moved the bundle's derived cost from 36.38 to
+    43.72 GH200-hours, a 20% swing from data that answered a different question.
+
+    `tenancy=N` restricts the basis to suites established at N jobs per GPU.
+    **It is not the default, because this repository cannot support it**: no
+    single tenancy covers the matrix. Tenancy 1 leaves 30 jobs unpriced, 2 leaves
+    all 394, 3 leaves 212. The default therefore keeps every suite and the
+    callers PRINT `rate_basis_tenancy()` beside the total, so the figure is read
+    as the mixed-tenancy estimate it is rather than as a single-tenant one.
+    Restoring a clean basis needs same-tenancy coverage of the arms, which is a
+    measurement, not a code change.
     """
     import statistics
+    from nanolab.crossover_replicate import _suite_tenancy
     per_run: dict[tuple[str, int, int], list[float]] = {}
     for cfgp in sorted((ROOT / "nanolab/out").glob("crossover*/**/config.json")):
         mp = cfgp.with_name("metrics.jsonl")
         if not mp.exists():
+            continue
+        if tenancy is not None and _suite_tenancy(cfgp.parent.parent) != tenancy:
             continue
         try:
             cfg = json.loads(cfgp.read_text(encoding="utf-8"))
@@ -1904,6 +1941,14 @@ def cost_report(jobs: list[dict]) -> int:
         print("no committed run records to derive throughput from", file=sys.stderr)
         return 1
     print("=== measured GH200 throughput (median tok/s, from committed run records) ===")
+    comp = rate_basis_tenancy()
+    if len([t for t in comp if t is not None]) > 1 or None in comp:
+        parts = ", ".join(f"{n} at {'unknown' if t is None else t}"
+                          for t, n in sorted(comp.items(), key=lambda kv: (kv[0] is None, kv[0])))
+        print(f"  BASIS MIXES TENANCIES ({parts} job(s) per GPU). tok_s falls with")
+        print("  jobs-per-GPU and not uniformly across arms, so this median describes no")
+        print("  single achievable configuration. Read the total below as a mixed-tenancy")
+        print("  estimate. See measured_rates.__doc__ for why a clean basis is unavailable.")
     for k in sorted(rates, key=lambda x: (str(x[0]), x[1], x[2])):
         print(f"  {str(k[0]):<12} bs{k[1]:<4} ctx{k[2]:<6} {rates[k]:>10,.0f} tok/s")
 

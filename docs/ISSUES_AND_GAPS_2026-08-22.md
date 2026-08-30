@@ -293,7 +293,7 @@ Only the CUDA `nanolab` work. E3 is Rust/Metal on the M5 Pro; E4/E5 need the RTX
 | `e1_perlayer_sp` | 10 | 19.99M | 1.06 |
 | `e1_embed_lr` | 10 | 19.99M | 1.06 |
 | `e2_matched32_50m` | 10 | 49.99M | 2.65 |
-| **total (default matrix)** | **394** | | **≈ 36.40** |
+| **total (default matrix)** | **394** | | **≈ 43.72** (mixed-tenancy basis; see `GPU_BUNDLE.md`) |
 | `d10_horizon` — **opt-in**, `--with-d10`, 3 seeds | 6 | 327.7M / 655.4M | ≈ 20 |
 
 1.91 of those hours are **extrapolated, not measured**: no committed run covers width

@@ -298,10 +298,27 @@ count in its `meta`, so a contended rate can never be read as an uncontended one
 
 ## Cost and instance choice
 
-Total work, derived: **≈ 36.40 GH200-hours** across the 394 jobs, of which 1.9 h is
+Total work, derived: **≈ 43.72 GH200-hours** across the 394 jobs, of which 3.88 h is
 extrapolated rather than measured (the proxy runs at width 256; no committed run
 covers it, so `--cost` applies a labelled factor). Every other job is priced against
-a measured rate. The longest single job is 18 minutes.
+a measured rate. The longest single job is in `e2_matched32_50m` at 25 minutes.
+
+> **This is a MIXED-TENANCY estimate and cannot be read as a single-tenant one.**
+> `--cost` derives rates from per-step `tok_s`, which falls with jobs-per-GPU and
+> does not fall uniformly across arms — attention and the minGRU hybrid recover
+> 1.78× and 1.72× when given the GPU alone, the two GDN arms only 1.04× and 1.05×.
+> The basis currently spans 40 runs at 1 job/GPU, 25 at 2, 45 at 3, and 130 whose
+> tenancy cannot be established from either `recipe.json` or the worker logs, so
+> the median describes no achievable configuration.
+>
+> The figure moved from 36.38 to 43.72 — 20% — purely by publishing one 3-tenant
+> suite into the basis, which is how the mixing was found. `measured_rates()` now
+> takes a `tenancy=` filter and `--cost` prints the composition, but **the default
+> still mixes, because this repository cannot support a clean basis**: no single
+> tenancy covers the matrix (tenancy 1 leaves 30 jobs unpriced, 2 leaves all 394,
+> 3 leaves 212). Fixing that is a measurement — same-tenancy coverage of the arms —
+> not a code change. Treat the total as an order-of-magnitude plan, and prefer
+> `--report`'s `gpu_hours_measured` once a run exists.
 
 | instance | $/GPU-hr | full bundle |
 |---|---|---|
