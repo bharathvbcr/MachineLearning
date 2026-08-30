@@ -1033,6 +1033,14 @@ def cmd_launch(args) -> None:
         print(f"CROSSOVER_BATCH={cluster_batch()} needs ~80GB/job; "
               f"forcing --workers 1 (asked {args.workers})")
         args.workers = 1
+    # Record the tenancy this launch will ACTUALLY run at. `cluster_workers()`
+    # reads CROSSOVER_WORKERS, which `launch --workers N` does not set, so a
+    # suite launched with --workers 3 recorded `workers: 1` while running three
+    # to a GPU. Throughput is only interpretable together with tenancy, and
+    # `_suite_tenancy` and every rate model downstream trust this field -- a
+    # recipe field set by assumption rather than by what happened is the defect
+    # this suite's own analysis exists to catch.
+    os.environ["CROSSOVER_WORKERS"] = str(args.workers)
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
     lock_recipe(out_root)

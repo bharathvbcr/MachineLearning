@@ -1,7 +1,7 @@
 {
   "batch_size": 32,
   "block_size": 512,
-  "workers": 1,
+  "workers": 3,
   "budget_by_arm": null,
   "eval_iters": 20,
   "token_budget": 50000000,

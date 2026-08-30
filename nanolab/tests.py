@@ -2221,6 +2221,61 @@ def e8_run_name_carries_the_recipe_so_resume_cannot_mix_configs():
     assert e8_config("attention", 1).run_name == a.run_name, "must be stable"
 
 
+@test
+def launch_records_the_tenancy_it_actually_runs_at():
+    """`launch --workers N` must write N into recipe.json, not the env default.
+
+    `cluster_workers()` reads CROSSOVER_WORKERS; `cmd_launch` spawns
+    `args.workers`. Those were two different sources, so a suite launched with
+    --workers 3 recorded `workers: 1` while running three jobs to a GPU. Every
+    downstream rate model trusts that field -- `_suite_tenancy`, wall-clock budget
+    sizing, and `scripts/gpu_bundle.py`'s cost basis -- and a rate measured at one
+    tenancy does not transfer to another. Caught in the release audit, on a suite
+    whose record had already been published.
+
+    `subprocess.Popen` is stubbed: the assertion is about what `lock_recipe`
+    writes, and an unstubbed run spawns real training workers into a temp dir.
+    """
+    import argparse, os, tempfile, json as _json, subprocess
+    from . import crossover_replicate as cr
+
+    class _NoProc:
+        def __init__(self, *a, **k): self.pid = -1
+        def wait(self, *a, **k): return 0
+        def poll(self): return 0
+        def terminate(self): pass
+        def kill(self): pass
+
+    prior_env = os.environ.get("CROSSOVER_WORKERS")
+    prior_batch = os.environ.get("CROSSOVER_BATCH")
+    real_popen = subprocess.Popen
+    try:
+        os.environ.pop("CROSSOVER_WORKERS", None)
+        # Batch 32, as the suite that exposed this ran at. The default 96 trips
+        # the >=64 VRAM clamp, which correctly forces workers to 1 -- so a test
+        # left on the default asserts against the clamp, not against the bug.
+        os.environ["CROSSOVER_BATCH"] = "32"
+        subprocess.Popen = _NoProc
+        with tempfile.TemporaryDirectory() as d:
+            args = argparse.Namespace(out=d, workers=3, arm=None, seed=None,
+                                      detach=True, unhold=False)
+            try:
+                cr.cmd_launch(args)
+            except (Exception, SystemExit):
+                pass          # the assertion is about recipe.json, not the run
+            rec = os.path.join(d, "recipe.json")
+            assert os.path.exists(rec), "launch wrote no recipe.json"
+            got = _json.loads(open(rec).read()).get("workers")
+            assert got == 3, f"recipe records workers={got}, launch ran 3"
+    finally:
+        subprocess.Popen = real_popen
+        for k, v in (("CROSSOVER_WORKERS", prior_env), ("CROSSOVER_BATCH", prior_batch)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = 0
