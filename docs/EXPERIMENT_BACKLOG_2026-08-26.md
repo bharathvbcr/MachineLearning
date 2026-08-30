@@ -237,8 +237,23 @@ whichever ordering you select via difficulty and budget, and yields none once bo
 adequately trained. Per the runner's own rule, that is reported as such rather than mapped
 onto the nearest row.
 
-**What survives the budget control.** The fine-grained ordering among attention-containing
-arms does not, but the recurrent/attention split does. At p=8:
+**What survives the budget control -- corrected 2026-08-30, once the GDN arms completed.**
+The fine-grained ordering among attention-containing arms does not survive. An earlier
+version of this paragraph said the *recurrent/attention* split does. **That was wrong**, and
+the completed `gdn` row is what refutes it: GDN is strongly budget-responsive and nearly
+saturates at p=4. What does not respond to budget is `mingru` specifically, not recurrence.
+
+p=4 (all five arms, both budgets):
+
+| arm | 3000 steps | 9000 steps |
+|---|---|---|
+| `attention` | 15/15 | **15/15** [0.80, 1.00] |
+| `hybrid_gdn_periodic` | 9/15 | **15/15** [0.80, 1.00] |
+| `gdn` | 7/15 | **13/15** [0.62, 0.96] |
+| `hybrid_mingru10_attn2` | 5/15 | 12/15 [0.55, 0.93] |
+| `mingru` | 1/15 | **1/15** [0.01, 0.30] |
+
+p=8 (all five arms, both budgets):
 
 | arm | 3000 steps | 9000 steps |
 |---|---|---|
@@ -248,16 +263,34 @@ arms does not, but the recurrent/attention split does. At p=8:
 | `gdn` | 2/15 | 6/15 [0.20, 0.64] |
 | `mingru` | 0/15 | **0/15** [0.00, 0.20] |
 
-`mingru` forms the head on **zero of thirty** runs across both budgets: 3x the compute does
-not rescue it. `gdn` is intermediate -- budget lifts it 2/15 -> 6/15, still short of every
-attention-containing arm, though its interval marginally overlaps `hybrid_gdn_periodic`'s.
-Adding 3 attention layers to GDN takes 6/15 -> 13/15 at the same budget and difficulty.
+*The one arm budget cannot rescue is minGRU.* It forms the head on **2 of 75 runs** across
+every difficulty and budget in the grid -- 1/15 at p=4 at *both* budgets, 0/15 everywhere
+harder. Tripling compute moves it by nothing. Every other arm improves substantially.
 
-*The durable claim, stated at the strength the data supports:* a pure minGRU stack does not
-form the induction head at p=8 at either budget, while every stack containing attention
-layers does at the higher budget. An earlier version of this claim was drawn from the p=6
-3000-step cell alone and was retracted as over-generalized; it holds here, but on different
-evidence and only at adequate budget.
+*Pure GDN is not in that category.* 7/15 -> 13/15 at p=4 and 2/15 -> 6/15 at p=8. A pure
+recurrent stack with the delta rule does form induction heads given budget; a pure minGRU
+stack does not, at any budget tried. **The distinction is the mixer's recall mechanism, not
+recurrence versus attention**, and the earlier framing obscured exactly the thing worth
+saying.
+
+*The Qwen-shaped arm is the strongest arm on this metric.* `hybrid_gdn_periodic` -- 3 GDN
+layers per attention layer, the 3:1 ratio the field converged on -- is joint-first at p=4
+(15/15, level with pure attention) and first at p=8 (13/15, above attention's 12/15). It is
+the only arm at or near the top at *both* difficulties under adequate budget.
+
+*That is a CE/recall disagreement worth stating carefully.* On held-out CE
+`hybrid_gdn_periodic` (4.290) loses to `attention` (4.221) by 0.069 nats with disjoint
+intervals, and loses to `hybrid_mingru10_attn2` (4.232). On recall at 9000 steps it matches
+attention exactly at p=4 and edges it at p=8. The honest claim is **not** that the ordering
+reverses -- the recall intervals overlap in both cells -- but that a CE separation which *is*
+disjoint does not reproduce on recall at all. A board that ranked these arms on CE would
+under-rate the arm that best does the thing hybrids are built for.
+
+*Where the GDN-vs-minGRU family comparison stands:* not established, and direction-unstable.
+`hybrid_gdn_periodic` vs `hybrid_mingru10_attn2` runs 9/15 vs 5/15 (p4/3k), 15/15 vs 12/15
+(p4/9k), 6/15 vs 12/15 (p8/3k, reversed), 13/15 vs 13/15 (p8/9k, identical). No cell is
+disjoint and the sign flips with difficulty. Reported as unresolved rather than as the
+inversion an earlier note called "suggestive".
 
 *Attention is the arm most sensitive to budget, not the least.* 2/15 -> 12/15 at p=8 is the
 largest single jump in the grid. Reading a short-budget recall board as an architecture
