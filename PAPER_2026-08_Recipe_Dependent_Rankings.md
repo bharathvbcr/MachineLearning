@@ -973,7 +973,7 @@ seed**: the induction head either forms inside the budget or it does not, so the
 *fraction of seeds forming the head* with a binomial interval, not a mean over a bimodal sample.
 
 `attention` vs `hybrid_mingru10_attn2` — the §4.5 tied pair — at 15 seeds per cell, batch 256,
-untied, 360 runs:
+untied, 405 runs:
 
 | key–value pairs | 3000 steps | 9000 steps |
 |---|---|---|
@@ -1004,9 +1004,11 @@ from it.** The full grid, all five families at both difficulties and both budget
 
 **`mingru` is the only arm on the board that budget does not move.** Every other family gains
 substantially from 3× the compute — attention 2/15 → 12/15, GDN 7/15 → 13/15, the minGRU hybrid
-5/15 → 12/15 — while minGRU is unchanged at 1/15 at four pairs and 0/15 at eight, with recall
-pinned in a 0.358–0.383 band. Its failure to form the induction head is therefore not a budget
-artifact; it is the single quantity in this grid that the budget control leaves standing.
+5/15 → 12/15 — while minGRU is unchanged at 1/15 at four pairs and 0/15 at eight. The rate is not
+hiding steady progress underneath a threshold: its *median* recall barely moves either, 0.560 →
+0.562 at four pairs and 0.361 → 0.376 at eight. Its failure to form the induction head is therefore
+not a budget artifact; it is the single quantity in this grid that the budget control leaves
+standing.
 
 **It is a fact about minGRU, not about recurrence.** We initially read this split as
 attention-containing versus not, and the four-pair cell refutes that: `gdn` carries no attention
@@ -1748,7 +1750,7 @@ tracked under the same exception rules:
 | `crossover50m_ratio32` | recurrent:attention ratio | 20 |
 | `crossover_wallclock32` | §6.9 cost basis | 20 |
 | `crossover_wallclock32_unmatched` | §6.9's retained failed attempt | 20 |
-| `mqar_e8` | §6.8 difficulty × budget | 360 |
+| `mqar_e8` | §6.8 difficulty × budget | 405 |
 
 **End-of-schedule losses.** Runs completed before the logging fix in §7.4 item 10 do not carry
 `final_val` in their `done` record. It was recovered from the final checkpoint of every run that

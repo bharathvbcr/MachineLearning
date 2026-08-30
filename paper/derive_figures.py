@@ -178,23 +178,39 @@ def controls():
 def mixer_board():
     """The ten-arm ranking at 50M tokens.
 
-    MIXER_BOARD — the one claim that did not survive reconstruction.
+    Attention leads this board at 4.222 [4.204, 4.240], and within THIS suite
+    the runner-up is 4.275 [4.245, 4.305] on an interval disjoint from it.
 
-    The pre-loss manuscript reported this board as placing attention first at
-    4.222 [4.204, 4.240] "but statistically tied with a 10xminGRU + 2xattention
-    hybrid at 4.232 [4.210, 4.254]". The first half reproduces exactly. The
-    second does not: the runner-up computes to 4.275 [4.245, 4.305] from these
-    runs, and its interval is disjoint from attention's.
+    That is not the whole comparison, and this docstring used to say it was.
+    It asserted that "the 4.232 figure could not be located in any surviving
+    run" and put the matched sweep's leader at 4.214 [4.207, 4.221]. Both
+    statements are wrong and are corrected here:
 
-    The 4.232 figure could not be located in any surviving run. The matched
-    batch-32 sweep (crossover50m_matched32) does place a minGRU hybrid on top,
-    at 4.214 [4.207, 4.221] -- but that sweep has no attention arm at all, so it
-    cannot support a claim about a tie with attention.
+      * 4.232 is `hybrid_mingru10_attn2` in `crossover50m_matched32`.
+        `matched_batch_board()` in this same file recomputes it from those five
+        seeds' `metrics.jsonl` and returns 4.2319 [4.2099, 4.2539] at
+        49,987,584 tokens. It has been derived by this script -- under "matched
+        batch-32: leader mean" -- the whole time this docstring claimed it was
+        unlocatable.
 
-    The honest reading is that attention wins this board outright at this
-    recipe, and that a paper arguing rankings are properties of the measurement
-    had a ranking claim of its own that depended on which condition was
-    tabulated. That is stated in the manuscript rather than quietly corrected.
+        What `--check` gave that row on its own was weaker than "enforced":
+        the contract is a substring test, and "4.232" occurs eight times in the
+        manuscript (section 5 discusses the very correction that lost it).
+        Rewriting the board's own row to 4.275 therefore passed. `check()` now
+        pins the leader to its table row as well, so the figure has to stay
+        where it is claimed, not merely somewhere in the document.
+      * 4.214 is that same arm read through `best_val`, the minimum over all
+        evaluations. `matched_batch_board()` was fixed to use the final
+        eval at the shared token count instead, because section 3.2 forbids
+        reporting best_val as a ranking; the fix moved the number by the 0.018
+        its own comment records, and this docstring kept the pre-fix value.
+
+    What remains true, and is the row's actual weakness, is that the comparison
+    is CROSS-SUITE: `crossover50m_matched32` has no attention arm
+    (`has_attention_arm` is False), so the tie pairs an attention mean from
+    this suite with a hybrid mean from that one. The manuscript states this as
+    gap E2 and caps the board at Medium-High confidence for it. That is a
+    disclosed limitation of a real comparison, not an unlocatable figure.
     """
     d = json.loads((OUT / "crossover50m" / "summary.json").read_text())
     rows = sorted(
@@ -601,9 +617,13 @@ STATED_NOT_DERIVED = {
     "1.42": "ratio 2.776/1.960, the §5 understatement factor",
     "4.207": "superseded normal-quantile bound, quoted in §5 as superseded",
     "4.221": "superseded normal-quantile bound, quoted in §5 as superseded",
-    "4.232": "pre-loss figure §5 corrects; appears in no surviving run",
-    "4.210": "pre-loss figure §5 corrects; appears in no surviving run",
-    "4.254": "pre-loss figure §5 corrects; appears in no surviving run",
+    # 4.232 / 4.210 / 4.254 were listed here as "appears in no surviving run".
+    # They are the matched batch-32 leader's mean and CI bounds, derived by
+    # matched_batch_board() and enforced by --check under "matched batch-32:
+    # leader mean/CI low/CI high". Exempting a figure this script DOES derive
+    # is dead weight at best: it changes no count today (the coverage filter
+    # tests `not in derived` first), but it is a standing licence for the
+    # figure to fall out of the contract and still read as accounted for.
     "4.759": "stale Mamba-2 mean from the pre-regeneration summary.json, §5",
     "4.680": "stale Mamba-2 CI bound from the pre-regeneration summary.json, §5",
     "4.837": "stale Mamba-2 CI bound from the pre-regeneration summary.json, §5",
@@ -669,6 +689,29 @@ def check(f):
         for token, why in missing:
             print(f"  - {why}: derived {token!r}, not found in the text")
         return 1
+
+    # Positional check for the one row whose figures also appear in the prose
+    # that discusses them. A bare substring test cannot tell "the board says
+    # 4.232" from "section 5 explains how 4.232 was once lost", so rewriting
+    # the board row alone slipped through it. Bind the matched batch-32 leader
+    # to a row that carries its arm name, its mean and both CI bounds together.
+    mb = f.get("matched_batch_board")
+    if mb and mb["rows"]:
+        r = mb["rows"][0]
+        # One line, arm name and figures on it, any number of cells between --
+        # the board has carried a rank column and a suite column at different
+        # times and neither is what this is checking.
+        row_re = re.compile(
+            r"(?m)^\|[^\n]*?" + re.escape(r["arm"]) + r"[^\n]*?\|"
+            r"[^\n]*?\**\s*" + re.escape(f"{r['final']:.3f}") + r"\s*\**\s*"
+            r"\[\s*" + re.escape(f"{r['ci'][0]:.3f}") + r"\s*,\s*"
+            + re.escape(f"{r['ci'][1]:.3f}") + r"\s*\]")
+        if not row_re.search(body):
+            print(f"FAIL: the matched batch-32 leader ({r['arm']}) is not on a "
+                  f"table row carrying {r['final']:.3f} "
+                  f"[{r['ci'][0]:.3f}, {r['ci'][1]:.3f}]. The figures may still "
+                  f"appear elsewhere in the prose; the board itself has drifted.")
+            return 1
 
     covered = len(stated) - len(unaccounted)
     pct = 100.0 * covered / len(stated) if stated else 100.0

@@ -598,6 +598,48 @@ gemma-metal inference
 
 ---
 
+## The GH200 nanolab campaign (2026-08-22 → 2026-08-30)
+
+The 2026-08-22 changelog row recorded that suites 22–26 lived only in
+`experiment-notes/nanolab/` and the paper, and that folding them in was
+outstanding. This section closes that, and covers the follow-up campaign that ran
+after it. Every figure below is re-derived from committed run records under
+`nanolab/out/`, not from notes. Full argument: `PAPER_2026-08_Recipe_Dependent_Rankings.md`.
+
+**The headline is a methods result, not an architecture one.** A ranking measured
+at one recipe is a property of that recipe. The same two architectures change
+places under a change of token budget, learning-rate horizon, batch size,
+evaluation metric, task difficulty, training budget, cost basis, kernel maturity
+or hardware — so a screen's output is a conditional statement that the field
+reports as an unconditional one.
+
+| result | evidence | grade |
+|---|---|---|
+| The ~7M attention/minGRU crossover does not replicate | n=5 on GH200: curves cross twice, 1.05M and 12.35M | **verified** |
+| Schedule, not budget, moves the late crossing | 20M cosine 14.58M vs 50M cosine 12.34M, pinned recovery to 0.001 | **verified** |
+| At batch 8 there is no crossing at all through 7.38M | 5 seeds, none cross | **verified** |
+| §4.5 board: attention and `hybrid_mingru10_attn2` tie on CE | 4.2213 [4.2022, 4.2403] vs 4.2319 [4.2099, 4.2539], n=5 | **verified** |
+| That tie survives 4× context | 2048 ctx: 4.2004 vs 4.2022, n=5 | **verified** |
+| It does NOT survive the cost basis | wall-clock-matched, attention wins by 0.0595, disjoint | **verified** |
+| The 3:1 periodic ratio beats the 10+2 hybrid | paired −0.0375 [−0.0426, −0.0323], 5/5 seeds | **verified** |
+| Attention *placement* matters independently of count | 10+2 vs bookend, both 2 attn layers: −0.0283, 5/5 | **verified** |
+| µP as implemented measured a broken attention temperature | one-term ablation recovers 0.4147 nats; minGRU unchanged to 4 dp | **verified** |
+| The Adam µP divisor is wrong for a Muon group | off by [4×, 2×], same direction every arm; no-divisor straddles 1.0 | **verified** |
+| minGRU cannot form an induction head at 8 pairs | 0/30 across both budgets; median recall 0.361 → 0.376 under 3× compute, so the rate is not masking progress | **verified** |
+| Recall separates the arms as a property of the metric | **RETRACTED** — it is a property of the budget | **withdrawn** |
+| Recurrence vs attention is the surviving split | **RETRACTED** — pure GDN reaches 13/15; the limit is minGRU's | **withdrawn** |
+
+**Two instrument defects worth carrying into any future suite.** `best_val` is a
+running minimum over however many evaluations fired, and evaluations fire on a
+fixed *step* interval — so a faster arm draws more of them and wins a lower
+minimum for free, a bias that grows with exactly the throughput advantage a
+wall-clock suite exists to measure. And **tenancy is a recipe field**: per-step
+`tok_s` falls with jobs-per-GPU and not uniformly across arms (attention recovers
+1.78× single-tenant, the GDN arms 1.04×), so a rate measured at one tenancy sizes
+a wrong budget at another. Both were caught by controls, not by review.
+
+---
+
 ## Open problems (honest frontier)
 
 1. **Native DFlash product speed** — exactness PASS; accept/tok/s far below MLX; `product_31b_decode_ge_15` false.  
@@ -606,6 +648,22 @@ gemma-metal inference
 4. **NAX from native** — TensorOps/NAX Int4 unbound; verify is simdgroup Q4 GEMM.  
 5. **QAT×export H100 suites** — toolkit exists; not the locked arch-ladder story.  
 6. **Muon timing A/B JSON** — rebench 4-bank vs per-matrix to replace DECISIONS folklore.
+7. **§8.4's µP rows 1–4 are unanswered** — the arm ran (250 jobs, 33.21 GH200-h) and
+   found a defect in its own instrumentation instead of an answer. A correct µP arm
+   needs the `1/d` attention rule paired with an init under which `q·k` grows Θ(d),
+   then a re-measured proxy sweep *and* target-width basin, because a transfer
+   measured through a broken temperature is not evidence about transfer.
+   ~126 jobs, ~13 GH200-h.
+8. **Everything nanolab is at one small scale** — ~50M parameters, 50M tokens, 12
+   layers. The reflex objection is that it is all small-scale noise; the answer is
+   that screens *are* run at this scale, but a two-or-three-size ladder would
+   convert the objection into a measured quantity. Highest-value unrun experiment.
+9. **The bundle's cost basis mixes tenancies and cannot currently be cleaned** — no
+   single jobs-per-GPU covers the job matrix (tenancy 1 leaves 30 of 394 unpriced,
+   2 leaves all 394, 3 leaves 212). `measured_rates(tenancy=…)` exists for when
+   coverage does; restoring a clean basis is a measurement, not a code change.
+10. **No external replication** — one author, one codebase, mostly one machine, for
+    a paper whose thesis is that single-lab results do not transfer.
 
 ---
 
@@ -649,6 +707,7 @@ E4B ladder:      4.78 → ~25.1 peak / ~23.9 quiet
 | 2026-08-23 | **The Polar champion is retired (§3).** A 24-job matched-LR re-tune at the exact `exact_128m_1000` protocol (`research/d7-lr-retune.json`, 15.6 GPU-h) finds **`normuon_adamw` ahead of `muon_polar_adamw` at all five matched learning rates on both seeds**, and at each candidate's best tested LR by **0.016317 BPB** (2-of-2). Both LRs were inherited from `arch02-16m`: Polar's 0.05 costs 0.032507 BPB (1.04× the selection margin), NorMuon's 0.1 costs 0.079048 (2.53×). The funnel's 0.031226 margin measured which inherited LR was less wrong. **Neither candidate may be cited as champion**; `champion-run.json` stays `locked: false`. Grade for any Polar-vs-NorMuon ordering: **RETIRED**. |
 | 2026-08-22 | **Funnel CI method corrected (D1).** `ci95` used the normal quantile at n=2 (correct `t₁ = 12.706`, interval ~6.5× too narrow) and `0.0` at n=1. Post-fix, Polar vs NorMuon at `exact_128m_1000` goes from `overlaps_best = False` to `None`. Legacy values preserved under `ci95_legacy_z`. |
 | 2026-08-22 | **D2 closed.** `native-optimizer-funnel.json → champion.winner_exact_gate` read `"pending"` while `research/exact-128m-gate-polar.json` recorded `passed: true` for the same candidate. Now `"passed"`, with the gate evidence inlined. |
+| 2026-08-30 | **The GH200 nanolab campaign is folded in** (new section above "Open problems"), closing the 2026-08-22 row below. Covers suites 22–26 plus everything after the 2026-08-24 paper draft: the 250-job µP/SP bundle, the recall probe (405 runs across difficulty × budget), sequence length at 2048, the ratio/placement board, both wall-clock attempts, and the release audit. Two claims are recorded as **withdrawn** rather than quietly dropped. Open problems gained items 7–10. |
 | 2026-08-22 | **GH200 crossover suites 22–26 are still not represented in this KB.** 120 completed runs at n=5 (attention/minGRU crossing at 12.35M, moving to 14.58M under a truncated cosine, absent at bs8) live only in `experiment-notes/nanolab/22–26` and `PAPER_2026-08_Recipe_Dependent_Rankings.md`. Folding them in is outstanding. |
 
 ---

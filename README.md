@@ -2,10 +2,18 @@
 
 This is a language-model research workspace spanning efficient training, architecture and optimizer experiments, educational implementations, and native Apple-silicon inference and training.
 
+**Primary result: [`PAPER_2026-08_Recipe_Dependent_Rankings.md`](PAPER_2026-08_Recipe_Dependent_Rankings.md)** —
+*Method Orderings in Language-Model Screens Are Properties of the Measurement, Not the Methods.*
+A controlled attempt to replicate one of this workspace's own short-horizon architecture
+comparisons, which does not reproduce it: holding architectures, optimizers and data fixed, the
+ranking changes places under a change of token budget, learning-rate horizon, batch size,
+evaluation metric, task difficulty, training budget, cost basis, kernel maturity or hardware.
+The per-job run records behind every table are committed under `nanolab/out/`.
+
 The main tracks are:
 
 - **[`Rust_MLKit/`](Rust_MLKit/)** — Rust, Metal, MLX, and Core ML implementations for Apple silicon, including native Gemma inference, custom GPU kernels, decode benchmarks, and ports of the strongest experimental architectures.
-- **[`nanolab/`](nanolab/)** — a clean, instrumented small-LM lab where architectural and training choices are exposed as CLI flags, with attention, Mamba-2, Gated DeltaNet, minGRU, SFT, STaR, and diffusion experiments.
+- **[`nanolab/`](nanolab/)** — a clean, instrumented small-LM lab where architectural and training choices are exposed as CLI flags, with attention, Mamba-2, Gated DeltaNet, minGRU, hybrid interleavings, SFT, STaR, and diffusion experiments, plus a multi-query associative-recall probe (`nanolab/mqar.py`) for the in-context retrieval axis that held-out cross-entropy does not exercise.
 - **`parameter-golf/`** — a *local-only* working clone of the OpenAI Parameter Golf challenge repository. It is excluded from this repository (see Credits And Provenance); the original trainers, verification scripts, and packaging tooling built on top of it are published here under [`Rust_MLKit/`](Rust_MLKit/).
 - **[`experiment-notes/`](experiment-notes/)** and **[`research/`](research/)** — experiment records, benchmark results, and reproducible study manifests across all tracks.
 - **[`learning-notes/`](learning-notes/)** and [`modern-small-lm-training-guide.md`](modern-small-lm-training-guide.md) — first-principles notes and a practical guide to modern small-model training.
@@ -30,7 +38,7 @@ The **[modern small-LM training guide](modern-small-lm-training-guide.md)** is t
 The **[experiment suite index](experiment-notes/00-INDEX.md)** is the lab notebook for the workspace. Each note records why an experiment was run, its setup and hardware, measured results, failures, evidence strength, artifacts, and what should—or should not—be concluded.
 
 - **[Training ablations](experiment-notes/00-INDEX.md#training)** cover Muon and learning-rate tuning, auxiliary heads, depth/width tradeoffs, gated attention, value residuals, adaptive raw-byte models, and planned H100 follow-ups.
-- **[Nanolab studies](experiment-notes/00-INDEX.md#nanolab)** track mixer quality, the recurrent-to-attention token-budget crossover, optimizer bake-offs, GPU throughput, chunk-parallel kernels, long 128M runs, and diffusion conversion.
+- **[Nanolab studies](experiment-notes/00-INDEX.md#nanolab)** track mixer quality, the recurrent-to-attention token-budget crossover, optimizer bake-offs, GPU throughput, chunk-parallel kernels, long 128M runs, and diffusion conversion. The 2026-08 GH200 campaign adds a µP/standard-parametrization tuning control, a wall-clock-matched board, a hybrid ratio-and-placement sweep, sequence length at 2048, and a 405-run recall grid across task difficulty and training budget — recorded in [`docs/EXPERIMENT_BACKLOG_2026-08-26.md`](docs/EXPERIMENT_BACKLOG_2026-08-26.md) and summarised in [`MASTER_ARCHITECTURAL_KB.md`](MASTER_ARCHITECTURAL_KB.md).
 - **[Gemma Metal studies](experiment-notes/00-INDEX.md#gemma-metal)** document native and MLX decode performance, speculative decoding, parity debugging, kernel roofline analysis, prompt caching, and product-path decisions on Apple silicon.
 - **[Architecture Metal studies](experiment-notes/00-INDEX.md#arch-metal)** record native Metal training throughput, kernel variants, validation BPB, and the tradeoff between the fastest and highest-quality configurations.
 
