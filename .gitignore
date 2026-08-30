@@ -83,6 +83,13 @@ Thumbs.db
 !**/out/**/recipe.json
 !**/out/**/ledger.json
 !**/out/**/summary.json
+# Added 2026-08-29. The recall probe (paper section 6.8) writes one ledger per suite
+# rather than one metrics.jsonl per run, and the end-of-schedule losses recovered
+# from checkpoints are the only surviving record for suites whose weights are gone
+# (section 7.4 item 11). Section 10 states both are published; these rules make that true.
+!**/out/**/runs.jsonl
+!**/out/**/final_val.json
+!**/out/final_vals_recovered.json
 *.pt
 models/
 .artifacts/
@@ -123,3 +130,7 @@ Rust_MLKit/arch_02_value_resid/metal-native/golden/fwd/
 LinkedIn_Article_*.md
 sync_to_obsidian/
 *.draft.md
+
+# Generated Rust coverage reports (absolute paths, rebuilt by cargo-llvm-cov)
+lcov.info
+**/lcov.info

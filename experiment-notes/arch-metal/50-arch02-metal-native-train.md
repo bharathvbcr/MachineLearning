@@ -84,7 +84,9 @@ The first `--preset 16m` verification is not yet a long-run result: FA_TILED B=1
 - [`Rust_MLKit/docs/optimization_map.md`](../../Rust_MLKit/docs/optimization_map.md) — live speed, binder, BPB, failure, and test gates.
 - [`Rust_MLKit/arch_02_value_resid/metal-native/README.md`](../../Rust_MLKit/arch_02_value_resid/metal-native/README.md) — recipes, benchmark tables, long-run results, and 16M scale-up.
 - [`Rust_MLKit/arch_02_value_resid/metal-native/DECISIONS.md`](../../Rust_MLKit/arch_02_value_resid/metal-native/DECISIONS.md) — accepted/rejected defaults and supporting evidence.
-- `Rust_MLKit/arch_02_value_resid/metal-native/out/sota_f32_clipsoft_seed1337_20k_fa_tiled_softsplit_warmdown/`
+- `Rust_MLKit/arch_02_value_resid/metal-native/out/sota_f32_clipsoft_seed1337_20k_fa_tiled_softfix_warmdown/` (golden init, 1.896880)
+- `Rust_MLKit/arch_02_value_resid/metal-native/out/sota_f32_clipsoft_seed42_20k_fa_tiled_softfix_warmdown/` (golden init, 1.892465)
+- `Rust_MLKit/arch_02_value_resid/metal-native/out/sota_f32_clipsoft_seed42_20k_fa_tiled_softfix_warmdown_reseed/` (**seeded** init, 1.887607 — the "seed 42 reseed" board row; this is the seeded-attention 20k arm PAPER §6.6 needs)
 - `Rust_MLKit/arch_02_value_resid/metal-native/out/sota_f32_clipsoft_seed1337_100k_fa_tiled_softsplit_wsd/`
 - `Rust_MLKit/arch_02_value_resid/metal-native/out/sota_f32_clipsoft_16m_seed1337_1k_opt/`
 - `Rust_MLKit/arch_02_value_resid/metal-native/out/opt16m_ab/`

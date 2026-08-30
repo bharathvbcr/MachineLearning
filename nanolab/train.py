@@ -63,7 +63,14 @@ def evaluate(model, batcher, cfg, ctx, optimizers=None):
     return val
 
 
-def train(cfg, overfit: int = 0):
+def train(cfg, overfit: int = 0, batchers=None):
+    """``batchers`` injects a (train, val) pair instead of reading a corpus.
+
+    The seam exists for the MQAR recall probe (E8, nanolab/mqar.py), whose
+    sequences are generated rather than sampled from a corpus. Anything honouring
+    data.Batcher's ``batch()``/``iterator()`` contract fits, and passing None
+    keeps the corpus path exactly as it was.
+    """
     set_seed(cfg.seed)
 
     if cfg.diffusion_mode != "none":
@@ -93,11 +100,14 @@ def train(cfg, overfit: int = 0):
     log = Logger(out_dir, cfg)
 
     # ---- data (guide §3) ----
-    data_dir, vocab_size, _ = get_dataset(cfg)
-    if cfg.vocab_size == 0:           # char datasets set vocab dynamically
-        cfg.vocab_size = vocab_size
-    train_batcher = Batcher(data_dir, "train", cfg, device, overfit=overfit)
-    val_batcher = Batcher(data_dir, "val", cfg, device)
+    if batchers is not None:
+        train_batcher, val_batcher = batchers
+    else:
+        data_dir, vocab_size, _ = get_dataset(cfg)
+        if cfg.vocab_size == 0:       # char datasets set vocab dynamically
+            cfg.vocab_size = vocab_size
+        train_batcher = Batcher(data_dir, "train", cfg, device, overfit=overfit)
+        val_batcher = Batcher(data_dir, "val", cfg, device)
 
     # ---- model (guide §2) ----
     model = build_model(cfg).to(device)
@@ -246,7 +256,8 @@ def train(cfg, overfit: int = 0):
         _save(out_dir / "best.pt", model, optimizers, cfg.max_steps, cfg, val, light=True)
     best_val = min(best_val, val)
     elapsed_s = time.time() - t0
-    log.done(best_val, human_time(elapsed_s), tokens_seen, elapsed_s=elapsed_s)
+    log.done(best_val, human_time(elapsed_s), tokens_seen, elapsed_s=elapsed_s,
+             final_val=val)
     return best_val
 
 
@@ -276,14 +287,20 @@ def _curriculum_frontier(cfg, step):
 
 
 def _mfu(flops_per_tok, tokens, dt, device):
-    """Model-FLOPs utilization (guide §6.1, §7). Peak FLOPs is hardware-specific;
-    default is a 3070 Ti Laptop BF16 dense peak (~46 TFLOP/s); override with the
-    PEAK_FLOPS env var for other cards. On CPU this is meaningless -> 0."""
+    """Model-FLOPs utilization (guide 6.1, 7), or None when peak is unknown.
+
+    Peak FLOPs is hardware-specific and must come from PEAK_FLOPS. It used to
+    fall back to a 3070 Ti Laptop's ~46 TFLOP/s, so a GH200 that never set the
+    variable logged 'mfu 169.3%' -- an impossible number recorded as if measured.
+    An unknown peak now reads as unknown. On CPU the quantity is meaningless -> 0.
+    """
     if not device.startswith("cuda"):
         return 0.0
+    raw = os.environ.get("PEAK_FLOPS", "").strip()
+    if not raw:
+        return None
     achieved = flops_per_tok * tokens / max(dt, 1e-9)
-    peak = float(os.environ.get("PEAK_FLOPS", 46e12))
-    return achieved / peak
+    return achieved / float(raw)
 
 
 def _save(path, model, optimizers, step, cfg, val, light=False):

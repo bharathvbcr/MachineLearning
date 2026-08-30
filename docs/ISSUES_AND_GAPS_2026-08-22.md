@@ -169,12 +169,17 @@ grounding. DocGen's *structure* (section flow, revision tasks, lineage critique)
 
 | # | Gap | Cost |
 |---|---|---|
-| E1 | **The µP arm (PAPER §8.4)** — specified with a pre-registered outcome table, not run. Runner is `scripts/gpu_bundle.py`; see `docs/GPU_BUNDLE.md`. | 52 jobs (`e1_proxy` 12 → `e1_sp_rerun` 10 → `e1_mup` 10 → `e1_perlayer_sp` 10 → `e1_embed_lr` 10) |
-| E2 | **Suite 26 never reran attention/minGRU at 50M** — its top and eighth rows are suite 22's sample (`26-matched32_lock.json` marks both `"source": "suite22"`), capping the combined ranking at Medium-High | 10 jobs @ 50M (`e2_matched32_50m`) |
+| E1 | **The µP arm (PAPER §8.4)** — specified with a pre-registered outcome table. **Design corrected 2026-08-25/26 and enlarged from 52 to 240 E1 jobs**, because as designed it could not answer its own decision rule: every cell ran at the s24 recipe while readout rows 2–3 are about s23 (20M cosine) and row 4 about s25 (batch 8), so the run would have answered **one readout of four**. Three further defects fixed in the same pass — the transferred LR was decided by **one seed** (§8.3's failure one axis over), each µP arm was measured at **one learning rate** (§8.3's offset-basin mechanism, rebuilt), and µP transfer from width 256 to 768 was **asserted, never measured** (the divisor in `optim.py` is the *Adam* µP rule applied to a Muon group). Runner is `scripts/gpu_bundle.py`; see `docs/GPU_BUNDLE.md`. | 240 jobs: `e1_proxy` 54 → `e1_sp_rerun` 10 → `e1_mup` 10 → `e1_mup_basin` 42 → `e1_mup_tuned` 10 → `e1_sp_basin` 54 → `e1_sp_sched20` 10 → `e1_mup_sched20` 10 → `e1_sp_bs8` 10 → `e1_mup_bs8` 10 → `e1_perlayer_sp` 10 → `e1_embed_lr` 10 
 | E3 | **Optimizer axis is n=2** at `advance_1000` and `exact_128m_1000` | Metal/M5 only, not CUDA |
 | E4 | **Suites 14/15 are single-seed with no preserved replay command**; suite 15's two follow-up scales are n=1 | needs 3070 Ti |
 | E5 | **Hardware is never isolated** — suite 25 isolated batch on GH200 only | needs 3070 Ti |
 | E6 | **No wall-clock/throughput artifact for suites 22–26.** | **FIXED 2026-08-22** (see below); suites 22–26 remain estimate-only |
+| E7 | **The seeded-attention 20k Metal run (PAPER §6.6)** — **CLOSED 2026-08-26, no compute.** The run already existed: `metal-native/out/sota_f32_clipsoft_seed42_20k_fa_tiled_softfix_warmdown_reseed`, FINAL EMA BPB **1.887607**, logged 2026-07-12 and already quoted in the §6.6 table as "seed 42 / 1.8876" without being recognised as the seeded arm. Seeded attention beats seeded minGRU 1.887607 vs 1.993295 (gap 0.1057) against an init effect of 0.0049 and backend nondeterminism of 0.0044, so the crossing is not an init artifact; §6.6 updated. Evidence and residual caveats (cross-seed pair; arms not parameter-matched, 0.780M vs 0.977M): `docs/EXPERIMENT_BACKLOG_2026-08-26.md` Tier 0. Note: no Metal run of any arm is reproducible on this machine — `fineweb10B_sp1024` and `fineweb_1024_bpe.model` left with the deleted `parameter-golf` self-clone (verified absent by whole-disk Spotlight sweep, `~/Code` to depth 7, and both backups). | none — closed from artifacts |
+| E8 | **Recall probe (MQAR-style)** — the §4.5 board is measured on held-out CE at 512 only, which cannot see in-context recall, the axis hybrids exist for; the attention/hybrid tie may be metric-dependent (§6.2, third metric). Needs new synthetic-task code in `nanolab`; Mac-runnable. Spec: backlog E8. | new code + small runs |
+| E9 | **Sequence-length axis** — every quality result is `block_size=512`; the hybrid ordering at 2048/4096 is unmeasured. Needs a `CROSSOVER_BLOCK` override in `crossover_replicate.py`; cost unknown until a smoke run at the new shape (512-context medians do not transfer — D14's lesson). Spec: backlog E9. | runner extension + GH200 |
+| E10 | **minGRU hybrid ratio/placement sweep** — the board's best hybrid family exists at one ratio (10+2 last-2) while GDN got three variants; the field's 3:1-periodic ratio was never run on the family that ties attention. Config-only: four new `Arm` entries, 20 jobs at the suite-26 recipe. Spec: backlog E10. | 20 GH200 jobs |
+| E11 | **Wall-clock-matched board** — §4.5 is token-matched; practitioners adopt hybrids at matched wall-clock. Phase 1 re-indexes the committed suite-26 curves by median `tok_s` (free, analysis only, within-suite/same-concurrency caveat); phase 2 runs it for real only if phase 1 moves a rank. Spec: backlog E11. | phase 1 free |
+| E12 | **Sliding-window attention arm** — no windowed-attention path exists in `mixers.py`; asks whether the hybrid's attention layers must be global (the QSA question at small scale). Only interpretable after E8. Spec: backlog E12. | new code; after E8 |
 
 **E6 detail (fixed).** `Logger.done` in `nanolab/utils.py` computed the elapsed time, printed it
 to the console, and emitted a `done` record containing only `best_val` and `tokens` — so every
@@ -192,7 +197,24 @@ estimate.
 - Two new tests cover the measured, estimated and untimed paths. 50/50 pass.
 
 Suites 22–26 are therefore still estimate-only; the first suite to carry a true wall clock will be
-the µP arm.
+the µP arm — and it should be recorded at the concurrency the reference suites used, not
+single-tenant. `ISOLATE_STAGES` records `"workers": 2` for suites 23, 25 and 26 and suite 22's
+documented launch is `--workers 4`, so the median `tok_s` this repository prices against is
+already a contended rate; a single-tenant run would produce throughput numbers that are not
+comparable to the suites the µP arm is measured against. Concurrency cannot affect a crossing
+token — separate processes, separate CUDA contexts, per-job seeds — so it is a reporting choice,
+and `gpu_bundle.py` records the worker count in the ledger `meta` so a contended rate can never
+be read as an uncontended one.
+
+**D14 (new, 2026-08-25): the corpus is part of the recipe and was treated as a capacity
+requirement.** `docs/GPU_BUNDLE.md` said E1/E2 "need ~50M tokens' worth of headroom and the
+existing 497.5M-token corpus is ample." The `Batcher` samples windows uniformly **with
+replacement**, so a 20M-token job over a 50M-token corpus and the same job over the 497.5M-token
+corpus are two different training distributions — 0.4 epochs against 0.04. Every cell in this
+bundle is compared against a published suite, so the corpus must be *the same corpus*. Preflight
+now fails closed when `train.bin` is not 497,500,000 tokens, and the documented procedure is to
+copy the reference `train.bin`/`val.bin` rather than re-tokenize, since a fresh tokenization of
+the same nominal size is not guaranteed byte-identical.
 
 ### 2.3 Data integrity
 
@@ -251,7 +273,7 @@ python3 scripts/gpu_bundle.py --cost
 ```
 
 That reads the committed per-job `metrics.jsonl` of suites 22–26, takes the median
-`tok_s` per (mixer, batch, context), and prices the 64-job matrix against it. E6 notes
+`tok_s` per (mixer, batch, context), and prices the 394-job matrix against it. E6 notes
 that the trainer discarded elapsed time; it never discarded per-step throughput.
 
 ### 3.1 What actually needs a GPU
@@ -260,102 +282,89 @@ Only the CUDA `nanolab` work. E3 is Rust/Metal on the M5 Pro; E4/E5 need the RTX
 
 | suite | jobs | tokens/job | GH200-hours |
 |---|---|---|---|
-| `e1_proxy` (width-256 matrix-LR sweep, per arm) | 12 | 19.99M | 0.42 |
-| `e1_sp_rerun` (SP cells of the 2×2, hardware control) | 10 | 19.99M | 1.06 |
-| `e1_mup` (µP cells) | 10 | 19.99M | 1.06 |
+| `e1_proxy` (width-256 matrix-LR sweep, per arm, 3 seeds, 9-point grid) | 54 | 19.99M | 1.91 |
+| `e1_sp_rerun` (SP cells of the s24 2×2, hardware + drift control) | 10 | 19.99M | 1.06 |
+| `e1_mup` (µP at the **transferred** LR -- the pre-registered cell) | 10 | 19.99M | 1.06 |
+| `e1_mup_tuned` (µP at its **measured** target-width optimum, n=5) | 10 | 19.99M | 1.06 |
+| `e1_mup_basin` (target-width µP LR curve, 0.25×…32×, 3 seeds) | 42 | 19.99M | 4.46 |
+| `e1_sp_basin` (target-width **SP** LR curve, 512× span, 3 seeds) | 54 | 19.99M | 5.73 |
+| `e1_sp_sched20` / `e1_mup_sched20` (s23, 20M cosine) | 20 | 19.99M | 2.12 |
+| `e1_sp_bs8` / `e1_mup_bs8` (s25, batch 8) | 20 | 8.19M | 1.68 |
 | `e1_perlayer_sp` | 10 | 19.99M | 1.06 |
 | `e1_embed_lr` | 10 | 19.99M | 1.06 |
 | `e2_matched32_50m` | 10 | 49.99M | 2.65 |
-| `d10_horizon` | 2 | 327.7M / 655.4M | 6.56 |
-| **total** | **64** | | **≈ 13.9** |
+| **total (default matrix)** | **394** | | **≈ 36.40** |
+| `d10_horizon` — **opt-in**, `--with-d10`, 3 seeds | 6 | 327.7M / 655.4M | ≈ 20 |
 
-6.98 of those hours are **extrapolated, not measured**: no committed run covers
-context 1024 or width 256, so `--cost` applies labelled factors (×0.7 for ctx1024,
-×3 for the narrow proxy) to a measured rate.
+1.91 of those hours are **extrapolated, not measured**: no committed run covers width
+256, so `--cost` applies a labelled factor to a measured rate. Every other row is
+priced against a rate recorded on the GH200 the suites ran on.
 
-### 3.2 Instance recommendation
+### 3.2 Instance recommendation: 1× GH200, and it is not close
 
-The old version of this section optimised **$/GPU-hour** and recommended the 8× A100
-40 GB. That is wrong for this matrix, and the reason is worth stating because it is a
-scheduling fact rather than a price fact.
+Two earlier versions of this section were wrong in opposite directions. The first
+optimised $/GPU-hour and recommended the 8× A100 40 GB. The second recommended
+running "E1+E2 on 8× A100" while `d10_horizon` was decided separately. Both are
+wrong for **E2**, and the reason is the one this document had already established for
+E1: `e2_matched32_50m`'s cells are **merged into suite 26's published board**, whose
+other eight rows were measured on a GH200. Measured on an A100 they carry the
+cross-hardware confound §7.1 refuses, and the board ends up worse than it started.
+The runner now enforces this in preflight rather than documenting it.
 
-`d10_horizon`'s 20k job is a single serial run of ≈ 4.4 GH200-hours — **47% of the
-bundle's compute in 2 of its 64 jobs**, and no number of GPUs shortens it. On an
-8-GPU box you rent eight GPUs while one job monopolises one of them, so the cheapest
-box per GPU-hour becomes one of the most expensive per bundle.
+| instance | $/GPU-hr | full 394-job bundle |
+|---|---|---|
+| **1× GH200 96 GB — $2.29/hr** | **2.29** | **$57 / 24.9 h** |
+| 4× H100 SXM5 — $16.36/hr | 4.09 | $73–79 / 4.5–4.8 h |
+| 8× A100 40 GB — $15.92/hr | 1.99 | $64–81 / 4.1–5.1 h |
+| 2× H100 SXM5 — $8.38/hr | 4.19 | $66–72 / 7.9–8.6 h |
+| 1× H100 SXM5 — $4.29/hr | 4.29 | $64–70 / 14.8–16.3 h |
+| 1× H100 PCIe — $3.29/hr | 3.29 | $59–72 / 18.1–21.7 h |
+| 1× A100 40 GB — $1.99/hr | 1.99 | $50–66 / 25.2–33.3 h |
+| 1× A10 24 GB — $1.29/hr | 1.29 | $64–95 / 49.4–73.6 h |
 
-| instance | $/GPU-hr | full bundle | E1+E2 only |
-|---|---|---|---|
-| 8× A100 40 GB — $15.92/hr | 1.99 | $132–171 / 8.3–10.7 h | **$41–49 / 2.6–3.1 h** |
-| 1× A100 40 GB — $1.99/hr | 1.99 | **$48–63** / 24–32 h | $26–34 / 13–17 h |
-| 8× A100 80 GB — $22.32/hr | 2.79 | $166–217 / 7.4–9.7 h | $53–64 / 2.4–2.9 h |
-| 1× H100 PCIe — $3.29/hr | 3.29 | $57–69 / 17–21 h | $32–38 / 9.6–11.5 h |
-| 4× H100 SXM5 — $16.36/hr | 4.09 | $84–92 / **5.2–5.6 h** | $45–48 / 2.8–2.9 h |
-| 2× H100 SXM5 — $8.38/hr | 4.19 | $64–70 / 7.6–8.3 h | $38–41 / 4.5–4.9 h |
-| 1× H100 SXM5 — $4.29/hr | 4.29 | $61–67 / 14–16 h | $34–37 / 8.0–8.7 h |
-| 1× A10 24 GB — $1.29/hr | 1.29 | $61–91 / 47–70 h | $33–49 / 25–38 h |
+The GH200 is the **cheapest row and the only correct one**. It is also the only row
+whose range is not an assumption: every measured rate in the cost model was recorded
+on that hardware, so its ratio is 1.0 by definition while every other row's is a
+guess about relative throughput. Dropping `d10_horizon` to opt-in is what makes the
+single-GPU box viable — the old matrix's critical path was one serial 4.4-hour job.
 
-Ranges come from an **assumed** throughput ratio against the GH200 (H100 SXM5
-0.95–1.05×, since GH200 carries an H100 die; A100 40 GB 0.45–0.60×). The
-assumption-free form of the same question is the break-even multiple: an H100 SXM5 at
-$4.29/hr must beat **2.16×** an A100 40 GB, per GPU, to cost less for the same work;
-4× H100 needs **2.06×**; 8× A100 80 GB needs **1.40×** over its own 40 GB sibling,
-which it will not deliver on the same silicon generation.
+### 3.3 The SP re-run is not optional, and stays on even on a GH200
 
-**Run it as two decisions, not one:**
-
-1. **E1 + E2 on 8× A100 40 GB — $41–49, under 3 hours.** 62 jobs, none longer than
-   18 minutes, fully independent: the case the 8-GPU box exists for. This is the
-   work PAPER §8.4's pre-registered readouts depend on, and it is the whole of E1
-   and E2.
-2. **`d10_horizon` separately, or not at all.** On **2× H100 SXM5** the whole bundle
-   is $64–70 in 7.6–8.3 h; alone on **1× A100 40 GB** the pair is ~$25 over a day.
-   Suite 20's horizon claim is already withdrawn in *both* directions (D10), so this
-   pair adds a new measurement rather than settling a live question — and it is the
-   only part that needs an enlarged corpus.
-
-40 GB is ample: weights + gradients + optimizer state is **1.07 GiB** (attention) and
-**1.33 GiB** (minGRU) at the 768-dim target, computed exactly from the parameter
-split. Activations are the rest and are not measurable without a GPU; `--smoke` on
-the rented box is the check. `d10_horizon` runs at context 1024, double every other
-job, and is the memory high-water mark.
-
-### 3.3 The hardware control is now in the matrix
-
-**Changing hardware changes the recipe — which is this paper's own finding.**
-
-§8.4's 2×2 puts new µP cells against suite 24's SP cells, and suite 24 ran on a
-GH200. On any other box that comparison is confounded by hardware, which PAPER §7.1
-refuses explicitly: the same architecture pair differs by ~0.18–0.3 nats at matched
-token markers across two GPUs.
-
-This section said so, and said the +10 re-run jobs were "not optional." `docs/GPU_BUNDLE.md`
-and `scripts/gpu_bundle.py` said the SP cells "are **not** rerun." **The two documents
-disagreed and the code followed the wrong one.** Closed 2026-08-24: `e1_sp_rerun` is a
-first-class suite in the matrix, on by default, and `--sp-cells suite24` is the
-explicit opt-out for a GH200 launch.
+The 2×2 needs its SP and µP cells measured on the same box. Closed 2026-08-24:
+`e1_sp_rerun` is a first-class suite, on by default. `--sp-cells suite24` remains the
+opt-out but now **requires a GH200 by device name**, and is recommended against even
+there: the re-run is 30 cheap jobs that convert an assumption about the environment
+into a measured drift number against suites 23/24/25, and it is the only way to
+detect a PyTorch or driver change.
 
 Also keep `compile=False`. It was forced on GH200 aarch64 by an Inductor stall; on x86
 it would work, and enabling it would be one more recipe change.
 
-### 3.4 Data preparation is a required, billed step
+### 3.4 The corpus is part of the recipe — copy it, do not re-tokenize
 
-`nanolab/data/` is gitignored, so a fresh box has no tokenized corpus:
+`nanolab/data/` is gitignored, so a fresh box has no tokenized corpus. See D14 above:
+because the `Batcher` samples **with replacement**, a corpus of a different size is a
+different training distribution, and every cell here is compared against a published
+suite. Preflight fails closed unless `train.bin` is 497,500,000 tokens.
 
 ```bash
-python -m nanolab.prep_fineweb --config sample-10BT --max_tokens 50000000
+rsync -az nanolab/data/HuggingFaceFW_fineweb-edu/ BOX:~/MLSystemsLab/nanolab/data/HuggingFaceFW_fineweb-edu/
 ```
 
-E1 and E2 fit in the existing 497.5M-token corpus with room to spare. **`d10_horizon`
-does not**: its 20k arm requests 655.4M tokens, so it would revisit training data at
-1.32 epochs while its 10k partner sits at 0.66 — a second variable moving alongside
-the one the pair exists to isolate. `--preflight` fails closed on this and prints the
-prep command for a larger corpus; `--allow-data-repeat` accepts it instead and records
-`data_epochs` per job so the repeat cannot go unreported.
+Verify with `md5sum` on both ends; a fresh `prep_fineweb` run of the same nominal size
+is not guaranteed byte-identical (shard selection, dataset revision).
 
-### 3.5 GH200 capacity is no longer the deciding factor
+**`d10_horizon` still does not fit**: its 20k arm requests 655.4M tokens, so it would
+revisit training data at 1.32 epochs while its 10k partner sits at 0.66 — a second
+variable moving alongside the one the pair exists to isolate. `--preflight` fails
+closed on this; `--allow-data-repeat` accepts it instead and records `data_epochs` per
+job so the repeat cannot go unreported.
 
-An earlier version of this section advised waiting for an out-of-capacity GH200,
-because that was the box suites 22–26 ran on and using it would save the SP re-run.
-That saving is 10 jobs ≈ 1.1 GPU-hours ≈ $2–5. It is not worth waiting for. Run the
-control.
+### 3.5 GH200 capacity IS the deciding factor
+
+An earlier version of this section said it was not, on the grounds that using the
+original box saves only the 10-job SP re-run (~$2–5), which is not worth waiting for.
+That reasoning covered E1 and silently omitted E2, whose ten cells join a GH200 board
+and are not portable at any price. It is also now moot in the other direction: on the
+current price list the GH200 at $2.29/GPU-hour is the **cheapest** instance for this
+bundle as well as the only valid one, so there is no longer a trade-off to make.

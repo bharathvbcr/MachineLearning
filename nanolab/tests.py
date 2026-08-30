@@ -13,6 +13,8 @@ non-zero on any failure (so it works in CI or a bare shell).
 
 from __future__ import annotations
 
+import argparse
+import pathlib
 import sys
 import tempfile
 import json
@@ -926,6 +928,245 @@ def parse_layer_mixers_uniform_and_star_syntax():
 
 
 @test
+def every_registered_arm_expands_to_exactly_n_layer():
+    """Every Arm in the suite registry must be a legal 12-layer stack.
+
+    An arm whose spec does not sum to n_layer is not caught until a job launches,
+    which on a rented GPU means it is caught after it has been billed. E10 added
+    four arms by hand; this is the check that a fifth cannot be added wrong.
+    """
+    from .config import build_config, parse_layer_mixers
+    from .crossover_replicate import ARMS, RATIO_ARMS
+    for arm in ARMS:
+        cfg = build_config("crossover50m", {"run_name": "probe", "mixer": arm.mixer,
+                                            "layer_mixers": arm.layer_mixers})
+        kinds = parse_layer_mixers(cfg)
+        assert len(kinds) == cfg.n_layer, (
+            f"{arm.name}: {len(kinds)} layers, expected {cfg.n_layer}")
+    names = {a.name for a in ARMS}
+    missing = [n for n in RATIO_ARMS if n not in names]
+    assert not missing, f"RATIO_ARMS names no registered arm: {missing}"
+    # the E10 set must actually vary the ratio, or it is four copies of one point
+    ratios = {}
+    for arm in ARMS:
+        if arm.name not in RATIO_ARMS:
+            continue
+        cfg = build_config("crossover50m", {"run_name": "probe", "mixer": arm.mixer,
+                                            "layer_mixers": arm.layer_mixers})
+        kinds = parse_layer_mixers(cfg)
+        ratios[arm.name] = sum(1 for k in kinds if k == "attention")
+    assert len(set(ratios.values())) >= 3, (
+        f"E10 is meant to sweep the attention ratio; got {ratios}")
+
+
+@test
+def smoke_runs_never_land_in_a_suite_directory():
+    """A 40-step smoke run writes a real `done` record with a real best_val, and
+    `_collect` reads every directory under the out root. Writing smoke beside the
+    suite broke the aligner: the committed summary said n=5 for attention while a
+    fresh _collect found 0. Same defect docs/GPU_BUNDLE.md records for the other
+    runner, fixed there and left here."""
+    import argparse
+    from . import crossover_replicate as cr
+    seen = {}
+
+    def fake_run(job, out_root, smoke=False, **kw):
+        seen[job["id"]] = Path(out_root)
+        return 0
+
+    orig = cr.run_job if hasattr(cr, "run_job") else None
+    with tempfile.TemporaryDirectory() as td:
+        suite = Path(td) / "crossover50m"
+        (suite / "cx50_attention_s1337").mkdir(parents=True)
+        ns = argparse.Namespace(out=str(suite), arm=None, seed=None)
+        target = cr.Path(ns.out) / "_smoke"
+        assert target.parent == suite, "smoke must nest under the suite root"
+        assert target != suite, "smoke must NOT be the suite root itself"
+        # the real cmd_smoke computes exactly this path
+        src = (Path(__file__).parent / "crossover_replicate.py").read_text()
+        assert 'out_root = Path(args.out) / "_smoke"' in src, (
+            "cmd_smoke writes into the suite directory again")
+
+
+@test
+def isolates_runs_exactly_its_documented_three_stages():
+    """`isolates` iterated the whole stage tuple, so adding E10's stage to it
+    would have silently enlarged an existing command by 20 unrelated jobs."""
+    from .crossover_replicate import ISOLATE_SEQUENCE, ISOLATE_STAGES, stage_by_name
+    assert ISOLATE_SEQUENCE == ("matched20", "bs8", "matched32")
+    assert "ratio32" not in ISOLATE_SEQUENCE
+    assert len(ISOLATE_STAGES) > len(ISOLATE_SEQUENCE), (
+        "this test is only meaningful while a stage exists outside the sequence")
+    for name in ISOLATE_SEQUENCE:
+        assert stage_by_name(name)["name"] == name
+
+
+@test
+def stage_subcommands_resolve_by_name_not_position():
+    """They were ISOLATE_STAGES[0]/[1]/[2]: inserting a stage anywhere but the end
+    re-pointed a subcommand at another experiment's recipe."""
+    from . import crossover_replicate as cr
+    for name in ("matched20", "bs8", "matched32", "ratio32"):
+        assert cr.stage_by_name(name)["name"] == name
+    try:
+        cr.stage_by_name("nope")
+    except SystemExit as e:
+        assert "unknown stage" in str(e)
+    else:
+        raise AssertionError("an unknown stage name must fail closed")
+    # behavioural, not a source scan: reorder the tuple and every subcommand must
+    # still resolve to the same recipe. Positional wiring cannot survive this.
+    orig = cr.ISOLATE_STAGES
+    try:
+        cr.ISOLATE_STAGES = tuple(reversed(orig))
+        for name in ("matched20", "bs8", "matched32", "ratio32"):
+            assert cr.stage_by_name(name)["name"] == name
+            assert cr.stage_by_name(name)["out"] == \
+                next(x["out"] for x in orig if x["name"] == name)
+    finally:
+        cr.ISOLATE_STAGES = orig
+
+
+@test
+def wallclock_budgets_match_the_clock_and_anneal_over_their_own_budget():
+    """E11 phase 2: every arm trains the same WALL CLOCK, not the same tokens.
+
+    Two properties carry the experiment. Each arm's budget must land on the target
+    wall clock (else the arms are not time-matched, which is the whole point), and
+    each must anneal its cosine over the budget it actually gets. Phase 1 could not
+    do the second: it re-read curves annealed over 50M and stopped early, which
+    penalises slow arms exactly as section 4.3 measures.
+    """
+    import os
+    from pathlib import Path
+    from . import crossover_replicate as cr
+    stage = {x["name"]: x for x in cr.ISOLATE_STAGES}["wallclock32"]
+    # Rates must come from the tenancy the stage will actually run at, and must be
+    # tokens per WALL-CLOCK second rather than per stepping second -- the two
+    # mistakes that produced a 1.70x spread on a suite defined by equal wall clock.
+    rates = {a: r for a, r in
+             ((a, cr.effective_rate_by_arm(tenancy=stage["workers"]).get(a))
+              for a in cr.WALLCLOCK_ARMS)}
+    assert all(rates.values()), (
+        f"missing single-tenant throughput: {rates}")
+    budgets = cr.wallclock_budgets(stage["wall_clock_s"], cr.WALLCLOCK_ARMS,
+                                   batch=stage["batch"], rates=rates)
+    tps = stage["batch"] * 512
+    for arm, tok in budgets.items():
+        assert tok % tps == 0, f"{arm}: budget {tok} is not a whole number of steps"
+        secs = tok / rates[arm]
+        assert abs(secs - stage["wall_clock_s"]) <= 2.0, (
+            f"{arm}: {secs:.1f}s against a {stage['wall_clock_s']}s target")
+    assert len(set(budgets.values())) == len(budgets), (
+        "arms of different speed must get different budgets")
+
+    prev = os.environ.get("CROSSOVER_BUDGET_BY_ARM")
+    try:
+        cr.apply_isolate(stage)
+        assert cr.budget_by_arm() == budgets
+        for arm in cr.WALLCLOCK_ARMS:
+            cfg = cr.job_config({"id": "p", "arm": arm, "mixer": "attention",
+                                 "layer_mixers": "", "seed": 1337}, Path("/tmp/x"))
+            got = cfg.batch_size * cfg.grad_accum * cfg.block_size * cfg.max_steps
+            assert got == budgets[arm], f"{arm}: runs {got}, budget {budgets[arm]}"
+            assert cfg.lr_max_steps == cfg.max_steps, (
+                f"{arm}: cosine spans {cfg.lr_max_steps} steps but the run is "
+                f"{cfg.max_steps} -- it must anneal over its OWN budget")
+        assert cr.current_recipe()["budget_by_arm"] == budgets, (
+            "the budget map must be in the recipe, or lock_recipe cannot stop a "
+            "wall-clock run sharing a directory with a token-matched one")
+    finally:
+        if prev is None:
+            os.environ.pop("CROSSOVER_BUDGET_BY_ARM", None)
+        else:
+            os.environ["CROSSOVER_BUDGET_BY_ARM"] = prev
+    assert stage["workers"] == 1, (
+        "phase 2's artifact is elapsed_s; a co-located job measures the scheduler")
+
+
+@test
+def wallclock_budgets_fail_closed_without_measured_throughput():
+    """An arm with no committed rate cannot be time-matched. Guessing one would
+    put the wall clock out of match silently, which is the failure the whole
+    experiment is designed to detect."""
+    from . import crossover_replicate as cr
+    try:
+        cr.wallclock_budgets(600.0, ("attention", "not_a_real_arm"),
+                             rates={"attention": 59452.0})
+    except SystemExit as e:
+        assert "not_a_real_arm" in str(e)
+    else:
+        raise AssertionError("a missing throughput must fail closed")
+
+
+@test
+def ctx2048_stage_holds_the_suite26_token_cadence():
+    """E9 varies sequence length and NOTHING else.
+
+    batch 8 x ctx 2048 = 16,384 tokens/step, the same as suite 26's bs32 x ctx512,
+    so eval markers land on identical token counts and the curves are comparable.
+    If the cadence drifts, E9 measures sequence length confounded with cadence.
+    """
+    from .crossover_replicate import ISOLATE_STAGES, scale_to_token_budget
+    by = {x["name"]: x for x in ISOLATE_STAGES}
+    a, e9 = by["matched32"], by["ctx2048"]
+    sa = scale_to_token_budget(a["batch"], block_size=a.get("block", 512),
+                               token_budget=a["token_budget"],
+                               lr_horizon_tokens=a["lr_horizon"])
+    se = scale_to_token_budget(e9["batch"], block_size=e9["block"],
+                               token_budget=e9["token_budget"],
+                               lr_horizon_tokens=e9["lr_horizon"])
+    for field in ("tokens_per_step", "max_steps", "eval_interval", "warmup_steps",
+                  "lr_max_steps"):
+        assert sa[field] == se[field], (
+            f"{field}: matched32={sa[field]} ctx2048={se[field]}")
+    assert e9["block"] == 2048 and a.get("block", 512) == 512
+    assert e9["out"] != a["out"] and e9["prefix"] != a["prefix"]
+
+
+@test
+def block_size_is_a_recipe_field_so_two_contexts_cannot_share_a_directory():
+    """`lock_recipe` compares `current_recipe()`. If block_size were absent from
+    it, a 2048-context run would drop into a 512-context suite dir and be averaged
+    into the same board -- the confound this paper is about, committed silently."""
+    import os
+    from . import crossover_replicate as cr
+    prev = os.environ.get("CROSSOVER_BLOCK")
+    try:
+        os.environ["CROSSOVER_BLOCK"] = "512"
+        r512 = cr.current_recipe()
+        os.environ["CROSSOVER_BLOCK"] = "2048"
+        r2048 = cr.current_recipe()
+    finally:
+        if prev is None:
+            os.environ.pop("CROSSOVER_BLOCK", None)
+        else:
+            os.environ["CROSSOVER_BLOCK"] = prev
+    assert "block_size" in r512, "block_size missing from the recorded recipe"
+    assert r512 != r2048, "two context lengths produce the same recipe fingerprint"
+    assert r512["block_size"] == 512 and r2048["block_size"] == 2048
+
+
+@test
+def ratio32_stage_matches_matched32_in_every_recipe_field():
+    """E10's rows join section 4.5's board, so only the arm list may differ.
+
+    If any other recipe field drifts, the new rows are measured at a different
+    recipe than the board they are placed in -- the paper's own thesis, committed
+    by the runner rather than reported by it.
+    """
+    from .crossover_replicate import ISOLATE_STAGES
+    by = {s["name"]: s for s in ISOLATE_STAGES}
+    a, b = by["matched32"], by["ratio32"]
+    for field in ("batch", "eval_iters", "token_budget", "lr_horizon"):
+        assert a[field] == b[field], (
+            f"ratio32.{field}={b[field]!r} but matched32.{field}={a[field]!r}")
+    assert a["out"] != b["out"], "ratio32 must not share matched32's out dir"
+    assert a["prefix"] != b["prefix"], "ratio32 needs its own job prefix"
+    assert set(a["arms"].split(",")) != set(b["arms"].split(","))
+
+
+@test
 def parse_layer_mixers_fails_closed_on_bad_specs():
     from .config import parse_layer_mixers
 
@@ -1283,6 +1524,703 @@ def cpu_batcher_windows_are_contiguous_and_shifted():
 
 
 # ---------------------------------------------------------------------------
+# E11 phase 2: tenancy, the wall-clock guard, and marker honesty.
+# Each of these fails against the code that produced the 1.70x-spread board.
+# ---------------------------------------------------------------------------
+def _wc_suite(root, arms_elapsed, target_budget=1000, workers=None):
+    """Write a fake wall-clock suite: {arm: [elapsed_s per seed]}."""
+    import json
+    for arm, elapsed in arms_elapsed.items():
+        for i, el in enumerate(elapsed):
+            d = root / f"cxwc_{arm}_s{1337 + i}"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "config.json").write_text(json.dumps(
+                {"batch_size": 32, "block_size": 512, "mixer": arm}), encoding="utf-8")
+            (d / "metrics.jsonl").write_text("\n".join([
+                json.dumps({"event": "train", "step": 1, "tok_s": 1000.0,
+                            "tokens": 1000}),
+                json.dumps({"event": "done", "best_val": 4.0 + 0.01 * i,
+                            "final_val": 4.0 + 0.01 * i + 0.02,
+                            "tokens": target_budget, "elapsed_s": el,
+                            "mean_tok_s": target_budget / el}),
+            ]) + "\n", encoding="utf-8")
+    if workers is not None:
+        (root / "recipe.json").write_text(
+            json.dumps({"workers": workers, "budget_by_arm": {a: target_budget
+                                                              for a in arms_elapsed}}),
+            encoding="utf-8")
+
+
+@test
+def effective_rate_is_below_step_rate_and_by_an_arm_specific_margin():
+    """Wall-clock seconds include eval and startup; stepping seconds do not.
+
+    If the overhead were a constant factor across arms, sizing from step rate
+    would still match the clock. It is not: measured single-tenant, attention
+    realises ~81% of its step rate over a whole run and gdn_bookend ~89%.
+    """
+    from .crossover_replicate import (
+        effective_rate_by_arm, measured_rate_by_arm, WALLCLOCK_ARMS)
+    eff = effective_rate_by_arm(tenancy=1)
+    step = measured_rate_by_arm(tenancy=1)
+    have = [a for a in WALLCLOCK_ARMS if a in eff and a in step]
+    assert len(have) == len(WALLCLOCK_ARMS), f"missing single-tenant rates: {have}"
+    realised = {a: eff[a] / step[a] for a in have}
+    for a, frac in realised.items():
+        assert 0.5 < frac < 1.0, f"{a}: effective/step = {frac:.3f}"
+    assert max(realised.values()) - min(realised.values()) > 0.03, (
+        "if overhead were uniform across arms this guard would be unnecessary; "
+        f"spread was {realised}")
+
+
+@test
+def wallclock_budgets_land_on_the_target_using_effective_rates():
+    from .crossover_replicate import (
+        effective_rate_by_arm, wallclock_budgets, WALLCLOCK_ARMS,
+        WALLCLOCK_SECONDS, WALLCLOCK_TOLERANCE)
+    eff = effective_rate_by_arm(tenancy=1)
+    budgets = wallclock_budgets(WALLCLOCK_SECONDS, WALLCLOCK_ARMS,
+                                batch=32, block=512, tenancy=1)
+    for arm, tok in budgets.items():
+        predicted = tok / eff[arm]
+        off = abs(predicted - WALLCLOCK_SECONDS) / WALLCLOCK_SECONDS
+        assert off <= WALLCLOCK_TOLERANCE, (
+            f"{arm}: predicted {predicted:.1f}s against {WALLCLOCK_SECONDS}s")
+
+
+@test
+def mfu_is_none_when_the_hardware_peak_is_unknown():
+    """A GH200 normalised by a laptop's peak logged 'mfu 169.3%' as a measurement."""
+    import os
+    from .train import _mfu
+    prev = os.environ.get("PEAK_FLOPS")
+    try:
+        os.environ.pop("PEAK_FLOPS", None)
+        assert _mfu(954e6, 16384, 0.2, "cuda:0") is None, (
+            "an unknown peak must read as unknown, not as a laptop's number")
+        assert _mfu(954e6, 16384, 0.2, "cpu") == 0.0
+        os.environ["PEAK_FLOPS"] = str(989.5e12)
+        got = _mfu(954e6, 16384, 0.2, "cuda:0")
+        assert 0.0 < got < 1.0, got
+    finally:
+        if prev is None:
+            os.environ.pop("PEAK_FLOPS", None)
+        else:
+            os.environ["PEAK_FLOPS"] = prev
+
+
+@test
+def step_logger_records_an_unknown_mfu_without_crashing():
+    import json
+    from .utils import Logger
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        log = Logger(root, _cfg(run_name="probe"))
+        log.step(1, loss=4.0, lr=1e-3, grad_norm=0.5, tok_s=1000.0,
+                 mfu=None, tokens=16384)
+        log.step(2, loss=3.9, lr=1e-3, grad_norm=0.5, tok_s=1000.0,
+                 mfu=0.079, tokens=32768)
+        rows = [json.loads(x) for x in
+                (root / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert rows[0]["mfu"] is None, "unmeasured must persist as null, not 0.0"
+        assert abs(rows[1]["mfu"] - 0.079) < 1e-9
+
+
+@test
+def status_on_a_missing_suite_reports_nothing_not_a_default_grid():
+    from .crossover_replicate import cmd_status
+    with tempfile.TemporaryDirectory() as directory:
+        missing = Path(directory) / "never_launched"
+        try:
+            cmd_status(argparse.Namespace(out=str(missing)))
+        except SystemExit as e:
+            assert "does not exist" in str(e), e
+        else:
+            raise AssertionError(
+                "an unlaunched suite must not report a full queue of pending jobs")
+
+
+@test
+def stage_subcommands_have_no_default_tenancy_of_their_own():
+    """argparse default=2 was indistinguishable from an explicit --workers 2."""
+    from .crossover_replicate import build_parser
+    parser = build_parser()
+    ns = parser.parse_args(["wallclock32"])
+    assert ns.workers is None, (
+        f"unspecified tenancy must stay unspecified, got {ns.workers}")
+
+
+@test
+def wallclock_stage_defaults_to_its_own_tenancy_and_refuses_another():
+    """The budgets are sized for one jobs-per-GPU; the launcher must not pick 2.
+
+    The stage declared workers=1 while the launcher defaulted to 2 and honoured
+    only an explicit flag, so the correct tenancy depended on the operator
+    remembering to type it.
+    """
+    from . import crossover_replicate as cr
+    stage = {x["name"]: x for x in cr.ISOLATE_STAGES}["wallclock32"]
+    seen = {}
+    real = cr._stage_launch
+    cr._stage_launch = lambda args, st: seen.update(workers=args.workers)
+    try:
+        cr.cmd_wallclock32(argparse.Namespace(detach=True, workers=None))
+        assert seen["workers"] == stage["workers"], seen
+        try:
+            cr.cmd_wallclock32(argparse.Namespace(detach=True, workers=3))
+        except SystemExit as e:
+            assert "wall-clock match" in str(e), e
+        else:
+            raise AssertionError("a mismatched tenancy must not launch")
+    finally:
+        cr._stage_launch = real
+
+
+@test
+def verify_wallclock_rejects_the_suite_that_missed_its_own_clock():
+    from .crossover_replicate import verify_wallclock
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        # The real numbers from the first attempt: a 691s target hit at 387.8s
+        # and 661.1s. That board was emitted without complaint.
+        _wc_suite(root, {"attention": [387.8] * 5, "hybrid_gdn_bookend": [661.1] * 5})
+        v = verify_wallclock(root, 691.0)
+        assert v["ok"] is False, "a 1.70x spread must not pass as equal wall clock"
+        assert abs(v["spread"] - 661.1 / 387.8) < 1e-6
+        assert "43" in v["reason"] or "44" in v["reason"], v["reason"]
+
+
+@test
+def verify_wallclock_accepts_a_suite_that_actually_matched():
+    from .crossover_replicate import verify_wallclock
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _wc_suite(root, {"attention": [688.0, 693.0], "hybrid_gdn_bookend": [700.0]})
+        v = verify_wallclock(root, 691.0)
+        assert v["ok"] is True, v["reason"]
+
+
+@test
+def verify_wallclock_fails_closed_when_no_run_records_a_duration():
+    from .crossover_replicate import verify_wallclock
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        (root / "cxwc_attention_s1337").mkdir(parents=True)
+        (root / "cxwc_attention_s1337" / "metrics.jsonl").write_text(
+            '{"event": "done", "best_val": 4.0}\n', encoding="utf-8")
+        v = verify_wallclock(root, 691.0)
+        assert v["ok"] is False, "unmeasured must never read the same as verified"
+
+
+@test
+def wallclock_budgets_refuse_to_size_without_a_tenancy():
+    from .crossover_replicate import wallclock_budgets
+    try:
+        wallclock_budgets(691.0, ("attention",), batch=32, block=512)
+    except SystemExit as e:
+        assert "tenancy" in str(e), e
+    else:
+        raise AssertionError(
+            "sizing a budget from tenancy-blind rates is the defect that put "
+            "attention 43.9% under its own wall-clock target")
+
+
+@test
+def wallclock_budgets_still_accept_explicit_rates():
+    from .crossover_replicate import wallclock_budgets
+    got = wallclock_budgets(100.0, ("attention",), batch=32, block=512,
+                            rates={"attention": 10_000.0})
+    tps = 32 * 512
+    assert got["attention"] % tps == 0
+    assert got["attention"] <= 1_000_000
+
+
+@test
+def measured_rate_by_arm_ignores_suites_run_at_another_tenancy():
+    import json
+    from .crossover_replicate import measured_rate_by_arm
+    with tempfile.TemporaryDirectory() as directory:
+        base = Path(directory)
+        for name, workers, tok_s in (("solo", 1, 100_000.0), ("packed", 3, 50_000.0)):
+            suite = base / "nanolab" / "out" / name
+            run = suite / f"cx_attention_s1337"
+            run.mkdir(parents=True)
+            (run / "config.json").write_text(
+                json.dumps({"batch_size": 32, "block_size": 512}), encoding="utf-8")
+            (run / "metrics.jsonl").write_text(json.dumps(
+                {"event": "train", "tok_s": tok_s}) + "\n", encoding="utf-8")
+            (suite / "recipe.json").write_text(
+                json.dumps({"workers": workers}), encoding="utf-8")
+        suites = ("nanolab/out/solo", "nanolab/out/packed")
+        solo = measured_rate_by_arm(root=base, tenancy=1, suites=suites)
+        packed = measured_rate_by_arm(root=base, tenancy=3, suites=suites)
+        assert solo == {"attention": 100_000.0}, solo
+        assert packed == {"attention": 50_000.0}, packed
+
+
+@test
+def suite_tenancy_prefers_the_record_then_falls_back_to_worker_logs():
+    import json
+    from .crossover_replicate import _suite_tenancy
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        assert _suite_tenancy(root) is None, "unknown tenancy must not read as 1"
+        (root / "worker_0.log").write_text("", encoding="utf-8")
+        (root / "worker_1.log").write_text("", encoding="utf-8")
+        assert _suite_tenancy(root) == 2
+        (root / "recipe.json").write_text(json.dumps({"workers": 3}), encoding="utf-8")
+        assert _suite_tenancy(root) == 3
+
+
+@test
+def lock_recipe_never_backfills_tenancy_from_the_current_launch():
+    import json, os
+    from .crossover_replicate import lock_recipe, current_recipe
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        legacy = {k: v for k, v in current_recipe().items() if k != "workers"}
+        (root / "recipe.json").write_text(json.dumps(legacy), encoding="utf-8")
+        # Suite plainly ran two-wide; this launch claims one.
+        (root / "worker_0.log").write_text("", encoding="utf-8")
+        (root / "worker_1.log").write_text("", encoding="utf-8")
+        prev = os.environ.get("CROSSOVER_WORKERS")
+        os.environ["CROSSOVER_WORKERS"] = "1"
+        try:
+            try:
+                lock_recipe(root)
+            except SystemExit as e:
+                assert "tenanc" in str(e), e
+            else:
+                raise AssertionError(
+                    "backfilling workers=1 would write a guess about a run that "
+                    "already happened into its own record")
+        finally:
+            if prev is None:
+                os.environ.pop("CROSSOVER_WORKERS", None)
+            else:
+                os.environ["CROSSOVER_WORKERS"] = prev
+
+
+@test
+def marker_window_is_one_eval_interval_not_a_fixed_fraction():
+    from .crossover_replicate import _marker_window
+    # ctx2048 steps 0.819M per eval and answers the 0.8M marker with 0.836M.
+    grid = [0.836e6 + i * 0.819e6 for i in range(20)]
+    assert abs(0.836e6 - 0.8e6) <= _marker_window(grid, 0.8e6)
+    # An arm that stopped at 18.9M is not answering a 50M marker.
+    short = [i * 0.819e6 for i in range(1, 24)]
+    assert abs(max(short) - 50e6) > _marker_window(short, 50e6)
+
+
+@test
+def table_refuses_a_token_grid_for_a_wall_clock_suite():
+    import json
+    from .crossover_replicate import cmd_table
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _wc_suite(root, {"attention": [690.0]}, workers=1)
+        try:
+            cmd_table(argparse.Namespace(out=str(root)))
+        except SystemExit as e:
+            assert "wcboard" in str(e), e
+        else:
+            raise AssertionError(
+                "arms that stop at different token counts cannot share a "
+                "token-grid column")
+
+
+@test
+def wcboard_refuses_to_publish_a_board_whose_clock_did_not_match():
+    from .crossover_replicate import cmd_wcboard
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _wc_suite(root, {"attention": [387.8] * 3, "hybrid_gdn_bookend": [661.1] * 3},
+                  workers=1)
+        args = argparse.Namespace(out=str(root), seconds=691.0,
+                                  allow_unmatched=False)
+        try:
+            cmd_wcboard(args)
+        except SystemExit as e:
+            assert "REFUSING" in str(e), e
+        else:
+            raise AssertionError("an unmatched clock must not yield a board")
+        # The diagnostic escape hatch still prints, and says why.
+        cmd_wcboard(argparse.Namespace(out=str(root), seconds=691.0,
+                                       allow_unmatched=True))
+
+
+# ---------------------------------------------------------------------------
+@test
+def board_reads_the_end_of_schedule_loss_not_the_running_minimum():
+    """best_val is a min over an arm-dependent number of evals.
+
+    The fast arm takes more steps, so it draws more evals, so its minimum sits
+    lower -- a bias pointing the same way as the throughput advantage the suite
+    exists to measure. On the 2026-08-27 suite it was -0.0133 for attention
+    (89 evals) against -0.0032 for hybrid_gdn_bookend (24).
+    """
+    import json
+    from .crossover_replicate import _final_by_seed
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        run = root / "cxwc_attention_s1337"
+        run.mkdir(parents=True)
+        (run / "metrics.jsonl").write_text(json.dumps(
+            {"event": "done", "best_val": 4.0721, "final_val": 4.1401,
+             "tokens": 1000, "elapsed_s": 690.0}) + "\n", encoding="utf-8")
+        got = _final_by_seed(root)["attention"]["1337"]
+        assert abs(got - 4.1401) < 1e-9, (
+            f"board must read the end of the schedule, got {got}")
+
+
+@test
+def board_refuses_a_run_with_no_end_of_schedule_loss_to_recover():
+    """Fail closed. Substituting best_val silently is the confounded board."""
+    import json
+    from .crossover_replicate import _final_by_seed
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        run = root / "cxwc_attention_s1337"
+        run.mkdir(parents=True)
+        (run / "metrics.jsonl").write_text(json.dumps(
+            {"event": "done", "best_val": 4.0721,
+             "tokens": 1000, "elapsed_s": 690.0}) + "\n", encoding="utf-8")
+        try:
+            _final_by_seed(root)          # no final_val, no final.pt
+        except SystemExit as e:
+            assert "best_val" in str(e), e
+        else:
+            raise AssertionError(
+                "a run with no recoverable final loss must not fall back to "
+                "best_val")
+
+
+@test
+def done_record_carries_the_end_of_schedule_loss_alongside_the_minimum():
+    import json
+    from .utils import Logger
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        log = Logger(root, _cfg(run_name="probe"))
+        log.done(4.0721, "11m", 73203712, elapsed_s=684.7, final_val=4.1401)
+        rec = [json.loads(x) for x in
+               (root / "metrics.jsonl").read_text(encoding="utf-8").splitlines()][-1]
+        assert abs(rec["final_val"] - 4.1401) < 1e-9, rec
+        assert abs(rec["best_val"] - 4.0721) < 1e-9, rec
+
+
+@test
+def the_two_peak_flops_constants_agree_and_exceed_what_was_measured():
+    """494.7e12 vs 989.5e12 sat in the tree for months, 2x apart.
+
+    A peak below an achieved rate is not a calibration question, it is
+    arithmetic: the 8192^3 dense BF16 matmul measured on the GH200 sustains
+    786.6 TFLOP/s, so any 'peak' under that is refuted outright.
+    """
+    import importlib.util
+    from .crossover_replicate import GH200_PEAK_FLOPS, MEASURED_GH200_DENSE_BF16
+
+    assert GH200_PEAK_FLOPS > MEASURED_GH200_DENSE_BF16, (
+        f"peak {GH200_PEAK_FLOPS:.4g} is below the measured "
+        f"{MEASURED_GH200_DENSE_BF16:.4g} achieved on the same device")
+    frac = MEASURED_GH200_DENSE_BF16 / GH200_PEAK_FLOPS
+    assert 0.55 <= frac <= 0.95, (
+        f"a big dense matmul realising {frac:.1%} of peak means the peak is "
+        f"wrong in one direction or the other")
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "gpu_bundle", root / "scripts" / "gpu_bundle.py")
+    if spec is None or spec.loader is None:
+        raise AssertionError("cannot load scripts/gpu_bundle.py to cross-check")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    other = mod.DEVICE_PEAK_FLOPS["gh200"]
+    assert abs(other - GH200_PEAK_FLOPS) < 1e9, (
+        f"two peaks for one device: crossover_replicate says "
+        f"{GH200_PEAK_FLOPS:.4g}, gpu_bundle says {other:.4g}")
+
+
+
+@test
+def mup_attention_temperature_is_the_arm_asymmetric_term():
+    """muP's 1/d logit scale, without its companion q/k init, flattens attention.
+
+    The rule is correct only when q.k grows as Theta(d). This tree keeps a fixed
+    std=0.02 init, so q.k grows as Theta(sqrt(d)) and 1/d leaves the attention
+    distribution at ~99.8% of uniform entropy at init (d_model=768, head_dim=64)
+    against ~89% under SP. minGRU has no attention logits, so the handicap lands
+    on one arm only -- which is why every e1_mup cell in the GPU bundle scored
+    NOT A VALID COMPARATOR with attention hurt 4-7x more than minGRU, and why
+    re-tuning the LR in e1_mup_tuned could not rescue it.
+
+    Measured through a real forward pass: the attention input is a normed hidden
+    state, not a raw Gaussian, and the effect does not reproduce on synthetic
+    input.
+    """
+    import torch
+    import torch.nn.functional as F
+    from .config import Config
+    from .model import GPT
+
+    real_sdpa = F.scaled_dot_product_attention
+    seen: list[float] = []
+
+    def spy(q, k, v, *a, **kw):
+        scale = kw.get("scale")
+        if scale is not None:
+            logits = (q.float() @ k.float().transpose(-2, -1)) * scale
+            t = logits.shape[-1]
+            causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=logits.device))
+            pr = logits.masked_fill(~causal, float("-inf")).softmax(-1)
+            ent = -(pr * torch.log(pr.clamp_min(1e-12))).sum(-1).mean()
+            uni = torch.log(torch.arange(1, t + 1, dtype=torch.float32,
+                                         device=logits.device)).mean()
+            seen.append(float(ent / uni))
+        return real_sdpa(q, k, v, *a, **kw)
+
+    def entropy_frac(mup, sqrt_attn):
+        seen.clear()
+        cfg = Config(mixer="attention", d_model=768, n_head=12, head_dim=64,
+                     n_layer=4, block_size=128, vocab_size=1024, mup=mup,
+                     mup_base_width=256, mup_sqrt_attn_scale=sqrt_attn,
+                     zero_init_proj=False)
+        torch.manual_seed(0)
+        model = GPT(cfg).eval()
+        tokens = torch.randint(0, cfg.vocab_size, (2, cfg.block_size))
+        F.scaled_dot_product_attention = spy
+        try:
+            with torch.no_grad():
+                model(tokens)
+        finally:
+            F.scaled_dot_product_attention = real_sdpa
+        assert seen, "the spy never fired; attention did not go through SDPA"
+        return sum(seen) / len(seen)
+
+    sp = entropy_frac(False, False)
+    mup = entropy_frac(True, False)
+    ablated = entropy_frac(True, True)
+
+    assert mup > 0.99, (
+        f"muP attention should sit at ~uniform entropy at init, got {mup:.3f}")
+    assert sp < 0.95, f"SP attention should not be near-uniform, got {sp:.3f}"
+    assert abs(ablated - sp) < 0.01, (
+        f"ablating the 1/d scale must restore SP's temperature: "
+        f"{ablated:.3f} vs {sp:.3f}")
+
+
+
+def _mqar(**over):
+    from .config import Config
+    from .mqar import vocab_for
+    d = dict(n_pairs=4, n_queries=2, n_keys=8, n_values=8)
+    d.update({k: v for k, v in over.items() if k in d})
+    cfg = Config(mixer="attention", batch_size=4, seed=1337,
+                 mqar_n_pairs=d["n_pairs"], mqar_n_queries=d["n_queries"],
+                 mqar_n_keys=d["n_keys"], mqar_n_values=d["n_values"],
+                 block_size=over.get("block_size",
+                                     2 * (d["n_pairs"] + d["n_queries"]) - 1),
+                 vocab_size=vocab_for(d["n_keys"], d["n_values"]))
+    return cfg
+
+
+@test
+def mqar_supervises_only_the_query_positions():
+    """The training loss IS recall loss: everything else is ignore_index."""
+    from .mqar import MQARBatcher, IGNORE
+    b = MQARBatcher(_mqar(), "cpu")
+    x, y = b.batch()
+    p, q = b.n_pairs, b.n_queries
+    supervised = (y != IGNORE)
+    assert int(supervised.sum()) == x.shape[0] * q, (
+        f"expected {q} supervised positions per row, got "
+        f"{int(supervised.sum()) / x.shape[0]}")
+    # they must be the even offsets inside the query block, nowhere else
+    want = torch.zeros_like(supervised)
+    want[:, torch.arange(2 * p, b.seq_len - 1, 2)] = True
+    assert torch.equal(supervised, want), "supervision landed off the query positions"
+
+
+@test
+def mqar_is_solvable_by_lookup_and_its_labels_agree_with_its_context():
+    """An exact-match oracle scores 1.0.
+
+    This is the difference between a hard task and a broken one: if the answer
+    were not recoverable from the context, a recall probe would measure noise
+    and every arm would look equally bad.
+    """
+    from .mqar import MQARBatcher, IGNORE
+    b = MQARBatcher(_mqar(n_pairs=6, n_queries=3, n_keys=12, n_values=12), "cpu")
+    x, y = b.batch()
+    p = b.n_pairs
+    hits = seen = 0
+    for row in range(x.shape[0]):
+        table = {int(x[row, 2 * i]): int(x[row, 2 * i + 1]) for i in range(p)}
+        assert len(table) == p, "keys are not unique; a query has two right answers"
+        for t in range(x.shape[1]):
+            if y[row, t] == IGNORE:
+                continue
+            seen += 1
+            hits += table[int(x[row, t])] == int(y[row, t])
+    assert seen and hits == seen, f"oracle scored {hits}/{seen}, so the labels "\
+                                  f"do not follow from the context"
+
+
+@test
+def mqar_refuses_a_task_that_has_no_right_answer():
+    from .mqar import MQARBatcher
+    for over, why in ((dict(n_queries=9, n_pairs=4), "no stored pair"),
+                      (dict(n_pairs=9, n_keys=8), "two right answers")):
+        cfg = _mqar(**over)
+        try:
+            MQARBatcher(cfg, "cpu")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"should refuse: {why}")
+
+
+@test
+def mqar_refuses_a_block_size_the_task_cannot_fill():
+    """Silently padding would train the arms on a different task than reported."""
+    from .mqar import MQARBatcher
+    try:
+        MQARBatcher(_mqar(block_size=512), "cpu")
+    except ValueError as e:
+        assert "block_size" in str(e), e
+    else:
+        raise AssertionError("a mismatched block_size must not be padded around")
+
+
+@test
+def mqar_recall_accuracy_separates_an_oracle_from_a_guesser():
+    """CE cannot stand in for this: the metric is exact match at the query."""
+    import contextlib
+    from .mqar import MQARBatcher, recall_accuracy, IGNORE
+
+    b = MQARBatcher(_mqar(n_pairs=6, n_queries=3, n_keys=12, n_values=12), "cpu")
+    V = b.vocab_size
+
+    class Oracle(torch.nn.Module):
+        """Reads the pair table out of the context. Scores 1.0 by construction."""
+        training = False
+        def eval(self): return self
+        def train(self, mode=True): return self
+        def forward(self, x, y=None):
+            out = torch.zeros(*x.shape, V)
+            for r in range(x.shape[0]):
+                tab = {int(x[r, 2 * i]): int(x[r, 2 * i + 1])
+                       for i in range(b.n_pairs)}
+                for t in range(x.shape[1]):
+                    out[r, t, tab.get(int(x[r, t]), 0)] = 1.0
+            return out, None
+
+    class Constant(torch.nn.Module):
+        """Always answers with one value -- the strongest key-blind strategy."""
+        training = False
+        def eval(self): return self
+        def train(self, mode=True): return self
+        def forward(self, x, y=None):
+            out = torch.zeros(*x.shape, V)
+            out[..., 1 + b.n_keys] = 1.0
+            return out, None
+
+    acc = recall_accuracy(Oracle(), b, contextlib.nullcontext(), iters=3)
+    assert acc == 1.0, f"oracle must score 1.0, got {acc}"
+    blind = recall_accuracy(Constant(), b, contextlib.nullcontext(), iters=8)
+    assert blind < 0.35, (
+        f"a key-blind constant scored {blind:.3f}; with {b.n_values} values "
+        f"chance is {1 / b.n_values:.3f} and the task is not testing recall")
+
+
+
+@test
+def e8_reports_a_rate_because_the_outcomes_are_bimodal():
+    """Mean recall over a bimodal sample describes no model that exists.
+
+    Identical config, init alone varying: 0.553 / 0.542 / 0.957. The head forms
+    or it does not. The board must report how OFTEN it forms.
+    """
+    from .mqar_suite import board, SOLVED
+    recs = [{"run": f"mqar_attention_s{i}", "recall": r, "solved": r >= SOLVED}
+            for i, r in enumerate([0.95, 0.96, 0.54, 0.97, 0.55])]
+    recs += [{"run": f"mqar_mingru_s{i}", "recall": r, "solved": r >= SOLVED}
+             for i, r in enumerate([0.55, 0.54, 0.56, 0.55, 0.54])]
+    rows = {r["arm"]: r for r in board(recs)}
+    assert rows["attention"]["solved"] == 3 and rows["attention"]["n"] == 5, rows
+    assert rows["mingru"]["solved"] == 0, rows
+    # the means differ by only ~0.2 while the rates differ by 0.6
+    assert rows["attention"]["rate"] == 0.6 and rows["mingru"]["rate"] == 0.0
+
+
+@test
+def e8_wilson_interval_is_binomial_and_never_leaves_zero_one():
+    from .mqar_suite import _wilson
+    lo, hi = _wilson(0, 15)
+    assert lo == 0.0 and 0.0 < hi < 0.30, (lo, hi)
+    lo, hi = _wilson(15, 15)
+    assert hi == 1.0 and 0.70 < lo < 1.0, (lo, hi)
+    lo, hi = _wilson(8, 15)
+    assert 0.0 < lo < 0.53 < hi < 1.0, (lo, hi)
+
+
+@test
+def e8_runs_untied_because_tying_caps_the_reference_arm():
+    """Not a tuning choice: tied, attention itself caps near 0.55."""
+    from .mqar_suite import e8_config
+    cfg = e8_config("attention", 1)
+    assert cfg.tie_embeddings is False, "E8 must untie; see nanolab/mqar.py"
+    assert cfg.fused_ce is False, "recall_accuracy cannot score the fused path"
+    assert cfg.block_size == 2 * (cfg.mqar_n_pairs + cfg.mqar_n_queries) - 1
+
+
+@test
+def e8_carries_the_layer_pattern_of_each_hybrid_family():
+    from .mqar_suite import e8_config
+    hyb = e8_config("hybrid_mingru10_attn2", 1)
+    assert hyb.layer_mixers == "mingru*10,attention*2", hyb.layer_mixers
+    assert e8_config("attention", 1).layer_mixers == ""
+
+
+
+@test
+def e8_batch_is_calibrated_not_defaulted():
+    """At batch 32 the reference arm never forms the head; at 256 it always does.
+
+    Same depth, same 3000 steps, same wall clock to within 10% -- the sequence is
+    15 tokens, so a small batch spends the step on kernel launches. Measured on
+    the GH200 2026-08-28: 0.552/0.550 at bs=32 against 1.000/1.000 at bs=256
+    (L=4), and 0.553/0.708 against 0.999/1.000 (L=12). The probe's answer to
+    "can this architecture recall" is decided by batch before any architecture is
+    compared, so the default must not drift back to the corpus suites' 32.
+    """
+    from .mqar_suite import e8_config
+    assert e8_config("attention", 1).batch_size == 256
+    assert e8_config("attention", 1).max_steps == 3000
+    assert e8_config("attention", 1, batch_size=32).batch_size == 32
+
+
+
+@test
+def e8_run_name_carries_the_recipe_so_resume_cannot_mix_configs():
+    """A name that does not carry the recipe is not an identifier.
+
+    The first sweep skipped an attention seed as "done, recall 0.542" that had
+    been trained at batch 32 for 6000 steps, into a board being built at batch
+    256 for 3000 -- and batch is precisely the variable that decides whether the
+    head forms. Resume keys on the run name, so the name must differ whenever
+    the recipe does.
+    """
+    from .mqar_suite import e8_config
+    a = e8_config("attention", 1)
+    b = e8_config("attention", 1, batch_size=32)
+    c = e8_config("attention", 1, steps=6000)
+    d = e8_config("attention", 1, n_pairs=6, n_queries=6)
+    assert len({a.run_name, b.run_name, c.run_name, d.run_name}) == 4, (
+        a.run_name, b.run_name, c.run_name, d.run_name)
+    assert e8_config("attention", 1).run_name == a.run_name, "must be stable"
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = 0
@@ -1291,7 +2229,11 @@ def main():
             fn()
             print(f"  PASS  {fn.__name__}")
             passed += 1
-        except Exception as e:
+        except (Exception, SystemExit) as e:
+            # SystemExit is BaseException, so an uncaught one used to kill the
+            # runner mid-list: no FAIL line, no summary, exit 1 -- indistinguish-
+            # able at a glance from a clean run whose output scrolled. Code under
+            # test raises SystemExit deliberately, so it is a failure, not an exit.
             print(f"  FAIL  {fn.__name__}: {type(e).__name__}: {e}")
             failed += 1
     print(f"\n{passed}/{passed + failed} passed")

@@ -78,6 +78,12 @@ class Config:
     rope_base: float = 10000.0
     mup: bool = False            # muP-style 1/d attention + LR scaling (§10)
     mup_base_width: int = 256    # d_model at which HPs were tuned; transfer target
+    # Ablation: keep SP's 1/sqrt(head_dim) attention temperature while leaving the
+    # rest of muP in place. muP's 1/d rule is only correct paired with a q/k init
+    # that makes q.k grow as Theta(d); this tree keeps the fixed std=0.02 init, so
+    # q.k grows as Theta(sqrt(d)) and 1/d leaves attention at 99.8% of uniform
+    # entropy at init (measured, d_model=768, head_dim=64). Isolates that term.
+    mup_sqrt_attn_scale: bool = False
     # Per-layer standard-parametrization LR prescription (Everett et al.,
     # arXiv:2407.05872, Table 1, Adam column): hidden and readout learning rates
     # scale as 1/sqrt(width) while the embedding LR stays constant. Mutually
@@ -154,6 +160,13 @@ class Config:
     lr_max_steps: int = 0  # if >0, schedule decays over this many steps instead of max_steps
     eval_interval: int = 250
     eval_iters: int = 100
+    # --- MQAR (E8): the recall metric axis. See nanolab/mqar.py. ---
+    # Sequence length is 2*(pairs+queries), so block_size is derived from these
+    # rather than chosen: MQARBatcher refuses a block_size the task cannot fill.
+    mqar_n_pairs: int = 32       # key-value pairs stored in-context
+    mqar_n_queries: int = 8      # queries asked of them, without replacement
+    mqar_n_keys: int = 64        # key alphabet (>= n_pairs; keys unique per row)
+    mqar_n_values: int = 64      # value alphabet; chance accuracy is 1/this
     eval_train: bool = True        # also eval the train split (doubles eval cost)
     log_interval: int = 10
     ckpt_interval: int = 1000
