@@ -124,6 +124,14 @@ Everything above assumes **attention** as the token mixer. The other 2026 option
 | **Gated DeltaNet** | gated linear attention | linear | Same, with stronger recall than vanilla SSMs |
 | **minGRU** | minimal parallel RNN | linear | Pedagogy / zero-dependency tiny baselines |
 
+*The recall difference between the two recurrent rows is measured here, and it is large.* On a
+multi-query associative-recall probe at four key–value pairs with adequate budget, Gated DeltaNet
+forms the induction head on **13/15** seeds and minGRU on **1/15**, at identical width, depth,
+difficulty and step count (PAPER §6.8). minGRU is immovable by compute on that task — 3× the steps
+changes neither its success rate nor its median recall. Treat "linear-recurrent" as a cost class,
+not a capability class: the delta rule retrieves, minGRU does not. *(Mamba-2 was not run in that
+grid, so the table's "vanilla SSMs" comparison remains uncited.)*
+
 **Recommendation:** at this scale a **well-tuned Transformer is the strongest, most reliable default** — the NanoGPT speedrun and Parameter Golf leaderboards both converged on optimized attention. Linear-recurrent mixers buy **cheaper long context and faster, constant-memory inference**, *not* better small-scale perplexity, so reach for them only when context length or throughput is the bottleneck. The decisive factor sub-200M is the **training recipe (optimizer / LR / data), not the mixer** — lock the recipe first (Phases 1–2), then A/B mixers with tokens + seed fixed.
 
 > Diffusion caveat (§9): SSM / linear mixers are built around **causal** recurrence; a bidirectional diffusion model changes their story — re-evaluate rather than copy, same logic as the GQA/MLA note in §2.4.
