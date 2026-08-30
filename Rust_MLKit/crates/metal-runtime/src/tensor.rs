@@ -28,6 +28,14 @@ impl DType {
     }
 }
 
+/// Checked storage size shared by allocation, views, and kernel validation.
+pub(crate) fn checked_nbytes(shape: &[usize], dtype: DType) -> Result<usize, String> {
+    let n = shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+        .ok_or_else(|| "tensor element count overflow".to_string())?;
+    n.checked_mul(dtype.size_of()).filter(|&bytes| bytes <= isize::MAX as usize)
+        .ok_or_else(|| "tensor byte size overflow".to_string())
+}
+
 /// Shared Metal buffer with recycle / residency policy.
 pub(crate) struct PooledBuffer {
     pub(crate) buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -172,13 +180,12 @@ impl Tensor {
 
     /// View into the same buffer at an element offset (same dtype).
     pub fn view(&self, shape: &[usize], elem_offset: usize) -> Tensor {
-        let n: usize = shape.iter().product();
-        let off = self.byte_offset + elem_offset * self.dtype.size_of();
-        assert!(
-            off + n * self.dtype.size_of() <= self.buffer.nbytes(),
-            "view out of bounds: off={off} n={n} buf={}",
-            self.buffer.nbytes()
-        );
+        self.validate().expect("invalid source view");
+        let nbytes = checked_nbytes(shape, self.dtype).expect("view size overflow");
+        let off = elem_offset.checked_mul(self.dtype.size_of())
+            .and_then(|off| self.byte_offset.checked_add(off)).expect("view offset overflow");
+        assert!(off.checked_add(nbytes).is_some_and(|end| end <= self.buffer.nbytes()),
+            "view out of bounds");
         Tensor {
             buffer: self.buffer.clone(),
             shape: shape.to_vec(),
@@ -186,6 +193,25 @@ impl Tensor {
             byte_offset: off,
             runtime: Arc::clone(&self.runtime),
         }
+    }
+
+    /// Validate public metadata before passing a view to a GPU kernel.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let bytes = checked_nbytes(&self.shape, self.dtype)?;
+        if self.byte_offset % self.dtype.size_of() != 0 ||
+            !self.byte_offset.checked_add(bytes).is_some_and(|end| end <= self.buffer.nbytes()) {
+            return Err("tensor view is misaligned or out of bounds".into());
+        }
+        if !self.buffer.inner.runtime.ptr_eq(&Arc::downgrade(&self.runtime)) {
+            return Err("tensor buffer belongs to a different runtime".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn overlaps(&self, other: &Tensor) -> bool {
+        Arc::ptr_eq(&self.buffer.inner, &other.buffer.inner)
+            && self.byte_offset < other.byte_offset + other.nbytes_logical()
+            && other.byte_offset < self.byte_offset + self.nbytes_logical()
     }
 
     /// Allocate a new buffer and GPU-copy contents (encoded into the active batch).
@@ -220,6 +246,11 @@ pub fn gpu_copy(src: &Tensor, dst: &Tensor) -> Result<(), String> {
 /// Host f32 → bf16 bit pattern (round-to-nearest-even truncate).
 pub fn f32_to_bf16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
+    // Preserve NaNs even when all payload bits would be truncated. Quiet them
+    // before rounding; negative payloads can otherwise overflow the u32 sum.
+    if bits & 0x7fff_ffff > 0x7f80_0000 {
+        return ((bits >> 16) as u16) | 0x0040;
+    }
     let round = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16;
     round as u16
 }
@@ -230,4 +261,43 @@ pub fn bf16_bits_to_f32(b: u16) -> f32 {
 
 pub fn f32_slice_to_bf16(data: &[f32]) -> Vec<u16> {
     data.iter().copied().map(f32_to_bf16_bits).collect()
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    #[test]
+    fn bf16_preserves_special_values_and_ties() {
+        for bits in [0x7f800001, 0x7fffffff, 0xff800001, 0xffffffff] {
+            assert!(bf16_bits_to_f32(f32_to_bf16_bits(f32::from_bits(bits))).is_nan(),
+                "NaN payload {bits:x} became finite or infinity");
+        }
+        for bits in [0, 0x80000000, 0x7f800000, 0xff800000] {
+            assert_eq!(f32_to_bf16_bits(f32::from_bits(bits)), (bits >> 16) as u16);
+        }
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3f808000)), 0x3f80);
+        assert_eq!(f32_to_bf16_bits(f32::from_bits(0x3f818000)), 0x3f82);
+        for b in 0..=u16::MAX {
+            let x = bf16_bits_to_f32(b);
+            if !x.is_nan() { assert_eq!(f32_to_bf16_bits(x), b); }
+        }
+    }
+
+    #[test]
+    fn allocation_rejects_overflow() {
+        let rt = GpuRuntime::new().unwrap();
+        assert!(rt.alloc_tensor_f32(&[usize::MAX, usize::MAX]).is_err());
+        assert!(rt.alloc_tensor_bf16(&[usize::MAX, usize::MAX]).is_err());
+        assert!(rt.alloc_tensor_f32_hot(&[usize::MAX / 4 + 2]).is_err());
+        assert!(rt.alloc_temp_f32(&[usize::MAX, usize::MAX]).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "view")]
+    fn view_rejects_offset_overflow() {
+        let rt = GpuRuntime::new().unwrap();
+        let t = rt.alloc_tensor_f32(&[4]).unwrap();
+        let _ = t.view(&[1], usize::MAX / 4 + 1);
+    }
 }

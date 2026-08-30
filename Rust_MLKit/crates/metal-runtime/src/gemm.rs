@@ -15,6 +15,45 @@ use objc2_metal::MTLComputePipelineState;
 use crate::runtime::{mtl_size, GpuRuntime, PrecisionMode};
 use crate::tensor::{DType, Tensor};
 
+#[derive(Clone, Copy)]
+enum Layout { NN, TN, NT }
+
+/// All public GEMM paths validate before casting, allocating scratch, or encoding.
+/// MPP uses signed 32-bit extents/offset arithmetic; reject larger matrices.
+fn validate_gemm(
+    a: &Tensor, b: &Tensor, c: &Tensor, layout: Layout, allow_bf16: bool,
+) -> Result<(usize, usize, usize), String> {
+    for t in [a, b, c] {
+        t.validate()?;
+        if t.shape.len() != 2 || t.shape.contains(&0) {
+            return Err("GEMM requires nonempty rank-2 tensors".into());
+        }
+        if t.numel() > i32::MAX as usize {
+            return Err("GEMM exceeds signed 32-bit kernel indexing".into());
+        }
+    }
+    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime()) ||
+        !std::sync::Arc::ptr_eq(a.runtime(), c.runtime()) {
+        return Err("GEMM tensors must belong to the same runtime".into());
+    }
+    if c.dtype != DType::F32 || (!allow_bf16 &&
+        (a.dtype != DType::F32 || b.dtype != DType::F32)) {
+        return Err("GEMM operand dtype does not match the selected precision path".into());
+    }
+    let (m, k, k2, n) = match layout {
+        Layout::NN => (a.shape[0], a.shape[1], b.shape[0], b.shape[1]),
+        Layout::TN => (a.shape[1], a.shape[0], b.shape[0], b.shape[1]),
+        Layout::NT => (a.shape[0], a.shape[1], b.shape[1], b.shape[0]),
+    };
+    if k != k2 || c.shape != [m, n] {
+        return Err("GEMM inner dimensions or output shape do not match".into());
+    }
+    if a.overlaps(c) || b.overlaps(c) {
+        return Err("GEMM output must not overlap either input".into());
+    }
+    Ok((m, n, k))
+}
+
 /// Tall-K / small-MN → split-K accumulate.
 /// Attn dW: M=N=128, K=BT=4096. MLP dW: one side = mlp_dim=384.
 fn prefer_tn_splitk(m: usize, n: usize, k: usize) -> bool {
@@ -92,9 +131,17 @@ pub fn select_backend(rt: &GpuRuntime) -> GemmBackend {
     }
 }
 
+fn validate_cast_input(src: &Tensor, dtype: DType) -> Result<(), String> {
+    src.validate()?;
+    if src.dtype != dtype || src.numel() == 0 || src.numel() > u32::MAX as usize {
+        return Err("cast requires the declared dtype and 1..=u32::MAX elements".into());
+    }
+    Ok(())
+}
+
 /// Cast f32 tensor → bf16 (GPU). Used at GEMM boundaries under `PrecisionMode::Bf16`.
 pub fn cast_f32_to_bf16(src: &Tensor) -> Result<Tensor, String> {
-    assert_eq!(src.dtype, DType::F32);
+    validate_cast_input(src, DType::F32)?;
     let rt = src.runtime();
     let dst = rt.alloc_tensor_bf16(&src.shape)?;
     cast_f32_to_bf16_into(src, &dst)?;
@@ -103,9 +150,12 @@ pub fn cast_f32_to_bf16(src: &Tensor) -> Result<Tensor, String> {
 
 /// Cast into an existing bf16 buffer (persistent weight banks).
 pub fn cast_f32_to_bf16_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
-    assert_eq!(src.dtype, DType::F32);
-    assert_eq!(dst.dtype, DType::BF16);
-    assert_eq!(src.shape, dst.shape);
+    validate_cast_input(src, DType::F32)?;
+    dst.validate()?;
+    if dst.dtype != DType::BF16 || src.shape != dst.shape ||
+        !std::sync::Arc::ptr_eq(src.runtime(), dst.runtime()) || src.overlaps(dst) {
+        return Err("cast destination must match shape/runtime, be bf16, and not overlap source".into());
+    }
     let rt = src.runtime();
     let p = rt.pipeline("cast_f32_to_bf16")?;
     let n = src.numel();
@@ -119,7 +169,7 @@ pub fn cast_f32_to_bf16_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
 
 /// Hot-resident bf16 clone of an f32 master (weights / EMA banks).
 pub fn cast_f32_to_bf16_hot(src: &Tensor) -> Result<Tensor, String> {
-    assert_eq!(src.dtype, DType::F32);
+    validate_cast_input(src, DType::F32)?;
     let rt = src.runtime();
     let dst = rt.alloc_tensor_bf16_hot(&src.shape)?;
     cast_f32_to_bf16_into(src, &dst)?;
@@ -128,7 +178,7 @@ pub fn cast_f32_to_bf16_hot(src: &Tensor) -> Result<Tensor, String> {
 
 /// Cast bf16 tensor → f32 (GPU).
 pub fn cast_bf16_to_f32(src: &Tensor) -> Result<Tensor, String> {
-    assert_eq!(src.dtype, DType::BF16);
+    validate_cast_input(src, DType::BF16)?;
     let rt = src.runtime();
     let dst = rt.alloc_tensor_f32(&src.shape)?;
     let p = rt.pipeline("cast_bf16_to_f32")?;
@@ -171,39 +221,11 @@ pub fn gemm(
     c: &Tensor,
     backend: GemmBackend,
 ) -> Result<(), String> {
-    assert_eq!(a.shape.len(), 2);
-    assert_eq!(b.shape.len(), 2);
-    assert_eq!(c.shape.len(), 2);
-    let m = a.shape[0];
-    let k = a.shape[1];
-    let k2 = b.shape[0];
-    let n = b.shape[1];
-    assert_eq!(k, k2, "inner dims must match");
-    assert_eq!(c.shape, &[m, n]);
+    let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true)?;
 
     let use_bf16 = a.dtype == DType::BF16 && b.dtype == DType::BF16;
-    if use_bf16 {
-        assert_eq!(c.dtype, DType::F32, "bf16 GEMM accumulates into f32 C");
-        if backend != GemmBackend::TensorOps {
-            return Err(
-                "bf16 GEMM requires TensorOps backend (simdgroup is f32-only)".into(),
-            );
-        }
-    } else {
-        assert_eq!(a.dtype, DType::F32);
-        assert_eq!(b.dtype, DType::F32);
-        assert_eq!(c.dtype, DType::F32);
-    }
-
-    match backend {
-        GemmBackend::TensorOps => {}
-        GemmBackend::Simdgroup => {
-            if m % 16 != 0 || n % 16 != 0 || k % 8 != 0 {
-                return Err(format!(
-                    "simdgroup GEMM requires M,N % 16 == 0 and K % 8 == 0; got {m}x{k} @ {k}x{n}"
-                ));
-            }
-        }
+    if a.dtype != b.dtype || (use_bf16 && backend != GemmBackend::TensorOps) {
+        return Err("GEMM requires matching operand dtypes; bf16 requires TensorOps".into());
     }
 
     let rt = a.runtime();
@@ -211,6 +233,8 @@ pub fn gemm(
         backend.kernel_name_bf16()
     } else if use_relaxed_f32(rt, backend) {
         backend.kernel_name_f32_relaxed()
+    } else if backend == GemmBackend::Simdgroup && (m % 16 != 0 || n % 16 != 0 || k % 8 != 0) {
+        "matmul_simdgroup_edges_f32"
     } else {
         backend.kernel_name_f32()
     };
@@ -227,8 +251,8 @@ pub fn gemm(
             dispatch_tensorops_nn(rt, &pipeline, a, b, c, m, n, k, tile)?;
         }
         GemmBackend::Simdgroup => {
-            // simdgroup overwrites C; still zero for determinism on views.
-            gpu_zero_tensor(c)?;
+            // Both simdgroup kernels overwrite every logical output element.
+            // No pre-zero dispatch or barrier is needed (including offset views).
             let m_u = m as u32;
             let n_u = n as u32;
             let k_u = k as u32;
@@ -382,6 +406,7 @@ pub fn gemm_train(
     c: &Tensor,
     backend: GemmBackend,
 ) -> Result<(), String> {
+    validate_gemm(a, b, c, Layout::NN, true)?;
     let rt = a.runtime();
     if use_bf16_gemm(rt, backend) {
         let a_bf = ensure_bf16(a)?;
@@ -392,27 +417,6 @@ pub fn gemm_train(
     gemm_f32(a, b, c, backend)
 }
 
-fn gpu_zero_tensor(t: &Tensor) -> Result<(), String> {
-    let rt = t.runtime();
-    let n = t.numel();
-    // Prefer GPU zero when async encoding is on (avoids host memset mid-batch).
-    if rt.async_encode_enabled() {
-        let p = rt.pipeline("zero_f32")?;
-        crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
-            crate::dispatch::set_tensor(bnd, t, 0);
-            crate::dispatch::set_u32(bnd, n as u32, 1);
-        })?;
-    } else {
-        // Views may have byte_offset — only zero the logical window via kernel.
-        let p = rt.pipeline("zero_f32")?;
-        crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
-            crate::dispatch::set_tensor(bnd, t, 0);
-            crate::dispatch::set_u32(bnd, n as u32, 1);
-        })?;
-    }
-    Ok(())
-}
-
 /// C[M,N] = A[K,M]^T @ B[K,N] (TN). A is stored [K,M], B [K,N].
 pub fn gemm_tn_f32(
     a_km: &Tensor,
@@ -420,13 +424,7 @@ pub fn gemm_tn_f32(
     c: &Tensor,
     backend: GemmBackend,
 ) -> Result<(), String> {
-    assert_eq!(a_km.shape.len(), 2);
-    assert_eq!(b_kn.shape.len(), 2);
-    let k = a_km.shape[0];
-    let m = a_km.shape[1];
-    assert_eq!(b_kn.shape[0], k);
-    let n = b_kn.shape[1];
-    assert_eq!(c.shape, &[m, n]);
+    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, false)?;
 
     if USE_TN_NT_DESCRIPTORS
         && backend == GemmBackend::TensorOps
@@ -463,6 +461,7 @@ pub fn gemm_tn_train(
     c: &Tensor,
     backend: GemmBackend,
 ) -> Result<(), String> {
+    validate_gemm(a_km, b_kn, c, Layout::TN, use_bf16_gemm(a_km.runtime(), backend))?;
     let rt = a_km.runtime();
     if use_bf16_gemm(rt, backend) {
         assert_eq!(c.dtype, DType::F32);
@@ -623,13 +622,7 @@ pub fn gemm_nt_f32(
     c: &Tensor,
     backend: GemmBackend,
 ) -> Result<(), String> {
-    assert_eq!(a_mk.shape.len(), 2);
-    assert_eq!(b_nk.shape.len(), 2);
-    let m = a_mk.shape[0];
-    let k = a_mk.shape[1];
-    let n = b_nk.shape[0];
-    assert_eq!(b_nk.shape[1], k);
-    assert_eq!(c.shape, &[m, n]);
+    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, false)?;
 
     if USE_TN_NT_DESCRIPTORS
         && backend == GemmBackend::TensorOps
@@ -662,6 +655,7 @@ pub fn gemm_nt_train(
     c: &Tensor,
     backend: GemmBackend,
 ) -> Result<(), String> {
+    validate_gemm(a_mk, b_nk, c, Layout::NT, use_bf16_gemm(a_mk.runtime(), backend))?;
     let rt = a_mk.runtime();
     if use_bf16_gemm(rt, backend) {
         assert_eq!(c.dtype, DType::F32);
@@ -685,14 +679,7 @@ pub fn gemm_tn_accum_train(
     c: &Tensor,
     backend: GemmBackend,
 ) -> Result<(), String> {
-    assert_eq!(a_km.shape.len(), 2);
-    assert_eq!(b_kn.shape.len(), 2);
-    let k = a_km.shape[0];
-    let m = a_km.shape[1];
-    assert_eq!(b_kn.shape[0], k);
-    let n = b_kn.shape[1];
-    assert_eq!(c.shape, &[m, n]);
-    assert_eq!(c.dtype, DType::F32);
+    let (m, n, k) = validate_gemm(a_km, b_kn, c, Layout::TN, use_bf16_gemm(a_km.runtime(), backend))?;
 
     let rt = a_km.runtime();
     let use_accum = crate::ab_flags::gemm_accum();
@@ -738,14 +725,7 @@ pub fn gemm_nt_accum_train(
     c: &Tensor,
     backend: GemmBackend,
 ) -> Result<(), String> {
-    assert_eq!(a_mk.shape.len(), 2);
-    assert_eq!(b_nk.shape.len(), 2);
-    let m = a_mk.shape[0];
-    let k = a_mk.shape[1];
-    let n = b_nk.shape[0];
-    assert_eq!(b_nk.shape[1], k);
-    assert_eq!(c.shape, &[m, n]);
-    assert_eq!(c.dtype, DType::F32);
+    let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, use_bf16_gemm(a_mk.runtime(), backend))?;
 
     let rt = a_mk.runtime();
     let use_accum = crate::ab_flags::gemm_accum();
@@ -827,10 +807,23 @@ mod tests {
     use crate::GpuRuntime;
 
     fn max_abs_err(got: &[f32], exp: &[f32]) -> f32 {
+        assert_eq!(got.len(), exp.len(), "parity length mismatch");
+        assert!(got.iter().chain(exp).all(|x| x.is_finite()), "nonfinite parity input");
         got.iter()
             .zip(exp.iter())
             .map(|(g, e)| (g - e).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn parity_metric_rejects_nonfinite_and_length_mismatch() {
+        for (got, expected) in [
+            (vec![f32::NAN], vec![0.0]),
+            (vec![f32::INFINITY], vec![f32::INFINITY]),
+            (vec![0.0], vec![0.0, 1.0]),
+        ] {
+            assert!(std::panic::catch_unwind(|| max_abs_err(&got, &expected)).is_err());
+        }
     }
 
     fn run_case(m: usize, n: usize, k: usize, backend: GemmBackend) {
@@ -1273,5 +1266,197 @@ mod tests {
         rt.synchronize().unwrap();
         let err = max_abs_err(&c.buffer.read_f32(), &exp);
         assert!(err < 1e-3, "MLP-up split-K TN err={err}");
+    }
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+
+    type Launch = fn(&Tensor, &Tensor, &Tensor, GemmBackend) -> Result<(), String>;
+    const LAUNCHES: &[Launch] = &[
+        gemm, gemm_train, gemm_tn_f32, gemm_nt_f32, gemm_tn_train,
+        gemm_nt_train, gemm_tn_accum_train, gemm_nt_accum_train,
+    ];
+
+    #[test]
+    fn rejects_invalid_metadata_and_mixed_runtimes() {
+        let rt = GpuRuntime::new().unwrap();
+        let other = GpuRuntime::new().unwrap();
+        let a = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let b = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let c = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let foreign = other.alloc_tensor_f32(&[16,16]).unwrap();
+        let mut cases = Vec::new();
+        for (shape, offset, dtype) in [
+            (vec![0,16],0,DType::F32), (vec![16,16],1,DType::F32),
+            (vec![16,16],4,DType::F32), (vec![usize::MAX,usize::MAX],0,DType::F32),
+            (vec![16,16],0,DType::BF16), (vec![16,15],0,DType::F32),
+        ] {
+            let mut bad = c.clone();
+            bad.shape = shape; bad.byte_offset = offset; bad.dtype = dtype;
+            cases.push(bad);
+        }
+        for precision in [PrecisionMode::F32, PrecisionMode::Bf16] {
+            rt.set_precision(precision);
+            for launch in LAUNCHES {
+                for bad in &cases {
+                    assert!(launch(&a,&b,bad,GemmBackend::TensorOps).is_err());
+                }
+                assert!(launch(&a,&foreign,&c,GemmBackend::TensorOps).is_err());
+                // A mismatched inner dimension must fail before any bf16 cast.
+                let bad_b = b.view(&[16,15], 0);
+                assert!(launch(&a,&bad_b,&c,GemmBackend::TensorOps).is_err());
+            }
+        }
+        assert_eq!(rt.take_dispatch_count(),0);
+    }
+
+    #[test]
+    fn disjoint_bank_views_work_and_overlap_is_rejected() {
+        let rt = GpuRuntime::new().unwrap();
+        let bank = rt.alloc_tensor_f32(&[3*256]).unwrap();
+        bank.buffer.write_f32(&vec![1.0;3*256]);
+        let a = bank.view(&[16,16],0);
+        let b = bank.view(&[16,16],256);
+        let c = bank.view(&[16,16],512);
+        for launch in LAUNCHES {
+            let overlap = bank.view(&[16,16],128);
+            assert!(launch(&a,&b,&overlap,GemmBackend::TensorOps).is_err());
+        }
+        rt.take_dispatch_count();
+        gemm(&a,&b,&c,GemmBackend::Simdgroup).unwrap();
+        rt.synchronize().unwrap();
+        assert_eq!(rt.take_dispatch_count(),1, "simdgroup must not pre-zero C");
+        let got = bank.buffer.read_f32();
+        assert!(got[..512].iter().all(|&x| x==1.0));
+        assert!(got[512..].iter().all(|&x| x==16.0));
+    }
+
+    #[test]
+    fn transpose_edges_precision_and_accumulation() {
+        let rt = GpuRuntime::new().unwrap();
+        assert!(rt.has_tensorops(), "TensorOps coverage requires the actual metallib");
+        for (m,n,k) in [(1,3,1),(17,31,9),(33,65,129),(17,31,2049)] {
+            for backend in [GemmBackend::Simdgroup, GemmBackend::TensorOps] {
+                for precision in [PrecisionMode::F32, PrecisionMode::Bf16] {
+                    rt.set_precision(precision);
+                    for (tn, accum) in [(true,false),(false,false),(true,true),(false,true)] {
+                        let ashape = if tn { [k,m] } else { [m,k] };
+                        let bshape = if tn { [k,n] } else { [n,k] };
+                        let av: Vec<f32> = (0..m*k).map(|i| (i%13) as f32/16.0-0.25).collect();
+                        let bv: Vec<f32> = (0..n*k).map(|i| (i%7) as f32/16.0-0.125).collect();
+                        let a = rt.alloc_tensor_f32(&ashape).unwrap();
+                        let b = rt.alloc_tensor_f32(&bshape).unwrap();
+                        let bank = rt.alloc_tensor_f32(&[m*n+8]).unwrap();
+                        a.buffer.write_f32(&av); b.buffer.write_f32(&bv);
+                        bank.buffer.write_f32(&vec![2.0;m*n+8]);
+                        let c = bank.view(&[m,n],4);
+                        let launch: Launch = match (tn,accum) {
+                            (true,false)=>gemm_tn_train, (false,false)=>gemm_nt_train,
+                            (true,true)=>gemm_tn_accum_train, (false,true)=>gemm_nt_accum_train,
+                        };
+                        launch(&a,&b,&c,backend).unwrap();
+                        rt.synchronize().unwrap();
+                        let got = bank.buffer.read_f32();
+                        assert_eq!(&got[..4],&[2.0;4]);
+                        assert_eq!(&got[m*n+4..],&[2.0;4]);
+                        for row in 0..m { for col in 0..n {
+                            let mut expected = if accum {2.0} else {0.0};
+                            for p in 0..k {
+                                expected += av[if tn {p*m+row} else {row*k+p}]
+                                    *bv[if tn {p*n+col} else {col*k+p}];
+                            }
+                            let x=got[4+row*n+col];
+                            assert!(x.is_finite() && (x-expected).abs()<1e-4,
+                                "{m}x{n}x{k} {backend:?} {precision:?} TN={tn} accum={accum}: {x} vs {expected}");
+                        }}
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn casts_reject_dtype_and_shape_before_encoding() {
+        let rt = GpuRuntime::new().unwrap();
+        let a = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let b = rt.alloc_tensor_bf16(&[256]).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+            cast_f32_to_bf16_into(&a, &b)));
+        assert!(result.is_ok(), "cast Result API panicked");
+        assert!(result.unwrap().is_err());
+        assert!(cast_bf16_to_f32(&a).is_err());
+        assert!(cast_f32_to_bf16(&b).is_err());
+        assert_eq!(rt.take_dispatch_count(), 0);
+    }
+
+    #[test]
+    fn rejects_bad_rank_without_panicking_or_encoding() {
+        let rt = GpuRuntime::new().unwrap();
+        let a = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let b = a.deep_copy().unwrap();
+        let c = a.deep_copy().unwrap();
+        rt.synchronize().unwrap();
+        let bad = a.view(&[256], 0);
+        for launch in LAUNCHES {
+            rt.take_dispatch_count();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+                launch(&bad, &b, &c, GemmBackend::TensorOps)));
+            assert!(result.is_ok(), "public Result API panicked");
+            assert!(result.unwrap().is_err(), "invalid rank accepted");
+            assert_eq!(rt.take_dispatch_count(), 0);
+        }
+    }
+
+    #[test]
+    fn rejects_output_alias_before_encoding() {
+        let rt = GpuRuntime::new().unwrap();
+        let a = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let b = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        for launch in LAUNCHES {
+            rt.take_dispatch_count();
+            assert!(launch(&a, &b, &a, GemmBackend::TensorOps).is_err());
+            assert_eq!(rt.take_dispatch_count(), 0);
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_dtype_on_transpose_paths() {
+        let rt = GpuRuntime::new().unwrap();
+        let mut a = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let b = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let c = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        a.dtype = DType::BF16; // backing allocation remains large enough for old buggy path
+        assert!(gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps).is_err());
+        assert!(gemm_nt_f32(&a, &b, &c, GemmBackend::TensorOps).is_err());
+    }
+
+    #[test]
+    fn simdgroup_edges_and_offset_guards() {
+        let rt = GpuRuntime::new().unwrap();
+        for (m,n,k) in [(1,1,1),(7,9,3),(16,16,16),(17,31,9),(33,65,129)] {
+            let av: Vec<f32> = (0..m*k).map(|i| (i%13) as f32 / 16.0 - 0.25).collect();
+            let bv: Vec<f32> = (0..k*n).map(|i| (i%7) as f32 / 16.0 - 0.125).collect();
+            let a = rt.alloc_tensor_f32(&[m,k]).unwrap();
+            let b = rt.alloc_tensor_f32(&[k,n]).unwrap();
+            let bank = rt.alloc_tensor_f32(&[m*n+8]).unwrap();
+            a.buffer.write_f32(&av);
+            b.buffer.write_f32(&bv);
+            let mut poisoned = vec![f32::NAN; m*n+8];
+            poisoned[..4].fill(123.0);
+            poisoned[m*n+4..].fill(123.0);
+            bank.buffer.write_f32(&poisoned);
+            let c = bank.view(&[m,n], 4);
+            gemm(&a,&b,&c,GemmBackend::Simdgroup).unwrap();
+            rt.synchronize().unwrap();
+            let got = bank.buffer.read_f32();
+            assert_eq!(&got[..4], &[123.0;4]);
+            assert_eq!(&got[m*n+4..], &[123.0;4]);
+            let expected = gemm_f32_cpu(&av,&bv,m,n,k);
+            for (x,y) in got[4..m*n+4].iter().zip(expected) {
+                assert!(x.is_finite() && (x-y).abs()<1e-4, "{m}x{n}x{k}: {x} vs {y}");
+            }
+        }
     }
 }

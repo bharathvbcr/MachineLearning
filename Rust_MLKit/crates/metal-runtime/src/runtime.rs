@@ -713,8 +713,7 @@ impl GpuRuntime {
         self: &Arc<Self>,
         shape: &[usize],
     ) -> Result<crate::tensor::Tensor, String> {
-        let numel: usize = shape.iter().product();
-        let nbytes = numel * 4;
+        let nbytes = crate::tensor::checked_nbytes(shape, crate::tensor::DType::F32)?;
         let mut bump = self.bump.lock().map_err(|e| e.to_string())?;
         let state = bump
             .as_mut()
@@ -722,7 +721,7 @@ impl GpuRuntime {
         // Align to 16 bytes for TensorOps.
         let align = 16;
         let cursor = (state.cursor + align - 1) & !(align - 1);
-        if cursor + nbytes > state.capacity {
+        if !cursor.checked_add(nbytes).is_some_and(|end| end <= state.capacity) {
             return Err(format!(
                 "bump arena exhausted: need {} more bytes (cursor={cursor}, cap={})",
                 nbytes, state.capacity
@@ -794,8 +793,8 @@ impl GpuRuntime {
         shape: &[usize],
         kind: BufferKind,
     ) -> Result<crate::tensor::Tensor, String> {
-        let numel: usize = shape.iter().product();
-        let buf = self.alloc_buffer_kind(numel * 4, kind)?;
+        let nbytes = crate::tensor::checked_nbytes(shape, crate::tensor::DType::F32)?;
+        let buf = self.alloc_buffer_kind(nbytes, kind)?;
         buf.zero();
         Ok(crate::tensor::Tensor {
             buffer: buf,
@@ -825,8 +824,8 @@ impl GpuRuntime {
         shape: &[usize],
         kind: BufferKind,
     ) -> Result<crate::tensor::Tensor, String> {
-        let numel: usize = shape.iter().product();
-        let buf = self.alloc_buffer_kind(numel * 2, kind)?;
+        let nbytes = crate::tensor::checked_nbytes(shape, crate::tensor::DType::BF16)?;
+        let buf = self.alloc_buffer_kind(nbytes, kind)?;
         buf.zero();
         Ok(crate::tensor::Tensor {
             buffer: buf,
