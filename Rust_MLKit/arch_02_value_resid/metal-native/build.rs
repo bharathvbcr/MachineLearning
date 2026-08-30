@@ -63,6 +63,7 @@ fn main() {
     // is the hot path; a simdgroup-only metallib is not acceptable.
     let tensorops_sources = [
         "matmul_tensorops.metal",
+        "matmul_tensorops_tune.metal",
         "flash_attn_tensorops.metal",
     ];
     for name in &tensorops_sources {
@@ -103,6 +104,7 @@ fn main() {
     // (shader dialect, not encode path). Fallback is documented via cargo:warning.
     let skip: &[&str] = &[
         "matmul_tensorops.metal",
+        "matmul_tensorops_tune.metal",
         "flash_attn_tensorops.metal",
     ];
     let mut others: Vec<PathBuf> = fs::read_dir(&kernels_dir)
