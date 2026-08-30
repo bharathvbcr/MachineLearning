@@ -1016,11 +1016,37 @@ specific gating mechanism, and the difference between the two recurrent families
 1/15 at identical difficulty, budget, width and depth — is far larger than anything the
 recurrent/attention distinction predicts.
 
-So the durable statement is two-part, and neither part is what we first drew from this probe:
-**one architecture in five cannot do the task at any budget we tested**, and **for every arm that
-can, the ordering is decided by where training stops**. The first is narrower than the hybrid
-literature's premise and does not support it as usually stated — recurrence is not the problem.
-The second is this paper's thesis, reproduced on the instrument we built to escape it.
+**A disjoint CE separation that does not reproduce on recall at all.** The strongest arm on this
+probe is `hybrid_gdn_periodic` — three GDN layers per attention layer, the 3:1 ratio the field has
+converged on. Under adequate budget it is joint-first at four pairs (15/15, level with pure
+attention) and first at eight (13/15 against attention's 12/15), the only arm at or near the top at
+both difficulties. On held-out CE at the same recipe it *loses* to attention by **0.0683** nats —
+4.2895 [4.2705, 4.3086] against 4.2213 [4.2022, 4.2403] — with intervals that do not overlap.
+
+The careful statement is not that the ordering reverses. The recall intervals overlap in both
+cells, so recall does not establish `hybrid_gdn_periodic` ahead of attention; what it establishes
+is that **a CE gap which is disjoint fails to appear on recall at all.** The two metrics are not
+merely differently scaled — one of them separates these arms decisively and the other, at every
+difficulty and budget we ran, does not separate them. A screen ranking these arms on CE would
+report a clear loss for the arm that best does the thing hybrids are built to do.
+
+*The corresponding family comparison is unresolved, and we say so rather than picking the cell that
+reads well.* `hybrid_gdn_periodic` against `hybrid_mingru10_attn2` runs 9/15 vs 5/15, then 15/15 vs
+12/15, then 6/15 vs 12/15 — reversed — then 13/15 vs 13/15, across the four difficulty × budget
+cells. No cell is disjoint and the sign flips with difficulty. An earlier note called this a
+suggestive inversion; on the full grid it is withdrawn rather than softened.
+
+So the durable statement is three-part, and none of the three is what we first drew from this
+probe: **one architecture in five cannot do the task at any budget we tested**; **for every arm
+that can, the ordering is decided by where training stops**; and **the CE separation between these
+arms does not reproduce on recall at any cell in the grid**.
+
+The first is narrower than the hybrid literature's premise and does not support it as usually
+stated — recurrence is not the problem, one gating mechanism is. The second is this paper's thesis,
+reproduced on the instrument we built to escape it. The third is the strongest practical warning
+here: held-out CE and in-context recall are not two views of one quality axis, and a screen that
+reports only the first will rank a hybrid on everything except the capability it was designed to
+provide.
 
 ### 6.9 The cost basis reorders the board, and the usual argument for hybrids does not survive it
 
