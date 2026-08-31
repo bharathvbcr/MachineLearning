@@ -2309,3 +2309,96 @@ pub fn gemm_q4_mlx_with_scalars(
         }
     })
 }
+
+// ------------------------------------------------------------ Reductions ---
+
+/// Threadgroup scratch depth in `reduce.metal`. Every lane writes its own slot,
+/// so a launch may never exceed this.
+const REDUCE_MAX_TG: usize = 1024;
+
+/// Threads per group for a row reduction: a power of two, capped by the
+/// kernel's scratch depth and the pipeline's own limit, and never more than
+/// the row is wide.
+fn reduce_tptg(max_threads: usize, cols: usize) -> usize {
+    reduction_tptg(max_threads, cols.next_power_of_two().max(1), REDUCE_MAX_TG)
+}
+
+/// `out[r, :] = softmax(x[r, :])` over `rows` rows of `cols` each.
+///
+/// Numerically stable: the row maximum is subtracted before exponentiating.
+/// Without that a single logit above about 88 overflows `exp` in f32 and takes
+/// the whole row to NaN, which is an ordinary input for attention scores rather
+/// than a pathological one.
+///
+/// A row whose exponentials sum to zero — every entry `-inf`, which is what a
+/// fully masked attention row looks like — yields a uniform distribution rather
+/// than NaN.
+///
+/// `x` and `out` may be the same buffer.
+///
+/// Scalar index for `_with_scalars`: 2 = `cols`.
+pub fn softmax_rows_f32(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    out: &GpuBuffer,
+    rows: u32,
+    cols: u32,
+) -> Result<(), String> {
+    row_reduce(rt, "softmax_rows_f32", x, out, rows, cols, cols)
+}
+
+/// `out[r] = sum(x[r, :])`. `out` holds one f32 per row.
+pub fn row_sum_f32(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    out: &GpuBuffer,
+    rows: u32,
+    cols: u32,
+) -> Result<(), String> {
+    row_reduce(rt, "row_sum_f32", x, out, rows, cols, 1)
+}
+
+/// `out[r] = max(x[r, :])`. `out` holds one f32 per row.
+pub fn row_max_f32(
+    rt: &Arc<GpuRuntime>,
+    x: &GpuBuffer,
+    out: &GpuBuffer,
+    rows: u32,
+    cols: u32,
+) -> Result<(), String> {
+    row_reduce(rt, "row_max_f32", x, out, rows, cols, 1)
+}
+
+/// Shared dispatch for the row reductions: one threadgroup per row.
+///
+/// `out_per_row` is how many f32 each row writes — `cols` for softmax, 1 for a
+/// scalar reduction — and is what `out`'s extent is checked against.
+fn row_reduce(
+    rt: &Arc<GpuRuntime>,
+    entry: &str,
+    x: &GpuBuffer,
+    out: &GpuBuffer,
+    rows: u32,
+    cols: u32,
+    out_per_row: u32,
+) -> Result<(), String> {
+    if cols == 0 {
+        return Err(format!("{entry}: cols must be non-zero"));
+    }
+    require::<f32>(x, elems(rows, cols, entry)?, &format!("{entry} x"))?;
+    require::<f32>(
+        out,
+        elems(rows, out_per_row, entry)?,
+        &format!("{entry} out"),
+    )?;
+    if rows == 0 {
+        return Ok(());
+    }
+    let p = rt.pipeline(entry)?;
+    let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), cols as usize);
+    dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
+        set_gpu_buf(bnd, x, 0);
+        set_gpu_buf(bnd, out, 1);
+        set_u32(bnd, cols, 2);
+    })
+}

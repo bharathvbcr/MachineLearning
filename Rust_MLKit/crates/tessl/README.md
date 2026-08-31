@@ -418,7 +418,6 @@ Recorded rather than implied. All kernels are wired to a typed Rust API, the sui
 |---|---|---|
 | **No batched / strided GEMM** | Attention *is* batched matmul. `gemm(a, b, c, backend)` has no batch dimension. | Needs a strided-descriptor pass over the TensorOps entry points, not a wrapper. |
 | **No f16** | Only f32 and bf16, so every PyTorch MPS interop boundary pays a cast. | Mechanical, but it doubles the tile-tuning matrix that `bench_gemm_tile_tune` already covers slowly. |
-| **No reductions** | No sum/mean/max/argmax or softmax at the GEMM layer; `nn` has argmax only for sampling. | — |
 | **Quantized TensorOps GEMM** | The `quant-prep` module allocates real `MTLTensor`s but there is no quantized matmul. | `MTLTensorDataType::Int4` is unbound in objc2-metal 0.3, so the dtype cannot be named. `QUANT_PREFILL_GEMM_WIRED` reports this. |
 | **No CPU fallback** | No Metal 4 device means nothing runs. | Deliberate: the crate is an Apple-silicon runtime, and a silent CPU path would make "GPU" benchmarks meaningless. |
 

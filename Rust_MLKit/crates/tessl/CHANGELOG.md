@@ -8,6 +8,12 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Row-wise reductions**: `nn::softmax_rows_f32`, `nn::row_sum_f32`,
+  `nn::row_max_f32`. One threadgroup per row, striding, so `cols` is unbounded.
+  Softmax subtracts the row maximum before exponentiating — without it a single
+  logit above about 88 overflows `exp` in f32 and takes the row to NaN, which is
+  an ordinary attention input rather than a pathological one. A fully masked row
+  (`-inf` everywhere) yields a uniform distribution rather than NaN.
 - **`gemm_epilogue` — fused GEMM epilogue.**
   `C = activation(alpha * A@B + beta * C_prev + bias)` in one dispatch, applied
   while the accumulator is still in registers, so `C` is written once and read
