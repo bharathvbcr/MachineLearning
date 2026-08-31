@@ -582,6 +582,14 @@ NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, tru
             has_bias ? bias : nullptr, alpha, beta, act);                      \
     }
 
+/// f16 operands with f32 accumulate. Same cooperative machinery as bf16 — the
+/// element type is a template parameter — so this is an instantiation, not a
+/// second implementation. f16 carries more mantissa than bf16 and far less
+/// exponent, which is the trade PyTorch interop asks for.
+NN_COOP_KERNEL(matmul2d_tensorops_f16_f32,             half, 128, 64, 4, false)
+NN_COOP_KERNEL(matmul2d_tensorops_f16_f32_64x64_sg4,   half,  64, 64, 4, false)
+NN_COOP_EPI_KERNEL(matmul2d_tensorops_f16_f32_epi,     half, 128, 64, 4, false)
+
 NN_COOP_EPI_KERNEL(matmul2d_tensorops_bf16_f32_epi,    bfloat, 128, 64, 4, false)
 NN_COOP_EPI_KERNEL(matmul2d_tensorops_f32_relaxed_epi,  float, 128, 64, 4, true)
 

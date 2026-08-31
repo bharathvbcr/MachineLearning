@@ -17,6 +17,12 @@ use crate::runtime::{BufferKind, GpuRuntime};
 pub enum DType {
     F32,
     BF16,
+    /// IEEE binary16. Two bytes like [`DType::BF16`], but the bits are spent
+    /// differently: 10 mantissa against bf16's 7, and 5 exponent against 8. It
+    /// carries more precision and far less range — anything above 65504
+    /// becomes infinity rather than merely losing digits. It exists here for
+    /// interoperability, since it is what most external tooling exchanges.
+    F16,
 }
 
 impl DType {
@@ -24,6 +30,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::BF16 => 2,
+            DType::F16 => 2,
         }
     }
 }
@@ -197,10 +204,24 @@ impl GpuBuffer {
         self.contents_f32().to_vec()
     }
 
+    /// Write raw 16-bit elements. Named for bf16 because that was the only
+    /// two-byte dtype when it was added; [`GpuBuffer::write_f16_bits`] is the
+    /// same call under the name an f16 caller expects.
     pub fn write_bf16_bits(&self, data: &[u16]) {
         let mut dst = self.contents_u16();
         assert_eq!(dst.len(), data.len());
         dst.copy_from_slice(data);
+    }
+
+    /// Write raw IEEE binary16 elements.
+    ///
+    /// Identical to [`GpuBuffer::write_bf16_bits`] — both move `u16` — but the
+    /// name is the point. f16 and bf16 have different bit layouts, so a call
+    /// site reading `write_bf16_bits(&f32_slice_to_f16(..))` states two
+    /// different formats in one line and invites exactly the mix-up that
+    /// produces plausible, wrong numbers.
+    pub fn write_f16_bits(&self, data: &[u16]) {
+        self.write_bf16_bits(data);
     }
 
     pub fn try_contents_u8(&self) -> Result<HostMapping<'_, u8>, String> {
@@ -384,6 +405,7 @@ impl Tensor {
         let t = match self.dtype {
             DType::F32 => self.runtime.alloc_tensor_f32(&self.shape)?,
             DType::BF16 => self.runtime.alloc_tensor_bf16(&self.shape)?,
+            DType::F16 => self.runtime.alloc_tensor_f16(&self.shape)?,
         };
         gpu_copy(self, &t)?;
         Ok(t)
@@ -414,6 +436,7 @@ pub fn gpu_copy(src: &Tensor, dst: &Tensor) -> Result<(), String> {
     let kernel = match src.dtype {
         DType::F32 => "copy_f32",
         DType::BF16 => "copy_bf16",
+        DType::F16 => "copy_f16",
     };
     let p = rt.pipeline(kernel)?;
     crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
@@ -441,6 +464,82 @@ pub fn bf16_bits_to_f32(b: u16) -> f32 {
 
 pub fn f32_slice_to_bf16(data: &[f32]) -> Vec<u16> {
     data.iter().copied().map(f32_to_bf16_bits).collect()
+}
+
+/// f32 -> IEEE binary16 bits, round-to-nearest-even, saturating to infinity.
+///
+/// Unlike [`f32_to_bf16_bits`] this cannot be a shift: bf16 shares f32's
+/// exponent field, so truncating the low 16 bits is already a bf16. Half has 5
+/// exponent bits, so the exponent must be re-biased and the value can overflow
+/// to infinity — 65504 is the largest finite half, and f32 reaches 3.4e38.
+pub fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mag = bits & 0x7fff_ffff;
+
+    // Inf and NaN. A NaN whose payload lives entirely in the discarded low
+    // bits must stay a NaN, so the quiet bit is set rather than the payload
+    // copied — the same concern `f32_to_bf16_bits` documents.
+    if mag >= 0x7f80_0000 {
+        return sign | if mag > 0x7f80_0000 { 0x7e00 } else { 0x7c00 };
+    }
+
+    let unbiased = ((mag >> 23) as i32) - 127;
+
+    // Above half's range. 65504 is the largest finite half and f32 reaches
+    // 3.4e38, so this is a saturation, not a truncation — the difference from
+    // bf16, which shares f32's exponent field and never gets here.
+    if unbiased > 15 {
+        return sign | 0x7c00;
+    }
+
+    if unbiased < -14 {
+        // Subnormal half: the value is `m * 2^-24` for integer `m`. Scaling by
+        // 2^24 in f64 is exact for any f32 this small, so the rounding is a
+        // single round-ties-even with no bit surgery to get wrong. `m` reaching
+        // 1024 encodes as 0x0400, the smallest normal, which is the correct
+        // carry out of the subnormal range.
+        let m = (f64::from(f32::from_bits(mag)) * 16_777_216.0).round_ties_even() as u32;
+        return sign | (m as u16);
+    }
+
+    // Normal half. Round the 23-bit mantissa to 10, ties to even; a carry out
+    // of the mantissa lands in the exponent, and a carry out of the exponent
+    // lands on 0x7c00 (infinity), both of which are the right answers.
+    let e = ((unbiased + 15) as u32) << 10;
+    let m = (mag & 0x007f_ffff) >> 13;
+    let rem = mag & 0x1fff;
+    let round_up = u32::from(rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1));
+    sign | ((e | m) + round_up) as u16
+}
+
+/// IEEE binary16 bits -> f32. Exact: every half is representable in f32.
+pub fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let mant = (h & 0x03ff) as u32;
+    if exp == 0 {
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
+        // Subnormal half: value is `mant * 2^-24`, which f32 represents as a
+        // normal. Renormalise by the position of the leading set bit — write
+        // `mant = 1.f * 2^msb`, so the exponent is `msb - 24` and the stored
+        // fraction is what remains after shifting that leading one out.
+        let msb = 31 - mant.leading_zeros();
+        let e = (msb as i32 - 24 + 127) as u32;
+        let frac = (mant << (23 - msb)) & 0x007f_ffff;
+        return f32::from_bits(sign | (e << 23) | frac);
+    }
+    if exp == 0x1f {
+        return f32::from_bits(sign | 0x7f80_0000 | (mant << 13));
+    }
+    f32::from_bits(sign | ((exp + 127 - 15) << 23) | (mant << 13))
+}
+
+/// Convert a slice to IEEE binary16 bits.
+pub fn f32_slice_to_f16(data: &[f32]) -> Vec<u16> {
+    data.iter().copied().map(f32_to_f16_bits).collect()
 }
 
 #[cfg(test)]

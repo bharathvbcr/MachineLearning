@@ -886,6 +886,42 @@ impl GpuRuntime {
         })
     }
 
+    /// Allocate an IEEE binary16 tensor.
+    ///
+    /// Two bytes per element like bf16, but not interchangeable with it: the
+    /// bit layouts differ, so a buffer written as one and read as the other is
+    /// silently wrong rather than merely imprecise.
+    pub fn alloc_tensor_f16(
+        self: &Arc<Self>,
+        shape: &[usize],
+    ) -> Result<crate::tensor::Tensor, String> {
+        self.alloc_tensor_f16_kind(shape, BufferKind::Cold)
+    }
+
+    pub fn alloc_tensor_f16_hot(
+        self: &Arc<Self>,
+        shape: &[usize],
+    ) -> Result<crate::tensor::Tensor, String> {
+        self.alloc_tensor_f16_kind(shape, BufferKind::Hot)
+    }
+
+    fn alloc_tensor_f16_kind(
+        self: &Arc<Self>,
+        shape: &[usize],
+        kind: BufferKind,
+    ) -> Result<crate::tensor::Tensor, String> {
+        let nbytes = crate::tensor::checked_nbytes(shape, crate::tensor::DType::F16)?;
+        let buf = self.alloc_buffer_kind(nbytes, kind)?;
+        unsafe { buf.zero_unsubmitted() };
+        Ok(crate::tensor::Tensor {
+            buffer: buf,
+            shape: shape.to_vec(),
+            dtype: crate::tensor::DType::F16,
+            byte_offset: 0,
+            runtime: Arc::clone(self),
+        })
+    }
+
     pub fn alloc_tensor_bf16(
         self: &Arc<Self>,
         shape: &[usize],

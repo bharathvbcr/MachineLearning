@@ -43,7 +43,8 @@ const DIM_MISMATCH: &str = "GEMM inner dimensions or output shape do not match";
 const CROSS_RUNTIME: &str = "GEMM tensors must belong to the same runtime";
 const BAD_DTYPE: &str = "GEMM operand dtype does not match the selected precision path";
 const OVERLAP: &str = "GEMM output must not overlap either input";
-const MIXED_OPERANDS: &str = "GEMM requires matching operand dtypes; bf16 requires TensorOps";
+const MIXED_OPERANDS: &str =
+    "GEMM requires matching operand dtypes; bf16 and f16 require TensorOps";
 
 #[test]
 fn gemm_rejects_mismatched_dimensions() {

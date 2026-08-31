@@ -99,3 +99,39 @@ kernel void softcap_f32(
     float z = clamp(pre[gid] / softcap, -16.0f, 16.0f);
     post[gid] = softcap * tanh(z);
 }
+
+kernel void copy_f16(
+    device const half *in [[buffer(0)]],
+    device half *out [[buffer(1)]],
+    constant uint &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    out[gid] = in[gid];
+}
+
+/// f32 -> IEEE half.
+///
+/// Unlike bf16, half has only 5 exponent bits, so values above 65504 do not
+/// merely lose precision — they become infinity. That is a real difference for
+/// activations, and it is why the cast is a conversion rather than a
+/// truncation the way `cast_f32_to_bf16` is.
+kernel void cast_f32_to_f16(
+    device const float *in [[buffer(0)]],
+    device half *out [[buffer(1)]],
+    constant uint &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    out[gid] = half(in[gid]);
+}
+
+kernel void cast_f16_to_f32(
+    device const half *in [[buffer(0)]],
+    device float *out [[buffer(1)]],
+    constant uint &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    out[gid] = float(in[gid]);
+}

@@ -75,7 +75,10 @@ pub use decode_icb::{
     take_decode_icb_capture, BinderEncodeNopGuard, DecodeIcb, DecodeIcbBind, DecodeIcbCapture,
     DecodeIcbCommand,
 };
-pub use gemm::{gemm, gemm_epilogue, gemm_f32, Activation, Epilogue, GemmBackend};
+pub use gemm::{
+    cast_f16_to_f32, cast_f32_to_f16, gemm, gemm_epilogue, gemm_f32, Activation, Epilogue,
+    GemmBackend,
+};
 pub use icb_smoke::{
     icb_smoke_enabled, run_copy_f32_smoke, set_icb_smoke, IcbBindBridge, IcbCopySmoke,
 };

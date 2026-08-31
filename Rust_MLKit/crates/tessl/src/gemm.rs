@@ -210,10 +210,58 @@ pub fn cast_bf16_to_f32(src: &Tensor) -> Result<Tensor, String> {
     Ok(dst)
 }
 
+/// `f32 -> f16`, allocating the destination.
+pub fn cast_f32_to_f16(src: &Tensor) -> Result<Tensor, String> {
+    src.validate()?;
+    if src.dtype != DType::F32 {
+        return Err("cast_f32_to_f16 expects an f32 source".into());
+    }
+    let rt = src.runtime();
+    let dst = rt.alloc_tensor_f16(&src.shape)?;
+    cast_between(src, &dst, "cast_f32_to_f16")?;
+    Ok(dst)
+}
+
+/// `f16 -> f32`, allocating the destination.
+pub fn cast_f16_to_f32(src: &Tensor) -> Result<Tensor, String> {
+    src.validate()?;
+    if src.dtype != DType::F16 {
+        return Err("cast_f16_to_f32 expects an f16 source".into());
+    }
+    let rt = src.runtime();
+    let dst = rt.alloc_tensor_f32(&src.shape)?;
+    cast_between(src, &dst, "cast_f16_to_f32")?;
+    Ok(dst)
+}
+
+/// Shared elementwise cast dispatch.
+fn cast_between(src: &Tensor, dst: &Tensor, kernel: &str) -> Result<(), String> {
+    let n = src.numel();
+    if n > u32::MAX as usize {
+        return Err(format!("{kernel}: element count exceeds uint indexing"));
+    }
+    let rt = src.runtime();
+    let p = rt.pipeline(kernel)?;
+    crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
+        crate::dispatch::set_tensor(bnd, src, 0);
+        crate::dispatch::set_tensor(bnd, dst, 1);
+        crate::dispatch::set_u32(bnd, n as u32, 2);
+    })
+}
+
 fn ensure_bf16(t: &Tensor) -> Result<Tensor, String> {
     match t.dtype {
         DType::BF16 => Ok(t.clone()),
         DType::F32 => cast_f32_to_bf16(t),
+        // Deliberately not a conversion. f16 -> bf16 loses three mantissa bits
+        // *and* changes the exponent range, so a silent one would degrade the
+        // caller's operands to buy a code path they did not ask for. An f16
+        // operand belongs on the f16 GEMM.
+        DType::F16 => Err(
+            "bf16 GEMM was asked for f16 operands; convert explicitly, or use \
+             the f16 kernels, which accumulate in f32 just as bf16 does"
+                .into(),
+        ),
     }
 }
 
@@ -236,16 +284,25 @@ pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<
     let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true)?;
 
     let use_bf16 = a.dtype == DType::BF16 && b.dtype == DType::BF16;
-    if a.dtype != b.dtype || (use_bf16 && backend != GemmBackend::TensorOps) {
-        return Err("GEMM requires matching operand dtypes; bf16 requires TensorOps".into());
+    let use_f16 = a.dtype == DType::F16 && b.dtype == DType::F16;
+    let narrow = use_bf16 || use_f16;
+    if a.dtype != b.dtype || (narrow && backend != GemmBackend::TensorOps) {
+        return Err("GEMM requires matching operand dtypes; bf16 and f16 require TensorOps".into());
     }
 
     let rt = a.runtime();
+    let elem = if use_bf16 {
+        CoopElem::Bf16
+    } else if use_f16 {
+        CoopElem::F16
+    } else {
+        CoopElem::RelaxedF32
+    };
     match backend {
-        // Cooperative-destination NN kernels (bf16 and relaxed f32): register
-        // accumulator, C written exactly once — no zero pre-pass to pack.
-        GemmBackend::TensorOps if use_bf16 || use_relaxed_f32(rt, backend) => {
-            let (kernel, tile) = nn_coop_kernel(m, n, k, use_bf16);
+        // Cooperative-destination NN kernels (bf16, f16 and relaxed f32):
+        // register accumulator, C written exactly once — no zero pre-pass.
+        GemmBackend::TensorOps if narrow || use_relaxed_f32(rt, backend) => {
+            let (kernel, tile) = nn_coop_kernel(m, n, k, elem);
             let pipeline = rt.pipeline(kernel)?;
             dispatch_tensorops_nn_coop(rt, &pipeline, a, b, c, m, n, k, tile)?;
         }
@@ -389,11 +446,12 @@ pub fn gemm_epilogue(
     }
 
     let use_bf16 = a.dtype == DType::BF16 && b.dtype == DType::BF16;
+    let use_f16 = a.dtype == DType::F16 && b.dtype == DType::F16;
     if a.dtype != b.dtype {
         return Err("GEMM requires matching operand dtypes".into());
     }
     let rt = a.runtime();
-    if !(use_bf16 || use_relaxed_f32(rt, backend)) || backend != GemmBackend::TensorOps {
+    if !(use_bf16 || use_f16 || use_relaxed_f32(rt, backend)) || backend != GemmBackend::TensorOps {
         return Err(
             "GEMM epilogue needs the cooperative-destination path: bf16 operands, or f32              with PrecisionMode::Relaxed, on the TensorOps backend. The exact-f32 and              simdgroup kernels write C straight from the matmul with no register              accumulator to fuse into, so there is nothing here to make faster"
                 .into(),
@@ -418,6 +476,8 @@ pub fn gemm_epilogue(
 
     let kernel = if use_bf16 {
         "matmul2d_tensorops_bf16_f32_epi"
+    } else if use_f16 {
+        "matmul2d_tensorops_f16_f32_epi"
     } else {
         "matmul2d_tensorops_f32_relaxed_epi"
     };
@@ -475,22 +535,34 @@ const TILE_COOP_NARROW: TileGeom = TileGeom {
 /// 64×64 sg4 wins narrow-N shapes by ~6%; 128×64 sg4 everything else. The
 /// in-kernel column-panel swizzle covers the huge-square case (+11% at
 /// 4096³), which retired the earlier 256×64 sg8 wide entry it outran.
-fn nn_coop_kernel(_m: usize, n: usize, _k: usize, bf16: bool) -> (&'static str, TileGeom) {
+/// Operand element type for the cooperative-destination NN kernels.
+///
+/// A three-way choice rather than the boolean this used to be: f16 and bf16
+/// are both two bytes and both accumulate in f32, but their bit layouts differ,
+/// so picking the wrong kernel is silently wrong rather than merely slower.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoopElem {
+    RelaxedF32,
+    Bf16,
+    F16,
+}
+
+fn nn_coop_kernel(_m: usize, n: usize, _k: usize, elem: CoopElem) -> (&'static str, TileGeom) {
     if n <= 512 {
         (
-            if bf16 {
-                "matmul2d_tensorops_bf16_f32_64x64_sg4"
-            } else {
-                "matmul2d_tensorops_f32_relaxed_64x64_sg4"
+            match elem {
+                CoopElem::Bf16 => "matmul2d_tensorops_bf16_f32_64x64_sg4",
+                CoopElem::F16 => "matmul2d_tensorops_f16_f32_64x64_sg4",
+                CoopElem::RelaxedF32 => "matmul2d_tensorops_f32_relaxed_64x64_sg4",
             },
             TILE_COOP_NARROW,
         )
     } else {
         (
-            if bf16 {
-                "matmul2d_tensorops_bf16_f32"
-            } else {
-                "matmul2d_tensorops_f32_relaxed"
+            match elem {
+                CoopElem::Bf16 => "matmul2d_tensorops_bf16_f32",
+                CoopElem::F16 => "matmul2d_tensorops_f16_f32",
+                CoopElem::RelaxedF32 => "matmul2d_tensorops_f32_relaxed",
             },
             TILE_COOP_DEFAULT,
         )

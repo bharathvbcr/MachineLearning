@@ -8,6 +8,15 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **IEEE binary16 (`DType::F16`)**: `alloc_tensor_f16`, `cast_f32_to_f16` /
+  `cast_f16_to_f32`, host `f32_to_f16_bits` / `f16_bits_to_f32` /
+  `f32_slice_to_f16`, `GpuBuffer::write_f16_bits`, and f16 GEMM kernels
+  (`matmul2d_tensorops_f16_f32`, the 64x64 variant, and the epilogue variant).
+  f16 and bf16 are both two bytes and both accumulate in f32, but their bit
+  layouts differ, so `nn_coop_kernel` now selects on a three-way `CoopElem`
+  rather than a boolean, and `ensure_bf16` refuses f16 operands instead of
+  converting them — that conversion would lose three mantissa bits and change
+  the exponent range to buy a path the caller did not ask for.
 - **Row-wise reductions**: `nn::softmax_rows_f32`, `nn::row_sum_f32`,
   `nn::row_max_f32`. One threadgroup per row, striding, so `cols` is unbounded.
   Softmax subtracts the row maximum before exponentiating — without it a single
