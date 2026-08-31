@@ -33,6 +33,28 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-link-lib=framework=Foundation");
 
+    // docs.rs builds on x86_64 Linux with no Xcode and no Metal toolchain, and
+    // `default.metallib` is gitignored so it is not in the published .crate
+    // either. Every other branch below shells out to `xcrun`, which does not
+    // exist there — so without this the crate has no path to a rendered docs
+    // page at all, only a red build.
+    //
+    // Documentation does not run kernels, so an empty metallib path is the
+    // honest answer: `metallib_path()` returns "" and `GpuRuntime::new` fails
+    // loudly if anything ever tried. `DOCS_RS` is set only by docs.rs, so this
+    // cannot silently swallow a real build.
+    if env::var_os("DOCS_RS").is_some() {
+        println!("cargo:warning=DOCS_RS set; skipping metallib AOT (docs only, no GPU)");
+        println!(
+            "cargo:kernels={}",
+            PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("kernels")
+                .display()
+        );
+        println!("cargo:rustc-env=TESSL_METALLIB=");
+        return;
+    }
+
     // Legacy spelling still honoured: this one is set by hand in CI/offline runs.
     if env::var_os("TESSL_SKIP_AOT").is_some() || env::var_os("METAL_RUNTIME_SKIP_AOT").is_some() {
         println!("cargo:warning=TESSL_SKIP_AOT set; skipping metallib AOT");

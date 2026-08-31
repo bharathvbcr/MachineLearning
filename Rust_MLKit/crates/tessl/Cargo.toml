@@ -14,6 +14,17 @@ license = "MIT OR Apache-2.0"
 # sources instead of keeping a copy that silently drifts.
 links = "tessl"
 
+# tessl is Apple-silicon only: `objc2-metal` is an unconditional dependency and
+# `build.rs` drives the Metal toolchain. Documenting it on docs.rs's default
+# x86_64-linux target is not possible, so point it at the target the crate
+# actually supports. `build.rs` detects `DOCS_RS` and skips the AOT shader
+# compile, which needs Xcode.
+[package.metadata.docs.rs]
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin"]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 default = []
 # Quantized MTLTensor prep (WWDC26-330). Off by default because it is exactly

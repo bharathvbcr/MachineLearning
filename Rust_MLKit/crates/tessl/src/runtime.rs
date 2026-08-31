@@ -478,6 +478,18 @@ impl GpuRuntime {
         self.device.name().to_string()
     }
 
+    /// Bytes of threadgroup memory a single dispatch may request.
+    ///
+    /// Kernels that stage an operand tile in `threadgroup` memory size that
+    /// request from a runtime dimension — the Q4 GEMV caches the whole `x`
+    /// vector, i.e. `cols * 4` bytes. Exceeding the limit is a dispatch-time
+    /// failure whose message names neither the kernel nor the dimension, so
+    /// callers check against this first. Apple guarantees at least 32 KiB;
+    /// current Apple silicon reports more.
+    pub fn max_threadgroup_memory(&self) -> usize {
+        self.device.maxThreadgroupMemoryLength()
+    }
+
     pub fn set_precision(&self, mode: PrecisionMode) {
         *self.precision.lock().unwrap() = mode;
     }
@@ -785,6 +797,11 @@ impl GpuRuntime {
         // Zero the logical window on the host (unified memory).
         {
             let ptr = state.buffer.metal().contents().as_ptr() as *mut u8;
+            // SAFETY: `off + nbytes == cursor` and the cursor was bounds-checked
+            // against the arena's capacity before it advanced, so this window
+            // lies inside `state.buffer`. `state` is held under the arena lock,
+            // so no other host thread is writing it, and the window is past the
+            // previous cursor — bytes no submitted command has been pointed at.
             unsafe {
                 std::ptr::write_bytes(ptr.add(off), 0, nbytes);
             }
@@ -1172,6 +1189,11 @@ impl GpuRuntime {
             }
         }
         m4.command_buffer.endCommandBuffer();
+        // SAFETY: `Retained::as_ptr` yields a pointer to an object this struct
+        // owns and keeps alive across the call, so the `NonNull` cannot dangle.
+        // `NonNull::new` rejects null rather than assuming it. The commit takes
+        // the pointer by value for the duration of the send and does not retain
+        // it past that.
         unsafe {
             let mut cb =
                 NonNull::new(Retained::as_ptr(&m4.command_buffer)

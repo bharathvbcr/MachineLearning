@@ -690,6 +690,12 @@ impl DecodeIcb {
             for b in cmd.binds.iter_mut() {
                 if let DecodeIcbBind::Immediate { index, bytes } = b {
                     let buf = rt.alloc_buffer_hot(bytes.len().max(4))?;
+                    // SAFETY: `buf` was allocated on the line above at
+                    // `max(bytes.len(), 4)` bytes and no other handle to it
+                    // exists yet, so the copy is unaliased and cannot overrun.
+                    // `bytes` is a separate owned `Vec`, so source and
+                    // destination cannot overlap — the precondition
+                    // `copy_nonoverlapping` adds over `copy`.
                     unsafe {
                         let dst = buf.metal().contents().as_ptr() as *mut u8;
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
@@ -816,6 +822,11 @@ impl DecodeIcb {
         let c = rt.alloc_buffer_hot(n * 4)?;
         let n_buf = rt.alloc_buffer_hot(4)?;
         n_buf.write_u32(&[n as u32]);
+        // SAFETY: `a`, `b` and `c` were each allocated at `n * 4` bytes just
+        // above and are not yet shared with anything, so these writes are
+        // unaliased and in bounds. They are Hot (shared-storage) buffers, so
+        // `contents()` is a valid, Metal-aligned host pointer. No command
+        // referencing them has been encoded yet.
         unsafe {
             let p = a.metal().contents().as_ptr() as *mut f32;
             for i in 0..n {

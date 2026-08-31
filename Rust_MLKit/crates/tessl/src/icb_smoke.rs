@@ -101,6 +101,10 @@ impl IcbCopySmoke {
         }
         let pipeline = pipeline_copy_f32_icb(rt)?;
         let n_buf = rt.alloc_buffer_hot(4)?;
+        // SAFETY: `n_buf` is a 4-byte Hot buffer allocated on the line above
+        // with no other handle to it, so this single `u32` write is unaliased
+        // and exactly fills it. `contents()` on a shared-storage buffer is
+        // Metal-aligned, well past `u32`'s requirement.
         unsafe {
             let p = n_buf.metal().contents().as_ptr() as *mut u32;
             *p = n as u32;
@@ -287,6 +291,11 @@ pub fn run_copy_f32_smoke(rt: &Arc<GpuRuntime>) -> Result<IcbCopySmoke, String> 
     let n = 64usize;
     let src = rt.alloc_buffer(n * 4)?;
     let dst = rt.alloc_buffer(n * 4)?;
+    // SAFETY: `src` and `dst` were just allocated at `n * 4` bytes on this
+    // thread and nothing else holds a handle to either, so these writes are
+    // unaliased and in bounds for `i < n`. Both are shared-storage buffers with
+    // a stable, Metal-aligned `contents()` pointer, and no GPU work has been
+    // encoded against them yet — the first `execute` is below.
     unsafe {
         let p = src.metal().contents().as_ptr() as *mut f32;
         for i in 0..n {
@@ -305,6 +314,9 @@ pub fn run_copy_f32_smoke(rt: &Arc<GpuRuntime>) -> Result<IcbCopySmoke, String> 
 
     // Second execute — proves ICB reuse without re-encoding.
     // Clear dst first so a no-op execute would fail the check.
+    // SAFETY: as above, and `rt.synchronize()` on the line before returned, so
+    // the GPU has finished every command touching `dst` and this write cannot
+    // race one.
     unsafe {
         let q = dst.metal().contents().as_ptr() as *mut f32;
         std::ptr::write_bytes(q as *mut u8, 0xFF, n * 4);
@@ -322,6 +334,24 @@ pub fn run_copy_f32_smoke(rt: &Arc<GpuRuntime>) -> Result<IcbCopySmoke, String> 
 }
 
 fn verify_copy(dst: &GpuBuffer, n: usize, label: &str) -> Result<(), String> {
+    // Both call sites pass the `n` that `dst` was allocated from, so this
+    // cannot fire today. It is here so the `unsafe` below is justified by a
+    // check in this function rather than by reasoning about its callers — the
+    // kind of invariant that holds until someone adds a third call site.
+    let capacity = dst.nbytes() / std::mem::size_of::<f32>();
+    if n > capacity {
+        return Err(format!(
+            "{label}: verify_copy asked for {n} floats from a buffer holding {capacity}"
+        ));
+    }
+    // SAFETY: `dst` is a shared-storage `GpuBuffer`, so its contents pointer is
+    // non-null and valid for `dst.nbytes()` bytes for as long as the buffer
+    // lives — which outlives this borrow. `n <= capacity` was just checked, so
+    // the slice cannot overrun, and `contents()` is 16-byte aligned by Metal,
+    // well past `f32`'s requirement. Every bit pattern is a valid `f32`. The
+    // caller synchronizes before verifying; a read racing the GPU would observe
+    // a torn value rather than undefined behaviour, and the comparison below
+    // would fail rather than the read.
     let out =
         unsafe { std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n) };
     for (i, &v) in out.iter().enumerate() {

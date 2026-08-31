@@ -50,17 +50,6 @@ kernel void rms_norm_bf16(
     }
 }
 
-/// Cast f32 activations → bf16 for simd GEMV (halves x bandwidth vs f32 stream).
-kernel void cast_f32_to_bf16(
-    device const float *src [[buffer(0)]],
-    device bfloat *dst [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    dst[gid] = bfloat(src[gid]);
-}
-
 /// Fused Gemma4 dual-norm residual: `resid[row] += rms_norm(x[row]) * weight`.
 /// Collapses rms_norm_f32 + ple_residual_add into one dispatch (31B post-attn/post-ff).
 /// When `layer_scale != 1`, folds end-of-layer `x *= scale`:

@@ -13,6 +13,7 @@
 - **Cooperative Register Accumulators:** High-throughput cooperative destination kernels (`get_destination_cooperative_tensor`) holding `f32` accumulators in GPU registers across the entire $K$-reduction, eliminating device memory round-trips for NN, TN, NT, and accumulating paths.
 - **In-Kernel Grid Swizzling & Bounds Checking:** Column-panel tile swizzling for large grids ($\ge 2048$ tiles) bounding operand rereads, combined with origin-shifted slice bounds checking for ragged edges.
 - **Zero-Wait Execution Pipeline:** Packed command encoding with bump-allocated constant arenas (16 MiB) and `MTLSharedEvent` synchronization—host threads never block mid-step.
+- **Neural-Network Kernel Library:** 44 model-agnostic kernels — RMSNorm, gated MLP activations, flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, and softcap/argmax sampling. These were promoted out of `gemma-metal`, where they were reachable only as raw strings through an overlay metallib.
 - **Decode ICB Capture & Replay:** Low-latency Indirect Command Buffer (ICB) capture and ping-pong replay with freeze-binds and range-batching for decode-shaped inference workloads.
 
 > [!IMPORTANT]
@@ -78,6 +79,7 @@ graph TD
 | [`dispatch`](src/dispatch.rs) | Metal 4 argument-table binding (`MTL4ArgumentTable`), constant staging cursor tracking, and 1D / 2D / 3D dispatch helpers. |
 | [`tensor`](src/tensor.rs) | Bounds-checked `GpuBuffer` / `Tensor` representations, multi-dimensional shape views, stride handling, and data types (`F32`, `Bf16`). |
 | [`ops`](src/ops.rs) | Elementwise utility launches (e.g., `softcap_f32`, activation scaling). |
+| [`nn`](src/nn.rs) | Neural-network kernels promoted out of `gemma-metal`: RMSNorm (`f32`, `bf16`, fused residual-add with layer scale), gated MLP activations (SiLU, `gelu_pytorch_tanh`), Q8 GEMV, KV-cache timestep stores and ring densify. Every entry point validates operand extents on the host before encoding. |
 | [`npy`](src/npy.rs) | NumPy `.npy` binary serialization for validating GPU buffer outputs directly against host CPU references. |
 | [`decode_icb`](src/decode_icb.rs) | Indirect Command Buffer (ICB) capture, command stream tracing, freeze-bind argument management, and execution batching. |
 | [`cb_replay`](src/cb_replay.rs) | Ping-pong command buffer replay harness for decode-heavy token generation loops. |
@@ -226,6 +228,14 @@ Measurements taken on Apple M5 Pro utilizing `bench/paired_cross_runtime.py`. Th
 
 ## Quickstart Guide
 
+Both snippets below are compiled and run as examples, so they cannot drift from
+the API:
+
+```bash
+cargo run --release --example gemm      # the GEMM quickstart
+cargo run --release --example nn_layer  # RMSNorm -> gate/up -> GELU -> residual
+```
+
 ### Basic GEMM Usage
 
 ```rust
@@ -263,12 +273,16 @@ let matmul_shader = tessl_kernels.join("matmul_tensorops.metal");
 
 To overlay custom metallibs onto `tessl` at runtime:
 ```rust
-// Initialize from standalone metallib:
-let rt = GpuRuntime::from_metallib_path("/path/to/custom.metallib")?;
+use std::path::Path;
 
-// Or overlay onto tessl default library:
+// Initialize from a standalone metallib:
+let rt = GpuRuntime::from_metallib_path(Path::new("/path/to/custom.metallib"))?;
+
+// Or overlay onto tessl's default library. Pipeline names must be unique
+// across the primary library and every overlay: `pipeline()` resolves the
+// primary first, so a duplicate name in an overlay is silently unreachable.
 let rt = GpuRuntime::new()?;
-rt.add_metallib("/path/to/custom_overlay.metallib")?;
+rt.add_metallib(Path::new("/path/to/custom_overlay.metallib"))?;
 ```
 
 ---
@@ -360,6 +374,23 @@ All runtime configuration parameters use the canonical `TESSL_*` prefix. Legacy 
 - [`../../docs/gemm_architecture.md`](../../docs/gemm_architecture.md): Deep-dive into cooperative accumulator gates, $K$-reduction bandwidth analysis, and arithmetic proofs.
 - [`../../docs/metal4_mpp.md`](../../docs/metal4_mpp.md): Low-level Metal 4 and Metal Performance Primitives integration guidelines.
 - [`bench/results/bf16_tile_tune_FINDINGS.md`](bench/results/bf16_tile_tune_FINDINGS.md): Empirical tuning log documenting $BK$ ladder benchmarks, root causes, and landed M5 Pro speedups.
+
+---
+
+## 🧭 Known gaps
+
+Recorded rather than implied. All 61 kernels are wired to a typed Rust API, the suite is warning-free, and there are no stubs; these are capabilities the crate does not have.
+
+| Gap | Why it matters | Why not yet |
+|---|---|---|
+| **No batched / strided GEMM** | Attention *is* batched matmul. `gemm(a, b, c, backend)` has no batch dimension. | Needs a strided-descriptor pass over the TensorOps entry points, not a wrapper. |
+| **No GEMM epilogue** | No alpha/beta, bias, or fused activation, so bias+GELU costs two extra dispatches and two extra round-trips through memory — most of the win on a bandwidth-bound machine. | Belongs in the cooperative-destination kernels, where the accumulator is still in registers. |
+| **No f16** | Only f32 and bf16, so every PyTorch MPS interop boundary pays a cast. | Mechanical, but it doubles the tile-tuning matrix that `bench_gemm_tile_tune` already covers slowly. |
+| **No reductions** | No sum/mean/max/argmax or softmax at the GEMM layer; `nn` has argmax only for sampling. | — |
+| **Quantized TensorOps GEMM** | The `quant-prep` module allocates real `MTLTensor`s but there is no quantized matmul. | `MTLTensorDataType::Int4` is unbound in objc2-metal 0.3, so the dtype cannot be named. `QUANT_PREFILL_GEMM_WIRED` reports this. |
+| **No CPU fallback** | No Metal 4 device means nothing runs. | Deliberate: the crate is an Apple-silicon runtime, and a silent CPU path would make "GPU" benchmarks meaningless. |
+
+The typed `nn` API covers 11 kernels in depth (RMSNorm, MLP gating, Q8 GEMV, KV stores) and the remaining promoted ones through shape-checked entry points; the MLX Q4 family is reached via `Q4MlxBank` rather than 15 separate signatures.
 
 ---
 

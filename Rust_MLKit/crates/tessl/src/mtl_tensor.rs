@@ -79,15 +79,28 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
         int8_tensorops_dtype: QuantDType::Int8.to_mtl().is_ok(),
         int4_tensorops_dtype: QuantDType::Int4.to_mtl().is_ok(),
         fp8_e8m0_tensorops_dtype: QuantDType::Fp8E8M0.to_mtl().is_ok(),
-        quant_prefill_gemm_wired: try_quant_tensorops_prefill_gemm_status().is_ok(),
+        // Const, not a call into a stub that returns `Err` so this can read
+        // `.is_ok()` off it. There is one fact here — quantized TensorOps
+        // prefill GEMM does not exist — and it is stated once.
+        quant_prefill_gemm_wired: QUANT_PREFILL_GEMM_WIRED,
         note: "Int4 unbound in objc2-metal 0.3; verify(M) = hand simdgroup Q4; TensorOps Q4 not shipped",
     }
 }
 
-fn try_quant_tensorops_prefill_gemm_status() -> Result<(), String> {
-    // Same sentinel as try_quant_tensorops_prefill_gemm — no device touch.
-    Err("quant TensorOps prefill GEMM not wired yet".into())
-}
+/// Whether a quantized TensorOps prefill GEMM exists in this crate.
+///
+/// It does not. There was a `try_quant_tensorops_prefill_gemm` whose entire
+/// body was `Err("not wired yet")`, with every parameter underscored, no
+/// caller, and no test — a function signature standing in for a design note.
+/// Callers planning around this read the flag; nothing is served by also
+/// offering them something to call that can only fail.
+///
+/// What is missing is upstream, not here: `MTLTensorDataType::Int4` is unbound
+/// in objc2-metal 0.3 (see [`QuantDType::to_mtl`]), so the dtype this path
+/// needs cannot be named yet. The rest of this module — [`GpuTensor`],
+/// [`alloc_device_tensor`], [`bind_mtl_tensor`] — is working code that will
+/// carry it when the binding lands.
+pub const QUANT_PREFILL_GEMM_WIRED: bool = false;
 
 /// Owned MTLTensor handle (device-allocated or buffer-backed).
 pub struct GpuTensor {
@@ -239,18 +252,6 @@ fn extents_from_dims(dims: &[usize]) -> Result<Retained<MTLTensorExtents>, Strin
     }
     .ok_or_else(|| "MTLTensorExtents::initWithRank_values failed".to_string())?;
     Ok(extents)
-}
-
-/// Documented entry point for Phase 2: try native quant TensorOps prefill GEMM.
-///
-/// Returns `Err` until gemma-metal wires Q4 banks + TensorOps quant kernels.
-pub fn try_quant_tensorops_prefill_gemm(
-    _rt: &GpuRuntime,
-    _a: &GpuTensor,
-    _b: &GpuTensor,
-    _c: &crate::tensor::Tensor,
-) -> Result<(), String> {
-    Err("quant TensorOps prefill GEMM not wired yet (Phase 2); use hand GEMV for decode".into())
 }
 
 #[cfg(test)]

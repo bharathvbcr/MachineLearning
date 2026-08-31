@@ -228,7 +228,7 @@ fn use_relaxed_f32(rt: &GpuRuntime, backend: GemmBackend) -> bool {
         && rt.has_tensorops()
 }
 
-/// C[M,N] = A[M,K] @ B[K,N]. Overwrites C.
+/// `C[M,N] = A[M,K] @ B[K,N]`. Overwrites C.
 ///
 /// - f32×f32→f32 always supported (exact or relaxed via runtime flag)
 /// - bf16×bf16→f32 accum (C must be f32) via TensorOps when available
@@ -492,7 +492,7 @@ pub fn gemm_train(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> R
     gemm_f32(a, b, c, backend)
 }
 
-/// C[M,N] = A[K,M]^T @ B[K,N] (TN). A is stored [K,M], B [K,N].
+/// `C[M,N] = A[K,M]^T @ B[K,N]` (TN). A is stored `[K,M]`, B `[K,N]`.
 pub fn gemm_tn_f32(
     a_km: &Tensor,
     b_kn: &Tensor,
@@ -695,7 +695,7 @@ fn gemm_tn_splitk_bf16_opts(
     Ok(())
 }
 
-/// C[M,N] = A[M,K] @ B[N,K]^T (NT). B is stored [N,K] (e.g. W[in,out]).
+/// `C[M,N] = A[M,K] @ B[N,K]^T` (NT). B is stored `[N,K]` (e.g. `W[in,out]`).
 pub fn gemm_nt_f32(
     a_mk: &Tensor,
     b_nk: &Tensor,
@@ -766,7 +766,7 @@ pub fn gemm_nt_train(
     gemm_nt_f32(a_mk, b_nk, c, backend)
 }
 
-/// C += A[K,M]^T @ B[K,N] (TN accumulate). No C zero — for dW into grad banks
+/// `C += A[K,M]^T @ B[K,N]` (TN accumulate). No C zero — for dW into grad banks
 /// and dx accumulate into a pre-zeroed buffer.
 pub fn gemm_tn_accum_train(
     a_km: &Tensor,
@@ -828,7 +828,7 @@ pub fn gemm_tn_accum_train(
     Ok(())
 }
 
-/// C += A[M,K] @ B[N,K]^T (NT accumulate). No C zero.
+/// `C += A[M,K] @ B[N,K]^T` (NT accumulate). No C zero.
 ///
 /// All call sites are **dX-class** accumulations into fresh pre-zeroed
 /// activation-grad buffers (never weight banks), so this path additionally

@@ -86,6 +86,26 @@ jobs:
           system_profiler SPDisplaysDataType 2>/dev/null | head -20 || true
           cargo run --release --bin probe_gemm_parity 2>&1 | head -30 || true
 
+      - name: Docs build clean
+        # rustdoc warnings were at 18 — matrix-shape notation such as
+        # `C[M,N] = A[M,K] @ B[K,N]` parsed as intra-doc links, plus one public
+        # doc linking a private item. They are at zero; this keeps them there.
+        # `-D warnings` and not a grep, so a new one fails rather than scrolls by.
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: docs.rs build (no Xcode, no Metal toolchain)
+        # docs.rs builds on x86_64 Linux where `xcrun` does not exist and the
+        # gitignored `default.metallib` is absent from the published .crate.
+        # `build.rs` detects DOCS_RS and skips the shader compile. Without this
+        # step the escape hatch rots silently and the first sign is a red build
+        # on docs.rs after a release, which cannot be fixed without a new one.
+        run: cargo doc --no-deps --all-features
+        env:
+          DOCS_RS: "1"
+          RUSTDOCFLAGS: -D warnings
+
       - name: Build (AOT-compiles the metallib)
         # TESSL_SKIP_AOT is NOT used here on purpose. It points the build at a
         # crate-root `default.metallib`, which is a gitignored local artefact
@@ -116,6 +136,13 @@ jobs:
         run: cargo test --release
       - name: Test with quant-prep
         run: cargo test --release --features quant-prep
+      - name: Run the README examples
+        # The README's snippets are these files. Building them proves they
+        # compile; running them proves the API still does what the prose says,
+        # which is the half that actually rots. Both assert their own output.
+        run: |
+          cargo run --release --example gemm
+          cargo run --release --example nn_layer
       - name: Deep GEMM fuzz
         # `gemm_fuzz_deep` is `#[ignore]`d so it stays out of the default run.
         # A real GPU runner is the right place to actually pay for it.

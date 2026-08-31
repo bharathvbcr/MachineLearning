@@ -25,7 +25,14 @@ pub fn metallib_path() -> &'static str {
     option_env!("GEMMA_METAL_METALLIB").unwrap_or("")
 }
 
-/// Kernel entry points in the gemma overlay metallib.
+/// Kernel entry points reachable from the shared [`GpuRuntime`].
+///
+/// Most of these now resolve from **tessl's own metallib**: the kernels were
+/// promoted into `tessl/kernels/` and are no longer part of this crate's
+/// overlay. `GpuRuntime::pipeline` searches the primary library before any
+/// overlay, so the names resolve unchanged. Only the Gemma-specific entries
+/// (`ple_*`, `persistent_interp_*`) still come from the overlay compiled by
+/// this crate's `build.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KernelId {
     GemvQ4,
@@ -371,7 +378,10 @@ fn pack_mlx_sb_bf16(scales: &[f32], biases: &[f32]) -> Vec<u16> {
     out
 }
 
-/// Shared runtime with gemma overlay metallib loaded.
+/// Shared runtime with this crate's overlay metallib loaded.
+///
+/// The overlay now carries only `ple_lookup*` and `persistent_interp*`; the
+/// general kernels live in tessl's primary metallib.
 pub struct GemmaGpu {
     pub rt: Arc<GpuRuntime>,
     /// Reused Cold scratch for f32→bf16 activation casts feeding simd GEMV.
@@ -1183,18 +1193,8 @@ pub fn gemv_q8(
     group_size: u32,
 ) -> Result<()> {
     // Q8 stays 1-thread-per-row (less common decode path).
-    let p = gpu.rt.pipeline(KernelId::GemvQ8.entry_name()).map_err(map_metal)?;
-    dispatch_1d(&gpu.rt, &p, rows as usize, |bnd| {
-        set_gpu_buf(bnd, packed, 0);
-        set_gpu_buf(bnd, scales, 1);
-        set_gpu_buf(bnd, zeros, 2);
-        set_gpu_buf(bnd, x, 3);
-        set_gpu_buf(bnd, y, 4);
-        set_u32(bnd, rows, 5);
-        set_u32(bnd, cols, 6);
-        set_u32(bnd, group_size, 7);
-    })
-    .map_err(map_metal)
+    tessl::nn::gemv_q8(&gpu.rt, packed, scales, zeros, x, y, rows, cols, group_size)
+        .map_err(map_metal)
 }
 
 /// Store one K or V timestep into a GPU KV cache slot (`dst[offset..] = src[0..n]`).
@@ -1975,15 +1975,8 @@ pub fn mlp_gelu_tanh(
     out: &GpuBuffer,
     n: u32,
 ) -> Result<()> {
-    let p = gpu
-        .rt
-        .pipeline(KernelId::MlpGeluTanh.entry_name())
-        .map_err(map_metal)?;
     let n_off = gpu.icb_scalars.push_u32(n)?;
-    dispatch_1d(&gpu.rt, &p, n as usize, |bnd| {
-        set_gpu_buf(bnd, gate, 0);
-        set_gpu_buf(bnd, up, 1);
-        set_gpu_buf(bnd, out, 2);
+    tessl::nn::mlp_gelu_tanh_with_scalars(&gpu.rt, gate, up, out, n, |bnd| {
         gpu.icb_scalars.bind_u32(bnd, n_off, 3);
     })
     .map_err(map_metal)
@@ -1997,15 +1990,8 @@ pub fn mlp_gelu_tanh_bf16(
     out_bf16: &GpuBuffer,
     n: u32,
 ) -> Result<()> {
-    let p = gpu
-        .rt
-        .pipeline(KernelId::MlpGeluTanhBf16.entry_name())
-        .map_err(map_metal)?;
     let n_off = gpu.icb_scalars.push_u32(n)?;
-    dispatch_1d(&gpu.rt, &p, n as usize, |bnd| {
-        set_gpu_buf(bnd, gate, 0);
-        set_gpu_buf(bnd, up, 1);
-        set_gpu_buf(bnd, out_bf16, 2);
+    tessl::nn::mlp_gelu_tanh_bf16_with_scalars(&gpu.rt, gate, up, out_bf16, n, |bnd| {
         gpu.icb_scalars.bind_u32(bnd, n_off, 3);
     })
     .map_err(map_metal)
@@ -2019,15 +2005,8 @@ pub fn mlp_silu(
     out: &GpuBuffer,
     n: u32,
 ) -> Result<()> {
-    let p = gpu
-        .rt
-        .pipeline(KernelId::MlpSilu.entry_name())
-        .map_err(map_metal)?;
     let n_off = gpu.icb_scalars.push_u32(n)?;
-    dispatch_1d(&gpu.rt, &p, n as usize, |bnd| {
-        set_gpu_buf(bnd, gate, 0);
-        set_gpu_buf(bnd, up, 1);
-        set_gpu_buf(bnd, out, 2);
+    tessl::nn::mlp_silu_with_scalars(&gpu.rt, gate, up, out, n, |bnd| {
         gpu.icb_scalars.bind_u32(bnd, n_off, 3);
     })
     .map_err(map_metal)
@@ -2043,17 +2022,10 @@ pub fn rms_norm_f32(
     dim: u32,
     eps: f32,
 ) -> Result<()> {
-    let p = gpu
-        .rt
-        .pipeline(KernelId::RmsNormF32.entry_name())
-        .map_err(map_metal)?;
     let rows_off = gpu.icb_scalars.push_u32(rows)?;
     let dim_off = gpu.icb_scalars.push_u32(dim)?;
     let eps_off = gpu.icb_scalars.push_f32(eps)?;
-    dispatch_1d(&gpu.rt, &p, rows as usize, |bnd| {
-        set_gpu_buf(bnd, x, 0);
-        set_gpu_buf(bnd, weight, 1);
-        set_gpu_buf(bnd, out, 2);
+    tessl::nn::rms_norm_f32_with_scalars(&gpu.rt, x, weight, out, rows, dim, |bnd| {
         gpu.icb_scalars.bind_u32(bnd, rows_off, 3);
         gpu.icb_scalars.bind_u32(bnd, dim_off, 4);
         gpu.icb_scalars.bind_f32(bnd, eps_off, 5);
@@ -2071,17 +2043,10 @@ pub fn rms_norm_bf16(
     dim: u32,
     eps: f32,
 ) -> Result<()> {
-    let p = gpu
-        .rt
-        .pipeline(KernelId::RmsNormBf16.entry_name())
-        .map_err(map_metal)?;
     let rows_off = gpu.icb_scalars.push_u32(rows)?;
     let dim_off = gpu.icb_scalars.push_u32(dim)?;
     let eps_off = gpu.icb_scalars.push_f32(eps)?;
-    dispatch_1d(&gpu.rt, &p, rows as usize, |bnd| {
-        set_gpu_buf(bnd, x, 0);
-        set_gpu_buf(bnd, weight, 1);
-        set_gpu_buf(bnd, out_bf16, 2);
+    tessl::nn::rms_norm_bf16_with_scalars(&gpu.rt, x, weight, out_bf16, rows, dim, |bnd| {
         gpu.icb_scalars.bind_u32(bnd, rows_off, 3);
         gpu.icb_scalars.bind_u32(bnd, dim_off, 4);
         gpu.icb_scalars.bind_f32(bnd, eps_off, 5);
@@ -2129,18 +2094,11 @@ pub fn rms_norm_residual_add_f32_scaled(
     eps: f32,
     layer_scale: f32,
 ) -> Result<()> {
-    let p = gpu
-        .rt
-        .pipeline(KernelId::RmsNormResidualAddF32.entry_name())
-        .map_err(map_metal)?;
     let rows_off = gpu.icb_scalars.push_u32(rows)?;
     let dim_off = gpu.icb_scalars.push_u32(dim)?;
     let eps_off = gpu.icb_scalars.push_f32(eps)?;
     let scale_off = gpu.icb_scalars.push_f32(layer_scale)?;
-    dispatch_1d(&gpu.rt, &p, rows as usize, |bnd| {
-        set_gpu_buf(bnd, x, 0);
-        set_gpu_buf(bnd, weight, 1);
-        set_gpu_buf(bnd, resid, 2);
+    tessl::nn::rms_norm_residual_add_f32_with_scalars(&gpu.rt, x, weight, resid, rows, dim, |bnd| {
         gpu.icb_scalars.bind_u32(bnd, rows_off, 3);
         gpu.icb_scalars.bind_u32(bnd, dim_off, 4);
         gpu.icb_scalars.bind_f32(bnd, eps_off, 5);

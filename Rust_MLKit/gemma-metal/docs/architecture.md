@@ -82,7 +82,7 @@ Primary Mac speed lever after honest INT4 decode.
 
 ## Encode substrate
 
-`tessl`: Metal 4-only CB/encoder, Hot/Cold residency, packed binder, const arena, GEMM, `softcap_f32`, MTLTensor prep hooks. Gemma overlay metallib compiled by `gemma-metal/build.rs`.
+`tessl`: Metal 4-only CB/encoder, Hot/Cold residency, packed binder, const arena, GEMM, the promoted NN kernel library (RMSNorm, MLP activations, flash attention, quantized GEMV/GEMM, KV stores, sampling), MTLTensor prep hooks. `gemma-metal/build.rs` compiles only the Gemma-specific overlay (PLE, persistent interpreter).
 
 ```mermaid
 flowchart LR

@@ -33,7 +33,7 @@ Rust_MLKit/
     src/                  # config … gpu_model, mtp, kernels, …
     src/bin/bench.rs      # Phase 4 speed harness
     src/bin/serve.rs      # Phase 6 OpenAI-compatible stub
-    kernels/              # Gemma overlay metallib
+    kernels/              # Gemma-only overlay: PLE + persistent-interp (general kernels live in tessl)
     bench/                # Phase 0 multi-runtime harness → docs/gates.md
     docs/
     DECISIONS.md

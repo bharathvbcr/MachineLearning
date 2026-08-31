@@ -161,7 +161,7 @@ fn coarse_default(from_env: Option<bool>, hazard: bool) -> bool {
 }
 
 /// Coarsen decode RAW barriers to phase edges (fewer Device drains).
-/// Default: on when [`hazard_barriers`] is true (see [`coarse_default`]).
+/// Default: on when [`hazard_barriers`] is true (see `coarse_default`, private).
 /// Override with `TESSL_COARSE_BARRIERS=0|1` (legacy:
 /// `GEMMA_METAL_COARSE_BARRIERS`, `METAL_RUNTIME_COARSE_BARRIERS`).
 pub fn coarse_barriers() -> bool {

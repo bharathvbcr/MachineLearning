@@ -103,6 +103,11 @@ impl<T> std::ops::Deref for HostMapping<'_, T> {
 }
 impl<T> std::ops::DerefMut for HostMapping<'_, T> {
     fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: as `Deref`, plus exclusivity. `&mut self` on a guard that
+        // only `map_host` constructs means no other `HostMapping` to this
+        // buffer is alive, and the runtime lease the guard holds rejects GPU
+        // encoding until it drops — so nothing else, host or device, can be
+        // reading these bytes while this `&mut [T]` exists.
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.buffer.metal().contents().as_ptr().cast::<T>(),
@@ -241,6 +246,11 @@ impl GpuBuffer {
     /// # Safety
     /// Storage must be fresh or retired after GPU completion, with no live views.
     pub(crate) unsafe fn zero_unsubmitted(&self) {
+        // SAFETY: discharged by this function's own contract, which the caller
+        // accepted by calling an `unsafe fn` — the storage is fresh or retired
+        // after GPU completion with no live views, so nothing else is reading
+        // these bytes. The write is exactly `nbytes()` from the buffer's own
+        // base, so it cannot overrun.
         unsafe {
             std::ptr::write_bytes(
                 self.metal().contents().as_ptr().cast::<u8>(),
