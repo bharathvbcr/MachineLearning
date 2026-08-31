@@ -208,10 +208,14 @@ def spawn_workers(argv: list[str], workers: int, gpus: int = 1) -> int:
     for i in range(total):
         env = dict(os.environ, MQAR_SHARD=f"{i}/{total}")
         if gpus > 1:
-            # Round-robin pin, so `workers` land on each device and every job
-            # still addresses "cuda:0". Without this the 8-GPU box bills eight
-            # and uses one.
-            env["CUDA_VISIBLE_DEVICES"] = str(i % gpus)
+            # Round-robin pin, so `workers` land on each device. The pinned card
+            # is renumbered to index 0 inside the child, so every job still
+            # addresses "cuda:0" and nothing in the training code changes.
+            # Without this the 8-GPU box bills eight and uses one. Ids come from
+            # the inherited allow-list so an operator's CUDA_VISIBLE_DEVICES is
+            # not escaped.
+            from .crossover_replicate import gpu_id_for_worker
+            env["CUDA_VISIBLE_DEVICES"] = gpu_id_for_worker(i, gpus)
         procs.append(subprocess.Popen(
             [sys.executable, "-u", "-m", "nanolab.mqar_suite", *argv], env=env))
     rc = 0

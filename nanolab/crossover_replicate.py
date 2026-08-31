@@ -376,6 +376,26 @@ def cluster_gpus() -> int:
     return max(1, int(os.environ.get("CROSSOVER_GPUS", "1")))
 
 
+def inherited_gpu_ids() -> list[str]:
+    """The device ids this process may use, in CUDA's own order.
+
+    Honours an inherited CUDA_VISIBLE_DEVICES. Without this, a launcher that
+    hardcodes "0".."N-1" for its children silently ESCAPES an operator's
+    restriction: `CUDA_VISIBLE_DEVICES=4,5,6,7 ... --gpus 4` would have run on
+    physical GPUs 0-3, i.e. on somebody else's cards.
+    """
+    raw = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").strip()
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def gpu_id_for_worker(wid: int, gpus: int) -> str:
+    """Physical device id for worker `wid`, round-robin over the allowed set."""
+    ids = inherited_gpu_ids()
+    return ids[wid % len(ids)] if ids else str(wid % gpus)
+
+
 def visible_gpu_count() -> int:
     """GPUs this process can actually see, honouring CUDA_VISIBLE_DEVICES."""
     try:
@@ -1376,17 +1396,29 @@ def cmd_launch(args) -> None:
         wenv = dict(env)
         if gpus > 1:
             # Round-robin, so gpus*workers processes land exactly `workers` to a
-            # device. Pinning by CUDA_VISIBLE_DEVICES rather than torch.set_device
-            # keeps every job seeing "cuda:0" and leaves the training code, the
-            # allocator and the peak-memory numbers untouched.
-            wenv["CUDA_VISIBLE_DEVICES"] = str(wid % gpus)
+            # device.
+            #
+            # Pinned with CUDA_VISIBLE_DEVICES rather than torch.cuda.set_device
+            # on purpose. The pinned card is renumbered to index 0 inside the
+            # child, so `pick_device`'s bare "cuda" and the nineteen no-argument
+            # torch.cuda.* calls in this package -- max_memory_allocated and
+            # reset_peak_memory_stats among them -- are all correct with no code
+            # change, because the process can see exactly one device. set_device
+            # would need injecting before anything touches CUDA, and any path
+            # that got there first would bind to device 0 and then report a peer
+            # GPU's memory as this job's.
+            #
+            # Ids come from the inherited allow-list, not from range(gpus): the
+            # naive form escapes an operator's CUDA_VISIBLE_DEVICES onto cards
+            # they did not offer.
+            wenv["CUDA_VISIBLE_DEVICES"] = gpu_id_for_worker(wid, gpus)
         log = (out_root / f"worker_{wid}.log").open("w", encoding="utf-8")
         workers.append(subprocess.Popen(
             cmd, env=wenv, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,
         ))
         print(f"  started worker {wid} pid={workers[-1].pid}"
-              + (f" gpu={wid % gpus}" if gpus > 1 else ""))
+              + (f" gpu={gpu_id_for_worker(wid, gpus)}" if gpus > 1 else ""))
     if args.detach:
         print("detached; monitor with: python -m nanolab.crossover_replicate status")
         return

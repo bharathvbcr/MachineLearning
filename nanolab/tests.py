@@ -3008,6 +3008,51 @@ def mqar_shard_flags_survive_reinvocation():
         == ["--cells", "16"]
 
 
+@test
+def worker_pinning_never_escapes_an_inherited_device_allowlist():
+    """Children are pinned with CUDA_VISIBLE_DEVICES, which the CUDA runtime
+    renumbers to index 0 inside the child -- that is why every job can keep
+    addressing "cuda:0" while `pick_device` returns a bare "cuda" and this
+    package makes nineteen no-argument torch.cuda.* calls.
+
+    The ids must come from the inherited allow-list. Hardcoding range(gpus)
+    would take `CUDA_VISIBLE_DEVICES=4,5,6,7 ... --gpus 4` onto physical GPUs
+    0-3: cards the operator did not offer, very possibly someone else's.
+    """
+    import os
+    from . import crossover_replicate as cr
+
+    prev = os.environ.get("CUDA_VISIBLE_DEVICES")
+    try:
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        assert [cr.gpu_id_for_worker(w, 4) for w in range(8)] == \
+            ["0", "1", "2", "3", "0", "1", "2", "3"]
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+        got = [cr.gpu_id_for_worker(w, 4) for w in range(8)]
+        assert got == ["4", "5", "6", "7", "4", "5", "6", "7"], got
+        assert not ({"0", "1", "2", "3"} & set(got)), \
+            "pinning escaped onto cards outside the allow-list"
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = " 2 , 3 "
+        assert cr.inherited_gpu_ids() == ["2", "3"], "whitespace not stripped"
+        assert cr.gpu_id_for_worker(0, 2) == "2"
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        assert cr.inherited_gpu_ids() == [], "empty is no restriction, not one card"
+        assert cr.gpu_id_for_worker(1, 2) == "1"
+    finally:
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None) if prev is None \
+            else os.environ.update(CUDA_VISIBLE_DEVICES=prev)
+
+    # Each device must receive exactly `workers` processes, on either path.
+    for gpus, workers in ((8, 2), (4, 1), (2, 3)):
+        per = {}
+        for wid in range(gpus * workers):
+            per.setdefault(cr.gpu_id_for_worker(wid, gpus), []).append(wid)
+        assert len(per) == gpus and all(len(v) == workers for v in per.values()), per
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = 0
