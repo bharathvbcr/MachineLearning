@@ -19,7 +19,7 @@ use objc2_metal::{
 use std::sync::Arc;
 
 use crate::dispatch::Binder;
-use crate::runtime::GpuRuntime;
+use crate::runtime::{GpuRuntime, ARGUMENT_TABLE_MAX_BUFFERS};
 use crate::tensor::GpuBuffer;
 
 /// Logical quantized element type for future TensorOps / GEMV paths.
@@ -116,10 +116,31 @@ impl GpuTensor {
 }
 
 /// Bind an MTLTensor into the Metal 4 argument table via `setResource:atBufferIndex:`.
-pub fn bind_mtl_tensor(bnd: &mut Binder<'_>, t: &GpuTensor, index: usize) {
+///
+/// `index` is the buffer slot, and the table has
+/// [`ARGUMENT_TABLE_MAX_BUFFERS`] of them — so the last valid slot is
+/// `ARGUMENT_TABLE_MAX_BUFFERS - 1`, not `ARGUMENT_TABLE_MAX_BUFFERS`. Metal
+/// does not range-check `setResource:atBufferIndex:`: an out-of-range slot
+/// writes past the table (a large one segfaults outright), which is why this
+/// safe wrapper rejects it instead of passing it through.
+pub fn bind_mtl_tensor(bnd: &mut Binder<'_>, t: &GpuTensor, index: usize) -> Result<(), String> {
+    if index >= ARGUMENT_TABLE_MAX_BUFFERS {
+        return Err(format!(
+            "MTLTensor bind index {index} out of range: argument table has \
+             {ARGUMENT_TABLE_MAX_BUFFERS} buffer slots (0..={})",
+            ARGUMENT_TABLE_MAX_BUFFERS - 1
+        ));
+    }
+    // SAFETY: `bind_resource_id` requires `index` to be within the argument
+    // table's buffer bind count; the check above establishes that against the
+    // same constant `runtime::try_init_metal4` builds the table with (the
+    // DecodeIcb tape table is built with the same width). The resource id is
+    // read from `t`, which owns its MTLTensor — and, for a buffer-backed
+    // tensor, the storage behind it — for at least as long as this call.
     unsafe {
         bnd.bind_resource_id(t.gpu_resource_id(), index);
     }
+    Ok(())
 }
 
 /// Probe whether the device can size an MTLTensor with the given dtype/shape.
@@ -256,6 +277,33 @@ mod tests {
         assert!(!r.fp8_e8m0_tensorops_dtype);
         assert!(!r.quant_prefill_gemm_wired);
         assert!(r.note.contains("Int4 unbound"));
+    }
+
+    /// The argument table has 31 buffer slots, so 30 is the last valid index
+    /// and 31 is already past the end. `setResource:atBufferIndex:` is not
+    /// range-checked by Metal: before this wrapper validated, index 31 wrote
+    /// past the table and `usize::MAX` took the process down with SIGSEGV.
+    #[test]
+    fn bind_mtl_tensor_rejects_out_of_range_index() {
+        let rt = GpuRuntime::new().expect("runtime");
+        let t = alloc_device_tensor(&rt, &[16, 16], QuantDType::Int8).expect("int8 tensor");
+        let mut outcome = None;
+        rt.with_binder(|bnd| {
+            outcome = Some((
+                bind_mtl_tensor(bnd, &t, 0),
+                bind_mtl_tensor(bnd, &t, ARGUMENT_TABLE_MAX_BUFFERS - 1),
+                bind_mtl_tensor(bnd, &t, ARGUMENT_TABLE_MAX_BUFFERS),
+                bind_mtl_tensor(bnd, &t, usize::MAX),
+            ));
+            Ok(())
+        })
+        .expect("binder scope");
+        let (first, last, past_end, huge) = outcome.expect("binder body ran");
+        first.expect("index 0 is a valid slot");
+        last.expect("the last slot must still bind");
+        let err = past_end.expect_err("index 31 is past the end of a 31-slot table");
+        assert!(err.contains("out of range"), "{err}");
+        huge.expect_err("usize::MAX must never reach setResource:atBufferIndex:");
     }
 
     /// Descriptor construction only (no device call). Full

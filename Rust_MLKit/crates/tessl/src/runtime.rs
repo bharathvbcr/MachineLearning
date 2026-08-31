@@ -39,6 +39,15 @@ const METAL4_CONST_ARENA_BYTES: usize = 16 * 1024 * 1024;
 /// Default pool freelist cap (~2 GiB of cached slabs).
 const DEFAULT_POOL_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
+/// Buffer slots in the Metal 4 argument table.
+///
+/// Every argument table this crate builds is created with this bind count, so a
+/// buffer index is in range iff it is `< ARGUMENT_TABLE_MAX_BUFFERS`. Public
+/// because callers that bind by raw index (e.g. `mtl_tensor::bind_mtl_tensor`,
+/// whose `setResource:atBufferIndex:` Metal does not range-check) have to check
+/// against the same number the table was built with.
+pub const ARGUMENT_TABLE_MAX_BUFFERS: usize = 31;
+
 /// Residency / recycle policy for pooled buffers (Audit 4 P0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BufferKind {
@@ -46,7 +55,10 @@ pub enum BufferKind {
     Cold,
     /// Weights / optim / long-lived — stay resident for the run.
     Hot,
-    /// Bump slab — Drop does not recycle (cursor reset after sync).
+    /// Bump slab — sub-allocated views share it and the cursor resets after
+    /// sync. Storage retires exactly like [`Self::Cold`]: `Drop` schedules the
+    /// slab for recycle, so it returns to the freelist once its last view has
+    /// dropped and the CB that used it has completed.
     Bump,
 }
 
@@ -327,7 +339,8 @@ pub struct GpuRuntime {
     active_m4: Mutex<Option<ActiveMetal4Batch>>,
     /// Last CounterHeap (t0, t1) resolved at synchronize.
     last_m4_stamps: Mutex<Option<(u64, u64)>>,
-    /// Dispatch counter since last commit (for fusion/telemetry).
+    /// `with_binder` calls since the last [`Self::take_dispatch_count`]
+    /// (fusion/telemetry). Commits do not clear it; only the taker does.
     pub dispatch_count: Mutex<usize>,
     precision: Mutex<PrecisionMode>,
     /// Phase H bridge: TensorOps f32 GEMM with `relaxed_precision` (tf32-class).
@@ -639,15 +652,19 @@ impl GpuRuntime {
         Ok(())
     }
 
+    /// Resolve (and cache) the pipeline state for a kernel name.
+    ///
+    /// The DecodeIcb binder-nop flag deliberately does *not* short-circuit this.
+    /// It suppresses encoding, not name resolution: a typo'd or removed kernel
+    /// must fail here on a replay step exactly as it does on a live one, and
+    /// callers read `threadExecutionWidth` / `maxTotalThreadsPerThreadgroup`
+    /// off the returned handle, which is only meaningful if it is that kernel's
+    /// own pipeline. A cache hit costs one uncontended lock (and no allocation
+    /// off the ICB path) — the same lookup live encode pays per dispatch.
     pub fn pipeline(
         &self,
         name: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
-        // DecodeIcb binder-nop prep: PSO is unused (with_binder is a no-op). Skip
-        // dual-mutex HashMap lookup — largest host bind-tax cut on replay steps.
-        if crate::decode_icb::binder_encode_nop() {
-            return self.pipeline_nop_standin();
-        }
         // Cache hit without holding overlay lock or allocating a key String.
         let icb = crate::decode_icb::icb_pipelines_enabled();
         {
@@ -666,28 +683,6 @@ impl GpuRuntime {
         let overlays = self.overlay_libraries.lock().map_err(|e| e.to_string())?;
         let mut cache = self.pipelines.lock().map_err(|e| e.to_string())?;
         cache.get_or_create(&self.device, &self.library, &overlays, name)
-    }
-
-    /// Cheap stand-in PSO for binder-nop replay prep (discarded; never encoded).
-    fn pipeline_nop_standin(
-        &self,
-    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
-        thread_local! {
-            static STANDIN: std::cell::RefCell<
-                Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
-            > = const { std::cell::RefCell::new(None) };
-        }
-        STANDIN.with(|slot| {
-            if let Some(p) = slot.borrow().as_ref() {
-                return Ok(p.clone());
-            }
-            let cache = self.pipelines.lock().map_err(|e| e.to_string())?;
-            let p = cache.map.values().next().cloned().ok_or_else(|| {
-                "pipeline_nop_standin: empty cache (binder-nop before any live encode?)".to_string()
-            })?;
-            *slot.borrow_mut() = Some(p.clone());
-            Ok(p)
-        })
     }
 
     /// Snapshot of overlay metallibs (for ICB pipeline construction).
@@ -1320,11 +1315,37 @@ fn resolve_two_timestamps(
         ));
     }
     let mut buf = vec![0u8; need];
+    // SAFETY: `getBytes:length:` copies `need` bytes into the destination, and
+    // `buf` is a live, uniquely borrowed allocation of exactly `need` bytes.
     unsafe {
         data.getBytes_length(NonNull::new(buf.as_mut_ptr().cast()).unwrap(), need);
-        let ptr = buf.as_ptr() as *const MTL4TimestampHeapEntry;
-        let a = (*ptr).timestamp;
-        let b = (*ptr.add(1)).timestamp;
+    }
+    decode_two_timestamps(&buf)
+}
+
+/// Decode two `MTL4TimestampHeapEntry` values out of resolved counter bytes.
+///
+/// Split out from [`resolve_two_timestamps`] so the byte decode is testable
+/// without a device, and so the alignment contract lives in one place: the
+/// staging buffer is a `Vec<u8>` (alignment 1), while the entry type is
+/// 8-aligned, so every read here goes through `read_unaligned`.
+fn decode_two_timestamps(bytes: &[u8]) -> Result<(u64, u64), String> {
+    let need = std::mem::size_of::<[MTL4TimestampHeapEntry; 2]>();
+    if bytes.len() < need {
+        return Err(format!(
+            "timestamp decode too small: {} bytes (need {need})",
+            bytes.len()
+        ));
+    }
+    // SAFETY: the length check above puts both entries fully inside `bytes`.
+    // `read_unaligned` imposes no alignment requirement on the source, which is
+    // what makes reading out of a `Vec<u8>` sound; `MTL4TimestampHeapEntry` is
+    // a `#[repr(C)]` struct of one `u64`, so every bit pattern is a valid value
+    // and the copy it makes is well defined.
+    unsafe {
+        let ptr = bytes.as_ptr().cast::<MTL4TimestampHeapEntry>();
+        let a = std::ptr::read_unaligned(ptr).timestamp;
+        let b = std::ptr::read_unaligned(ptr.add(1)).timestamp;
         Ok((a, b))
     }
 }
@@ -1347,7 +1368,7 @@ fn try_init_metal4(
         .ok_or_else(|| "newCommandBuffer (MTL4) returned nil".to_string())?;
 
     let desc = MTL4ArgumentTableDescriptor::new();
-    desc.setMaxBufferBindCount(31);
+    desc.setMaxBufferBindCount(ARGUMENT_TABLE_MAX_BUFFERS as _);
     desc.setMaxTextureBindCount(16);
     desc.setMaxSamplerStateBindCount(8);
     let table = device
@@ -1411,7 +1432,7 @@ fn try_init_metal4(
         command_buffer: cmd,
         argument_table: PersistentArgumentTable {
             table,
-            max_buffers: 31,
+            max_buffers: ARGUMENT_TABLE_MAX_BUFFERS as u64,
         },
         counter_heap,
         residency,
@@ -1597,6 +1618,118 @@ mod tests {
         assert!(cursor > 0, "const arena cursor should advance");
         rt.synchronize().unwrap();
         assert_eq!(*rt.metal4.const_cursor.lock().unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod timestamp_decode_tests {
+    use super::*;
+
+    /// Resolved counter bytes are staged in a `Vec<u8>` (alignment 1) while
+    /// `MTL4TimestampHeapEntry` is 8-aligned, so the decode must not assume the
+    /// staging address happens to be 8-aligned.
+    #[test]
+    fn decodes_two_entries_from_an_unaligned_buffer() {
+        let need = std::mem::size_of::<[MTL4TimestampHeapEntry; 2]>();
+        assert_eq!(std::mem::align_of::<MTL4TimestampHeapEntry>(), 8);
+        let mut raw = vec![0u8; need + 1];
+        // Pick the offset that lands the payload on an odd address whatever the
+        // allocator returned.
+        let off = usize::from(raw.as_ptr() as usize % 2 == 0);
+        raw[off..off + 8].copy_from_slice(&0x0123_4567_89ab_cdefu64.to_ne_bytes());
+        raw[off + 8..off + 16].copy_from_slice(&0x0fed_cba9_8765_4321u64.to_ne_bytes());
+        let bytes = &raw[off..];
+        assert_ne!(
+            bytes.as_ptr() as usize % 8,
+            0,
+            "test did not actually produce a misaligned buffer"
+        );
+        let (a, b) = decode_two_timestamps(bytes).expect("decode");
+        assert_eq!(a, 0x0123_4567_89ab_cdef);
+        assert_eq!(b, 0x0fed_cba9_8765_4321);
+    }
+
+    #[test]
+    fn short_buffer_is_rejected_not_read() {
+        let need = std::mem::size_of::<[MTL4TimestampHeapEntry; 2]>();
+        let short = vec![0u8; need - 1];
+        let err = decode_two_timestamps(&short).expect_err("short buffer must not decode");
+        assert!(err.contains("too small"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod nop_pipeline_tests {
+    use super::*;
+
+    /// Env marker set on the isolated child process (see below).
+    const CHILD_ENV: &str = "TESSL_BINDER_NOP_CHILD";
+    const SELF_NAME: &str =
+        "runtime::nop_pipeline_tests::pipeline_under_binder_nop_resolves_the_named_kernel";
+
+    /// binder-nop suppresses *encoding*; it must not suppress name resolution.
+    ///
+    /// The flag is process-global and turns every `with_binder` into a no-op,
+    /// so setting it here would make any GEMM test running in parallel encode
+    /// nothing and assert against stale memory. Restoring it on drop is not
+    /// enough — the damage happens while it is set. So the parent invocation
+    /// only re-runs this same test in a child process, filtered to itself and
+    /// single-threaded, where nothing else can be encoding; the child (marked
+    /// by `CHILD_ENV`) does the real work.
+    #[test]
+    fn pipeline_under_binder_nop_resolves_the_named_kernel() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            binder_nop_assertions();
+            return;
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", "--test-threads=1", SELF_NAME])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("spawn isolated child test");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success(),
+            "isolated binder-nop child failed:\n{stdout}\n{stderr}"
+        );
+        // A filter that matched nothing also exits 0 — make that loud.
+        assert!(
+            stdout.contains("1 passed"),
+            "child ran no test (filter out of sync with {SELF_NAME}?):\n{stdout}"
+        );
+    }
+
+    fn binder_nop_assertions() {
+        // Belt and braces inside the child: restore every ICB flag on drop.
+        let _flags = crate::decode_icb::IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("runtime");
+        // Warm the cache the way a replay step is reached: a live encode pass
+        // ran first. An empty cache is not what this test is about.
+        let live_copy = rt.pipeline("copy_f32").expect("copy_f32 live");
+        rt.pipeline("zero_f32").expect("zero_f32 live");
+        crate::decode_icb::set_binder_encode_nop(true);
+
+        let err = rt
+            .pipeline("this_kernel_does_not_exist_anywhere")
+            .expect_err("binder-nop must still reject a kernel that is not in any metallib");
+        assert!(err.contains("not found in metallib"), "{err}");
+
+        // Two different kernels must not share one pipeline state: callers read
+        // threadExecutionWidth / maxTotalThreadsPerThreadgroup off this handle.
+        let copy = rt.pipeline("copy_f32").expect("copy_f32 under binder-nop");
+        let zero = rt.pipeline("zero_f32").expect("zero_f32 under binder-nop");
+        assert!(
+            !std::ptr::eq(Retained::as_ptr(&copy), Retained::as_ptr(&zero)),
+            "binder-nop handed two different kernels the same pipeline state"
+        );
+
+        // And the handle is the one the live path returns for that name.
+        assert!(
+            std::ptr::eq(Retained::as_ptr(&copy), Retained::as_ptr(&live_copy)),
+            "binder-nop returned a stand-in instead of copy_f32's own pipeline"
+        );
     }
 }
 
