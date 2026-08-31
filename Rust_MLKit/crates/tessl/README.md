@@ -49,7 +49,7 @@ graph TD
 
     subgraph Metal4Layer["Metal 4 Driver & Hardware Layer"]
         CmdBuf["MTL4CommandBuffer / Allocator"]
-        ArgTable["MTL4ArgumentTable (32-slot)"]
+        ArgTable["MTL4ArgumentTable (31-slot)"]
         ResSet["MTLResidencySet (Hot / Cold Pools)"]
         SharedEvt["MTLSharedEvent (Zero-wait Sync)"]
     end
@@ -219,7 +219,7 @@ Measurements taken on Apple M5 Pro utilizing `bench/paired_cross_runtime.py`. Th
 
 > [!WARNING]
 > **Benchmarking Rigor:**
-> - **Clock Drift:** Single-run cross-runtime benchmarks can fluctuate by 15–20% on identical workloads due to Apple Silicon dynamic power governor adjustments. Always use paired, interleaved sweeps (`bench_gemm_coop_ab` or `paired_cross_runtime.py`).
+> - **Clock Drift:** Single-run cross-runtime benchmarks can fluctuate by 15–20% on identical workloads due to Apple Silicon dynamic power governor adjustments. Always use paired, interleaved sweeps (`bench_gemm_tnnt_tune` or `paired_cross_runtime.py`).
 > - **Dispatch Floor:** Below ~2 GFLOP of total work, both runtimes hit a ~0.25 ms host submit-and-wait floor, measuring host driver dispatch latency rather than raw shader throughput.
 
 ---
@@ -283,15 +283,24 @@ cargo test --release --lib -- --test-threads=1
 python3 scripts/audit_gemm_tiles.py
 
 # Run randomized adversarial shape fuzzing (with self-asserting kernel coverage)
-GEMM_FUZZ_SEED=0xdeadbeef GEMM_FUZZ_CASES=1200 \
-  cargo test --release --lib -- --test-threads=1 --nocapture gemm_randomized_shape_fuzz
+# Quick fuzz (160 cases) runs as part of the ordinary suite:
+cargo test --release --lib -- --test-threads=1 --nocapture gemm_fuzz_quick
+
+# Deep soak (2500 cases), #[ignore]d so it stays out of the default run:
+cargo test --release --lib -- --ignored --test-threads=1 --nocapture gemm_fuzz_deep
+
+# Replay a specific failing seed:
+STRESS_SEED=0xdeadbeef cargo test --release --lib -- --test-threads=1 gemm_fuzz_quick
 ```
 
 ### Static Tile Audit (`scripts/audit_gemm_tiles.py`)
 Cross-references every Rust `TileGeom` struct against the `constexpr int SM/SN` parameters compiled into `matmul_tensorops.metal`, including macro-instantiated kernels (`NN_COOP_KERNEL`, `TN_NT_COOP_KERNEL`). A mismatch would cause the host to dispatch incorrect threadgroup grids, silently leaving output tiles unwritten.
 
 ### Self-Asserting Shape Fuzzer
-`gemm_randomized_shape_fuzz` validates numerical correctness across non-standard matrix dimensions and **asserts its own coverage**—the test panics if any selectable NN kernel is exercised in fewer than 1% of fuzz iterations.
+`gemm_fuzz_quick` / `gemm_fuzz_deep` validate numerical correctness across non-standard matrix dimensions, reporting the failing seed so it can be replayed via `STRESS_SEED`.
+
+> [!NOTE]
+> An earlier version of this section claimed the fuzzer "asserts its own coverage — the test panics if any selectable NN kernel is exercised in fewer than 1% of fuzz iterations". No such assertion is implemented. It named a test (`gemm_randomized_shape_fuzz`) and environment variables (`GEMM_FUZZ_SEED`, `GEMM_FUZZ_CASES`) that do not exist either, so the documented command ran zero tests and reported success. Per-kernel coverage accounting would be worth adding; until it is, the fuzzer checks correctness on the shapes it happens to draw and nothing more.
 
 > [!CAUTION]
 > GPU tests are not thread-safe across concurrent OS threads sharing default command encoders. Always specify `--test-threads=1` when running `cargo test`.
@@ -309,7 +318,7 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 
 | Binary | Description & Usage |
 |---|---|
-| `bench_gemm_coop_ab` | Paired, round-interleaved A/B evaluation for kernel comparisons. |
+| `bench_gemm_tnnt_tune` | TN/NT tile sweep; the paired, round-interleaved A/B comparison lane. |
 | `bench_gemm_tile_tune` | Exhaustive tile geometry ($SM \times SN$) and $BK$ ladder benchmark. |
 | `bench_gemm_tnnt_tune` | Paired A/B tuning evaluation for TN/NT descriptor and accumulate kernels. |
 | `bench_gemm_sweep` | Automated cross-runtime sweep (`f32`, `tf32`, `bf16`) with JSON telemetry output. |
@@ -328,8 +337,8 @@ All runtime configuration parameters use the canonical `TESSL_*` prefix. Legacy 
 | `TESSL_GEMM_ACCUM` | `0` | Enables native TensorOps `multiply_accumulate` for TN/NT accumulate paths. |
 | `TESSL_GEMM_ACCUM_DX` | `0` | Enables hardware accumulate path specifically for $dX$ NT GEMM. |
 | `TESSL_GEMM_INTERIOR` | `0` | Enables interior-offset tile optimizations for `f32` GEMM. |
-| `TESSL_HAZARD_BARRIERS` | `1` | Enforces explicit device barriers after compute dispatches (`0` skips). |
-| `TESSL_COARSE_BARRIERS` | `0` | Replaces per-RAW barriers with coarse phase-level synchronization. |
+| `TESSL_HAZARD_BARRIERS` | `0` (barriers on) | **Unsafe, do not enable.** `1` *removes* the always-on Dispatch→Dispatch device barrier. The sense is the opposite of what this row said until 2026-08-31, and following the old wording to "enforce barriers" removed them. Enabling it requires the caller to place an explicit `Binder::barrier` at every RAW edge, and tessl's own ops do not: measured on an M5 Pro, `gemm_tn_accum_train` 64×64×128 under async encode produced wrong results in **300 of 300** repetitions with this set, and `stress_mapping_reentry_and_queued_copies` fails 3/3. |
+| `TESSL_COARSE_BARRIERS` | inherits `TESSL_HAZARD_BARRIERS` | Replaces per-RAW barriers with coarse phase-level synchronization. |
 | `TESSL_MID_COMMIT=N` | `0` | Overlaps host command encoding with GPU execution every $N$ dispatches. |
 | `TESSL_DECODE_ICB` | `0` | Enables Indirect Command Buffer capture and execution path. |
 | `TESSL_ICB_FREEZE_BINDS` | `0` | Freezes argument table buffer bindings directly into ICB commands. |
