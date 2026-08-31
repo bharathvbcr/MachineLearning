@@ -403,9 +403,17 @@ Inference-stack decisions for agents. Training decisions stay in
     **`GEMMA_METAL_ICB_TAPE_EXECUTE=0`** → `note_layer_live_replay`;
     **`GEMMA_METAL_ICB_SKIP_NOP_LOOP=0`** → binder-nop layer loop.
   - **A2 bind-tax cut SHIPPED (2026-07-19, v0.5):** inherit still blocked
-    (residual no-op; keep opt-in). Landed: binder-nop PSO stand-in; packed tape
-    `with_binder` + cached `gpu_addr`; atomic `IcbScalarPool` cursors. Ratio
-    was ~0.77.
+    (residual no-op; keep opt-in). Landed: packed tape `with_binder` + cached
+    `gpu_addr`; atomic `IcbScalarPool` cursors. Ratio was ~0.77.
+    - **Reverted 2026-08-31: the binder-nop PSO stand-in.** Under binder-nop,
+      `GpuRuntime::pipeline` returned an arbitrary cached PSO — HashMap
+      iteration order — instead of resolving the requested kernel, so
+      `pipeline("a_kernel_that_does_not_exist")` returned `Ok`, and any caller
+      reading `threadExecutionWidth` off the handle got another kernel's
+      geometry. Suppressing *encoding* must not also suppress *name
+      resolution*: a typo'd or deleted kernel has to fail. Removing it cost
+      nothing measurable — a cache hit is one uncontended lock, which live
+      encode already pays per dispatch.
   - **A2 residual SHIPPED (2026-07-19, v0.5.1):** `IcbScalarWriteTape` captured
     with the layer-graph (const pushes + `IcbDynSrc` + KV host commits). Mini
     DecodeIcb replay **skips the binder-nop layer loop** — applies the push

@@ -5207,10 +5207,37 @@ mod tests {
             live_encodes, 1,
             "expected one live capture encode, got {live_encodes}"
         );
-        assert!(
-            icb_replays >= (seeds.len() as u64).saturating_sub(1),
-            "expected ICB replays on steps after capture, got {icb_replays}"
-        );
+        let tape_default = std::env::var("GEMMA_METAL_ICB_TAPE_EXECUTE")
+            .ok()
+            .map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "live"))
+            .unwrap_or(true);
+        let replay_mode = if tape_default {
+            "tape_execute"
+        } else {
+            "live_layer_replay"
+        };
+        // Assert the counter that belongs to the mode actually running.
+        //
+        // `icb_replays` used to be incremented by `note_layer_live_replay` too,
+        // so this assertion passed in both modes — including the one where no
+        // tape executes at all, which is precisely what it was supposed to
+        // detect. Now that the two are counted separately, live-layer replay
+        // must be checked against its own counter or this asserts that a tape
+        // ran in the mode defined by no tape running.
+        let expected_replays = (seeds.len() as u64).saturating_sub(1);
+        if tape_default {
+            assert!(
+                icb_replays >= expected_replays,
+                "expected ICB tape replays on steps after capture, got {icb_replays}"
+            );
+        } else {
+            let live_replays = icb.encode_once_scaffold().layer_live_replays();
+            assert!(
+                live_replays >= expected_replays,
+                "expected live layer replays on steps after capture under \
+                 {replay_mode}, got {live_replays}"
+            );
+        }
         // Capture step must match live (proves tape is layer graph, not noop).
         assert_eq!(
             live_out[0], icb_out[0],
@@ -5231,15 +5258,6 @@ mod tests {
         let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bench/results");
         let _ = std::fs::create_dir_all(&out_dir);
         let latest = out_dir.join("decode_icb_mini_token_parity_latest.json");
-        let tape_default = std::env::var("GEMMA_METAL_ICB_TAPE_EXECUTE")
-            .ok()
-            .map(|v| !matches!(v.as_str(), "0" | "false" | "off" | "live"))
-            .unwrap_or(true);
-        let replay_mode = if tape_default {
-            "tape_execute"
-        } else {
-            "live_layer_replay"
-        };
         let verdict = if tokens_match {
             format!("PASS: {replay_mode} tokens ≡ live (Q4 bf16→f32 cast; densify stable)")
         } else {
