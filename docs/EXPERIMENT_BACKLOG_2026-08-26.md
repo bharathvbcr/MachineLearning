@@ -595,8 +595,25 @@ suite costs less than storing its weights.
 
 ### E12 — sliding-window attention arm: must the hybrid's attention be global?
 
-**Status: needs code** — `nanolab/mixers.py` has no windowed-attention path (verified:
-only the semi-AR block-window decode helper). Smallest honest version: a `window_size`
+**Status: CODE COMPLETE 2026-08-31, unrun.** Superseded in detail by
+`docs/SWA_BOARD_2026-08-31.md`, which specifies E12 together with two new items it
+motivated — **E15** (the same arms at context 2048) and **E16** (MQAR across sequence
+lengths that straddle the window). Both arms this entry asked for exist: `swa` (as
+`swa_w64/w128/w256`) and `hybrid_mingru10_swa2`. Run all three with
+`python -m nanolab.crossover_replicate swaboard`; ~285 runs, 33–90 GPU-h, $152–414.
+
+The gating condition below is now met: E8 exists (360 runs), and E16 extends it to the
+sequence lengths at which a window can actually bind — E8's own grid runs at `block_size`
+15, which a 64-wide window spans entirely, so `swa` there IS `attention`.
+
+The prompt for this was arXiv:2608.28444 (*Sliding-window beats linear attention*). Note
+that paper is training-free masking of a **pretrained** model against a **post-trained**
+linear retrofit; E12/E15/E16 pretrain from scratch and answer only the from-scratch
+analogue. `docs/SWA_BOARD_2026-08-31.md` scopes what closing the rest would take, and
+recommends against starting it as part of this paper.
+
+**Original entry (2026-08-26), for provenance:** `nanolab/mixers.py` has no
+windowed-attention path (verified: only the semi-AR block-window decode helper). Smallest honest version: a `window_size`
 option on the existing attention mixer implemented as an attention mask, then two arms —
 `swa` (all-12 windowed) and `hybrid_mingru10_swa2` — against their global-attention
 twins. At 512 context use window 128 so the window binds.
@@ -794,6 +811,11 @@ and 2; E13; E14; E8 (360 runs across difficulty x budget). Any further Metal-tra
 still gated on restoring `fineweb10B_sp1024` from an external copy, not on compute.
 
 **Remaining, in the order they earn their cost:**
+
+0. **E12 / E15 / E16 — the sliding-window board.** Code complete and tested 2026-08-31,
+   unrun. One command (`swaboard`), 285 runs, 33–90 GPU-h, $152–414, spec and cost basis
+   in `docs/SWA_BOARD_2026-08-31.md`. Run the probe phase first: on CUDA an explicit
+   `attn_mask` loses the flash kernel, and a math-path fallback at ctx 2048 would OOM.
 
 1. **§8.4's µP rows 1-4 — a decision, not an experiment.** Still unanswered. E13 established
    the µP cells measured a broken attention temperature; `*_spattn` is µP-with-SP-attention

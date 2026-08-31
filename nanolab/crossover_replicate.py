@@ -13,6 +13,8 @@ lie, and the token of the flip is recipe-dependent.
     python -m nanolab.crossover_replicate matched20
     python -m nanolab.crossover_replicate bs8
     python -m nanolab.crossover_replicate matched32
+    python -m nanolab.crossover_replicate swa32
+    python -m nanolab.crossover_replicate swa2k
     python -m nanolab.crossover_replicate status
     python -m nanolab.crossover_replicate plot
     python -m nanolab.crossover_replicate table
@@ -22,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import torch
+import torch.nn.functional as F
 import json
 import math
 import os
@@ -50,6 +54,25 @@ MATCHED32_OUT = Path("nanolab/out/crossover50m_matched32")
 # one directory. Sharing the directory would either trip that guard or, worse,
 # silently blend two arm sets under one recipe.json.
 RATIO32_OUT = Path("nanolab/out/crossover50m_ratio32")
+# E12: sliding-window attention, the arm the section 4.5 board never had.
+# arXiv:2608.28444 reports SWA(w=64, s=4) matching or beating post-trained
+# linear attention; this board's linear-attention family is GDN, already at n=5
+# on the matched32 recipe, so the comparison drops straight in. Own out dir for
+# the same reason E10 has one: `lock_recipe` compares the arm list.
+#
+# NOT the paper's experiment, and the note is the point. The paper is
+# TRAINING-FREE -- it masks a pretrained model at inference. These arms are
+# pretrained from scratch at 50M tokens. That answers "is a local-attention
+# stack competitive with a linear-attention stack when both are trained the same
+# way", which is what this board can ask; it does not answer "can you retrofit a
+# pretrained model", which needs a pretrained model this repo does not train.
+SWA32_OUT = Path("nanolab/out/crossover50m_swa32")
+# E15: the same SWA arms at 4x the context, on E9's recipe (batch 8 x ctx 2048 =
+# 16,384 tokens/step, identical to suite 26's cadence). This is where the paper's
+# claim actually lives: at ctx 512 a 64-wide window already spans 1/8 of the
+# sequence and there is almost nothing for locality to save, which is why E12
+# alone would understate SWA. Windows here span 1/32, 1/8 and 1/4 of context.
+SWA2K_OUT = Path("nanolab/out/crossover50m_swa2k")
 # E9: the same board at 4x the context. batch 8 x ctx 2048 = 16,384 tokens/step,
 # which is exactly suite 26's bs32 x ctx512 cadence, so eval markers land on the
 # same token counts and the loss-vs-token curves are directly comparable. The only
@@ -121,6 +144,13 @@ class Arm:
     mixer: str
     layer_mixers: str = ""
     note: str = ""
+    # Extra Config fields this arm needs, as (key, value) pairs -- a tuple, not a
+    # dict, so the dataclass stays hashable. `job_config` applies them by ARM
+    # NAME rather than from the job dict, so a job built by any of the four
+    # construction sites gets them; and `current_recipe` records them, so
+    # changing an arm's window cannot silently reuse the directory that holds
+    # runs measured at the old one.
+    overrides: tuple[tuple[str, object], ...] = ()
 
 
 # Core replication (suite 14) plus expansions: MLA (suite 13 board) and hybrids
@@ -157,7 +187,36 @@ ARMS: tuple[Arm, ...] = (
         "attention at first and last layer"),
     Arm("hybrid_mingru8_attn4", "mingru", "mingru*8,attention*4",
         "1:2 ratio upper arm"),
+    # E12: SWA(w, s) at three windows plus the sink ablation. The window sweep
+    # already has its top endpoint on the board for free -- at block_size 512 a
+    # window of 512 IS full causal attention, i.e. the `attention` arm at n=5 --
+    # so these four arms buy the 1/8, 1/4 and 1/2 points of that curve.
+    Arm("swa_w64", "swa", note="SWA(64,4) -- the paper's primary config",
+        overrides=(("swa_window", 64), ("swa_sinks", 4))),
+    Arm("swa_w128", "swa", note="SWA(128,4) -- 1/4 of the 512 context",
+        overrides=(("swa_window", 128), ("swa_sinks", 4))),
+    Arm("swa_w256", "swa", note="SWA(256,4) -- 1/2 of the 512 context",
+        overrides=(("swa_window", 256), ("swa_sinks", 4))),
+    Arm("swa_w64_nosink", "swa", note="SWA(64,0) -- isolates the sinks",
+        overrides=(("swa_window", 64), ("swa_sinks", 0))),
+    # E15 only: at ctx 512 a 512-wide window IS full attention, so this arm is
+    # meaningless there and is deliberately absent from SWA_ARMS.
+    Arm("swa_w512", "swa", note="SWA(512,4) -- 1/4 of the 2048 context",
+        overrides=(("swa_window", 512), ("swa_sinks", 4))),
+    # The backlog's E12 question proper: must the hybrid's attention be GLOBAL?
+    # `hybrid_mingru10_attn2` is the board's co-leader; this is its twin with the
+    # two attention layers windowed. If it holds, those layers were doing local
+    # work all along; if it drops, the global retrieval story earns its cost.
+    # Window 128 at ctx 512 is the backlog's own choice -- wide enough to train,
+    # narrow enough that the window binds.
+    Arm("hybrid_mingru10_swa2", "mingru", "mingru*10,swa*2",
+        "E12: the board's co-leader with its attention windowed",
+        overrides=(("swa_window", 128), ("swa_sinks", 4))),
 )
+SWA_ARMS = ("swa_w64", "swa_w128", "swa_w256", "swa_w64_nosink",
+            "hybrid_mingru10_swa2")
+# Same four questions at ctx 2048: three locality ratios plus the sink ablation.
+SWA2K_ARMS = ("swa_w64", "swa_w256", "swa_w512", "swa_w64_nosink")
 # The four E10 arms, as one name so a launcher cannot list three of them.
 RATIO_ARMS = ("hybrid_mingru11_attn1", "hybrid_mingru_periodic",
               "hybrid_mingru_bookend", "hybrid_mingru8_attn4")
@@ -198,6 +257,18 @@ def scale_to_token_budget(batch_size: int, block_size: int = 512,
 
 def cluster_batch() -> int:
     return int(os.environ.get("CROSSOVER_BATCH", "96"))
+
+
+def cluster_swa_chunk() -> int:
+    """SWA attention chunking: -1 auto, 0 dense, >0 that chunk size.
+
+    A recipe field, not a tuning knob. It is numerically identical either way
+    (asserted in tests), so it never moves a quality row -- but it changes tok/s
+    by up to 2x, so a suite that mixed two settings would produce a throughput
+    column nothing could interpret. `probe` measures both and prints which to
+    pin here.
+    """
+    return int(os.environ.get("SWA_CHUNK", "-1"))
 
 
 def cluster_workers() -> int:
@@ -466,6 +537,11 @@ def current_recipe() -> dict:
         # Recorded so `lock_recipe` refuses to mix two wall-clock budgets, or a
         # wall-clock-matched run and a token-matched one, in one directory.
         "budget_by_arm": budget_by_arm() or None,
+        # An arm's window is part of the architecture it names. Recorded so that
+        # editing SWA(64,4) to SWA(64,8) and relaunching refuses the directory
+        # instead of averaging two architectures under one arm name.
+        "arm_overrides": selected_arm_overrides(),
+        "swa_chunk": cluster_swa_chunk(),
         "eval_iters": cluster_eval_iters(),
         "token_budget": cluster_token_budget(),
         "lr_horizon": cluster_lr_horizon(),
@@ -583,6 +659,33 @@ ISOLATE_STAGES: tuple[dict, ...] = (
         "prefix": "cx2k",
         "workers": 2,
     },
+    # E12: identical to `matched32` in every recipe field, so its rows drop
+    # straight into the section 4.5 board. Only the arm list differs.
+    {
+        "name": "swa32",
+        "out": SWA32_OUT,
+        "batch": 32,
+        "eval_iters": 20,
+        "token_budget": TOKEN_BUDGET,
+        "lr_horizon": None,
+        "arms": ",".join(SWA_ARMS),
+        "prefix": "cx32swa",
+        "workers": 2,
+    },
+    # E15: E9's recipe exactly -- batch 8, block 2048, 50M budget -- so its rows
+    # sit beside the five families already measured at that context.
+    {
+        "name": "swa2k",
+        "out": SWA2K_OUT,
+        "batch": 8,
+        "block": 2048,
+        "eval_iters": 20,
+        "token_budget": TOKEN_BUDGET,
+        "lr_horizon": None,
+        "arms": ",".join(SWA2K_ARMS),
+        "prefix": "cx2kswa",
+        "workers": 2,
+    },
     {
         "name": "ratio32",
         "out": RATIO32_OUT,
@@ -620,6 +723,26 @@ def apply_isolate(stage: dict) -> None:
         os.environ.pop("CROSSOVER_LR_HORIZON", None)
     os.environ["CROSSOVER_ARMS"] = stage["arms"]
     os.environ["CROSSOVER_JOB_PREFIX"] = stage["prefix"]
+
+
+def arm_overrides(name: str) -> dict:
+    """Config overrides for an arm, looked up by name.
+
+    Read from the registry rather than carried in the job dict on purpose: jobs
+    are built at four sites (`expand_grid`, `cmd_smoke`, `cmd_run`, `cmd_probe`)
+    and a fifth would silently drop the window, producing an arm called
+    `swa_w64` that ran at the default window.
+    """
+    for arm in ARMS:
+        if arm.name == name:
+            return dict(arm.overrides)
+    return {}
+
+
+def selected_arm_overrides() -> dict:
+    """`{arm: overrides}` for the arms this launch selects, or None if none set."""
+    got = {a.name: dict(a.overrides) for a in selected_arms() if a.overrides}
+    return got or None
 
 
 def job_batch(job: dict) -> int:
@@ -675,10 +798,14 @@ def job_config(job: dict, out_root: Path, smoke: bool = False):
         ckpt_interval=scaled["ckpt_interval"],
         log_interval=scaled["log_interval"],
         eval_train=False,
+        swa_chunk=cluster_swa_chunk(),
         eval_iters=cluster_eval_iters(),
         compile=False,
         mem_fraction=0.0,
     )
+    # Applied last: an arm's own knobs (e.g. the SWA window) are what makes it
+    # that arm, so they are not overridable by the generic scaling above.
+    overrides.update(arm_overrides(job.get("arm", "")))
     if smoke:
         overrides.update(
             max_steps=40, lr_max_steps=40, eval_interval=20, eval_iters=4,
@@ -988,7 +1115,15 @@ def cmd_smoke(args) -> None:
     # fixed there and left here.
     out_root = Path(args.out) / "_smoke"
     seed = SEEDS[0]
-    arms = [a for a in ARMS if a.name in ("attention", "mingru")]
+    # Was hardcoded to attention/mingru, so no smoke run ever built a windowed
+    # layer and `swa32`'s first real failure would have been on the rented box.
+    # Defaults still cover the original pair.
+    want = [x.strip() for x in (args.arms or "attention,mingru").split(",") if x.strip()]
+    by = {a.name: a for a in ARMS}
+    missing = [n for n in want if n not in by]
+    if missing:
+        raise SystemExit(f"unknown smoke arms: {missing}")
+    arms = [by[n] for n in want]
     for arm in arms:
         job = {
             "id": f"smoke_{arm.name}_s{seed}",
@@ -1462,6 +1597,8 @@ cmd_matched20 = _stage_cmd("matched20")
 cmd_bs8 = _stage_cmd("bs8")
 cmd_matched32 = _stage_cmd("matched32")
 cmd_ratio32 = _stage_cmd("ratio32")
+cmd_swa32 = _stage_cmd("swa32")
+cmd_swa2k = _stage_cmd("swa2k")
 cmd_ctx2048 = _stage_cmd("ctx2048")
 cmd_wallclock32 = _stage_cmd("wallclock32")
 
@@ -1487,6 +1624,175 @@ def _launch_blocking(args, stage: dict) -> None:
                   if j.get("status") != "done" and not job_done(Path(stage["out"]), j["id"])]
     if unfinished:
         raise SystemExit(f"{stage['name']} unfinished: {unfinished}")
+
+
+# ---------------------------------------------------------------------------
+# E12+E13+E14: the whole sliding-window board, one GPU, in order.
+# ---------------------------------------------------------------------------
+# Deliberately NOT added to ISOLATE_SEQUENCE: that command has its own three
+# stages and a documented history of being silently enlarged.
+SWA_BOARD_PHASES: tuple[str, ...] = (
+    "probe", "swa32", "swa2k", "mqar-calibrate", "mqar-grid")
+# Batches the calibration pass tries, smallest first. E8 calibrated 256 at
+# sequence 15; a 511-token cell holds 34x more tokens per row, so the batch that
+# fits and the batch that trains are both open questions there -- hence a sweep
+# rather than a constant.
+MQAR_CALIB_BATCHES = (64, 128, 256, 512)
+MQAR_OUT = Path("nanolab/out/mqar_e16")
+
+
+def _swa_path_report(cfg, device, batch) -> str:
+    """Time the dense and chunked SWA paths at this stage's real shape.
+
+    The auto rule in `swa_auto_chunk` was fitted on Apple silicon; this is the
+    same measurement on the box that will actually be billed, so the operator
+    can pin SWA_CHUNK from data instead of inheriting someone else's hardware.
+    """
+    import time
+    from .mixers import sliding_window_mask, swa_chunked, swa_auto_chunk
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    H, D, T = cfg.n_head, cfg.head_dim, cfg.block_size
+    dt = torch.bfloat16 if dev.type == "cuda" else torch.float32
+    q, k, v = (torch.randn(batch, H, T, D, device=dev, dtype=dt, requires_grad=True)
+               for _ in range(3))
+    mask = sliding_window_mask(T, cfg.swa_window, cfg.swa_sinks, dev, {})
+    auto = swa_auto_chunk(T, cfg.swa_window)
+
+    def timed(fn, n=5):
+        for _ in range(2):
+            fn().sum().backward()
+        _sync(dev)
+        t0 = time.perf_counter()
+        for _ in range(n):
+            fn().sum().backward()
+        _sync(dev)
+        return (time.perf_counter() - t0) / n * 1000
+
+    dense = timed(lambda: F.scaled_dot_product_attention(q, k, v, attn_mask=mask))
+    best, bc = dense, 0
+    for c in sorted({256, max(256, cfg.swa_window), auto} - {0}):
+        if c >= T:
+            continue
+        t = timed(lambda c=c: swa_chunked(q, k, v, cfg.swa_window, cfg.swa_sinks,
+                                          1.0 / math.sqrt(D), c))
+        if t < best:
+            best, bc = t, c
+    note = "" if bc == auto else f"  <- auto picked {auto}; pin SWA_CHUNK={bc}"
+    return (f"dense {dense:.1f}ms, best chunk {bc or 'dense'} {best:.1f}ms "
+            f"({dense / best:.2f}x){note}")
+
+
+def _sync(dev) -> None:
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+    elif dev.type == "mps":
+        torch.mps.synchronize()
+
+
+def swa_backend_report_only(cfg, device, batch):
+    """`assert_swa_backend_is_viable` without the refusal, for SWA_ALLOW_MATH=1."""
+    from .mixers import swa_sdpa_backends
+    return swa_sdpa_backends(cfg, device, batch)
+
+
+def _mqar(argv: list[str]) -> None:
+    """Run the MQAR suite as a subprocess.
+
+    Subprocess, not import: `mqar_suite` imports ARMS from this module, so an
+    import here would be circular -- and a multi-hour phase is better off with
+    its own address space anyway.
+    """
+    cmd = [sys.executable, "-u", "-m", "nanolab.mqar_suite", *argv]
+    print(f"$ {' '.join(cmd)}", flush=True)
+    rc = subprocess.call(cmd)
+    if rc:
+        raise SystemExit(f"mqar phase failed (exit {rc}); board not complete")
+
+
+def cmd_swaboard(args) -> None:
+    """E12 -> E13 -> E14 on one GPU, in dependency order.
+
+    Phases are resumable (`--from`) and individually runnable (`--only`) because
+    the grid is hours long and a failure in phase 4 should not re-bill phases
+    1-3. Every phase is idempotent on its own artifacts: the CE stages skip runs
+    already marked done, and the MQAR ledger skips runs already recorded.
+    """
+    want = list(SWA_BOARD_PHASES)
+    if args.only:
+        if args.only not in SWA_BOARD_PHASES:
+            raise SystemExit(f"unknown phase {args.only!r}; have {SWA_BOARD_PHASES}")
+        want = [args.only]
+    elif args.start_from:
+        if args.start_from not in SWA_BOARD_PHASES:
+            raise SystemExit(f"unknown phase {args.start_from!r}; have {SWA_BOARD_PHASES}")
+        want = list(SWA_BOARD_PHASES[SWA_BOARD_PHASES.index(args.start_from):])
+    print(f"=== swaboard phases: {' -> '.join(want)} ===\n", flush=True)
+
+    for phase in want:
+        print(f"\n########## phase {phase} ##########", flush=True)
+        if phase == "probe":
+            # Preflight, and it is not a formality: on CUDA an explicit attn_mask
+            # cannot use the flash kernel, and if SDPA falls back to the math path
+            # at context 2048 the score matrix is materialised and the stage OOMs.
+            # Better to learn that in 15 minutes than four hours in.
+            from .mixers import assert_swa_backend_is_viable
+            for block, batches in ((512, "32"), (2048, "8")):
+                os.environ["CROSSOVER_BLOCK"] = str(block)
+                bs = int(batches)
+                for arm in ("swa_w64", "swa_w512"):
+                    cfg = job_config({"id": "pf", "arm": arm, "mixer": "swa",
+                                      "layer_mixers": "", "seed": 1337},
+                                     Path("nanolab/out"), smoke=True)
+                    cfg.block_size = block
+                    rep = (swa_backend_report_only(cfg, args.device, bs)
+                           if os.environ.get("SWA_ALLOW_MATH")
+                           else assert_swa_backend_is_viable(cfg, args.device, bs))
+                    served = [n for n, r in rep.items() if r["ok"]]
+                    print(f"  sdpa ctx{block} {arm} bs{bs}: {', '.join(served) or 'NONE'}",
+                          flush=True)
+                    print(f"  swa  ctx{block} {arm}: {_swa_path_report(cfg, args.device, bs)}",
+                          flush=True)
+                cmd_probe(argparse.Namespace(
+                    out=str(Path("nanolab/out") / f"swa_probe_ctx{block}"),
+                    batches=batches, steps=args.probe_steps,
+                    mixers="attention,swa_w64,swa_w512"))
+            os.environ.pop("CROSSOVER_BLOCK", None)
+        elif phase in ("swa32", "swa2k"):
+            _launch_blocking(argparse.Namespace(**vars(args)), stage_by_name(phase))
+        elif phase == "mqar-calibrate":
+            _mqar(["--out", str(MQAR_OUT), "--device", args.device,
+                   "--cells", ",".join(str(p) for p in _mqar_cells()),
+                   "--calibrate", ",".join(str(b) for b in MQAR_CALIB_BATCHES),
+                   "--steps", str(args.mqar_steps)])
+        elif phase == "mqar-grid":
+            calib = MQAR_OUT / "calibration.json"
+            if not calib.exists():
+                raise SystemExit(
+                    f"{calib} missing: run the mqar-calibrate phase first. One "
+                    "batch does not serve every sequence length, and an "
+                    "uncalibrated cell reports 'not solved' for a model that was "
+                    "merely untrainable at that batch.")
+            by_cell = json.loads(calib.read_text(encoding="utf-8"))
+            _mqar(["--out", str(MQAR_OUT), "--device", args.device,
+                   "--cells", ",".join(str(p) for p in _mqar_cells()),
+                   "--batch-by-cell", json.dumps(by_cell),
+                   "--arms", ",".join(_mqar_arms()),
+                   "--seeds", str(args.mqar_seeds),
+                   "--workers", str(args.mqar_workers),
+                   "--steps", str(args.mqar_steps)])
+    print("\n=== swaboard complete ===")
+    print("  CE boards : nanolab/out/crossover50m_swa32, .../crossover50m_swa2k")
+    print(f"  recall    : {MQAR_OUT}/runs.jsonl")
+
+
+def _mqar_cells() -> tuple[int, ...]:
+    from .mqar_suite import E16_PAIRS
+    return E16_PAIRS
+
+
+def _mqar_arms() -> tuple[str, ...]:
+    from .mqar_suite import E16_ARMS
+    return E16_ARMS
 
 
 def cmd_isolates(args) -> None:
@@ -1804,8 +2110,11 @@ def cmd_probe(args) -> None:
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
             scaled = scale_to_token_budget(bs)
-            job = {"id": f"probe_{mixer}_bs{bs}", "arm": mixer, "mixer": mixer,
-                   "layer_mixers": "", "seed": 1337}
+            spec = next((a for a in ARMS if a.name == mixer), None)
+            job = {"id": f"probe_{mixer}_bs{bs}", "arm": mixer,
+                   "mixer": spec.mixer if spec else mixer,
+                   "layer_mixers": spec.layer_mixers if spec else "",
+                   "seed": 1337}
             os.environ["CROSSOVER_BATCH"] = str(bs)
             cfg = job_config(job, out_root, smoke=False)
             cfg.max_steps = args.steps
@@ -1827,7 +2136,7 @@ def cmd_probe(args) -> None:
             peak = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
             nv = _nv_query()
             watts = nv.get("power_w", float("nan"))
-            mfu = _mfu_from_toks(mixer, tok_s, cfg)
+            mfu = _mfu_from_toks(job["mixer"], tok_s, cfg)
             print(f"{mixer:<12} {bs:4d} {tok_s:10.0f} {mfu*100:7.1f}% {peak:8.2f} "
                   f"{watts:6.0f} {status}")
             results.append({
@@ -1851,10 +2160,11 @@ def cmd_probe(args) -> None:
 
 
 def _mfu_from_toks(mixer: str, tok_s: float, cfg) -> float:
-    n = cfg.estimate_params()
-    flops = 6 * n
-    if mixer in ("attention", "mla"):
-        flops += 12 * cfg.n_layer * cfg.n_head * cfg.head_dim * cfg.block_size
+    from .model import mixer_flops_per_token
+    # Delegated, not reimplemented: this used to hardcode `attention`/`mla` and
+    # charge every other mixer ZERO attention FLOPs, so adding a mixer produced
+    # a quietly wrong MFU here and a correct one in model.py.
+    flops = 6 * cfg.estimate_params() + mixer_flops_per_token(cfg)
     peak = float(os.environ.get("PEAK_FLOPS", str(GH200_PEAK_FLOPS)))
     return (flops * tok_s) / peak
 
@@ -1866,7 +2176,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("list", parents=[common])
-    sub.add_parser("smoke", parents=[common])
+    sm = sub.add_parser("smoke", parents=[common])
+    sm.add_argument("--arms", default="attention,mingru",
+                    help="comma-separated arm names to smoke (40 steps each)")
     run = sub.add_parser("run", parents=[common])
     run.add_argument("--arm", required=True, choices=[a.name for a in ARMS])
     run.add_argument("--seed", type=int, default=SEEDS[0])
@@ -1910,6 +2222,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("bs8", "attn vs minGRU, suite-14 8.192M tokens, bs8, n=5"),
         ("matched32", "8 drifted arms, 50M, bs32, eval_iters=20, n=5"),
         ("ratio32", "E10: 4 minGRU hybrid ratios/placements, 50M, bs32, n=5"),
+        ("swa32", "E12: SWA(64/128/256, 4) + sink ablation, 50M, bs32, n=5"),
+        ("swa2k", "E15: the SWA arms at context 2048, 50M, bs8, n=5"),
         ("ctx2048", "E9: 5 families at context 2048, 50M, bs8, n=5"),
         ("wallclock32", "E11 p2: top-4 arms matched on WALL CLOCK, own cosine, n=5"),
     ):
@@ -1919,6 +2233,23 @@ def build_parser() -> argparse.ArgumentParser:
         # an operator override from its own default.
         sp.add_argument("--workers", type=int, default=None)
         sp.add_argument("--detach", action="store_true")
+    board = sub.add_parser(
+        "swaboard", parents=[common],
+        help="E12+E13+E14: the whole sliding-window board on one GPU, in order")
+    board.add_argument("--only", default="",
+                       help=f"run one phase only; one of {', '.join(SWA_BOARD_PHASES)}")
+    board.add_argument("--from", dest="start_from", default="",
+                       help="resume from this phase onward (phases are idempotent)")
+    board.add_argument("--workers", type=int, default=None)
+    board.add_argument("--detach", action="store_true")
+    board.add_argument("--device", default="cuda")
+    board.add_argument("--probe-steps", type=int, default=30)
+    board.add_argument("--mqar-seeds", type=int, default=15)
+    board.add_argument("--mqar-workers", type=int, default=4,
+                       help="MQAR runs are ~9.5M-param models that leave the GPU "
+                            "mostly idle one at a time; this is the grid's main "
+                            "cost lever. Lower it if the probe reports tight memory.")
+    board.add_argument("--mqar-steps", type=int, default=3000)
     iso = sub.add_parser("isolates", parents=[common],
                          help="run matched20, then bs8, then matched32")
     iso.add_argument("--wait", action="store_true",
@@ -1946,9 +2277,12 @@ def main():
         "bs8": cmd_bs8,
         "matched32": cmd_matched32,
         "ratio32": cmd_ratio32,
+        "swa32": cmd_swa32,
+        "swa2k": cmd_swa2k,
         "ctx2048": cmd_ctx2048,
         "wallclock32": cmd_wallclock32,
         "isolates": cmd_isolates,
+        "swaboard": cmd_swaboard,
         "wcboard": cmd_wcboard,
     }[args.cmd](args)
 

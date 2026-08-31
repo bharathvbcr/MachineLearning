@@ -8,6 +8,7 @@ the Transformer-vs-SSM A/B honest (guide §2.5, §8).
 | mixer      | what it is                 | cost in T | deps                         |
 |------------|----------------------------|-----------|------------------------------|
 | attention  | full pairwise mixing       | quadratic | none (SDPA / FlashAttention) |
+| swa        | local window + sink tokens | linear    | none (SDPA, masked)          |
 | mingru     | minimal parallel RNN       | linear    | none (pure torch reference)  |
 | mamba2     | selective state-space (SSD)| linear    | none (pure torch, slow)      |
 | gdn        | gated linear attention     | linear    | none (pure torch, slow)      |
@@ -82,6 +83,113 @@ def block_causal_mask(T: int, block_len: int, device, cache: dict) -> torch.Tens
     return m
 
 
+def sliding_window_mask(T: int, window: int, sinks: int, device,
+                        cache: dict) -> torch.Tensor:
+    """SWA(w, s): causal attention over a local window plus StreamingLLM sinks.
+
+    A query at position ``t`` attends to the ``s`` FIRST positions of the
+    sequence and to the ``w - s`` most recent positions (itself included), so
+    every query sees at most ``w`` keys and the mixer is linear in T. This is
+    the mask of "Sliding-window beats linear attention" (arXiv:2608.28444),
+    which reports SWA(64, 4) matching or beating post-trained linear attention.
+
+    The sinks are the load-bearing part. A trained transformer parks surplus
+    attention mass on the first few tokens; a window that scrolls off them
+    leaves the softmax with nowhere to dump it, which is the documented reason
+    naive local attention degrades. ``sinks=0`` is therefore the ablation that
+    isolates the claim, not a cheaper default.
+
+    ``window >= T`` degenerates to a plain causal mask, so a stack is only
+    genuinely local when the window is shorter than ``block_size``.
+
+    Returns a (1,1,T,T) boolean keep-mask for SDPA's ``attn_mask``.
+    """
+    if window < 1:
+        raise ValueError(f"swa window must be >=1, got {window}")
+    if not 0 <= sinks < window:
+        raise ValueError(f"swa sinks must satisfy 0 <= sinks < window, "
+                         f"got sinks={sinks} window={window}")
+    key = (T, window, sinks, device)
+    m = cache.get(key)
+    if m is None:
+        i = torch.arange(T, device=device)
+        q, k = i[:, None], i[None, :]
+        causal = k <= q
+        # `window - sinks` recent keys, self included; k == q always survives, so
+        # no row is fully masked and the softmax cannot produce NaN.
+        keep = causal & (k > q - (window - sinks))
+        if sinks:
+            keep = keep | (causal & (k < sinks))
+        m = keep[None, None]
+        cache[key] = m
+    return m
+
+
+def swa_auto_chunk(T: int, window: int) -> int:
+    """Chunk size for `swa_chunked`, or 0 to use the dense mask.
+
+    Chunking trades one big masked SDPA for T/c small ones, so it wins only when
+    the window is small relative to the context. Measured FORWARD+BACKWARD at
+    H12 D64 fp32 on Apple M-series -- forward alone gives the wrong answer and
+    picked the wrong chunk size, because the chunked path builds T/c times as
+    many autograd nodes and the backward is where that is paid:
+
+        T=2048 W= 64  causal 196  dense 178 | c128 124  c256  86  c512 102
+        T=2048 W=512  causal 186  dense 194 | c128 240  c256 125  c512 122
+        T= 512 W= 64  causal  51  dense  51 | c128  53  c256  45
+        T= 512 W=256  causal  50  dense  50 | c128  68  c256  56   <- chunk LOSES
+
+    So: chunk when T >= 4*window, at c = max(256, window). That rule picks the
+    fastest cell in all four cases above and correctly declines the one where
+    chunking loses. Note the dense path is at best equal to full causal attention
+    and at T=2048/W=64 is slower than it -- a "cheap" mixer that cost more than
+    the baseline it is meant to beat, which is what this replaces.
+
+    The crossover is hardware-dependent and these are not CUDA numbers.
+    `crossover_replicate probe` re-measures both paths on the actual box.
+    """
+    if window <= 0 or T <= 0:
+        return 0
+    if T < 4 * window:            # too little to skip; the loop would dominate
+        return 0
+    return max(256, window)
+
+
+def swa_chunked(q, k, v, window: int, sinks: int, scale: float,
+                chunk: int) -> torch.Tensor:
+    """SWA(w, s) computed chunk-by-chunk. EXACT, not an approximation.
+
+    A chunk of queries [s0, e0) can only reach keys in [s0 - (w - s) + 1, e0)
+    together with the sinks, so it never forms the other T keys' scores at all.
+    That is the whole point: the dense-mask path computes every T*T score and
+    then throws 97% of them away, which is why it runs slower than the full
+    attention it is supposed to be cheaper than.
+
+    Equivalence with the dense path is asserted in `nanolab.tests` rather than
+    argued here -- a "fast path" that quietly computes something else is the
+    failure mode this replaces.
+    """
+    B, H, T, D = q.shape
+    span = window - sinks
+    out = q.new_empty(B, H, T, D)
+    pos = torch.arange(T, device=q.device)
+    for s0 in range(0, T, chunk):
+        e0 = min(s0 + chunk, T)
+        lo = max(0, s0 - span + 1)
+        if lo <= sinks:                    # the two ranges touch: one slice
+            ks, vs, kpos = k[:, :, :e0], v[:, :, :e0], pos[:e0]
+        else:
+            ks = torch.cat([k[:, :, :sinks], k[:, :, lo:e0]], dim=2)
+            vs = torch.cat([v[:, :, :sinks], v[:, :, lo:e0]], dim=2)
+            kpos = torch.cat([pos[:sinks], pos[lo:e0]])
+        qpos = pos[s0:e0]
+        m = ((kpos[None, :] <= qpos[:, None])
+             & ((kpos[None, :] > qpos[:, None] - span) | (kpos[None, :] < sinks)))
+        out[:, :, s0:e0] = F.scaled_dot_product_attention(
+            q[:, :, s0:e0], ks, vs, attn_mask=m[None, None], scale=scale)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # 1. Attention — the default, strongest sub-200M mixer (guide §2.5)
 # ---------------------------------------------------------------------------
@@ -93,7 +201,7 @@ class Attention(nn.Module):
     on by default for the attention path.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, window: int = 0, sinks: int = 0):
         super().__init__()
         self.cfg = cfg
         self.n_head = cfg.n_head
@@ -134,6 +242,22 @@ class Attention(nn.Module):
         # >0 => block-causal (semi-AR) mask of this block length, set by
         # GPT.set_block_attention(); overrides ``causal`` when active.
         self.block_attn = 0
+        # >0 => SWA(window, sinks); 0 keeps this class's full-attention default,
+        # so the `attention` arm is byte-identical to what it was. Fixed at
+        # construction by the `swa` registry entry rather than toggled later:
+        # unlike `causal`/`block_attn` this is not a decoding mode, it is which
+        # architecture the arm IS, and a run must not be able to change it.
+        self.swa_window = int(window)
+        self.swa_sinks = int(sinks)
+        # 0 = dense mask; >0 = that chunk size; <0 = auto (see swa_auto_chunk).
+        # Numerically identical either way, so it never affects a quality row --
+        # but it does affect tok/s, so it is a recipe field, not a free knob.
+        self.swa_chunk = int(getattr(cfg, "swa_chunk", -1))
+        if self.swa_window:
+            sliding_window_mask(1 + self.swa_window, self.swa_window,
+                                self.swa_sinks, "cpu", {})   # validate now, not on GPU
+        elif self.swa_sinks:
+            raise ValueError("swa sinks set without a window")
         self._mask_cache = {}
 
     def forward(self, x, cos, sin, v0=None):
@@ -164,9 +288,28 @@ class Attention(nn.Module):
             v = v.repeat_interleave(rep, dim=1)
 
         scale = self.attn_scale
+        if self.block_attn > 0 and self.swa_window:
+            # Two mask generators, one attn_mask slot. Silently letting either win
+            # would evaluate an architecture nobody asked for.
+            raise ValueError("block-causal (diffusion) attention and SWA are "
+                             "mutually exclusive masks")
         if self.block_attn > 0:                  # semi-AR: causal across blocks, dense within
             mask = block_causal_mask(T, self.block_attn, x.device, self._mask_cache)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+        elif self.swa_window:
+            if not self.causal:
+                raise ValueError("SWA is causal-only; set_causal(False) would "
+                                 "make the window mask meaningless")
+            chunk = (swa_auto_chunk(T, self.swa_window) if self.swa_chunk < 0
+                     else self.swa_chunk)
+            if chunk:
+                y = swa_chunked(q, k, v, self.swa_window, self.swa_sinks,
+                                scale, chunk)
+            else:
+                mask = sliding_window_mask(T, self.swa_window, self.swa_sinks,
+                                           x.device, self._mask_cache)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask,
+                                                   scale=scale)
         else:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal, scale=scale)
         y = y.transpose(1, 2).contiguous()       # (B, T, H, D)
@@ -212,21 +355,60 @@ class Attention(nn.Module):
         ck, cv = cache.get("k"), cache.get("v")
         k_full = k_t if ck is None else torch.cat([ck, k_t], dim=2)
         v_full = v_t if cv is None else torch.cat([cv, v_t], dim=2)
+
+        scale = self.attn_scale
+        attn_mask = None
+        kpos = None
+        if self.swa_window:
+            if not causal:
+                raise ValueError(
+                    "cached SWA decode requires causal=True. A window is defined "
+                    "on distance to the query, so a bidirectional block has no "
+                    "windowed reading -- the diffusion path is not SWA-compatible.")
+            # Absolute positions, not cache offsets: eviction makes the cache
+            # SHORTER than the prefix it represents, so its length stops being a
+            # position. Carrying `pos` is what keeps the mask correct after the
+            # first eviction, and RoPE is already baked into the cached k, so a
+            # dropped entry needs no re-indexing.
+            start = int(cache.get("end", 0))
+            cpos = cache.get("pos")
+            if cpos is None:                       # nothing evicted yet: contiguous
+                cpos = torch.arange(start, device=x.device)
+            apos = torch.arange(start, start + T, device=x.device)
+            kpos = torch.cat([cpos, apos])
+            w, sk = self.swa_window, self.swa_sinks
+            keep = ((kpos[None, :] <= apos[:, None])
+                    & ((kpos[None, :] > apos[:, None] - (w - sk))
+                       | (kpos[None, :] < sk)))
+            attn_mask = keep[None, None]
+        elif causal:                              # full to cache, causal within block
+            Lk = k_full.shape[2]
+            left = torch.ones(T, Lk - T, dtype=torch.bool, device=x.device)
+            right = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+            attn_mask = torch.cat([left, right], dim=1)[None, None]
+
         if commit:
-            cache["k"], cache["v"] = k_full.detach(), v_full.detach()
+            if self.swa_window:
+                # Keep the sinks plus the tail the NEXT block can still reach:
+                # its first query sits at `end` and reaches back w - sinks - 1
+                # positions. Everything else is unreachable forever, so holding
+                # it would grow the cache without ever being read -- which is the
+                # entire memory argument for a window.
+                end = start + T
+                tail = self.swa_window - self.swa_sinks - 1
+                live = (kpos < self.swa_sinks) | (kpos >= end - tail)
+                cache["k"] = k_full[:, :, live].detach()
+                cache["v"] = v_full[:, :, live].detach()
+                cache["pos"] = kpos[live]
+                cache["end"] = end
+            else:
+                cache["k"], cache["v"] = k_full.detach(), v_full.detach()
 
         kk, vv = k_full, v_full
         if self.n_kv_head != self.n_head:
             rep = self.n_head // self.n_kv_head
             kk = kk.repeat_interleave(rep, dim=1)
             vv = vv.repeat_interleave(rep, dim=1)
-        scale = self.attn_scale
-        attn_mask = None
-        if causal:                                # full to cache, causal within block
-            Lk = k_full.shape[2]
-            left = torch.ones(T, Lk - T, dtype=torch.bool, device=x.device)
-            right = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
-            attn_mask = torch.cat([left, right], dim=1)[None, None]
         y = F.scaled_dot_product_attention(q, kk, vv, attn_mask=attn_mask,
                                            is_causal=False, scale=scale)
         y = y.transpose(1, 2).contiguous()
@@ -660,8 +842,21 @@ class MLA(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+def build_swa(cfg) -> Attention:
+    """SWA arm: the `attention` arm with a windowed mask and nothing else.
+
+    Every other lever — GQA, RoPE, QK-norm, output gating, value residual,
+    init, parameter count — is whatever `attention` uses, because the board
+    this feeds compares mixers one lever at a time. SWA adds no parameters:
+    StreamingLLM sinks are ordinary sequence positions kept in the window, not
+    learned logits, so `swa` and `attention` have identical param counts.
+    """
+    return Attention(cfg, window=cfg.swa_window, sinks=cfg.swa_sinks)
+
+
 MIXER_REGISTRY = {
     "attention": Attention,
+    "swa": build_swa,
     "mingru": MinGRU,
     "mamba2": Mamba2,
     "gdn": GatedDeltaNet,
@@ -674,6 +869,68 @@ def build_mixer(cfg, mixer: str | None = None) -> nn.Module:
     if kind not in MIXER_REGISTRY:
         raise KeyError(f"unknown mixer {kind!r}; known: {list(MIXER_REGISTRY)}")
     return MIXER_REGISTRY[kind](cfg)
+
+
+def swa_sdpa_backends(cfg, device, batch: int | None = None) -> dict:
+    """Which SDPA backends can serve this SWA config at its REAL shape.
+
+    Exists because an explicit ``attn_mask`` cannot use the flash kernel on
+    CUDA. The memory-efficient backend does accept masks and does not
+    materialise the score matrix; the math fallback does, at B*H*T*T. At batch 8
+    and context 2048 that is gigabytes of transient per layer, and the
+    difference is invisible until it is measured -- so measure it, on the box,
+    before a multi-hour stage commits to it.
+
+    Returns ``{backend_name: {"ok": bool, "peak_gb": float, "err": str}}``.
+    Reported, never inferred: this is the one property of the SWA path that
+    could not be checked off the target hardware.
+    """
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    B = int(batch or cfg.batch_size)
+    H, D, T = cfg.n_head, cfg.head_dim, cfg.block_size
+    dev = torch.device(device)
+    dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
+    q, k, v = (torch.randn(B, H, T, D, device=dev, dtype=dtype) for _ in range(3))
+    mask = sliding_window_mask(T, cfg.swa_window, cfg.swa_sinks, dev, {})
+
+    out = {}
+    for name in [n for n in dir(SDPBackend) if n.isupper() and n != "ERROR"]:
+        peak, err = float("nan"), ""
+        try:
+            if dev.type == "cuda":
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+            with sdpa_kernel(getattr(SDPBackend, name)):
+                F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+            if dev.type == "cuda":
+                torch.cuda.synchronize()
+                peak = torch.cuda.max_memory_allocated() / 1e9
+            ok = True
+        except Exception as e:                     # backend simply cannot serve it
+            ok, err = False, f"{type(e).__name__}: {e}"[:120]
+        out[name] = {"ok": ok, "peak_gb": peak, "err": err}
+    return out
+
+
+def assert_swa_backend_is_viable(cfg, device, batch: int | None = None) -> dict:
+    """Fail closed when the only backend that can serve the window is MATH.
+
+    On CPU/MPS this is informational -- math is often the only backend there and
+    the shapes are small. On CUDA, falling back to math means the B*H*T*T score
+    matrix is materialised for every layer, which is the documented way this
+    stage would OOM at context 2048 hours into a run.
+    """
+    report = swa_sdpa_backends(cfg, device, batch)
+    fast = [n for n, r in report.items() if r["ok"] and n != "MATH"]
+    if torch.device(device).type == "cuda" and not fast:
+        raise SystemExit(
+            "SWA preflight: no SDPA backend except MATH can serve a windowed "
+            f"mask at B={batch or cfg.batch_size} H={cfg.n_head} T={cfg.block_size}. "
+            "Math materialises the full score matrix per layer. Lower the batch, "
+            "or set SWA_ALLOW_MATH=1 to proceed knowing the memory cost.\n  "
+            + "\n  ".join(f"{n}: {r['err'] or 'ok'}" for n, r in report.items()))
+    return report
 
 
 def mixer_needs_eager(mixer: str) -> bool:

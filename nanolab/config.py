@@ -24,7 +24,7 @@ from dataclasses import dataclass, fields
 
 
 # Registries — the pluggable axes the guide calls out (§2.5, §4.2, §5.3).
-MIXERS = ("attention", "mingru", "mamba2", "gdn", "mla")
+MIXERS = ("attention", "swa", "mingru", "mamba2", "gdn", "mla")
 # Compact LAYER_TYPES aliases used by the hypercascade trainers.
 MIXER_ALIASES = {"attn": "attention", "mamba": "mamba2"}
 OPTIMIZERS = (
@@ -106,6 +106,19 @@ class Config:
     # attention-only knobs (champion variant from old runs):
     gated_attention: bool = True   # per-head sigmoid gate on attn output
     value_residual: bool = True    # blend layer-0 values into later layers
+    # ---- SWA(w, s) knobs, read only by the `swa` mixer ----
+    # Defaults are the primary configuration of arXiv:2608.28444, SWA(64, 4):
+    # each query sees the 4 first positions (StreamingLLM sinks) plus the 60
+    # most recent. A window >= block_size is NOT an error -- it is exactly full
+    # causal attention -- so a locality claim must state the ratio, not the
+    # window alone. `swa_sinks = 0` is the ablation that isolates the sinks.
+    swa_window: int = 64
+    swa_sinks: int = 4
+    # Attention-chunking for the window: 0 dense, >0 that chunk, <0 auto.
+    # Numerically identical to the dense path (asserted in tests); it changes
+    # throughput only, so it must be held constant across a suite or two arms'
+    # tok/s stop being comparable.
+    swa_chunk: int = -1
     # recurrent-mixer knobs (mamba2 / gdn):
     d_state: int = 64
     mixer_chunk: int = 64
@@ -209,6 +222,12 @@ class Config:
         if self.n_kv_head == 0:
             self.n_kv_head = self.n_head
         assert self.mixer in MIXERS, f"mixer must be one of {MIXERS}"
+        # Checked here, not in the mixer, so a bad window is caught while the
+        # config is built rather than after a cluster job has been billed.
+        assert self.swa_window >= 1, f"swa_window must be >=1, got {self.swa_window}"
+        assert 0 <= self.swa_sinks < self.swa_window, (
+            f"swa_sinks must satisfy 0 <= sinks < window, got "
+            f"sinks={self.swa_sinks} window={self.swa_window}")
         assert self.optimizer in OPTIMIZERS, f"optimizer must be one of {OPTIMIZERS}"
         assert self.schedule in SCHEDULES, f"schedule must be one of {SCHEDULES}"
         assert self.diffusion_mode in DIFFUSION_MODES, f"diffusion_mode must be one of {DIFFUSION_MODES}"

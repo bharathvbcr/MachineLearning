@@ -40,7 +40,7 @@ each trick a flag on a `Config`, so an A/B is literally one changed field.
 |---|---|---|
 | `config.py` | §0, §2.2, §8 | `Config` dataclass; `cpu_smoke`/`phase0`/`phase1`/`phase2` presets; CLI |
 | `model.py` | §2 | GPT: RoPE, RMSNorm pre-norm, QK-norm, SwiGLU/ReLU²/GELU, tied embeddings, zero-init projections, μP-ready, grad-checkpointing |
-| `mixers.py` | §2.5, §2.1 | Pluggable `--mixer`: `attention` (GQA+gated+value-residual), `mingru`, `mamba2`, `gdn`, `mla` (DeepSeek latent attention) |
+| `mixers.py` | §2.5, §2.1 | Pluggable `--mixer`: `attention` (GQA+gated+value-residual), `swa` (sliding window + StreamingLLM sinks, `--swa_window/--swa_sinks`), `mingru`, `mamba2`, `gdn`, `mla` (DeepSeek latent attention) |
 | `special_tokens.py` | §2, §11 | Control tokens (`<think>`, `</think>`, `<|answer|>`) utilizing padded vocab space |
 | `optim.py` | §4 | `Muon`+AdamW hybrid, `Lion`, `ScheduleFreeAdamW`, **`Sophia`** (clipped diagonal Hessian), **`Prodigy`** (LR-free), SGD |
 | `schedules.py` | §5 | constant / cosine / WSD / ReduceLROnPlateau; **LR finder**; schedule-as-multiplier (preserves μP/Muon per-group LR) |

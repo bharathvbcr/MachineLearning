@@ -387,10 +387,7 @@ class GPT(nn.Module):
             ffn_params = sum(p.numel() for b in self.blocks for p in b.ffn.experts.parameters())
             inactive = ffn_params * (1 - cfg.moe_top_k / cfg.moe_experts)
             N -= int(inactive)
-        n_attn = sum(1 for k in parse_layer_mixers(cfg) if k in ("attention", "mla"))
-        H, Q, T = cfg.n_head, cfg.head_dim, cfg.block_size
-        attn = 12 * n_attn * H * Q * T
-        return 6 * N + attn
+        return 6 * N + mixer_flops_per_token(cfg)
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -405,6 +402,27 @@ class GPT(nn.Module):
             nxt = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, nxt), dim=1)
         return idx
+
+
+def mixer_flops_per_token(cfg) -> int:
+    """The sequence-mixer's own FLOPs term.
+
+    Sole owner of this formula. `GPT.flops_per_token` and the crossover probe's
+    MFU estimate both call it: they used to carry separate copies, and the copy
+    in the probe silently charged an unrecognised mixer ZERO attention FLOPs --
+    so a new mixer's MFU came out too low there and too high nowhere, with
+    nothing to reveal the disagreement.
+
+    Convention: T keys per query, with the causal factor of 2 left out (as the
+    original did). A windowed query can never see more than `swa_window` keys,
+    so SWA's span is capped -- charging it the dense T would inflate its MFU by
+    T/window, 8x at SWA(64,4) on a 512 context.
+    """
+    kinds = parse_layer_mixers(cfg)
+    H, Q, T = cfg.n_head, cfg.head_dim, cfg.block_size
+    n_attn = sum(1 for k in kinds if k in ("attention", "mla"))
+    n_swa = sum(1 for k in kinds if k == "swa")
+    return 12 * H * Q * (n_attn * T + n_swa * min(cfg.swa_window, T))
 
 
 def build_model(cfg) -> GPT:

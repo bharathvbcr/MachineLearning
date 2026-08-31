@@ -2276,6 +2276,561 @@ def launch_records_the_tenancy_it_actually_runs_at():
                 os.environ[k] = v
 
 
+@test
+def swa_mask_is_causal_local_and_keeps_the_sinks():
+    """SWA(w, s) = the s first positions plus the w-s most recent, causal.
+
+    The mask IS the architecture here, so it is asserted position by position
+    rather than by spot-checking a shape.
+    """
+    from .mixers import sliding_window_mask
+
+    T, w, s = 12, 5, 2
+    m = sliding_window_mask(T, w, s, "cpu", {})[0, 0]
+    assert m.shape == (T, T) and m.dtype == torch.bool
+
+    for q in range(T):
+        want = {k for k in range(q + 1) if k > q - (w - s)} | {k for k in range(min(s, q + 1))}
+        got = {k for k in range(T) if bool(m[q, k])}
+        assert got == want, f"row {q}: got {sorted(got)} want {sorted(want)}"
+        assert not any(bool(m[q, k]) for k in range(q + 1, T)), f"row {q} attends forward"
+        assert len(got) <= w, f"row {q} sees {len(got)} keys, window is {w}"
+        assert got, f"row {q} is fully masked -- softmax would emit NaN"
+
+    # Sinks are what distinguishes SWA from plain local attention: without them
+    # a late query loses position 0 entirely.
+    nosink = sliding_window_mask(T, w, 0, "cpu", {})[0, 0]
+    assert bool(m[T - 1, 0]) and not bool(nosink[T - 1, 0])
+    assert int(nosink[T - 1].sum()) == w
+
+
+@test
+def swa_is_the_attention_arm_plus_a_mask_and_nothing_else():
+    """A window >= block_size must reproduce full attention EXACTLY, on the same
+    weights, and a shorter window must not. The first half is what makes `swa`
+    a one-lever change from `attention`; the second is what proves the mask is
+    actually wired in and not silently dropped."""
+    # _cfg uses block_size=32, so a 32-wide window spans the whole context.
+    m, cfg = _toy_model(mixer="swa", swa_window=32, swa_sinks=4)
+    x, _ = _batch(cfg)
+    m.eval()
+    # `_zero_init_output_projections` zeroes every o_proj, so at init the mixer
+    # contributes exactly nothing to the residual stream and EVERY mask compares
+    # equal. Both halves of this test pass vacuously without this line.
+    g = torch.Generator().manual_seed(7)
+    with torch.no_grad():
+        for blk in m.blocks:
+            blk.mixer.o_proj.weight.copy_(
+                torch.randn(blk.mixer.o_proj.weight.shape, generator=g) * 0.05)
+    with torch.no_grad():
+        wide, _ = m(x)
+        for blk in m.blocks:                     # same weights, mask off
+            blk.mixer.swa_window = 0
+        full, _ = m(x)
+        for blk in m.blocks:                     # same weights, genuinely local
+            blk.mixer.swa_window, blk.mixer.swa_sinks = 8, 4
+            blk.mixer._mask_cache.clear()
+        local, _ = m(x)
+    assert torch.allclose(wide, full, atol=1e-6), (
+        f"window >= T is not full attention (max diff "
+        f"{(wide - full).abs().max().item():.2e})")
+    assert not torch.allclose(local, full, atol=1e-4), \
+        "an 8-wide window changed nothing -- the mask is not reaching SDPA"
+
+
+@test
+def swa_adds_no_parameters_over_attention():
+    """StreamingLLM sinks are ordinary positions, not learned logits. If `swa`
+    and `attention` differed in parameter count the board would be comparing
+    capacity, not mixing."""
+    a, _ = _toy_model(mixer="attention")
+    w, _ = _toy_model(mixer="swa")
+    assert a.num_params() == w.num_params(), \
+        f"attention {a.num_params()} vs swa {w.num_params()}"
+    assert {n for n, _ in a.named_parameters()} == {n for n, _ in w.named_parameters()}
+
+
+@test
+def swa_flops_are_charged_at_the_window_not_the_context():
+    """MFU is the number a "cheap and fast" claim rests on. A windowed query can
+    never see more than `swa_window` keys, so charging it the dense context would
+    inflate SWA's MFU by context/window -- 8x at the default on this board."""
+    attn, _ = _toy_model(mixer="attention", block_size=256)
+    wide, _ = _toy_model(mixer="swa", block_size=256, swa_window=256, swa_sinks=4)
+    narrow, _ = _toy_model(mixer="swa", block_size=256, swa_window=32, swa_sinks=4)
+    assert wide.flops_per_token() == attn.flops_per_token(), \
+        "a full-width window is full attention and must cost the same"
+    assert narrow.flops_per_token() < attn.flops_per_token(), \
+        "a 32-wide window is charged the dense 256 context"
+    # The whole difference is the attention term shrinking 256 -> 32.
+    H, Q, L = attn.cfg.n_head, attn.cfg.head_dim, attn.cfg.n_layer
+    assert attn.flops_per_token() - narrow.flops_per_token() == 12 * L * H * Q * (256 - 32)
+
+
+@test
+def swa_fails_closed_on_masks_it_cannot_express():
+    from .mixers import sliding_window_mask
+
+    for w, s in ((0, 0), (4, 4), (4, 5), (4, -1)):
+        try:
+            sliding_window_mask(8, w, s, "cpu", {})
+            raise AssertionError(f"window={w} sinks={s} must be refused")
+        except ValueError:
+            pass
+    for kw in (dict(swa_window=0), dict(swa_window=4, swa_sinks=4)):
+        try:
+            _cfg(mixer="swa", **kw)
+            raise AssertionError(f"{kw} must be refused at config time")
+        except (AssertionError, ValueError) as e:
+            assert "swa" in str(e), e
+
+    m, cfg = _toy_model(mixer="swa", swa_window=8, swa_sinks=2)
+    x, _ = _batch(cfg)
+    # Two mask generators, one attn_mask slot: neither may silently win.
+    m.set_block_attention(4)
+    try:
+        m(x)
+        raise AssertionError("block-causal + SWA must be refused")
+    except ValueError:
+        pass
+    m.set_block_attention(0)
+    # Cached SWA decode is implemented (see swa_cached_decode_matches_the_
+    # uncached_window); what it must still refuse is a BIDIRECTIONAL block,
+    # where "distance to the query" has no meaning.
+    try:
+        m.blocks[0].mixer.forward_cached(
+            torch.zeros(1, 4, cfg.d_model), None, None, None, {}, True, causal=False)
+        raise AssertionError("bidirectional cached SWA must be refused")
+    except ValueError as e:
+        assert "causal" in str(e), e
+
+
+@test
+def swa_arms_carry_their_window_into_the_job_config():
+    """The window is what makes `swa_w64` that arm. `job_config` must apply it
+    from the registry, so that a job built at any construction site gets it."""
+    from . import crossover_replicate as cr
+
+    windows = {"swa_w64": (64, 4), "swa_w128": (128, 4), "swa_w256": (256, 4),
+               "swa_w64_nosink": (64, 0), "swa_w512": (512, 4),
+               # The hybrid is a `mingru` arm whose windowed layers still need
+               # the knob: the override must reach Config regardless of family.
+               "hybrid_mingru10_swa2": (128, 4)}
+    for name, (w, s) in windows.items():
+        arm = next(a for a in cr.ARMS if a.name == name)
+        assert arm.mixer == "swa" or "swa" in arm.layer_mixers, \
+            f"{name} has no windowed layer"
+        # Built the way `cmd_run` builds one -- no `overrides` key in the job.
+        job = {"id": f"t_{name}", "arm": name, "mixer": arm.mixer,
+               "layer_mixers": arm.layer_mixers, "seed": 1337}
+        cfg = cr.job_config(job, Path("/tmp/does-not-matter"), smoke=True)
+        assert (cfg.swa_window, cfg.swa_sinks) == (w, s), \
+            f"{name} built at SWA({cfg.swa_window},{cfg.swa_sinks}), want SWA({w},{s})"
+    # Every SWA arm on either board must be one of the windows checked above.
+    assert set(cr.SWA_ARMS) | set(cr.SWA2K_ARMS) <= set(windows)
+    # The backlog's E12 question -- windowed attention INSIDE the hybrid -- must
+    # actually be on the ctx-512 board, and must expand to 10 minGRU + 2 SWA.
+    assert "hybrid_mingru10_swa2" in cr.SWA_ARMS
+    from .config import parse_layer_mixers
+    kinds = parse_layer_mixers(cr.job_config(
+        {"id": "t", "arm": "hybrid_mingru10_swa2", "mixer": "mingru",
+         "layer_mixers": "mingru*10,swa*2", "seed": 1337},
+        Path("/tmp/x"), smoke=True))
+    assert kinds == ("mingru",) * 10 + ("swa",) * 2, kinds
+
+
+@test
+def swa32_stage_matches_matched32_in_every_recipe_field():
+    """E12's rows join section 4.5's board, so only the arm list may differ."""
+    from .crossover_replicate import ISOLATE_STAGES, SWA_ARMS
+    by = {s["name"]: s for s in ISOLATE_STAGES}
+    a, e12 = by["matched32"], by["swa32"]
+    for field in ("batch", "eval_iters", "token_budget", "lr_horizon"):
+        assert a[field] == e12[field], (
+            f"swa32.{field}={e12[field]!r} but matched32.{field}={a[field]!r}")
+    assert a.get("block", 512) == e12.get("block", 512)
+    assert a["out"] != e12["out"], "swa32 must not share matched32's out dir"
+    assert a["prefix"] != e12["prefix"], "swa32 needs its own job prefix"
+    assert set(e12["arms"].split(",")) == set(SWA_ARMS)
+
+
+@test
+def an_arms_window_is_a_recipe_field_so_two_cannot_share_a_directory():
+    """Editing SWA(64,4) to SWA(64,8) and relaunching must refuse the directory
+    rather than average two architectures under one arm name."""
+    import os
+    from . import crossover_replicate as cr
+
+    prev = os.environ.get("CROSSOVER_ARMS")
+    try:
+        os.environ["CROSSOVER_ARMS"] = "swa_w64"
+        r64 = cr.current_recipe()
+        os.environ["CROSSOVER_ARMS"] = "swa_w128"
+        r128 = cr.current_recipe()
+        os.environ["CROSSOVER_ARMS"] = "attention"
+        rattn = cr.current_recipe()
+    finally:
+        if prev is None:
+            os.environ.pop("CROSSOVER_ARMS", None)
+        else:
+            os.environ["CROSSOVER_ARMS"] = prev
+    assert "arm_overrides" in r64, "arm_overrides missing from the recorded recipe"
+    assert r64["arm_overrides"] == {"swa_w64": {"swa_window": 64, "swa_sinks": 4}}
+    assert r64["arm_overrides"] != r128["arm_overrides"], \
+        "two windows produce the same recipe fingerprint"
+    assert rattn["arm_overrides"] is None, \
+        "an arm with no knobs must not invent a fingerprint field"
+
+
+@test
+def swa2k_stage_holds_the_ctx2048_token_cadence():
+    """E15 must sit on E9's recipe exactly, or its rows are not comparable with
+    the five families already measured at context 2048."""
+    from .crossover_replicate import ISOLATE_STAGES, SWA2K_ARMS, scale_to_token_budget
+    by = {x["name"]: x for x in ISOLATE_STAGES}
+    e9, e13 = by["ctx2048"], by["swa2k"]
+    for field in ("batch", "block", "eval_iters", "token_budget", "lr_horizon"):
+        assert e9[field] == e13[field], f"{field}: ctx2048={e9[field]} swa2k={e13[field]}"
+    a = scale_to_token_budget(e9["batch"], block_size=e9["block"],
+                              token_budget=e9["token_budget"],
+                              lr_horizon_tokens=e9["lr_horizon"])
+    b = scale_to_token_budget(e13["batch"], block_size=e13["block"],
+                              token_budget=e13["token_budget"],
+                              lr_horizon_tokens=e13["lr_horizon"])
+    assert a == b, "swa2k does not share ctx2048's token cadence"
+    assert e13["out"] != e9["out"] and e13["prefix"] != e9["prefix"]
+    assert set(e13["arms"].split(",")) == set(SWA2K_ARMS)
+    # A 512-wide window is full attention at ctx 512, so that arm must not be
+    # on the ctx-512 board where it would be a duplicate `attention` under
+    # another name.
+    from .crossover_replicate import SWA_ARMS
+    assert "swa_w512" in SWA2K_ARMS and "swa_w512" not in SWA_ARMS
+
+
+@test
+def mqar_arms_carry_their_window_and_stay_distinct():
+    """`e8_config` reads ARMS. Without applying each arm's overrides every swa_*
+    arm would train at the default window -- one architecture under four names --
+    and a run_name keyed on the mixer family would collide them in the ledger."""
+    from .mqar_suite import E16_ARMS, E16_PAIRS, e8_config
+
+    names = set()
+    for arm in E16_ARMS:
+        cfg = e8_config(arm, 1, n_pairs=64, n_queries=64, n_keys=256, n_values=256)
+        names.add(cfg.run_name)
+        if arm.startswith("swa"):
+            assert cfg.mixer == "swa"
+            want = 0 if arm.endswith("nosink") else 4
+            assert (cfg.swa_window, cfg.swa_sinks) == (64, want), \
+                f"{arm} built at SWA({cfg.swa_window},{cfg.swa_sinks})"
+            assert arm in cfg.run_name, f"{arm} run_name loses the arm identity"
+    assert len(names) == len(E16_ARMS), "two arms share a run_name"
+    # The cells must actually straddle the window, or the probe cannot separate
+    # SWA from attention at all.
+    seqs = [4 * p - 1 for p in E16_PAIRS]
+    assert seqs == [63, 255, 511], seqs
+    assert seqs[0] <= 64 < seqs[1], "no cell brackets the 64-wide window"
+
+
+@test
+def mqar_control_cell_makes_swa_identical_to_attention():
+    """At seq 63 a 64-wide window spans the whole sequence, so `swa_w64` IS
+    `attention`. That cell is the harness control: asserted on the mask so it
+    holds exactly, not to within training noise."""
+    from .mixers import sliding_window_mask
+
+    T = 63
+    causal = torch.tril(torch.ones(T, T, dtype=torch.bool))
+    for sinks in (0, 4):
+        m = sliding_window_mask(T, 64, sinks, "cpu", {})[0, 0]
+        assert torch.equal(m, causal), \
+            f"window 64 over {T} tokens (sinks={sinks}) is not full causal"
+    # ...and at 255 it is emphatically not.
+    m255 = sliding_window_mask(255, 64, 4, "cpu", {})[0, 0]
+    assert not torch.equal(m255, torch.tril(torch.ones(255, 255, dtype=torch.bool)))
+    assert int(m255[-1].sum()) == 64, "last query should see exactly `window` keys"
+
+
+@test
+def mqar_refuses_a_multi_cell_sweep_without_calibration():
+    """Batch decides whether the head forms at all, and the threshold moves with
+    sequence length. A multi-cell sweep on one batch would report `not solved`
+    for a cell that was merely untrainable at that batch."""
+    import subprocess, sys
+    r = subprocess.run(
+        [sys.executable, "-m", "nanolab.mqar_suite", "--cells", "16,64",
+         "--device", "cpu", "--out", tempfile.mkdtemp()],
+        capture_output=True, text=True)
+    assert r.returncode != 0, "multi-cell sweep without calibration was allowed"
+    assert "calibrate" in (r.stderr + r.stdout).lower()
+
+    from .mqar_suite import _parse_batch_by_cell
+    assert _parse_batch_by_cell("16:256,64:128") == {16: 256, 64: 128}
+    assert _parse_batch_by_cell('{"16": 256}') == {16: 256}
+    assert _parse_batch_by_cell("") == {}
+
+
+@test
+def mixer_flops_have_exactly_one_owner():
+    """`_mfu_from_toks` used to carry its own copy of this formula and charged
+    any unrecognised mixer ZERO attention FLOPs, so a new mixer's MFU was wrong
+    in the probe and right in the model with nothing to surface the split."""
+    from .crossover_replicate import _mfu_from_toks
+    from .model import mixer_flops_per_token
+
+    for mixer, kw in (("attention", {}), ("swa", dict(swa_window=64)),
+                      ("mla", {}), ("mingru", {})):
+        cfg = _cfg(mixer=mixer, n_layer=4, block_size=128, **kw)
+        model, _ = _toy_model(mixer=mixer, n_layer=4, block_size=128, **kw)
+        assert model.flops_per_token() - 6 * model.num_params(non_embedding=True) \
+            == mixer_flops_per_token(cfg), f"{mixer}: model term is not the shared one"
+        mfu = _mfu_from_toks(mixer, 1e5, cfg)
+        assert mfu > 0, f"{mixer} MFU is zero -- the probe lost the mixer term"
+    swa = _cfg(mixer="swa", n_layer=4, block_size=128, swa_window=32)
+    attn = _cfg(mixer="attention", n_layer=4, block_size=128)
+    assert _mfu_from_toks("swa", 1e5, swa) < _mfu_from_toks("attention", 1e5, attn)
+
+
+@test
+def swaboard_phases_are_ordered_resumable_and_fail_closed():
+    """The board is hours long, so a phase-4 failure must not re-bill phases 1-3,
+    and mqar-grid must refuse to run on an uncalibrated cell."""
+    import argparse as _ap, os
+    from . import crossover_replicate as cr
+
+    assert cr.SWA_BOARD_PHASES == ("probe", "swa32", "swa2k",
+                                   "mqar-calibrate", "mqar-grid")
+    # Dependency order: every CE stage before the recall grid, calibrate before grid.
+    i = cr.SWA_BOARD_PHASES.index
+    assert i("swa32") < i("swa2k") < i("mqar-calibrate") < i("mqar-grid")
+    # It must NOT have been bolted onto `isolates`, which owns its own three.
+    assert cr.ISOLATE_SEQUENCE == ("matched20", "bs8", "matched32")
+    for name in ("swa32", "swa2k"):
+        assert cr.stage_by_name(name)["name"] == name
+
+    def _args(**kw):
+        base = dict(only="", start_from="", out="", workers=None, detach=False,
+                    device="cpu", probe_steps=1, mqar_seeds=1, mqar_steps=1)
+        base.update(kw)
+        return _ap.Namespace(**base)
+
+    for bad in ("nope", "swa33"):
+        for field in ("only", "start_from"):
+            try:
+                cr.cmd_swaboard(_args(**{field: bad}))
+                raise AssertionError(f"{field}={bad!r} must be refused")
+            except SystemExit as e:
+                assert "unknown phase" in str(e), e
+
+    # mqar-grid without a calibration.json must refuse rather than guess a batch.
+    real = cr.MQAR_OUT
+    try:
+        cr.MQAR_OUT = Path(tempfile.mkdtemp()) / "absent"
+        try:
+            cr.cmd_swaboard(_args(only="mqar-grid"))
+            raise AssertionError("mqar-grid ran without calibration")
+        except SystemExit as e:
+            assert "calibrate" in str(e).lower(), e
+    finally:
+        cr.MQAR_OUT = real
+
+
+@test
+def swa_cached_decode_matches_the_uncached_window():
+    """Windowed KV decode must reproduce the uncached windowed forward EXACTLY.
+
+    This is the inference path a training-free SWA swap needs. It used to raise
+    NotImplementedError because a full-cache read would have sampled from a
+    different model than was trained; eviction makes it exact, and this asserts
+    the exactness rather than the intention.
+    """
+    W, S, BLK, T = 12, 3, 8, 48
+    m, cfg = _toy_model(mixer="swa", swa_window=W, swa_sinks=S, block_size=T,
+                        batch_size=1, n_layer=2)
+    m.eval()
+    g = torch.Generator().manual_seed(7)
+    with torch.no_grad():        # zero-init o_proj would make every mask equal
+        for b in m.blocks:
+            b.mixer.o_proj.weight.copy_(
+                torch.randn(b.mixer.o_proj.weight.shape, generator=g) * 0.05)
+    x = torch.randint(0, cfg.vocab_size, (1, T), generator=g)
+
+    with torch.no_grad():
+        caches = [{} for _ in m.blocks]
+        outs, sizes = [], []
+        for p0 in range(0, T, BLK):
+            outs.append(m.forward_hidden_window(x[:, p0:p0 + BLK], p0, caches,
+                                                commit=True, causal=True))
+            sizes.append(caches[0]["k"].shape[2])
+        cached = torch.cat(outs, dim=1)
+        uncached = m.forward_hidden_window(x, 0, [{} for _ in m.blocks],
+                                           commit=False, causal=True)
+    d = (cached - uncached).abs().max().item()
+    assert d < 1e-5, f"cached windowed decode diverges by {d:.2e}"
+    # The whole memory argument for a window: the cache must stop growing.
+    assert all(z <= W - 1 for z in sizes), f"cache grew past the window: {sizes}"
+    assert sizes[-1] == sizes[-2], f"cache still growing at the end: {sizes}"
+
+    # A bidirectional block has no windowed reading; it must refuse, not guess.
+    try:
+        m.forward_hidden_window(x[:, :BLK], 0, [{} for _ in m.blocks],
+                                commit=False, causal=False)
+        raise AssertionError("bidirectional cached SWA must be refused")
+    except ValueError as e:
+        assert "causal" in str(e)
+
+
+@test
+def swa_backend_preflight_reports_and_fails_closed():
+    """The one SWA property that cannot be checked off the target hardware, so
+    it is checked ON it before a multi-hour stage commits."""
+    from .mixers import swa_sdpa_backends, assert_swa_backend_is_viable
+
+    cfg = _cfg(mixer="swa", swa_window=8, swa_sinks=2, n_head=4, head_dim=16,
+               block_size=32, batch_size=2)
+    rep = swa_sdpa_backends(cfg, "cpu")
+    assert rep, "preflight reported no backends at all"
+    assert all({"ok", "peak_gb", "err"} <= set(v) for v in rep.values())
+    assert any(v["ok"] for v in rep.values()), "no backend can serve a windowed mask"
+    # Off CUDA it must report, never refuse: math is often all there is there.
+    # Compared on the decidable fields -- `peak_gb` is NaN off CUDA and NaN != NaN.
+    again = assert_swa_backend_is_viable(cfg, "cpu")
+    assert {k: v["ok"] for k, v in again.items()} == {k: v["ok"] for k, v in rep.items()}
+
+
+@test
+def swa_survives_torch_compile():
+    """`Config.compile` defaults to True, so `--mixer swa` outside the crossover
+    suites is compiled. The mask cache is keyed on a device object inside
+    forward; a graph break there would be silent."""
+    m, cfg = _toy_model(mixer="swa", swa_window=8, swa_sinks=2)
+    x, y = _batch(cfg)
+    with torch.no_grad():
+        eager, _ = m(x)
+        compiled, _ = torch.compile(m)(x)
+    assert torch.allclose(eager, compiled, atol=1e-5), \
+        f"compiled swa diverges by {(eager - compiled).abs().max().item():.2e}"
+
+
+@test
+def smoke_can_cover_any_arm_including_the_windowed_ones():
+    """`cmd_smoke` hardcoded attention/mingru, so no smoke run ever built a
+    windowed layer and swa32's first real failure would have been on the box."""
+    import argparse as _ap
+    from . import crossover_replicate as cr
+
+    parsed = cr.build_parser().parse_args(["smoke"])
+    assert parsed.arms == "attention,mingru", "default smoke coverage changed"
+    try:
+        cr.cmd_smoke(_ap.Namespace(out=tempfile.mkdtemp(), arms="not_an_arm"))
+        raise AssertionError("unknown smoke arm must be refused")
+    except SystemExit as e:
+        assert "unknown smoke arms" in str(e)
+    for name in ("swa_w64", "hybrid_mingru10_swa2"):
+        assert any(a.name == name for a in cr.ARMS), f"{name} not smokeable"
+
+
+@test
+def swa_chunked_is_exactly_the_dense_window():
+    """The fast path must compute the SAME function, not a cheaper approximation.
+
+    Block-local attention (each block sees itself plus the previous one) is the
+    usual shortcut here and gives queries between w and 2w of context -- a
+    different architecture wearing the same name. This is exact SWA(w, s).
+    """
+    import torch.nn.functional as _F
+    from .mixers import sliding_window_mask, swa_chunked, swa_auto_chunk
+
+    for T, W, S in ((2048, 64, 4), (2048, 512, 4), (512, 64, 4), (511, 64, 0),
+                    (300, 64, 4), (65, 64, 4), (128, 32, 1)):
+        c = swa_auto_chunk(T, W) or 128
+        g = torch.Generator().manual_seed(T + W)
+        q, k, v = (torch.randn(2, 3, T, 16, generator=g) for _ in range(3))
+        ref = _F.scaled_dot_product_attention(
+            q, k, v, attn_mask=sliding_window_mask(T, W, S, "cpu", {}), scale=0.25)
+        got = swa_chunked(q, k, v, W, S, 0.25, c)
+        d = (got - ref).abs().max().item()
+        assert d < 1e-5, f"T={T} W={W} S={S} c={c}: chunked differs by {d:.2e}"
+
+    # The rule must decline where chunking measured slower, not just where it is
+    # incorrect -- T < 4*window is the boundary the benchmark table fitted.
+    assert swa_auto_chunk(2048, 64) == 256 and swa_auto_chunk(2048, 512) == 512
+    assert swa_auto_chunk(512, 64) == 256
+    assert swa_auto_chunk(512, 256) == 0, "chunking loses here and must be declined"
+    assert swa_auto_chunk(63, 64) == 0, "no window binds, so no chunking"
+
+
+@test
+def swa_chunk_choice_never_changes_a_quality_row():
+    """Dense and chunked must give the same model, so the knob can be tuned per
+    box without invalidating a board. Asserted end-to-end, not just on SDPA."""
+    outs = []
+    for chunk in (0, 128, 256, -1):
+        m, cfg = _toy_model(mixer="swa", swa_window=16, swa_sinks=2,
+                            block_size=128, swa_chunk=chunk)
+        g = torch.Generator().manual_seed(3)
+        with torch.no_grad():
+            for b in m.blocks:
+                b.mixer.o_proj.weight.copy_(
+                    torch.randn(b.mixer.o_proj.weight.shape, generator=g) * 0.05)
+        x, _ = _batch(cfg)
+        with torch.no_grad():
+            outs.append(m(x)[0])
+    for o in outs[1:]:
+        d = (o - outs[0]).abs().max().item()
+        assert d < 1e-5, f"swa_chunk changed the model output by {d:.2e}"
+
+
+@test
+def swa_chunk_is_a_recipe_field_not_a_free_knob():
+    """Identical numerics but up to 2x throughput, so two settings in one suite
+    would produce a tok/s column nothing can interpret."""
+    import os
+    from . import crossover_replicate as cr
+    prev = os.environ.get("SWA_CHUNK")
+    try:
+        os.environ["SWA_CHUNK"] = "-1"
+        auto = cr.current_recipe()
+        os.environ["SWA_CHUNK"] = "0"
+        dense = cr.current_recipe()
+    finally:
+        os.environ.pop("SWA_CHUNK", None) if prev is None else os.environ.update(SWA_CHUNK=prev)
+    assert "swa_chunk" in auto, "swa_chunk missing from the recorded recipe"
+    assert auto != dense, "two chunk settings share a recipe fingerprint"
+    cfg = cr.job_config({"id": "t", "arm": "swa_w64", "mixer": "swa",
+                         "layer_mixers": "", "seed": 1337}, Path("/tmp/x"), smoke=True)
+    assert cfg.swa_chunk == cr.cluster_swa_chunk()
+
+
+@test
+def mqar_workers_shard_the_grid_without_losing_or_duplicating_runs():
+    """225 runs used to execute in one Python loop on a box that fits far more.
+    Sharding is the grid's main cost lever, so it must partition exactly."""
+    from .mqar_suite import shard, _drop_workers_flag
+
+    jobs = [(a, s) for a in ("attention", "gdn", "mingru", "swa_w64") for s in range(15)]
+    for w in (1, 2, 3, 4, 7):
+        parts = [shard(jobs, w, i) for i in range(w)]
+        flat = [j for p in parts for j in p]
+        assert sorted(flat) == sorted(jobs), f"workers={w} lost or duplicated runs"
+        assert len(flat) == len(set(flat)), f"workers={w} duplicated a run"
+        # Round-robin, so cost-heavy arms spread instead of landing on one worker.
+        sizes = [len(p) for p in parts]
+        assert max(sizes) - min(sizes) <= 1, f"workers={w} split unevenly: {sizes}"
+        for p in parts:
+            assert len({a for a, _ in p}) == min(w and 4 or 4, 4) or w > 4
+    for bad in ((0, 0), (2, 2), (2, -1)):
+        try:
+            shard(jobs, *bad)
+            raise AssertionError(f"shard{bad} must be refused")
+        except ValueError:
+            pass
+    # Re-invoking a worker must strip the flag AND its value, both spellings.
+    assert _drop_workers_flag(["--out", "x", "--workers", "3", "--steps", "9"]) \
+        == ["--out", "x", "--steps", "9"]
+    assert _drop_workers_flag(["--workers=5", "--steps", "9"]) == ["--steps", "9"]
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = 0

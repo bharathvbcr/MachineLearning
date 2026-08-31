@@ -1,6 +1,6 @@
 # Experiment suite index
 
-This lab notebook records methods, variants, failures, results, reproduction paths, and concrete artifacts for 37 experiment suites. Of these, 30 are done, five are partial, one is blocked, and one is planned. Confidence grades describe the evidence actually preserved, not the ambition of the experiment.
+This lab notebook records methods, variants, failures, results, reproduction paths, and concrete artifacts for 38 experiment suites. Of these, 30 are done, five are partial, one is blocked, and two are planned. Confidence grades describe the evidence actually preserved, not the ambition of the experiment.
 
 Copy [`_TEMPLATE.md`](_TEMPLATE.md) for new suites. Status values: `done` / `partial` / `planned` / `blocked`.
 
@@ -57,6 +57,7 @@ Copy [`_TEMPLATE.md`](_TEMPLATE.md) for new suites. Status values: `done` / `par
 | [24-matched20-prefix](nanolab/24-matched20-prefix.md) | 20M stop, 50M cosine | done | High | Lambda GH200 | Independent prefix recovered flips at 1.04M and 12.34M. |
 | [25-gh200-bs8](nanolab/25-gh200-bs8.md) | GH200 bs8 n=5 @ 8.192M | done | High (to 7.38M) | Lambda GH200 | No flip by 7.38M; minGRU leads from eval 1 on every seed. |
 | [26-matched32-hybrids](nanolab/26-matched32-hybrids.md) | 8 arms bs32 eval_iters=20 50M | done | High | Lambda GH200 | Attn 4.222 ties hybrid_mingru 4.232; Mamba hybrid 4.333 not 4.60. |
+| [27-swa-board-planned](nanolab/27-swa-board-planned.md) | SWA arms (E12/E15/E16): ctx512, ctx2048, MQAR | planned | Low | Target Lambda GH200 (code verified on MPS/CPU only) | No result exists; code complete and tested, 33-90 GPU-h specified in docs/SWA_BOARD_2026-08-31.md. |
 
 ## Gemma-metal
 
