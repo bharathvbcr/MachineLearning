@@ -299,6 +299,16 @@ impl<'a> Binder<'a> {
 
     /// Dynamic threadgroup memory (`threadgroup T *ptr [[threadgroup(index)]]`).
     pub fn set_threadgroup_memory(&mut self, index: usize, length: usize) {
+        // Same slot space as the buffer binds, and previously unchecked while
+        // every `bind_*` validated. An out-of-range index reached Metal
+        // directly.
+        if !self.valid_index(index) {
+            return;
+        }
+        // SAFETY: `index` is within the argument table's bind count, checked
+        // immediately above; `length` is a byte count Metal validates against
+        // the device's threadgroup memory limit; and `self.enc` is a live
+        // encoder for the duration of the borrow.
         unsafe {
             self.enc
                 .setThreadgroupMemoryLength_atIndex(length as _, index as _);
@@ -395,6 +405,22 @@ impl<'a> Binder<'a> {
         count: u64,
         inherit_arg_table: bool,
     ) {
+        // Do not encode over a poisoned binder: a prior failure means the
+        // argument table is not in the state this range assumes.
+        if self.error.is_some() {
+            return;
+        }
+        // A range past the end of the ICB is caller data, not a Metal detail.
+        // `executeCommandsInBuffer` with an out-of-range range is undefined,
+        // and `start`/`count` reach here straight from the caller.
+        let icb_len = icb.size();
+        match start.checked_add(count) {
+            Some(end) if end <= icb_len as u64 => {}
+            _ => {
+                self.fail("ICB execute range out of bounds");
+                return;
+            }
+        }
         let range = NSRange {
             location: start as _,
             length: count as _,
@@ -403,6 +429,9 @@ impl<'a> Binder<'a> {
             // Latch so ICB `inheritBuffers=true` sees MTL4 binds.
             self.latch_argument_table();
         }
+        // SAFETY: `range` is within `icb`'s command count, checked above; `icb`
+        // outlives this call through the borrow; and the argument table has
+        // been latched when the commands inherit it.
         unsafe {
             self.enc.executeCommandsInBuffer_withRange(icb, range);
         }

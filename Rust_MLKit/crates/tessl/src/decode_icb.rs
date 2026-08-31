@@ -555,7 +555,19 @@ impl DecodeIcb {
         buf.metal().gpuAddress()
     }
 
-    /// Tiny Hot scalars (softcap f32×1, lone u32 dims) — read-only on tape.
+    /// Formerly: buffers at or below this size were *assumed* read-only and
+    /// excluded from the disjointness test, on the grounds that tiny Hot
+    /// allocations are softcap scalars and lone u32 dims.
+    ///
+    /// That is an assumption about what a size is usually used for, not a
+    /// property of the buffer, and the failure it permits is silent. A genuine
+    /// read-after-write through a 16-byte buffer — a token id, a reduction
+    /// scalar — had its barrier elided, and so did a RAW through a shared
+    /// activation buffer that happened to be bound by most commands. Both
+    /// produce wrong output with nothing to notice it.
+    ///
+    /// Retained only so this comment has somewhere to live. Nothing reads it.
+    #[allow(dead_code)]
     const READONLY_MAX_NBYTES: usize = 64;
 
     /// Large-Buf ids for a cmd, minus ambient read-only. Immediate → `None`.
@@ -565,14 +577,19 @@ impl DecodeIcb {
             match b {
                 DecodeIcbBind::Immediate { .. } => return None,
                 DecodeIcbBind::Buf { buf, .. } => {
-                    if buf.nbytes() <= Self::READONLY_MAX_NBYTES {
-                        continue;
-                    }
-                    let id = Self::buf_id(buf);
-                    if ambient.contains(&id) {
-                        continue;
-                    }
-                    ids.push(id);
+                    // Every bound buffer counts. Excluding small ones, or ones
+                    // bound by most commands, elided real RAW barriers — see
+                    // `READONLY_MAX_NBYTES`. Without knowing which binds are
+                    // *written*, a shared buffer must be treated as a possible
+                    // dependency.
+                    //
+                    // This is strictly more conservative than what shipped, so
+                    // fewer barriers are elided and the throughput this feature
+                    // was added for needs re-measuring on a real model. Getting
+                    // it back properly means tracking writes at bind time, not
+                    // guessing from size.
+                    let _ = ambient;
+                    ids.push(Self::buf_id(buf));
                 }
             }
         }
@@ -1068,6 +1085,31 @@ impl DecodeIcb {
             && !self.prebuilt_tables.is_empty()
             && self.prebuilt_tables.len() == self.commands.len();
 
+        // ICB execution cannot run a command whose pipeline was not built with
+        // `supportIndirectCommandBuffers`. On a mixed tape `encode_cpu` returns
+        // early without encoding anything — while still setting `encoded` and
+        // `optimized` — and `execute` then decides per command, running the
+        // ICB-capable ones and dropping the rest. Measured through the public
+        // API: the surviving command's destination stayed [0,0,0,0] while this
+        // returned Ok and reported last_execute_icb=1/1.
+        //
+        // Dropping half a tape is not a degraded mode, it is a wrong answer, so
+        // it is refused. `freeze_binds` already rejects the same shape at
+        // encode time; this covers the `TESSL_ICB_EXECUTE=1` path that does not.
+        if use_icb_exec
+            && !self
+                .commands
+                .iter()
+                .all(|c| c.pipeline.supportIndirectCommandBuffers())
+        {
+            return Err(format!(
+                "DecodeIcb: ICB execution requested for a tape whose {} command(s) are not \
+                 all ICB-capable. Those commands would be silently dropped. Capture with \
+                 ICB-capable pipelines (TESSL_ICB_PIPELINES=1) or leave ICB execute off.",
+                self.commands.len()
+            ));
+        }
+
         if use_icb_exec && need_opt {
             let all_icb = self
                 .commands
@@ -1360,6 +1402,9 @@ pub struct DecodeIcbCapture {
     current_tg_mem: Option<(usize, usize)>,
     /// Binds seen since the last `note_pipeline` that could not be recorded.
     unrecordable_binds: usize,
+    /// How many times `begin_decode_icb_capture` was called while this capture
+    /// was already live. Non-zero means a previous capture was never taken.
+    pub nested_begins: usize,
 }
 
 impl DecodeIcbCapture {
@@ -1452,7 +1497,32 @@ impl DecodeIcbCapture {
 /// Begin recording dispatches on this thread (Binder hooks).
 pub fn begin_decode_icb_capture() {
     CAPTURE.with(|c| {
-        *c.borrow_mut() = Some(DecodeIcbCapture::default());
+        let mut slot = c.borrow_mut();
+        if let Some(existing) = slot.as_mut() {
+            // Re-entry. There is no RAII guard on this API, so an early `?`
+            // between begin and take leaves capture live for the rest of the
+            // thread's life — growing without bound and holding a `GpuBuffer`
+            // clone for every bind, which keeps those buffers out of the
+            // freelist and pinned in the residency set forever.
+            //
+            // The first tape is kept rather than discarded: it is the one with
+            // the recorded work, and throwing it away is how the leak stayed
+            // invisible. The count rides along so `take` can report it instead
+            // of handing back a tape that silently spans two capture attempts.
+            existing.nested_begins += 1;
+            return;
+        }
+        *slot = Some(DecodeIcbCapture::default());
+    });
+}
+
+/// Abandon an in-progress capture.
+///
+/// The counterpart `begin`/`take` pair has no RAII guard, so a caller that
+/// bails between them leaks the tape. Call this on the error path.
+pub fn end_decode_icb_capture() {
+    CAPTURE.with(|c| {
+        *c.borrow_mut() = None;
     });
 }
 
@@ -1962,6 +2032,53 @@ mod tests {
         // The destination is untouched, which is what makes the old accounting
         // a lie rather than a rounding difference.
         let _ = out;
+    }
+
+    /// A second `begin` must not silently discard the first tape.
+    ///
+    /// The begin/take pair has no RAII guard, so a caller that bails between
+    /// them leaks the capture for the thread's lifetime — growing without bound
+    /// and holding a `GpuBuffer` clone per bind, which keeps those buffers out
+    /// of the freelist and pinned in residency. Silently replacing the tape on
+    /// re-entry is what kept that invisible.
+    ///
+    /// Against the pre-fix code the recorded command is gone and
+    /// `nested_begins` does not exist.
+    #[test]
+    fn a_second_capture_begin_is_recorded_not_silent() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let a = rt.alloc_buffer_hot(64 * 4).expect("a");
+        let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+        let tg = mtl_size(1, 1, 1);
+
+        begin_decode_icb_capture();
+        capture_note_pipeline(pipe);
+        capture_note_bind(0, &a, 0);
+        capture_note_dispatch(tg, tg);
+
+        // A caller that forgot to take, then began again.
+        begin_decode_icb_capture();
+
+        let cap = take_decode_icb_capture().expect("capture");
+        assert_eq!(
+            cap.commands.len(),
+            1,
+            "the first tape's work must survive re-entry, not be discarded"
+        );
+        assert_eq!(
+            cap.nested_begins, 1,
+            "re-entry must be recorded so the leak is visible"
+        );
+
+        // And the explicit escape hatch actually clears it.
+        begin_decode_icb_capture();
+        assert!(decode_icb_capture_active());
+        end_decode_icb_capture();
+        assert!(
+            !decode_icb_capture_active(),
+            "end_decode_icb_capture must release the tape and its pinned buffers"
+        );
     }
 
     /// A nested nop guard must not end its parent's scope on drop.
