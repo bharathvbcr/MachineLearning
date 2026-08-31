@@ -341,6 +341,200 @@ pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<
     Ok(())
 }
 
+/// Element strides between consecutive batch elements.
+///
+/// A **zero** stride is the point of having three of these rather than one: it
+/// broadcasts that operand across the batch. Batched activations against a
+/// single shared weight matrix — the common shape — is `stride_b: 0`, which
+/// needs no copies of B at all.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchStrides {
+    /// Elements between consecutive A matrices. Usually `m * k`.
+    pub a: usize,
+    /// Elements between consecutive B matrices. `0` broadcasts one B.
+    pub b: usize,
+    /// Elements between consecutive C matrices. Usually `m * n`.
+    pub c: usize,
+}
+
+impl BatchStrides {
+    /// Contiguous batches of all three operands.
+    pub fn contiguous(m: usize, n: usize, k: usize) -> Self {
+        Self {
+            a: m * k,
+            b: k * n,
+            c: m * n,
+        }
+    }
+
+    /// Contiguous A and C against one shared B.
+    pub fn shared_b(m: usize, n: usize, k: usize) -> Self {
+        Self {
+            a: m * k,
+            b: 0,
+            c: m * n,
+        }
+    }
+}
+
+/// A batched GEMM's shape: the dimensions of one matrix, how many there are,
+/// and how to step between them.
+///
+/// The per-matrix dimensions are given explicitly rather than read off the
+/// tensors' shapes. A rank-2 shape cannot express a batch — `[batch * m, k]`
+/// and `[m, k]` are the same tensor to a shape check — and a zero stride makes
+/// it worse, since a broadcast B is genuinely `[k, n]` while A is not. Stating
+/// the dimensions removes the guess.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchedGemm {
+    /// Rows of one A, and of one C.
+    pub m: usize,
+    /// Columns of one B, and of one C.
+    pub n: usize,
+    /// The contracted dimension.
+    pub k: usize,
+    /// How many matrices.
+    pub batch: usize,
+    /// Element steps between consecutive matrices.
+    pub strides: BatchStrides,
+}
+
+/// `C[i] = A[i] @ B[i]` for `spec.batch` matrices, in one dispatch.
+///
+/// The batch is the grid's second dimension, so batching costs a pointer offset
+/// per threadgroup and nothing else — the tile geometry, the register
+/// accumulator and the swizzle are the single-matrix path's, and each element
+/// is bit-identical to the [`gemm`] that would have produced it.
+///
+/// Requires the cooperative-destination path (bf16, f16, or f32 with relaxed
+/// precision on TensorOps), for the same reason [`gemm_epilogue`] does.
+///
+/// `a`, `b` and `c` point at the *first* matrix; [`BatchStrides`] reaches the
+/// rest. Every operand's last element is bounds checked against its buffer,
+/// because an over-long batch reads past the end of device memory rather than
+/// failing.
+pub fn gemm_batched(
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+    spec: BatchedGemm,
+) -> Result<(), String> {
+    let BatchedGemm {
+        m,
+        n,
+        k,
+        batch,
+        strides,
+    } = spec;
+    if batch == 0 {
+        return Ok(());
+    }
+    if m == 0 || n == 0 || k == 0 {
+        return Err("batched GEMM requires nonzero m, n and k".into());
+    }
+    for t in [a, b, c] {
+        t.validate()?;
+        if t.numel() > i32::MAX as usize {
+            return Err("batched GEMM exceeds signed 32-bit kernel indexing".into());
+        }
+    }
+    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime())
+        || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime())
+    {
+        return Err("batched GEMM tensors must belong to the same runtime".into());
+    }
+    if c.dtype != DType::F32 {
+        return Err("batched GEMM writes f32 output".into());
+    }
+    if a.dtype != b.dtype {
+        return Err("GEMM requires matching operand dtypes".into());
+    }
+    let rt = a.runtime();
+    let use_bf16 = a.dtype == DType::BF16 && b.dtype == DType::BF16;
+    let use_f16 = a.dtype == DType::F16 && b.dtype == DType::F16;
+    if backend != GemmBackend::TensorOps || !(use_bf16 || use_f16 || use_relaxed_f32(rt, backend)) {
+        return Err(
+            "batched GEMM needs the cooperative-destination path: bf16 or f16 operands, \
+             or f32 with relaxed precision, on the TensorOps backend"
+                .into(),
+        );
+    }
+
+    // The last batch element must fit. Without this the kernel walks off the
+    // end of whichever operand was sized for a smaller batch and reads whatever
+    // happens to be resident.
+    for (t, first, stride, what) in [
+        (a, m * k, strides.a, "A"),
+        (b, k * n, strides.b, "B"),
+        (c, m * n, strides.c, "C"),
+    ] {
+        let need = stride
+            .checked_mul(batch - 1)
+            .and_then(|off| off.checked_add(first))
+            .ok_or_else(|| format!("batched GEMM: {what} extent overflows usize"))?;
+        if t.numel() < need {
+            return Err(format!(
+                "batched GEMM: {what} holds {} elements but batch {batch} at stride \
+                 {stride} reaches {need}",
+                t.numel()
+            ));
+        }
+        if stride > u32::MAX as usize {
+            return Err(format!("batched GEMM: {what} stride exceeds uint indexing"));
+        }
+    }
+
+    if batch == 1 {
+        // Nothing to batch; the single-matrix kernel is already the best
+        // implementation and keeps the documented bit-identity trivially true.
+        let elem = coop_elem(use_bf16, use_f16);
+        let (kernel, tile) = nn_coop_kernel(m, n, k, elem);
+        let pipeline = rt.pipeline(kernel)?;
+        return dispatch_tensorops_nn_coop(rt, &pipeline, a, b, c, m, n, k, tile);
+    }
+
+    let kernel = match coop_elem(use_bf16, use_f16) {
+        CoopElem::Bf16 => "matmul2d_tensorops_bf16_f32_batched",
+        CoopElem::F16 => "matmul2d_tensorops_f16_f32_batched",
+        CoopElem::RelaxedF32 => "matmul2d_tensorops_f32_relaxed_batched",
+    };
+    let pipeline = rt.pipeline(kernel)?;
+    // Only the 128x64 geometry is instantiated batched; a narrow variant is a
+    // tuning question left until measured, as for the epilogue.
+    let tile = TILE_COOP_DEFAULT;
+    let tiles_n = n.div_ceil(tile.sn);
+    let tiles_m = m.div_ceil(tile.sm);
+    let tg = morton_tg_count(tiles_n, tiles_m);
+    let tpt = threads_per_tg(&pipeline, tile);
+    rt.with_binder(|bnd| {
+        bnd.set_pipeline(&pipeline);
+        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
+        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
+        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_u32(m as u32, 3);
+        bnd.bind_u32(n as u32, 4);
+        bnd.bind_u32(k as u32, 5);
+        bnd.bind_u32(tiles_n as u32, 6);
+        bnd.bind_u32(tiles_m as u32, 7);
+        bnd.bind_u32(strides.a as u32, 8);
+        bnd.bind_u32(strides.b as u32, 9);
+        bnd.bind_u32(strides.c as u32, 10);
+        bnd.dispatch(mtl_size(tg, batch, 1), mtl_size(tpt, 1, 1));
+        Ok(())
+    })
+}
+
+fn coop_elem(use_bf16: bool, use_f16: bool) -> CoopElem {
+    if use_bf16 {
+        CoopElem::Bf16
+    } else if use_f16 {
+        CoopElem::F16
+    } else {
+        CoopElem::RelaxedF32
+    }
+}
+
 /// Activation fused into a GEMM epilogue.
 ///
 /// The discriminants are ABI: they cross to `GemmActivation` in

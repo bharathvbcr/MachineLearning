@@ -76,8 +76,8 @@ pub use decode_icb::{
     DecodeIcbCommand,
 };
 pub use gemm::{
-    cast_f16_to_f32, cast_f32_to_f16, gemm, gemm_epilogue, gemm_f32, Activation, Epilogue,
-    GemmBackend,
+    cast_f16_to_f32, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_f32, Activation,
+    BatchStrides, BatchedGemm, Epilogue, GemmBackend,
 };
 pub use icb_smoke::{
     icb_smoke_enabled, run_copy_f32_smoke, set_icb_smoke, IcbBindBridge, IcbCopySmoke,

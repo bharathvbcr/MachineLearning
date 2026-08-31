@@ -562,6 +562,41 @@ NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, tru
 /// not use — and the tuned geometries above are the crate's most measured
 /// code. `EPILOGUE` is a template parameter, so these share one source with
 /// them and the plain path compiles to exactly what it did before.
+/// Strided batched NN GEMM.
+///
+/// The grid gains a second dimension: `tgpig.y` is the batch index, and each
+/// operand is offset by its own stride. Per-operand strides rather than one
+/// shared stride because a **zero** stride is the useful case — batched
+/// activations against a single shared weight matrix is the common shape, and
+/// a zero stride expresses it without materialising `batch` copies of B.
+///
+/// Everything inside the tile is the existing helper, so batching costs a
+/// pointer offset and nothing else. The tuned geometry and the epilogue both
+/// apply unchanged.
+#define NN_COOP_BATCHED_KERNEL(NAME, ELEM, SM, SN, NSG, RELAXED)               \
+    kernel void NAME(device ELEM *A [[buffer(0)]],                             \
+                     device ELEM *B [[buffer(1)]],                             \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     constant uint &tiles_m [[buffer(7)]],                     \
+                     constant uint &stride_a [[buffer(8)]],                    \
+                     constant uint &stride_b [[buffer(9)]],                    \
+                     constant uint &stride_c [[buffer(10)]],                   \
+                     uint2 tgpig [[threadgroup_position_in_grid]]) {           \
+        const ulong batch = (ulong)tgpig.y;                                    \
+        mm_nn_coop_f32acc<ELEM, SM, SN, NSG, RELAXED, false>(                  \
+            A + batch * (ulong)stride_a, B + batch * (ulong)stride_b,          \
+            C + batch * (ulong)stride_c, M, N, K, tiles_n, tiles_m, tgpig.x,   \
+            nullptr, 1.0f, 0.0f, 0u);                                          \
+    }
+
+NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_bf16_f32_batched,   bfloat, 128, 64, 4, false)
+NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_f16_f32_batched,      half, 128, 64, 4, false)
+NN_COOP_BATCHED_KERNEL(matmul2d_tensorops_f32_relaxed_batched, float, 128, 64, 4, true)
+
 #define NN_COOP_EPI_KERNEL(NAME, ELEM, SM, SN, NSG, RELAXED)                   \
     kernel void NAME(device ELEM *A [[buffer(0)]],                             \
                      device ELEM *B [[buffer(1)]],                             \

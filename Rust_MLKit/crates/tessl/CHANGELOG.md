@@ -8,6 +8,14 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Strided batched GEMM**: `gemm_batched` with `BatchedGemm` and
+  `BatchStrides`. The batch is the grid's second dimension, so it costs a
+  pointer offset per threadgroup and nothing else — every element is
+  bit-identical to the `gemm` that would have produced it. Per-operand strides,
+  because a **zero** stride is the useful case: batched activations against one
+  shared weight matrix needs no copies of B. Dimensions are passed explicitly
+  rather than read from tensor shapes, since a rank-2 shape cannot distinguish
+  `[batch * m, k]` from `[m, k]` and a broadcast B genuinely is `[k, n]`.
 - **IEEE binary16 (`DType::F16`)**: `alloc_tensor_f16`, `cast_f32_to_f16` /
   `cast_f16_to_f32`, host `f32_to_f16_bits` / `f16_bits_to_f32` /
   `f32_slice_to_f16`, `GpuBuffer::write_f16_bits`, and f16 GEMM kernels
