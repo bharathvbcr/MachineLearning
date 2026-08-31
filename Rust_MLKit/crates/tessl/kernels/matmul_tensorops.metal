@@ -365,10 +365,48 @@ kernel void matmul2d_tensorops_tn_splitk_bf16_f32(
 // K ≥ 2048. Register cost of the accumulator is SM*SN*4/(32*NSG) B/thread.
 // =============================================================================
 
-template <typename ElemT, int SM, int SN, int NSG, bool RELAXED>
+/// Activation applied by a fused GEMM epilogue.
+///
+/// Values are ABI: they cross from `tessl::gemm::Activation` as a `uint`, so
+/// reordering them silently changes what every caller computes.
+enum GemmActivation : uint {
+    GEMM_ACT_NONE = 0u,
+    GEMM_ACT_RELU = 1u,
+    GEMM_ACT_GELU_TANH = 2u,
+    GEMM_ACT_SILU = 3u,
+};
+
+/// `gelu_pytorch_tanh`, in the *same* formulation as `mlp_gelu_tanh.metal`.
+///
+/// Deliberately a copy of that kernel's math rather than a fresh derivation:
+/// the clamp before cubing and `precise::tanh` are both load-bearing. At `-O2`
+/// MSL lowers plain `tanh` to `air.fast_tanh`, which returns NaN past roughly
+/// |10|, and the inner term reaches ~301 at |x| = 20. A crate with two
+/// different GELUs would be a worse defect than a slow one.
+static inline float gemm_gelu_tanh(float x) {
+    float xc = clamp(x, -20.0f, 20.0f);
+    float x3 = xc * xc * xc;
+    float inner = 0.7978845608028654f * (xc + 0.044715f * x3);
+    float t = precise::tanh(clamp(inner, -10.0f, 10.0f));
+    return 0.5f * xc * (1.0f + t);
+}
+
+static inline float gemm_apply_activation(float v, uint act) {
+    switch (act) {
+        case GEMM_ACT_RELU: return fmax(v, 0.0f);
+        case GEMM_ACT_GELU_TANH: return gemm_gelu_tanh(v);
+        // silu(x) = x * sigmoid(x), matching `mlp_silu.metal`.
+        case GEMM_ACT_SILU: return v / (1.0f + exp(-v));
+        default: return v;
+    }
+}
+
+template <typename ElemT, int SM, int SN, int NSG, bool RELAXED, bool EPILOGUE>
 inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
                               uint M, uint N, uint K, uint tiles_n,
-                              uint tiles_m, uint tgpig) {
+                              uint tiles_m, uint tgpig,
+                              device const float *bias, float alpha, float beta,
+                              uint act) {
     constexpr auto d = matmul2d_descriptor(
         SM, SN, dynamic_length_v<int>, false, false, RELAXED,
         matmul2d_descriptor::mode::multiply);
@@ -407,6 +445,43 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
         for (uint16_t i = 0; i < cT.get_capacity(); ++i)
             cT.set(i, 0.0f);
         op.run(tA, tB, cT);
+        if (EPILOGUE) {
+            // `beta * C_prev` reuses the accumulate path's trick: a second
+            // cooperative tensor loaded from C, combined in registers, so C is
+            // read once and written once rather than round-tripped per term.
+            if (beta != 0.0f) {
+                auto prevT = op.template get_destination_cooperative_tensor<
+                    metal::remove_addrspace_t<decltype(tA)>,
+                    metal::remove_addrspace_t<decltype(tB)>, float>();
+                prevT.load(tC);
+#pragma clang loop unroll(full)
+                for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+                    if (cT.is_valid_element(i)) cT[i] = cT[i] * alpha + beta * prevT[i];
+            } else if (alpha != 1.0f) {
+#pragma clang loop unroll(full)
+                for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+                    if (cT.is_valid_element(i)) cT[i] *= alpha;
+            }
+            if (bias) {
+                // Row stride 0: every one of the SM rows reads the same SN
+                // bias values, so a per-column bias broadcasts through the
+                // same `load` path as C with no separate indexing.
+                auto tBias = tensor(const_cast<device float *>(bias) + tx,
+                                    dextents<int, 2>{SN, SM}, array<int, 2>{1, 0});
+                auto biasT = op.template get_destination_cooperative_tensor<
+                    metal::remove_addrspace_t<decltype(tA)>,
+                    metal::remove_addrspace_t<decltype(tB)>, float>();
+                biasT.load(tBias);
+#pragma clang loop unroll(full)
+                for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+                    if (cT.is_valid_element(i)) cT[i] += biasT[i];
+            }
+            if (act != GEMM_ACT_NONE) {
+#pragma clang loop unroll(full)
+                for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+                    if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], act);
+            }
+        }
         cT.store(tC);
     } else {
         auto mA = tensor(A, dextents<int, 2>{(int)K, (int)M}, array<int, 2>{1, (int)K});
@@ -422,6 +497,40 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
         for (uint16_t i = 0; i < cT.get_capacity(); ++i)
             cT.set(i, 0.0f);
         op.run(tA, tB, cT);
+        if (EPILOGUE) {
+            if (beta != 0.0f) {
+                auto prevT = op.template get_destination_cooperative_tensor<
+                    metal::remove_addrspace_t<decltype(tA)>,
+                    metal::remove_addrspace_t<decltype(tB)>, float>();
+                prevT.load(tC);
+#pragma clang loop unroll(full)
+                for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+                    if (cT.is_valid_element(i)) cT[i] = cT[i] * alpha + beta * prevT[i];
+            } else if (alpha != 1.0f) {
+#pragma clang loop unroll(full)
+                for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+                    if (cT.is_valid_element(i)) cT[i] *= alpha;
+            }
+            if (bias) {
+                // Edge tiles take the bounds-checked slice path, so the bias
+                // view is built the same way `mC` is and sliced identically.
+                auto mBias = tensor(const_cast<device float *>(bias),
+                                    dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, 0});
+                auto tBias = mBias.slice(tx, ty);
+                auto biasT = op.template get_destination_cooperative_tensor<
+                    metal::remove_addrspace_t<decltype(tA)>,
+                    metal::remove_addrspace_t<decltype(tB)>, float>();
+                biasT.load(tBias);
+#pragma clang loop unroll(full)
+                for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+                    if (cT.is_valid_element(i)) cT[i] += biasT[i];
+            }
+            if (act != GEMM_ACT_NONE) {
+#pragma clang loop unroll(full)
+                for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+                    if (cT.is_valid_element(i)) cT[i] = gemm_apply_activation(cT[i], act);
+            }
+        }
         cT.store(tC);
     }
 }
@@ -436,14 +545,45 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
                      constant uint &tiles_n [[buffer(6)]],                     \
                      constant uint &tiles_m [[buffer(7)]],                     \
                      uint tgpig [[threadgroup_position_in_grid]]) {            \
-        mm_nn_coop_f32acc<ELEM, SM, SN, NSG, RELAXED>(                         \
-            A, B, C, M, N, K, tiles_n, tiles_m, tgpig);                        \
+        mm_nn_coop_f32acc<ELEM, SM, SN, NSG, RELAXED, false>(                   \
+            A, B, C, M, N, K, tiles_n, tiles_m, tgpig, nullptr, 1.0f, 0.0f, 0u);\
     }
 
 NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32,            bfloat, 128, 64, 4, false)
 NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32_64x64_sg4,  bfloat,  64, 64, 4, false)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed,            float, 128, 64, 4, true)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, true)
+
+/// Epilogue variants: `C = act(alpha * A@B + beta * C_prev + bias)`.
+///
+/// A separate entry point rather than extra parameters on the kernels above.
+/// Metal faults on a declared-but-unbound buffer, so widening the existing
+/// signatures would force every current caller to bind four operands it does
+/// not use — and the tuned geometries above are the crate's most measured
+/// code. `EPILOGUE` is a template parameter, so these share one source with
+/// them and the plain path compiles to exactly what it did before.
+#define NN_COOP_EPI_KERNEL(NAME, ELEM, SM, SN, NSG, RELAXED)                   \
+    kernel void NAME(device ELEM *A [[buffer(0)]],                             \
+                     device ELEM *B [[buffer(1)]],                             \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     constant uint &tiles_m [[buffer(7)]],                     \
+                     device const float *bias [[buffer(8)]],                   \
+                     constant float &alpha [[buffer(9)]],                      \
+                     constant float &beta [[buffer(10)]],                      \
+                     constant uint &act [[buffer(11)]],                        \
+                     constant uint &has_bias [[buffer(12)]],                   \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        mm_nn_coop_f32acc<ELEM, SM, SN, NSG, RELAXED, true>(                   \
+            A, B, C, M, N, K, tiles_n, tiles_m, tgpig,                         \
+            has_bias ? bias : nullptr, alpha, beta, act);                      \
+    }
+
+NN_COOP_EPI_KERNEL(matmul2d_tensorops_bf16_f32_epi,    bfloat, 128, 64, 4, false)
+NN_COOP_EPI_KERNEL(matmul2d_tensorops_f32_relaxed_epi,  float, 128, 64, 4, true)
 
 /// TN / NT bf16 GEMMs — cooperative destination tensor (2026-08-30 round 2,
 /// bench/results/bf16_tnnt_coop_m5pro.txt): register accumulator, C touched

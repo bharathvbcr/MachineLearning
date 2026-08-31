@@ -284,6 +284,179 @@ pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<
     Ok(())
 }
 
+/// Activation fused into a GEMM epilogue.
+///
+/// The discriminants are ABI: they cross to `GemmActivation` in
+/// `matmul_tensorops.metal` as a `uint`, so reordering them changes what every
+/// caller computes without changing any Rust that reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(u32)]
+pub enum Activation {
+    /// No activation; the epilogue is scale, accumulate and bias only.
+    #[default]
+    None = 0,
+    /// `max(x, 0)`.
+    Relu = 1,
+    /// `gelu_pytorch_tanh`, in the same clamped `precise::tanh` formulation as
+    /// `nn::mlp_gelu_tanh`. Deliberately not a second derivation: at `-O2` MSL
+    /// lowers plain `tanh` to `air.fast_tanh`, which NaNs past roughly |10|.
+    GeluTanh = 2,
+    /// `x * sigmoid(x)`, matching `nn::mlp_silu`.
+    Silu = 3,
+}
+
+/// What a fused GEMM epilogue applies to the accumulator before it is stored.
+///
+/// `C = activation(alpha * (A @ B) + beta * C_prev + bias)`
+///
+/// # Why fuse
+///
+/// Every term here is otherwise a separate dispatch that reads all of `C` and
+/// writes all of `C`. A bias-plus-GELU costs two extra full round-trips through
+/// device memory, which on a bandwidth-bound machine is most of what the GEMM
+/// saved. Applied here the accumulator is still in registers, so `C` is written
+/// exactly once — and read at most once, only when `beta != 0`.
+///
+/// `bias` is per-column, length `N`, broadcast across every row. It is read
+/// through a row-stride-0 tensor view, so the same cooperative `load` path that
+/// fetches `C_prev` fetches the bias with no separate indexing.
+#[derive(Clone, Copy, Debug)]
+pub struct Epilogue<'a> {
+    /// Scale on the product. `1.0` is the identity.
+    pub alpha: f32,
+    /// Scale on `C`'s prior contents. `0.0` skips reading `C` entirely, which
+    /// is a bandwidth saving and not merely an arithmetic one.
+    pub beta: f32,
+    /// Per-column bias of length `N`, or `None`.
+    pub bias: Option<&'a Tensor>,
+    /// Activation applied last, after scale, accumulate and bias.
+    pub activation: Activation,
+}
+
+impl Default for Epilogue<'_> {
+    /// The identity epilogue: `C = A @ B`.
+    fn default() -> Self {
+        Self {
+            alpha: 1.0,
+            beta: 0.0,
+            bias: None,
+            activation: Activation::None,
+        }
+    }
+}
+
+impl Epilogue<'_> {
+    /// Whether this epilogue would change the result at all.
+    ///
+    /// A caller passing the identity is dispatched to the plain kernel rather
+    /// than paying for an epilogue that computes `C = 1.0 * C + 0.0`.
+    pub fn is_identity(&self) -> bool {
+        self.alpha == 1.0
+            && self.beta == 0.0
+            && self.bias.is_none()
+            && self.activation == Activation::None
+    }
+}
+
+/// `C = activation(alpha * (A @ B) + beta * C + bias)`, in one dispatch.
+///
+/// The fused form of a GEMM followed by a scale, an accumulate, a bias add and
+/// an activation. See [`Epilogue`] for why that matters.
+///
+/// Requires the cooperative-destination path — bf16 operands, or f32 with
+/// [`GpuRuntime::set_relaxed_precision`] on — because that is the path that holds the
+/// accumulator in registers. An f32 exact GEMM has nowhere to fuse into and is
+/// refused rather than silently falling back to separate dispatches, which
+/// would make the call quietly slower than the unfused code it replaced.
+///
+/// An identity epilogue dispatches to the plain [`gemm`].
+pub fn gemm_epilogue(
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+    epi: Epilogue<'_>,
+) -> Result<(), String> {
+    if epi.is_identity() {
+        return gemm(a, b, c, backend);
+    }
+    let (m, n, k) = validate_gemm(a, b, c, Layout::NN, true)?;
+    if !epi.alpha.is_finite() || !epi.beta.is_finite() {
+        return Err(format!(
+            "GEMM epilogue: alpha and beta must be finite, got alpha={} beta={}",
+            epi.alpha, epi.beta
+        ));
+    }
+
+    let use_bf16 = a.dtype == DType::BF16 && b.dtype == DType::BF16;
+    if a.dtype != b.dtype {
+        return Err("GEMM requires matching operand dtypes".into());
+    }
+    let rt = a.runtime();
+    if !(use_bf16 || use_relaxed_f32(rt, backend)) || backend != GemmBackend::TensorOps {
+        return Err(
+            "GEMM epilogue needs the cooperative-destination path: bf16 operands, or f32              with PrecisionMode::Relaxed, on the TensorOps backend. The exact-f32 and              simdgroup kernels write C straight from the matmul with no register              accumulator to fuse into, so there is nothing here to make faster"
+                .into(),
+        );
+    }
+
+    if let Some(bias) = epi.bias {
+        bias.validate()?;
+        if bias.dtype != DType::F32 {
+            return Err("GEMM epilogue: bias must be f32".into());
+        }
+        if !std::sync::Arc::ptr_eq(rt, bias.runtime()) {
+            return Err("GEMM epilogue: bias belongs to a different runtime".into());
+        }
+        if bias.numel() < n {
+            return Err(format!(
+                "GEMM epilogue: bias is per-column and must hold at least N = {n}                  elements, got {}",
+                bias.numel()
+            ));
+        }
+    }
+
+    let kernel = if use_bf16 {
+        "matmul2d_tensorops_bf16_f32_epi"
+    } else {
+        "matmul2d_tensorops_f32_relaxed_epi"
+    };
+    let pipeline = rt.pipeline(kernel)?;
+    // Only the 128x64 sg4 geometry has an epilogue instantiation. The narrow
+    // 64x64 variant exists for shapes the tile tune found it better on; adding
+    // an epilogue copy of it is a tuning question, not a correctness one, and
+    // is deliberately left until measured.
+    let tile = TILE_COOP_DEFAULT;
+    let tiles_n = n.div_ceil(tile.sn);
+    let tiles_m = m.div_ceil(tile.sm);
+    let tg = morton_tg_count(tiles_n, tiles_m);
+    let tpt = threads_per_tg(&pipeline, tile);
+    let (alpha, beta, act) = (epi.alpha, epi.beta, epi.activation as u32);
+    let has_bias = u32::from(epi.bias.is_some());
+    // Buffer 8 is read unconditionally by the kernel binding, so it must be
+    // bound even when unused: Metal faults on a declared-but-unbound buffer.
+    // `has_bias` is what decides whether it is dereferenced.
+    let bias_buf = epi.bias.unwrap_or(c);
+    rt.with_binder(|bnd| {
+        bnd.set_pipeline(&pipeline);
+        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
+        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
+        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_u32(m as u32, 3);
+        bnd.bind_u32(n as u32, 4);
+        bnd.bind_u32(k as u32, 5);
+        bnd.bind_u32(tiles_n as u32, 6);
+        bnd.bind_u32(tiles_m as u32, 7);
+        bnd.bind_buf(bias_buf.buffer.metal(), bias_buf.byte_offset, 8);
+        bnd.bind_f32(alpha, 9);
+        bnd.bind_f32(beta, 10);
+        bnd.bind_u32(act, 11);
+        bnd.bind_u32(has_bias, 12);
+        bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
+        Ok(())
+    })
+}
+
 /// Cooperative-destination NN tile geometries (must match the NN_COOP_KERNEL
 /// instantiations in matmul_tensorops.metal).
 const TILE_COOP_DEFAULT: TileGeom = TileGeom {

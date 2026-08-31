@@ -377,14 +377,46 @@ All runtime configuration parameters use the canonical `TESSL_*` prefix. Legacy 
 
 ---
 
+## 🔗 Fused GEMM epilogue
+
+`gemm_epilogue` computes `C = activation(alpha * A@B + beta * C_prev + bias)` in one dispatch.
+
+Every term there is otherwise a separate kernel that reads all of `C` and writes all of `C`. A bias plus an activation costs two extra full round-trips through device memory — on a bandwidth-bound machine, most of what the GEMM saved. Applied inside the cooperative-destination kernel the accumulator is still in registers, so `C` is written exactly once and read at most once, only when `beta != 0`.
+
+```rust
+use tessl::{gemm_epilogue, Activation, Epilogue, GemmBackend};
+
+gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, Epilogue {
+    alpha: 1.0,
+    beta: 0.0,                 // skips reading C entirely
+    bias: Some(&bias),         // per-column, length N
+    activation: Activation::GeluTanh,
+})?;
+```
+
+Bias is per-column and broadcasts across rows through a **row-stride-0 tensor view**, so the same cooperative `load` that fetches `C_prev` fetches the bias with no separate indexing.
+
+| shape | `gemm` | fused | `gemm` + one pass over C | epilogue cost | vs one pass |
+|---|---:|---:|---:|---:|---:|
+| 512³ | 0.377 ms | 0.558 ms | 0.661 ms | 0.181 ms | **1.57× cheaper** |
+| 1024³ | 0.471 ms | 0.584 ms | 0.746 ms | 0.113 ms | **2.43× cheaper** |
+| 2048×2048×512 | 0.916 ms | 1.139 ms | 1.297 ms | 0.223 ms | **1.71× cheaper** |
+
+`cargo run --release --example epilogue_cost`. The comparison arm is `gemm` plus a *single* `add_inplace_f32` sweep — strictly less work than a real bias broadcast, and half the work of bias plus a separate activation. Fusing beats even that lower bound at every shape. All three arms are GPU-side in one interleaved run, so the machine's load average of 52 during measurement affects them alike.
+
+`Activation::GeluTanh` is the same clamped `precise::tanh` formulation as `nn::mlp_gelu_tanh`, deliberately copied rather than re-derived: at `-O2` MSL lowers plain `tanh` to `air.fast_tanh`, which returns NaN past roughly |10|, and a crate with two different GELUs would be a worse defect than a slow one.
+
+It requires the cooperative-destination path — bf16 operands, or f32 with relaxed precision. The exact-f32 and simdgroup kernels write `C` straight from the matmul with no register accumulator, so there is nothing to fuse into; those are refused rather than silently falling back to separate dispatches, which would make the call quietly slower than the unfused code it replaced.
+
+---
+
 ## 🧭 Known gaps
 
-Recorded rather than implied. All 61 kernels are wired to a typed Rust API, the suite is warning-free, and there are no stubs; these are capabilities the crate does not have.
+Recorded rather than implied. All kernels are wired to a typed Rust API, the suite is warning-free, and there are no stubs; these are capabilities the crate does not have. **The fused epilogue shipped** — see [Fused GEMM epilogue](#-fused-gemm-epilogue).
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
 | **No batched / strided GEMM** | Attention *is* batched matmul. `gemm(a, b, c, backend)` has no batch dimension. | Needs a strided-descriptor pass over the TensorOps entry points, not a wrapper. |
-| **No GEMM epilogue** | No alpha/beta, bias, or fused activation, so bias+GELU costs two extra dispatches and two extra round-trips through memory — most of the win on a bandwidth-bound machine. | Belongs in the cooperative-destination kernels, where the accumulator is still in registers. |
 | **No f16** | Only f32 and bf16, so every PyTorch MPS interop boundary pays a cast. | Mechanical, but it doubles the tile-tuning matrix that `bench_gemm_tile_tune` already covers slowly. |
 | **No reductions** | No sum/mean/max/argmax or softmax at the GEMM layer; `nn` has argmax only for sampling. | — |
 | **Quantized TensorOps GEMM** | The `quant-prep` module allocates real `MTLTensor`s but there is no quantized matmul. | `MTLTensorDataType::Int4` is unbound in objc2-metal 0.3, so the dtype cannot be named. `QUANT_PREFILL_GEMM_WIRED` reports this. |

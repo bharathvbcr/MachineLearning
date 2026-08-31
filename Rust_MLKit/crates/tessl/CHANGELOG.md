@@ -8,6 +8,22 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`gemm_epilogue` — fused GEMM epilogue.**
+  `C = activation(alpha * A@B + beta * C_prev + bias)` in one dispatch, applied
+  while the accumulator is still in registers, so `C` is written once and read
+  at most once. Measured 1.57x to 2.43x cheaper than a single elementwise sweep
+  over `C` — which is itself strictly less work than any real unfused epilogue.
+- `Activation` (`None`, `Relu`, `GeluTanh`, `Silu`) and `Epilogue`, with
+  `Epilogue::default()` as the identity, which dispatches to plain `gemm`.
+- Per-column bias broadcasts through a row-stride-0 tensor view, reusing the
+  cooperative `load` path that fetches `C_prev`.
+- `matmul2d_tensorops_bf16_f32_epi` and `matmul2d_tensorops_f32_relaxed_epi`.
+  Separate entry points rather than extra parameters on the existing kernels:
+  Metal faults on a declared-but-unbound buffer, so widening those signatures
+  would force every current caller to bind four operands it does not use. The
+  epilogue is a template parameter, so both share one source and the plain path
+  compiles to exactly what it did before.
+- `examples/epilogue_cost.rs`.
 - **`nn` module — 44 kernels promoted out of `gemma-metal`.** RMSNorm (f32,
   bf16, fused residual-add with layer scale), gated MLP activations (SiLU,
   `gelu_pytorch_tanh`), sliding-window and global flash attention, fused
