@@ -24,8 +24,8 @@ use objc2::ClassType;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTL4Compiler, MTL4CompilerDescriptor, MTL4ComputePipelineDescriptor,
-    MTL4IndirectCommandBufferSupportState, MTL4LibraryFunctionDescriptor, MTLAllocation,
-    MTLBuffer, MTLComputePipelineState, MTLDevice, MTLIndirectCommandBuffer,
+    MTL4IndirectCommandBufferSupportState, MTL4LibraryFunctionDescriptor, MTLAllocation, MTLBuffer,
+    MTLComputePipelineState, MTLDevice, MTLIndirectCommandBuffer,
     MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand,
     MTLResourceOptions,
 };
@@ -48,7 +48,12 @@ pub fn icb_smoke_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = env_truthy(&["TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE", "GEMMA_METAL_ICB_SMOKE"]).unwrap_or(false);
+    let on = env_truthy(&[
+        "TESSL_ICB_SMOKE",
+        "METAL_RUNTIME_ICB_SMOKE",
+        "GEMMA_METAL_ICB_SMOKE",
+    ])
+    .unwrap_or(false);
     ICB_SMOKE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
 }
@@ -168,11 +173,7 @@ impl IcbCopySmoke {
     }
 
     /// CPU-encode command 0 once (pipeline + dispatch; binds per [`IcbBindBridge`]).
-    pub fn encode_copy(
-        &mut self,
-        src: &GpuBuffer,
-        dst: &GpuBuffer,
-    ) -> Result<(), String> {
+    pub fn encode_copy(&mut self, src: &GpuBuffer, dst: &GpuBuffer) -> Result<(), String> {
         let cmd: Retained<ProtocolObject<dyn MTLIndirectComputeCommand>> =
             unsafe { self.icb.indirectComputeCommandAtIndex(0) };
         cmd.reset();
@@ -321,9 +322,8 @@ pub fn run_copy_f32_smoke(rt: &Arc<GpuRuntime>) -> Result<IcbCopySmoke, String> 
 }
 
 fn verify_copy(dst: &GpuBuffer, n: usize, label: &str) -> Result<(), String> {
-    let out = unsafe {
-        std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n)
-    };
+    let out =
+        unsafe { std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n) };
     for (i, &v) in out.iter().enumerate() {
         let expect = (i as f32) + 0.5;
         if v != expect {

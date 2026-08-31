@@ -58,7 +58,12 @@ pub fn decode_icb_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = env_truthy(&["TESSL_DECODE_ICB", "METAL_RUNTIME_DECODE_ICB", "GEMMA_METAL_DECODE_ICB"]).unwrap_or(false);
+    let on = env_truthy(&[
+        "TESSL_DECODE_ICB",
+        "METAL_RUNTIME_DECODE_ICB",
+        "GEMMA_METAL_DECODE_ICB",
+    ])
+    .unwrap_or(false);
     DECODE_ICB.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
 }
@@ -81,9 +86,7 @@ pub enum DecodeIcbBind {
 
 #[inline]
 fn buf_gpu_addr(buf: &GpuBuffer, byte_offset: usize) -> u64 {
-    buf.metal()
-        .gpuAddress()
-        .wrapping_add(byte_offset as u64)
+    buf.metal().gpuAddress().wrapping_add(byte_offset as u64)
 }
 
 /// One frozen compute dispatch (pipeline + grid + bind recipe).
@@ -139,12 +142,7 @@ impl StickyArgTable {
     }
 
     #[inline]
-    fn bind_addr(
-        &mut self,
-        bnd: &mut crate::dispatch::Binder<'_>,
-        gpu_addr: u64,
-        index: usize,
-    ) {
+    fn bind_addr(&mut self, bnd: &mut crate::dispatch::Binder<'_>, gpu_addr: u64, index: usize) {
         self.bind_total = self.bind_total.saturating_add(1);
         if index < ARG_TABLE_SLOTS {
             let bit = 1u32 << index;
@@ -160,12 +158,7 @@ impl StickyArgTable {
 
     /// Immediate binds always materialize a fresh const-arena address.
     #[inline]
-    fn bind_bytes(
-        &mut self,
-        bnd: &mut crate::dispatch::Binder<'_>,
-        bytes: &[u8],
-        index: usize,
-    ) {
+    fn bind_bytes(&mut self, bnd: &mut crate::dispatch::Binder<'_>, bytes: &[u8], index: usize) {
         self.bind_total = self.bind_total.saturating_add(1);
         let addr = bnd.bind_bytes(bytes, index);
         self.set_calls = self.set_calls.saturating_add(1);
@@ -210,7 +203,8 @@ impl StickyArgTable {
 /// Default **ON** — freeze Buf binds into per-command MTL4 argument tables.
 fn prebuilt_tables_enabled() -> bool {
     env_truthy(&[
-        "TESSL_ICB_PREBUILT_TABLES", "METAL_RUNTIME_ICB_PREBUILT_TABLES",
+        "TESSL_ICB_PREBUILT_TABLES",
+        "METAL_RUNTIME_ICB_PREBUILT_TABLES",
         "GEMMA_METAL_ICB_PREBUILT_TABLES",
     ])
     .unwrap_or(true)
@@ -235,7 +229,8 @@ pub fn icb_freeze_binds_enabled() -> bool {
         return v == 1;
     }
     let on = env_truthy(&[
-        "TESSL_ICB_FREEZE_BINDS", "METAL_RUNTIME_ICB_FREEZE_BINDS",
+        "TESSL_ICB_FREEZE_BINDS",
+        "METAL_RUNTIME_ICB_FREEZE_BINDS",
         "GEMMA_METAL_ICB_FREEZE_BINDS",
     ])
     .unwrap_or(false);
@@ -263,7 +258,8 @@ pub fn icb_range_batch_enabled() -> bool {
         return v == 1;
     }
     let on = env_truthy(&[
-        "TESSL_ICB_RANGE_BATCH", "METAL_RUNTIME_ICB_RANGE_BATCH",
+        "TESSL_ICB_RANGE_BATCH",
+        "METAL_RUNTIME_ICB_RANGE_BATCH",
         "GEMMA_METAL_ICB_RANGE_BATCH",
     ])
     .unwrap_or(false);
@@ -290,7 +286,8 @@ pub fn icb_coarse_ranges_enabled() -> bool {
         return v == 1;
     }
     if let Some(on) = env_truthy(&[
-        "TESSL_ICB_COARSE_RANGES", "METAL_RUNTIME_ICB_COARSE_RANGES",
+        "TESSL_ICB_COARSE_RANGES",
+        "METAL_RUNTIME_ICB_COARSE_RANGES",
         "GEMMA_METAL_ICB_COARSE_RANGES",
     ]) {
         ICB_COARSE_RANGES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
@@ -380,10 +377,7 @@ struct EncodeCmdOpts {
 }
 
 impl DecodeIcb {
-    pub fn from_commands(
-        rt: &GpuRuntime,
-        commands: Vec<DecodeIcbCommand>,
-    ) -> Result<Self, String> {
+    pub fn from_commands(rt: &GpuRuntime, commands: Vec<DecodeIcbCommand>) -> Result<Self, String> {
         Self::from_commands_ex(rt, commands, icb_freeze_binds_enabled())
     }
 
@@ -619,8 +613,7 @@ impl DecodeIcb {
         rt: &GpuRuntime,
         commands: &[DecodeIcbCommand],
     ) -> Result<PrebuiltTables, String> {
-        let mut unique: Vec<(u64, Retained<ProtocolObject<dyn MTL4ArgumentTable>>)> =
-            Vec::new();
+        let mut unique: Vec<(u64, Retained<ProtocolObject<dyn MTL4ArgumentTable>>)> = Vec::new();
         let mut tables = Vec::with_capacity(commands.len());
         for cmd in commands {
             let fp = buf_bind_fingerprint(&cmd.binds);
@@ -800,11 +793,7 @@ impl DecodeIcb {
                     } = b
                     {
                         unsafe {
-                            icmd.setKernelBuffer_offset_atIndex(
-                                buf.metal(),
-                                *byte_offset,
-                                *index,
-                            );
+                            icmd.setKernelBuffer_offset_atIndex(buf.metal(), *byte_offset, *index);
                         }
                     }
                 }
@@ -956,8 +945,12 @@ impl DecodeIcb {
             self.barriers_coarsened = true;
         }
         let use_icb_exec = freeze
-            || env_truthy(&["TESSL_ICB_EXECUTE", "METAL_RUNTIME_ICB_EXECUTE", "GEMMA_METAL_ICB_EXECUTE"])
-                .unwrap_or(false);
+            || env_truthy(&[
+                "TESSL_ICB_EXECUTE",
+                "METAL_RUNTIME_ICB_EXECUTE",
+                "GEMMA_METAL_ICB_EXECUTE",
+            ])
+            .unwrap_or(false);
         let need_opt = !self.optimized;
         let icb = self.icb.clone();
         let n = self.commands.len() as u64;
@@ -1003,9 +996,16 @@ impl DecodeIcb {
                         None
                     };
                     let (icb_n, icb_cmds) = Self::encode_cmd(
-                        bnd, cmd, &icb, i,
-                        EncodeCmdOpts { use_icb_exec, freeze_binds: freeze },
-                        prebuilt, &mut s,
+                        bnd,
+                        cmd,
+                        &icb,
+                        i,
+                        EncodeCmdOpts {
+                            use_icb_exec,
+                            freeze_binds: freeze,
+                        },
+                        prebuilt,
+                        &mut s,
                     );
                     execute_icb_calls = execute_icb_calls.saturating_add(icb_n);
                     execute_icb_cmds = execute_icb_cmds.saturating_add(icb_cmds);
@@ -1056,8 +1056,7 @@ impl DecodeIcb {
                         for b in &cmd.binds {
                             sticky.bind_total = sticky.bind_total.saturating_add(1);
                             if matches!(b, DecodeIcbBind::Buf { .. }) {
-                                sticky.prebuilt_elided =
-                                    sticky.prebuilt_elided.saturating_add(1);
+                                sticky.prebuilt_elided = sticky.prebuilt_elided.saturating_add(1);
                             }
                         }
                     }
@@ -1078,9 +1077,16 @@ impl DecodeIcb {
                         None
                     };
                     let (icb_n, icb_cmds) = Self::encode_cmd(
-                        bnd, cmd, &icb, i,
-                        EncodeCmdOpts { use_icb_exec, freeze_binds: freeze },
-                        prebuilt, &mut sticky,
+                        bnd,
+                        cmd,
+                        &icb,
+                        i,
+                        EncodeCmdOpts {
+                            use_icb_exec,
+                            freeze_binds: freeze,
+                        },
+                        prebuilt,
+                        &mut sticky,
                     );
                     execute_icb_calls = execute_icb_calls.saturating_add(icb_n);
                     execute_icb_cmds = execute_icb_cmds.saturating_add(icb_cmds);
@@ -1128,7 +1134,10 @@ impl DecodeIcb {
         prebuilt: Option<&ProtocolObject<dyn MTL4ArgumentTable>>,
         sticky: &mut StickyArgTable,
     ) -> (u64, u64) {
-        let EncodeCmdOpts { use_icb_exec, freeze_binds } = opts;
+        let EncodeCmdOpts {
+            use_icb_exec,
+            freeze_binds,
+        } = opts;
         let mut icb_calls = 0u64;
         let mut icb_cmds = 0u64;
         if freeze_binds {
@@ -1386,8 +1395,12 @@ pub fn icb_pipelines_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = env_truthy(&["TESSL_ICB_PIPELINES", "METAL_RUNTIME_ICB_PIPELINES", "GEMMA_METAL_ICB_PIPELINES"])
-        .unwrap_or(false);
+    let on = env_truthy(&[
+        "TESSL_ICB_PIPELINES",
+        "METAL_RUNTIME_ICB_PIPELINES",
+        "GEMMA_METAL_ICB_PIPELINES",
+    ])
+    .unwrap_or(false);
     ICB_PIPELINES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
 }
@@ -1489,9 +1502,8 @@ mod tests {
         dec.execute(&rt).unwrap();
         rt.synchronize().unwrap();
         let n = 32usize;
-        let out = unsafe {
-            std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n)
-        };
+        let out =
+            unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in out.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0, "mismatch at {i}");
         }
@@ -1502,9 +1514,8 @@ mod tests {
         }
         dec.execute(&rt).unwrap();
         rt.synchronize().unwrap();
-        let out2 = unsafe {
-            std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n)
-        };
+        let out2 =
+            unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in out2.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0);
         }
@@ -1540,9 +1551,8 @@ mod tests {
         dec.execute(&rt).unwrap();
         rt.synchronize().unwrap();
         let n = 32usize;
-        let out = unsafe {
-            std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n)
-        };
+        let out =
+            unsafe { std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in out.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0, "freeze mismatch at {i}");
         }
@@ -1551,7 +1561,10 @@ mod tests {
         assert_eq!(set_tables, 0, "freeze must issue 0 setArgumentTable");
         assert_eq!(set_calls, 0);
         assert_eq!(elided, bind_total);
-        eprintln!("decode_icb_freeze_binds_zero_arg_table: {}", dec.status_line());
+        eprintln!(
+            "decode_icb_freeze_binds_zero_arg_table: {}",
+            dec.status_line()
+        );
     }
 
     #[test]
@@ -1700,18 +1713,18 @@ mod tests {
         rt.synchronize().unwrap();
         let (calls, covered) = dec.last_execute_icb_stats();
         // Spans: [a→b, c→d] + barrier + [b→e] + barrier → 2 execute_icb
-        assert_eq!(calls, 2, "coarse+range should yield 2 execute_icb, got {calls}");
+        assert_eq!(
+            calls, 2,
+            "coarse+range should yield 2 execute_icb, got {calls}"
+        );
         assert_eq!(covered, 3);
         assert_eq!(dec.barriers_elided(), 1);
-        let out_b = unsafe {
-            std::slice::from_raw_parts(b.metal().contents().as_ptr() as *const f32, n)
-        };
-        let out_d = unsafe {
-            std::slice::from_raw_parts(d.metal().contents().as_ptr() as *const f32, n)
-        };
-        let out_e = unsafe {
-            std::slice::from_raw_parts(e.metal().contents().as_ptr() as *const f32, n)
-        };
+        let out_b =
+            unsafe { std::slice::from_raw_parts(b.metal().contents().as_ptr() as *const f32, n) };
+        let out_d =
+            unsafe { std::slice::from_raw_parts(d.metal().contents().as_ptr() as *const f32, n) };
+        let out_e =
+            unsafe { std::slice::from_raw_parts(e.metal().contents().as_ptr() as *const f32, n) };
         for i in 0..n {
             assert_eq!(out_b[i], (i as f32) + 1.0, "b mismatch");
             assert_eq!(out_d[i], (i as f32) + 10.0, "d mismatch");

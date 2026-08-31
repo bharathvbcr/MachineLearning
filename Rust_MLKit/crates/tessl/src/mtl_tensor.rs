@@ -45,8 +45,7 @@ impl QuantDType {
                     .into(),
             ),
             QuantDType::Fp8E8M0 => Err(
-                "FP8 E8M0 MTLTensor scale planes require newer Metal SDK (macOS 27+ notes)"
-                    .into(),
+                "FP8 E8M0 MTLTensor scale planes require newer Metal SDK (macOS 27+ notes)".into(),
             ),
         }
     }
@@ -230,10 +229,7 @@ pub fn try_quant_tensorops_prefill_gemm(
     _b: &GpuTensor,
     _c: &crate::tensor::Tensor,
 ) -> Result<(), String> {
-    Err(
-        "quant TensorOps prefill GEMM not wired yet (Phase 2); use hand GEMV for decode"
-            .into(),
-    )
+    Err("quant TensorOps prefill GEMM not wired yet (Phase 2); use hand GEMV for decode".into())
 }
 
 #[cfg(test)]
@@ -245,7 +241,10 @@ mod tests {
         assert!(QuantDType::Int8.to_mtl().is_ok());
         let err = QuantDType::Int4.to_mtl().unwrap_err();
         assert!(err.contains("Int4"), "{err}");
-        assert!(err.contains("unbound") || err.contains("not in objc2"), "{err}");
+        assert!(
+            err.contains("unbound") || err.contains("not in objc2"),
+            "{err}"
+        );
         assert!(QuantDType::Fp8E8M0.to_mtl().is_err());
     }
 

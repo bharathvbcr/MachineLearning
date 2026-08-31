@@ -462,9 +462,7 @@ impl PingPongCbReplay {
 
     /// Any slot in Ready (eligible for ICB replay).
     pub fn has_ready_slot(&self) -> bool {
-        self.slots
-            .iter()
-            .any(|s| s.phase == CbReplayPhase::Ready)
+        self.slots.iter().any(|s| s.phase == CbReplayPhase::Ready)
     }
 
     /// Execute the attached DecodeIcb (after a successful [`Self::try_replay`]).
@@ -588,7 +586,11 @@ impl PingPongCbReplay {
     }
 
     /// Begin recording into `slot` (must be Idle or Ready after GPU wait).
-    pub fn begin_record(&mut self, slot: CbSlot, label: impl Into<String>) -> Result<(), CbReplayError> {
+    pub fn begin_record(
+        &mut self,
+        slot: CbSlot,
+        label: impl Into<String>,
+    ) -> Result<(), CbReplayError> {
         let s = &mut self.slots[slot.index()];
         match s.phase {
             CbReplayPhase::Idle | CbReplayPhase::Ready => {}
@@ -799,9 +801,8 @@ mod tests {
         assert_eq!(pp.icb_replays(), 1);
         assert_eq!(pp.icb_stub().phase, IcbStubPhase::Allocated);
         let n = 32usize;
-        let got = unsafe {
-            std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n)
-        };
+        let got =
+            unsafe { std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in got.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0, "mismatch at {i}");
         }
@@ -813,11 +814,11 @@ mod tests {
             let q = out.metal().contents().as_ptr() as *mut u8;
             std::ptr::write_bytes(q, 0xFF, n * 4);
         }
-        pp.try_replay_icb(CbSlot::A, &rt).expect("second try_replay_icb");
+        pp.try_replay_icb(CbSlot::A, &rt)
+            .expect("second try_replay_icb");
         rt.synchronize().unwrap();
-        let got2 = unsafe {
-            std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n)
-        };
+        let got2 =
+            unsafe { std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n) };
         for (i, v) in got2.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) + 1.0);
         }

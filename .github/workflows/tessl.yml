@@ -71,28 +71,11 @@ jobs:
         with:
           workspaces: Rust_MLKit/crates/tessl
 
-      # Style gates are non-blocking on purpose, and this is a temporary state
-      # with a number attached, not a permanent shrug.
-      #
-      # As of adding this workflow, tessl does not pass either gate: 10 files
-      # need rustfmt, and clippy reports 45 findings across five lint kinds
-      # (manual_div_ceil, needless_range_loop, unnecessary_cast,
-      # too_many_arguments, unusual_byte_groupings). All are stylistic — a newer
-      # clippy than the one the last cleanup pass ran against, not new defects.
-      #
-      # They are run here so the debt is visible on every push rather than
-      # invisible until someone remembers. Reformatting ten files and rewriting
-      # 45 call sites is its own change with its own review, not a side effect
-      # of adding CI. Drop `continue-on-error` on both steps once that lands.
-      - name: rustfmt (non-blocking, 10 files currently fail)
-        continue-on-error: true
-        run: cargo fmt --all --check
-      - name: clippy (non-blocking, 45 findings currently)
-        continue-on-error: true
-        run: cargo clippy --all-targets -- -D warnings
-      - name: clippy with quant-prep (non-blocking)
-        continue-on-error: true
-        run: cargo clippy --all-targets --features quant-prep -- -D warnings
+      # Blocking. The debt these were introduced non-blocking to surface —
+      # 10 unformatted files and 45 clippy findings — has been cleared.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features quant-prep -- -D warnings
 
       - name: Probe the runner's Metal capabilities
         # Informational, never a gate. Reports whether this runner has a device
