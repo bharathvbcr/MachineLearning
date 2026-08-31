@@ -105,10 +105,29 @@ pub struct DecodeIcbCommand {
     /// calls. Replay must honor these instead of forcing always-on for every cmd
     /// (product tok/s regression under shipping hazard skip-auto — D16).
     pub barrier_after: bool,
+    /// Binds that reached the encoder but could NOT be recorded on the tape.
+    ///
+    /// [`crate::dispatch::Binder::bind_buf`] and `bind_resource_id` take a raw
+    /// `MTLBuffer` / `MTLResourceID` with no owning `GpuBuffer`, so there is
+    /// nothing for [`DecodeIcbBind::Buf`] to hold — and holding it is what pins
+    /// the operand's `Arc`. Every GEMM binds A, B and C through `bind_buf`, so
+    /// a captured GEMM recorded only its scalar immediates: replay would rebind
+    /// no operands at all, and the unrecorded buffers were pinned by nothing,
+    /// free to be recycled and handed to a new tensor while the tape still
+    /// logically referenced them.
+    ///
+    /// Recording the count turns that from a silent wrong answer into a refusal
+    /// — see the check in [`DecodeIcb::from_commands_ex`].
+    pub incomplete_binds: usize,
 }
 
 /// MTL4 argument-table max buffer bind count (matches runtime table descriptor).
-const ARG_TABLE_SLOTS: usize = 31;
+/// Re-export of the one authority on the argument table's size.
+///
+/// This was a second `= 31` literal sitting beside `runtime`'s. Two constants
+/// for one hardware limit is how they drift, and this one is compared against
+/// caller-supplied bind indices.
+use crate::runtime::ARGUMENT_TABLE_MAX_BUFFERS as ARG_TABLE_SLOTS;
 
 /// Sticky arg-table state for A2: skip `setAddress` when the slot already holds
 /// the same GPU address across consecutive tape commands.
@@ -338,6 +357,11 @@ pub struct DecodeIcb {
     encoded: bool,
     optimized: bool,
     execute_count: u64,
+    /// Whether the most recent `execute` was suppressed by binder-encode-nop.
+    ///
+    /// Distinguishes "a replay ran" from "a replay was asked for while encoding
+    /// was disabled", which the counters alone cannot express.
+    last_execute_was_nop: bool,
     /// True when built from a Binder capture of the mini layer/head graph
     /// (not the `mini_copy_chain` smoke). Enables host-encode skip on replay.
     layer_graph: bool,
@@ -392,6 +416,67 @@ impl DecodeIcb {
         if commands.is_empty() {
             return Err("DecodeIcb: empty command list".into());
         }
+        // Reject bind indices the argument table cannot hold.
+        //
+        // The prebuilt and freeze paths filter `index < ARG_TABLE_SLOTS` and
+        // silently drop anything above, while `Binder::bind_addr` correctly
+        // errors on the same index — so a tape could be built with `index: 40`,
+        // return `Ok`, and replay with that operand simply absent. Worse,
+        // `buf_bind_fingerprint` applies the same filter, so two commands
+        // differing *only* in an out-of-range bind hash identically and share
+        // one prebuilt argument table.
+        //
+        // Unlike the incomplete-bind check below, this is not scoped to
+        // freeze-binds: an index past the table is invalid in every mode.
+        for (i, cmd) in commands.iter().enumerate() {
+            for b in &cmd.binds {
+                let index = match b {
+                    DecodeIcbBind::Buf { index, .. } | DecodeIcbBind::Immediate { index, .. } => {
+                        *index
+                    }
+                };
+                if index >= ARG_TABLE_SLOTS {
+                    return Err(format!(
+                        "DecodeIcb: command {i} binds index {index}, but the argument table \
+                         has {ARG_TABLE_SLOTS} slots. Encoding would drop it silently."
+                    ));
+                }
+            }
+        }
+        // Refuse a freeze-binds tape that is missing operands.
+        //
+        // Scope matters here, and getting it wrong disables a shipping feature.
+        // Under the default path the ICB is built with `setInheritBuffers(true)`
+        // and picks up the *live* argument table at execute time, so binds that
+        // never reached the tape are supplied by the encoder anyway and the
+        // caller's own handles keep the buffers alive. Refusing there breaks
+        // gemma-metal's layer-graph replay for a hazard it does not have —
+        // measured: six of its tests fail.
+        //
+        // Under `freeze_binds` the descriptor sets `setInheritBuffers(false)`
+        // and each command's binds are written into the ICB with
+        // `setKernelBuffer`. There the tape *is* the source of truth: a bind
+        // that was never recorded leaves that slot unwritten on every replay,
+        // and pins no `Arc`, so the buffer it referred to can be recycled into
+        // an unrelated tensor while the tape still logically points at it. Both
+        // failures are silent, which is why this refuses instead of warning.
+        if freeze_binds {
+            if let Some((i, cmd)) = commands
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.incomplete_binds > 0)
+            {
+                return Err(format!(
+                    "DecodeIcb freeze_binds: command {i} has {} bind(s) that could not be \
+                     recorded (bound through bind_buf / bind_resource_id, which carry no \
+                     owning GpuBuffer). Freeze-binds writes the tape's binds into the ICB, \
+                     so those slots would stay unwritten on every replay and pin nothing \
+                     against recycling. Bind through bind_tensor or bind_gpu_buf.",
+                    cmd.incomplete_binds
+                ));
+            }
+        }
+
         let mut commands = commands;
         if freeze_binds {
             // Classic setKernelBuffer needs real MTLBuffers; materialize any
@@ -446,6 +531,7 @@ impl DecodeIcb {
             encoded: false,
             optimized: false,
             execute_count: 0,
+            last_execute_was_nop: false,
             layer_graph,
             triage_probe: None,
             last_bind_total: 0,
@@ -744,6 +830,8 @@ impl DecodeIcb {
                 owned_immediates: Vec::new(),
                 // a→b must drain before b→c (no live always-on during tape execute).
                 barrier_after: true,
+                // Built from GpuBuffers directly, so nothing is unrecordable.
+                incomplete_binds: 0,
             },
             DecodeIcbCommand {
                 pipeline: pipe,
@@ -753,6 +841,7 @@ impl DecodeIcb {
                 tg_mem: None,
                 owned_immediates: Vec::new(),
                 barrier_after: false,
+                incomplete_binds: 0,
             },
         ];
         let dec = Self::from_commands_ex(rt, cmds, freeze_binds)?;
@@ -827,6 +916,12 @@ impl DecodeIcb {
 
     pub fn encoded(&self) -> bool {
         self.encoded
+    }
+
+    /// Whether the most recent [`DecodeIcb::execute`] was a no-op because
+    /// binder-encode-nop was in force.
+    pub fn last_execute_was_nop(&self) -> bool {
+        self.last_execute_was_nop
     }
 
     pub fn execute_count(&self) -> u64 {
@@ -938,6 +1033,21 @@ impl DecodeIcb {
         if !self.encoded {
             return Err("DecodeIcb: encode before execute".into());
         }
+        // Under binder-encode-nop every `with_binder` body is skipped, so this
+        // whole call is a no-op: no dispatch is encoded and the destination
+        // buffers keep whatever they held. It used to return `Ok` while
+        // incrementing `execute_count` and setting `optimized` — reporting a
+        // completed, optimized replay for work that provably did not happen,
+        // which `cb_replay` then counted as a successful tape replay.
+        //
+        // Control flow is deliberately unchanged (callers hold this guard
+        // around encode loops and expect a benign no-op); only the bookkeeping
+        // is corrected, and the fact is recorded so a caller can tell.
+        if crate::decode_icb::binder_encode_nop() {
+            self.last_execute_was_nop = true;
+            return Ok(());
+        }
+        self.last_execute_was_nop = false;
         let freeze = self.freeze_binds;
         let range_batch = freeze && icb_range_batch_enabled();
         if range_batch && icb_coarse_ranges_enabled() && !self.barriers_coarsened {
@@ -1248,6 +1358,8 @@ pub struct DecodeIcbCapture {
     current_pipeline: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     current_binds: Vec<DecodeIcbBind>,
     current_tg_mem: Option<(usize, usize)>,
+    /// Binds seen since the last `note_pipeline` that could not be recorded.
+    unrecordable_binds: usize,
 }
 
 impl DecodeIcbCapture {
@@ -1255,6 +1367,12 @@ impl DecodeIcbCapture {
         self.current_pipeline = Some(p);
         self.current_binds.clear();
         self.current_tg_mem = None;
+        self.unrecordable_binds = 0;
+    }
+
+    /// Note a bind that reached the encoder but carries no owning `GpuBuffer`.
+    pub fn note_unrecordable_bind(&mut self) {
+        self.unrecordable_binds += 1;
     }
 
     pub fn note_bind(&mut self, index: usize, buf: &GpuBuffer, byte_offset: usize) {
@@ -1299,14 +1417,27 @@ impl DecodeIcbCapture {
         let Some(pipeline) = self.current_pipeline.clone() else {
             return;
         };
+        // Clone rather than take. The argument table is a property of the
+        // encoder, not of a single dispatch: under one `set_pipeline`, a second
+        // dispatch inherits every bind the first one used. Taking them recorded
+        // the second dispatch with zero binds — measured as
+        // `cmd0: binds=3, cmd1: binds=0` for one pipeline and two dispatches,
+        // which is exactly the shape of the split-K loop. That loop survived
+        // only because it happens to re-bind all seven scalars every iteration.
+        //
+        // `current_binds` is already a slot table keyed by index, with
+        // last-write-wins in `note_bind` / `note_immediate`, so carrying it
+        // forward models the real argument table rather than accumulating
+        // duplicates.
         self.commands.push(DecodeIcbCommand {
             pipeline,
             threadgroups,
             threads_per_tg,
-            binds: std::mem::take(&mut self.current_binds),
-            tg_mem: self.current_tg_mem.take(),
+            binds: self.current_binds.clone(),
+            tg_mem: self.current_tg_mem,
             owned_immediates: Vec::new(),
             barrier_after: false,
+            incomplete_binds: self.unrecordable_binds,
         });
     }
 
@@ -1338,6 +1469,15 @@ pub(crate) fn capture_note_pipeline(p: Retained<ProtocolObject<dyn MTLComputePip
     CAPTURE.with(|c| {
         if let Some(ref mut cap) = *c.borrow_mut() {
             cap.note_pipeline(p);
+        }
+    });
+}
+
+/// Record that a bind reached the encoder but could not be put on the tape.
+pub(crate) fn capture_note_unrecordable_bind() {
+    CAPTURE.with(|c| {
+        if let Some(cap) = c.borrow_mut().as_mut() {
+            cap.note_unrecordable_bind();
         }
     });
 }
@@ -1420,18 +1560,27 @@ pub fn binder_encode_nop() -> bool {
 }
 
 /// RAII: enable binder encode nop; restore off on drop.
-pub struct BinderEncodeNopGuard;
+pub struct BinderEncodeNopGuard {
+    /// The flag value this guard replaced, restored on drop.
+    previous: bool,
+}
 
 impl BinderEncodeNopGuard {
     pub fn enter() -> Self {
+        // Remember what was in effect. Restoring a constant `false` on drop
+        // meant an inner guard ended an outer guard's scope: with two nested
+        // guards, the inner drop re-enabled encoding while the outer guard was
+        // still logically in force, so the layers it was meant to suppress got
+        // encoded after all.
+        let previous = binder_encode_nop();
         set_binder_encode_nop(true);
-        Self
+        Self { previous }
     }
 }
 
 impl Drop for BinderEncodeNopGuard {
     fn drop(&mut self) {
-        set_binder_encode_nop(false);
+        set_binder_encode_nop(self.previous);
     }
 }
 
@@ -1608,6 +1757,7 @@ mod tests {
             tg_mem: None,
             owned_immediates: Vec::new(),
             barrier_after,
+            incomplete_binds: 0,
         };
         let cmds = vec![mk(&a, false), mk(&b, false), mk(&c, true)];
 
@@ -1691,6 +1841,7 @@ mod tests {
             tg_mem: None,
             owned_immediates: Vec::new(),
             barrier_after: bar,
+            incomplete_binds: 0,
         };
         // a→b (bar) | c→d (bar) | b→e (bar). First bar is disjoint from c→d → elide.
         // Second bar: span writes include b (from a→b) and d; b→e reads b → keep.
@@ -1735,6 +1886,196 @@ mod tests {
         eprintln!(
             "decode_icb_coarse_ranges_elides_disjoint_keeps_raw: {}",
             dec.status_line()
+        );
+    }
+
+    /// A second dispatch under one `set_pipeline` inherits the first one's binds.
+    ///
+    /// The argument table belongs to the encoder, not to a dispatch. Recording
+    /// it with `mem::take` gave `cmd0: binds=N, cmd1: binds=0`, so a replayed
+    /// tape would leave every slot unwritten for the second and later
+    /// dispatches. The split-K loop has exactly this shape and survived only
+    /// because it re-binds all seven scalars every iteration.
+    ///
+    /// Against the pre-fix code this asserts `3 == 0` on the second command.
+    #[test]
+    fn binds_persist_across_dispatches_under_one_pipeline() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let a = rt.alloc_buffer_hot(64 * 4).expect("a");
+        let b = rt.alloc_buffer_hot(64 * 4).expect("b");
+        let n = rt.alloc_buffer_hot(4).expect("n");
+        let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+
+        begin_decode_icb_capture();
+        capture_note_pipeline(pipe);
+        capture_note_bind(0, &a, 0);
+        capture_note_bind(1, &b, 0);
+        capture_note_bind(2, &n, 0);
+        let tg = mtl_size(1, 1, 1);
+        capture_note_dispatch(tg, tg);
+        // No re-binding between the two dispatches: the table still holds them.
+        capture_note_dispatch(tg, tg);
+        let cap = take_decode_icb_capture().expect("capture");
+
+        assert_eq!(cap.commands.len(), 2, "two dispatches were recorded");
+        assert_eq!(cap.commands[0].binds.len(), 3);
+        assert_eq!(
+            cap.commands[1].binds.len(),
+            3,
+            "the second dispatch inherits the argument table; recording it with \
+             zero binds would replay with unwritten slots"
+        );
+    }
+
+    /// A suppressed execute must not be counted as a replay that happened.
+    ///
+    /// Under binder-encode-nop every `with_binder` body is skipped, so
+    /// `execute` encodes nothing and the destination keeps its prior contents.
+    /// It nonetheless returned `Ok`, incremented `execute_count` and set
+    /// `optimized` — and `cb_replay` counted that as a successful tape replay.
+    /// A token that did not happen was indistinguishable from one that did.
+    ///
+    /// Against the pre-fix code `execute_count` is 1 and `optimized` is true.
+    #[test]
+    fn an_execute_suppressed_by_nop_is_not_counted() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        set_decode_icb(true);
+        let (mut dec, out) = DecodeIcb::mini_copy_chain(&rt, 64).expect("mini copy chain");
+        let before = dec.execute_count();
+
+        set_binder_encode_nop(true);
+        let result = dec.execute(&rt);
+        set_binder_encode_nop(false);
+
+        result.expect("a suppressed execute stays benign for callers holding the guard");
+        assert!(
+            dec.last_execute_was_nop(),
+            "the suppression must be observable"
+        );
+        assert_eq!(
+            dec.execute_count(),
+            before,
+            "no dispatch was encoded, so no execute may be counted"
+        );
+        // The destination is untouched, which is what makes the old accounting
+        // a lie rather than a rounding difference.
+        let _ = out;
+    }
+
+    /// A nested nop guard must not end its parent's scope on drop.
+    ///
+    /// `Drop` restored a constant `false`, so an inner guard's drop re-enabled
+    /// encoding while the outer guard was still logically in force — and the
+    /// layers the outer guard existed to suppress got encoded after all.
+    ///
+    /// Against the pre-fix code the final assertion sees `false`.
+    #[test]
+    fn a_nested_nop_guard_restores_its_parent() {
+        let _flags = IcbFlagsTestGuard::lock();
+        set_binder_encode_nop(false);
+        assert!(!binder_encode_nop());
+
+        let outer = BinderEncodeNopGuard::enter();
+        assert!(binder_encode_nop(), "the outer guard enables nop");
+        {
+            let _inner = BinderEncodeNopGuard::enter();
+            assert!(binder_encode_nop());
+        }
+        assert!(
+            binder_encode_nop(),
+            "the inner guard's drop must restore the outer guard's state, not a constant"
+        );
+        drop(outer);
+        assert!(!binder_encode_nop(), "the outer drop restores the original");
+    }
+
+    /// A bind the argument table cannot hold must be refused, not dropped.
+    ///
+    /// The prebuilt and freeze encode paths filter `index < ARG_TABLE_SLOTS`
+    /// and silently drop anything above, so a tape built with `index: 40` used
+    /// to return `Ok` and replay with that operand absent. `buf_bind_fingerprint`
+    /// applies the same filter, so two commands differing only in an
+    /// out-of-range bind also collided onto one shared table.
+    ///
+    /// Against the pre-fix code `from_commands` returns `Ok` here.
+    #[test]
+    fn an_out_of_range_bind_index_is_refused() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let a = rt.alloc_buffer_hot(64 * 4).expect("a");
+        let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+        let tg = mtl_size(1, 1, 1);
+
+        // ARG_TABLE_SLOTS is 31, so 31 is already one past the end.
+        for index in [ARG_TABLE_SLOTS, 40] {
+            let cmds = vec![DecodeIcbCommand {
+                pipeline: pipe.clone(),
+                threadgroups: tg,
+                threads_per_tg: tg,
+                binds: vec![DecodeIcbBind::Buf {
+                    index,
+                    buf: a.clone(),
+                    byte_offset: 0,
+                    gpu_addr: buf_gpu_addr(&a, 0),
+                }],
+                tg_mem: None,
+                owned_immediates: Vec::new(),
+                barrier_after: false,
+                incomplete_binds: 0,
+            }];
+            let err = DecodeIcb::from_commands(&rt, cmds)
+                .map(|_| ())
+                .expect_err("index {index} is past the argument table");
+            assert!(
+                err.contains("argument table"),
+                "the error must name the cause, got: {err}"
+            );
+        }
+    }
+
+    /// A tape with binds that could not be recorded must be refused, not replayed.
+    ///
+    /// `bind_buf` takes a raw `MTLBuffer` with no owning `GpuBuffer`, so there
+    /// is nothing to record and nothing to pin. Every GEMM binds A, B and C
+    /// that way, so a captured GEMM recorded only its scalar immediates.
+    /// Replaying it would leave the operand slots unwritten *and* leave the
+    /// buffers free to be recycled into unrelated tensors — both silent.
+    ///
+    /// Against the pre-fix code `from_commands` returns `Ok` here.
+    #[test]
+    fn a_tape_missing_operand_binds_is_refused() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        let a = rt.alloc_buffer_hot(64 * 4).expect("a");
+        let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb pipeline");
+
+        begin_decode_icb_capture();
+        capture_note_pipeline(pipe);
+        capture_note_bind(0, &a, 0);
+        // Stand in for `Binder::bind_buf`, which reaches the encoder with no
+        // owning handle for the tape to hold.
+        capture_note_unrecordable_bind();
+        let tg = mtl_size(1, 1, 1);
+        capture_note_dispatch(tg, tg);
+        let cap = take_decode_icb_capture().expect("capture");
+
+        assert_eq!(cap.commands[0].incomplete_binds, 1);
+
+        // Inherit mode is fine: the live argument table supplies the bind.
+        DecodeIcb::from_commands_ex(&rt, cap.commands.clone(), false)
+            .map(|_| ())
+            .expect("inherit-buffers replay does not depend on the tape's binds");
+
+        // Freeze-binds writes the tape's binds into the ICB, so a missing one
+        // is an unwritten slot on every replay.
+        let err = DecodeIcb::from_commands_ex(&rt, cap.commands, true)
+            .map(|_| ())
+            .expect_err("a freeze-binds tape missing operands must not build");
+        assert!(
+            err.contains("could not be recorded"),
+            "the error must name the cause, got: {err}"
         );
     }
 }

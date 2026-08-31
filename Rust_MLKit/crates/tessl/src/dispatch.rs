@@ -193,6 +193,10 @@ impl<'a> Binder<'a> {
             self.fail("GPU address overflow");
             return;
         };
+        // A raw `MTLBuffer` carries no owning `GpuBuffer`, so there is nothing
+        // for the capture tape to record or to pin. Mark the tape incomplete
+        // instead of letting it silently omit the operand.
+        crate::decode_icb::capture_note_unrecordable_bind();
         self.bind_addr(addr, index);
     }
 
@@ -242,7 +246,27 @@ impl<'a> Binder<'a> {
     ///
     /// # Safety
     /// `index` must be within the argument table's buffer bind count.
+    /// # Safety
+    ///
+    /// `resource_id` must name a resource that stays alive and resident for the
+    /// duration of the encode. That is the caller's to guarantee and cannot be
+    /// checked here, which is why this stays `unsafe`.
+    ///
+    /// The range of `index` is *not* the caller's problem any more: it is
+    /// checked below. It used to be part of this contract while
+    /// `Binder::max_buffers` was private, so an out-of-crate caller had no way
+    /// to satisfy it — and an out-of-range index reached
+    /// `setResource:atBufferIndex:` on a 31-slot table. Probed directly: index
+    /// 31 passed through silently, `usize::MAX` took the process down with
+    /// SIGSEGV. Checking here fixes the class at the one place every caller
+    /// goes through.
     pub unsafe fn bind_resource_id(&mut self, resource_id: MTLResourceID, index: usize) {
+        if !self.valid_index(index) {
+            return;
+        }
+        // As `bind_buf`: a bare `MTLResourceID` carries no owning handle, so a
+        // capture that contains one cannot be replayed faithfully.
+        crate::decode_icb::capture_note_unrecordable_bind();
         unsafe {
             self.table
                 .setResource_atBufferIndex(resource_id, index as _);
