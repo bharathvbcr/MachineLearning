@@ -89,7 +89,7 @@ impl TrainingEngine {
                 config.optimizer
             ));
         }
-        let rt = GpuRuntime::new()?;
+        let rt = crate::gpu_runtime()?;
         rt.set_precision(match config.precision {
             PrecisionModeConfig::Bf16 => PrecisionMode::Bf16,
             PrecisionModeConfig::F32 => PrecisionMode::F32,
@@ -163,7 +163,7 @@ impl TrainingEngine {
 
     pub fn load(path: &Path) -> Result<Self, String> {
         let meta = read_training_checkpoint_meta(path)?;
-        let rt = GpuRuntime::new()?;
+        let rt = crate::gpu_runtime()?;
         rt.set_precision(if meta.bf16_precision {
             PrecisionMode::Bf16
         } else {

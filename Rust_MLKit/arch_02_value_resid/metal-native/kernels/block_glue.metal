@@ -92,14 +92,8 @@ kernel void mlp_act_sq_leaky_f32_to_bf16(
     y[gid] = bfloat(a * a);
 }
 
-/// Flatten attention heads [B,T,H,D] → [B,T,H*D] is a no-op (already contiguous).
-/// Copy tensor.
-kernel void copy_f32(
-    device const float *in [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    out[gid] = in[gid];
-}
+// Note: zero_f32, copy_f32, copy_bf16, add_inplace_f32, transpose2d_f32,
+// cast_f32_to_bf16, cast_bf16_to_f32 and softcap_f32 are defined once, in
+// tessl/kernels/utils.metal, and linked into this metallib by build.rs.
+// They were byte-identical duplicates here; two definitions of one kernel
+// is a metallib link error waiting to happen, not a redundancy.

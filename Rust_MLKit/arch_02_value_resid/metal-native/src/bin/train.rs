@@ -218,7 +218,7 @@ fn main() -> Result<(), String> {
             Some("1") | Some("true") | Some("TRUE") | Some("yes")
         );
 
-    let rt = GpuRuntime::new()?;
+    let rt = tessl_arch02::gpu_runtime()?;
     if let Some(mb) = pool_cache_mb {
         rt.set_pool_cache_cap_bytes(mb.saturating_mul(1024 * 1024));
     }

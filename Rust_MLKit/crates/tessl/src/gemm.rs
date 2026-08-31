@@ -833,6 +833,11 @@ pub fn gemm_tn_accum_train(
 }
 
 /// C += A[M,K] @ B[N,K]^T (NT accumulate). No C zero.
+///
+/// All call sites are **dX-class** accumulations into fresh pre-zeroed
+/// activation-grad buffers (never weight banks), so this path additionally
+/// honors `TESSL_GEMM_ACCUM_DX` — accumulate-mode dX with dW kept on the
+/// Soft-safe temp+add path (arch_02 Audit 7).
 pub fn gemm_nt_accum_train(
     a_mk: &Tensor,
     b_nk: &Tensor,
@@ -842,7 +847,7 @@ pub fn gemm_nt_accum_train(
     let (m, n, k) = validate_gemm(a_mk, b_nk, c, Layout::NT, use_bf16_gemm(a_mk.runtime(), backend))?;
 
     let rt = a_mk.runtime();
-    let use_accum = crate::ab_flags::gemm_accum();
+    let use_accum = crate::ab_flags::gemm_accum() || crate::ab_flags::gemm_accum_dx();
     if use_accum && use_bf16_gemm(rt, backend) {
         let a_bf = ensure_bf16(a_mk)?;
         let b_bf = ensure_bf16(b_nk)?;

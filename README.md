@@ -126,10 +126,10 @@ The Metal GEMM/runtime crates are named `tessl`. They were renamed from
 names and were deliberately **not** rewritten, since they record what was true
 when they were written.
 
-| directory | package | lib |
-|---|---|---|
-| `Rust_MLKit/crates/tessl/` | `tessl` | `tessl` |
-| `Rust_MLKit/arch_02_value_resid/metal-native/` | `tessl-arch02` | `tessl_arch02` |
+| directory | package | lib | role |
+|---|---|---|---|
+| `Rust_MLKit/crates/tessl/` | `tessl` | `tessl` | Metal 4 GEMM + encode runtime. Owns the GEMM kernels, benchmarks and audit. |
+| `Rust_MLKit/arch_02_value_resid/metal-native/` | `tessl-arch02` | `tessl_arch02` | arch_02 trainer. Depends on `tessl`; keeps only its training kernels and modules. |
 
 The `arch_02_value_resid/metal-native/` directory keeps its name (it is the
 arch_02 experiment's trainer), and the `METAL_NATIVE_*` / `METAL_RUNTIME_*`

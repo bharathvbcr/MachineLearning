@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 fn main() -> Result<(), String> {
-    let rt = Arc::new(GpuRuntime::new()?);
+    let rt = Arc::new(tessl_arch02::gpu_runtime()?);
     let b: usize = std::env::var("BENCH_B")
         .ok()
         .and_then(|s| s.parse().ok())

@@ -161,17 +161,6 @@ kernel void rms_norm_scale_bwd_f32(
         }
     }
 }
-
-kernel void add_inplace_f32(
-    device float *dst [[buffer(0)]],
-    device const float *src [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    dst[gid] += src[gid];
-}
-
 kernel void copy_scale_f32(
     device const float *src [[buffer(0)]],
     device float *dst [[buffer(1)]],
@@ -182,29 +171,6 @@ kernel void copy_scale_f32(
     if (gid >= n) return;
     dst[gid] = src[gid] * scale;
 }
-
-kernel void transpose2d_f32(
-    device const float *in [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint &rows [[buffer(2)]],
-    constant uint &cols [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= rows * cols) return;
-    uint i = gid / cols;
-    uint j = gid % cols;
-    out[j * rows + i] = in[i * cols + j];
-}
-
-kernel void zero_f32(
-    device float *x [[buffer(0)]],
-    constant uint &n [[buffer(1)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    x[gid] = 0.0f;
-}
-
 /// Fuse rms_norm_scale_bwd (accum into residual dx) + residual_scale_add_bwd.
 /// `dx_mid` arrives with the MLP-residual contribution; this adds d(mlp_in) via
 /// RMS and then splits into dx_in + d_attn_out (+ dscale).
@@ -293,3 +259,9 @@ kernel void resid_mix_rms_norm_scale_bwd_f32(
         atomic_fetch_add_explicit(&dmix[C + c], d * x0[base + c], memory_order_relaxed);
     }
 }
+
+// Note: zero_f32, copy_f32, copy_bf16, add_inplace_f32, transpose2d_f32,
+// cast_f32_to_bf16, cast_bf16_to_f32 and softcap_f32 are defined once, in
+// tessl/kernels/utils.metal, and linked into this metallib by build.rs.
+// They were byte-identical duplicates here; two definitions of one kernel
+// is a metallib link error waiting to happen, not a redundancy.

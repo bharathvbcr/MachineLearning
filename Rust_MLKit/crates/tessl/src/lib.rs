@@ -18,6 +18,7 @@ pub mod gemm;
 pub mod icb_smoke;
 pub mod infer_trace;
 pub mod mtl_tensor;
+pub mod npy;
 pub mod ops;
 pub mod runtime;
 pub mod tensor;

@@ -282,13 +282,8 @@ pub fn slice_last_dim(t: &Tensor, start: usize, len: usize) -> Tensor {
     let byte_offset = t.byte_offset + start * 4;
     let mut shape = t.shape.clone();
     *shape.last_mut().unwrap() = len;
-    Tensor {
-        buffer: t.buffer.clone(),
-        shape,
-        dtype: t.dtype,
-        byte_offset,
-        runtime: Arc::clone(t.runtime()),
-    }
+    Tensor::from_buffer(t.runtime(), t.buffer.clone(), &shape, t.dtype, byte_offset)
+        .expect("these views are built over a buffer this crate just allocated")
 }
 
 pub fn accum_slice_grad(
@@ -372,13 +367,8 @@ pub fn reshape_heads(t: &Tensor, h: usize, p: usize) -> Tensor {
     shape.pop();
     shape.push(h);
     shape.push(p);
-    Tensor {
-        buffer: t.buffer.clone(),
-        shape,
-        dtype: t.dtype,
-        byte_offset: t.byte_offset,
-        runtime: Arc::clone(t.runtime()),
-    }
+    Tensor::from_buffer(t.runtime(), t.buffer.clone(), &shape, t.dtype, t.byte_offset)
+        .expect("these views are built over a buffer this crate just allocated")
 }
 
 pub fn flatten_heads(t: &Tensor, d_inner: usize) -> Tensor {
@@ -386,13 +376,8 @@ pub fn flatten_heads(t: &Tensor, d_inner: usize) -> Tensor {
     shape.pop();
     shape.pop();
     shape.push(d_inner);
-    Tensor {
-        buffer: t.buffer.clone(),
-        shape,
-        dtype: t.dtype,
-        byte_offset: t.byte_offset,
-        runtime: Arc::clone(t.runtime()),
-    }
+    Tensor::from_buffer(t.runtime(), t.buffer.clone(), &shape, t.dtype, t.byte_offset)
+        .expect("these views are built over a buffer this crate just allocated")
 }
 
 pub fn unflatten_heads(t: &Tensor, h: usize, p: usize) -> Tensor {

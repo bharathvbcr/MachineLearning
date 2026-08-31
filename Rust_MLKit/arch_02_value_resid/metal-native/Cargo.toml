@@ -21,19 +21,11 @@ path = "src/bin/verify_mixers.rs"
 name = "bench_conv1d"
 path = "src/bin/bench_conv1d.rs"
 
-[[bin]]
-name = "bench_gemm_sweep"
-path = "src/bin/bench_gemm_sweep.rs"
 
-[[bin]]
-name = "probe_gemm_parity"
-path = "src/bin/probe_gemm_parity.rs"
 
-[[bin]]
-name = "bench_gemm_tile_tune"
-path = "src/bin/bench_gemm_tile_tune.rs"
 
 [dependencies]
+tessl = { path = "../../crates/tessl" }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSError", "NSData", "NSValue", "NSRange"] }
 objc2-metal = { version = "0.3", features = [

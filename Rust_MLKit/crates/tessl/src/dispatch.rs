@@ -409,6 +409,57 @@ pub fn dispatch_1d(
     })
 }
 
+/// 1D-over-x grid with `ny` rows of threadgroups.
+pub fn dispatch_2d(
+    rt: &GpuRuntime,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    nx: usize,
+    ny: usize,
+    encode_bufs: impl FnOnce(&mut Binder<'_>),
+) -> Result<(), String> {
+    if nx == 0 || ny == 0 {
+        return Ok(());
+    }
+    if [nx, ny].iter().any(|&n| n > u32::MAX as usize) {
+        return Err("dispatch extent exceeds uint indexing".into());
+    }
+    let width = pipeline.threadExecutionWidth() as usize;
+    let tx = width.min(nx).max(1);
+    let groups_x = nx.div_ceil(tx);
+    rt.with_binder(|bnd| {
+        bnd.set_pipeline(pipeline);
+        encode_bufs(bnd);
+        bnd.dispatch(mtl_size(groups_x, ny, 1), mtl_size(tx, 1, 1));
+        Ok(())
+    })
+}
+
+/// 1D-over-x grid with `ny` x `nz` planes of threadgroups.
+pub fn dispatch_3d(
+    rt: &GpuRuntime,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    encode_bufs: impl FnOnce(&mut Binder<'_>),
+) -> Result<(), String> {
+    if nx == 0 || ny == 0 || nz == 0 {
+        return Ok(());
+    }
+    if [nx, ny, nz].iter().any(|&n| n > u32::MAX as usize) {
+        return Err("dispatch extent exceeds uint indexing".into());
+    }
+    let width = pipeline.threadExecutionWidth() as usize;
+    let tx = width.min(nx).max(1);
+    let groups_x = nx.div_ceil(tx);
+    rt.with_binder(|bnd| {
+        bnd.set_pipeline(pipeline);
+        encode_bufs(bnd);
+        bnd.dispatch(mtl_size(groups_x, ny, nz), mtl_size(tx, 1, 1));
+        Ok(())
+    })
+}
+
 /// 2D grid of threadgroups with fixed threads-per-threadgroup (FA-2 tiles).
 pub fn dispatch_2d_tg(
     rt: &GpuRuntime,
@@ -493,5 +544,19 @@ mod audit_tests {
         let mut t=rt.alloc_tensor_f32(&[4]).unwrap();
         t.byte_offset=usize::MAX;
         assert!(rt.with_binder(|b| { b.bind_tensor(&t,0); Ok(()) }).is_err());
+    }
+
+    /// Moved here with `dispatch_2d`/`dispatch_3d`. The extent check must reject
+    /// before the caller's encode closure runs — a closure that has already bound
+    /// resources into a doomed dispatch is the failure this guards.
+    #[test]
+    fn oversized_extent_rejected_before_callback() {
+        let rt = GpuRuntime::new().unwrap();
+        let p = rt.pipeline("copy_f32").unwrap();
+        let called = std::cell::Cell::new(false);
+        assert!(dispatch_2d(&rt, &p, usize::MAX, 1, |_| called.set(true)).is_err());
+        assert!(!called.get(), "oversized 2D dispatch reached encoder");
+        assert!(dispatch_3d(&rt, &p, 1, 1, usize::MAX, |_| called.set(true)).is_err());
+        assert!(!called.get(), "oversized 3D dispatch reached encoder");
     }
 }

@@ -2,8 +2,22 @@
 name = "tessl"
 version = "0.1.0"
 edition = "2021"
-description = "Shared Metal 4 encode runtime + TensorOps GEMM (extracted from arch_02 metal-native)"
+rust-version = "1.82"
+description = "Metal 4 GEMM and encode runtime for Apple silicon, built on Metal Performance Primitives TensorOps"
+repository = "https://github.com/bharathvbcr/MachineLearning"
+readme = "README.md"
+keywords = ["metal", "gemm", "gpu", "apple-silicon", "bf16"]
+categories = ["science", "hardware-support", "api-bindings"]
+# BLOCKER for publishing: pick a license and add it here plus a LICENSE file at
+# the crate root. There is none in this repository, and it is not a choice to
+# make on the author's behalf. Once set:
+#   license = "MIT OR Apache-2.0"   (or whichever)
+# then delete the `publish = false` line below.
 publish = false
+# Exposes `DEP_TESSL_KERNELS` to dependents' build scripts (see build.rs), so a
+# crate that compiles its own metallib can pull tessl's canonical GEMM kernel
+# sources instead of keeping a copy that silently drifts.
+links = "tessl"
 
 [dependencies]
 objc2 = "0.6"
@@ -46,3 +60,19 @@ libc = "0.2"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[[bin]]
+name = "bench_gemm_sweep"
+path = "src/bin/bench_gemm_sweep.rs"
+
+[[bin]]
+name = "bench_gemm_coop_ab"
+path = "src/bin/bench_gemm_coop_ab.rs"
+
+[[bin]]
+name = "bench_gemm_tile_tune"
+path = "src/bin/bench_gemm_tile_tune.rs"
+
+[[bin]]
+name = "probe_gemm_parity"
+path = "src/bin/probe_gemm_parity.rs"

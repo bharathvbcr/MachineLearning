@@ -5,9 +5,9 @@
 //! the production kernel accumulates on the first K block. Every variant is
 //! checked against the production kernel's output before its time is reported.
 
-use tessl_arch02::gemm::{cast_f32_to_bf16, gemm, gemm_nt_accum_train, gemm_nt_train, gemm_tn_accum_train, gemm_tn_train, GemmBackend};
-use tessl_arch02::runtime::{mtl_size, GpuRuntime, PrecisionMode};
-use tessl_arch02::tensor::Tensor;
+use tessl::gemm::{cast_f32_to_bf16, gemm, gemm_nt_accum_train, gemm_nt_train, gemm_tn_accum_train, gemm_tn_train, GemmBackend};
+use tessl::runtime::{mtl_size, GpuRuntime, PrecisionMode};
+use tessl::tensor::Tensor;
 use objc2_metal::MTLComputePipelineState;
 use std::time::Instant;
 
@@ -195,7 +195,7 @@ fn require_tune_kernels(rt: &std::sync::Arc<GpuRuntime>, probe: &str) {
             "error: tuning kernel `{probe}` is not in the metallib.\n\
              The GEMM A/B rig is opt-in so it stays out of the shipped metallib.\n\
              Rebuild with it:\n\
-             \n    METAL_NATIVE_GEMM_TUNE=1 cargo build --release --bins\n"
+             \n    TESSL_GEMM_TUNE=1 cargo build --release --bins\n"
         );
         std::process::exit(2);
     }

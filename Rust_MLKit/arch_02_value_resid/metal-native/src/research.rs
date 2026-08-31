@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn device_research_telemetry_reports_role_norms_and_drift() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let w = init_weights_seeded(&rt, ModelConfig::sota_toy(), 19).expect("weights");
         let grads = Grads::zeros_like(&rt, &w).expect("grads");
         for value in grads.qo_bank.buffer.contents_f32().iter_mut() {

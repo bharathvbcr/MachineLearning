@@ -560,13 +560,7 @@ fn stem_fwd(
     let bg_rows = rt.alloc_tensor_f32(&[bt, db])?;
     let hash_idx = {
         let buf = rt.alloc_buffer(bt * 4)?;
-        Tensor {
-            buffer: buf,
-            shape: vec![bt],
-            dtype: crate::tensor::DType::F32,
-            byte_offset: 0,
-            runtime: Arc::clone(rt),
-        }
+        Tensor::from_buffer(rt, buf, &[bt], crate::tensor::DType::F32, 0)?
     };
     let p = rt.pipeline("stem_gather_f32")?;
     dispatch_1d(rt, &p, bt, |bnd| {
@@ -1051,13 +1045,8 @@ fn ce_mean(
 fn reshape_view(t: &Tensor, shape: &[usize]) -> Tensor {
     let numel: usize = shape.iter().product();
     assert_eq!(numel, t.numel());
-    Tensor {
-        buffer: t.buffer.clone(),
-        shape: shape.to_vec(),
-        dtype: t.dtype,
-        byte_offset: t.byte_offset,
-        runtime: Arc::clone(t.runtime()),
-    }
+    Tensor::from_buffer(t.runtime(), t.buffer.clone(), shape, t.dtype, t.byte_offset)
+        .expect("these views are built over a buffer this crate just allocated")
 }
 
 fn upload_i32(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[i32]) -> Result<Tensor, String> {
@@ -1069,25 +1058,14 @@ fn upload_i32(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[i32]) -> Result<Ten
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, numel);
     }
-    Ok(Tensor {
-        buffer: buf,
-        shape: shape.to_vec(),
-        dtype: crate::tensor::DType::F32, // logical; contents are i32
-        byte_offset: 0,
-        runtime: Arc::clone(rt),
-    })
+    // dtype is logical; contents are i32.
+    Tensor::from_buffer(rt, buf, shape, crate::tensor::DType::F32, 0)
 }
 
 fn alloc_i32_empty(rt: &Arc<GpuRuntime>, shape: &[usize]) -> Result<Tensor, String> {
     let numel: usize = shape.iter().product();
     let buf = rt.alloc_buffer(numel * 4)?;
-    Ok(Tensor {
-        buffer: buf,
-        shape: shape.to_vec(),
-        dtype: crate::tensor::DType::F32,
-        byte_offset: 0,
-        runtime: Arc::clone(rt),
-    })
+    Tensor::from_buffer(rt, buf, shape, crate::tensor::DType::F32, 0)
 }
 
 fn write_i32_tensor(t: &Tensor, data: &[i32]) {

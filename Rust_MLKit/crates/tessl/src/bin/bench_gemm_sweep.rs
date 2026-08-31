@@ -6,10 +6,10 @@
 //!
 //! `--dump-parity DIR` writes A/B/C as .npy for the numeric check in the Python lane.
 
-use tessl_arch02::gemm::{cast_f32_to_bf16, gemm, GemmBackend};
-use tessl_arch02::npy::write_npy_f32;
-use tessl_arch02::runtime::GpuRuntime;
-use tessl_arch02::tensor::Tensor;
+use tessl::gemm::{cast_f32_to_bf16, gemm, GemmBackend};
+use tessl::npy::write_npy_f32;
+use tessl::runtime::GpuRuntime;
+use tessl::tensor::Tensor;
 use std::path::Path;
 use std::time::Instant;
 

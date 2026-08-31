@@ -25,6 +25,8 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-env-changed=METAL_RUNTIME_SKIP_AOT");
+    println!("cargo:rerun-if-env-changed=TESSL_GEMM_TUNE");
+    println!("cargo:rerun-if-env-changed=METAL_NATIVE_GEMM_TUNE");
 
     // CoreGraphics is required for MTLCreateSystemDefaultDevice.
     println!("cargo:rustc-link-lib=framework=CoreGraphics");
@@ -48,6 +50,10 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let kernels_dir = manifest_dir.join("kernels");
 
+    // Canonical GEMM kernel sources. Dependents that build their own metallib
+    // read this as `DEP_TESSL_KERNELS` (Cargo derives the name from `links`).
+    println!("cargo:kernels={}", kernels_dir.display());
+
     let sdk = xcrun_stdout(&["--sdk", "macosx", "--show-sdk-path"]);
     let metal = resolve_metal();
     let metallib = resolve_metallib();
@@ -56,9 +62,18 @@ fn main() {
 
     // TensorOps kernels — Metal 4 dialect (macOS 26+ / MPP). Hard-fail: NAX GEMM
     // is the hot path; a simdgroup-only metallib is not acceptable.
-    let tensorops_sources = ["matmul_tensorops.metal"];
-    for name in &tensorops_sources {
-        let src = kernels_dir.join(name);
+    // The GEMM A/B rig (kernels/tune/) is 92 measurement-only kernels that
+    // nothing dispatches at runtime. Linking it took the shipped metallib from
+    // 0.22 MB to 1.09 MB, so it is opt-in. It lives in a subdirectory precisely
+    // so the directory glob below cannot pick it up by accident.
+    let want_tune = env::var_os("TESSL_GEMM_TUNE").is_some()
+        || env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
+    let mut tensorops_sources: Vec<PathBuf> = vec![kernels_dir.join("matmul_tensorops.metal")];
+    if want_tune {
+        tensorops_sources.push(kernels_dir.join("tune/matmul_tensorops_tune.metal"));
+    }
+    for src in &tensorops_sources {
+        let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("<unnamed>");
         if !src.exists() {
             panic!(
                 "required TensorOps source missing: {}; Metal 4 / macOS 26 toolchain required",

@@ -5,8 +5,10 @@
 //! - f32 GEMM interior offset tiles off by default
 //! - TensorOps multiply_accumulate off by default
 //!
-//! Env names accept `METAL_RUNTIME_*` first, then fall back to `METAL_NATIVE_*`
-//! so existing A/B scripts still work.
+//! Env names are canonically `TESSL_*`. The legacy `METAL_RUNTIME_*` and
+//! `METAL_NATIVE_*` spellings are still read, in that order, so scripts written
+//! against either former crate keep working after the rename. First name that
+//! parses wins; nothing is silently ignored.
 
 use std::sync::atomic::{AtomicI8, Ordering};
 use std::sync::OnceLock;
@@ -22,17 +24,31 @@ pub(crate) fn env_truthy(names: &[&str]) -> Option<bool> {
     None
 }
 
-fn flags() -> &'static (bool, bool) {
-    static FLAGS: OnceLock<(bool, bool)> = OnceLock::new();
+fn flags() -> &'static (bool, bool, bool) {
+    static FLAGS: OnceLock<(bool, bool, bool)> = OnceLock::new();
     FLAGS.get_or_init(|| {
         let gemm_interior = env_truthy(&[
+            "TESSL_GEMM_INTERIOR",
             "METAL_RUNTIME_GEMM_INTERIOR",
             "METAL_NATIVE_GEMM_INTERIOR",
         ])
         .unwrap_or(false);
-        let gemm_accum = env_truthy(&["METAL_RUNTIME_GEMM_ACCUM", "METAL_NATIVE_GEMM_ACCUM"])
-            .unwrap_or(false);
-        (gemm_interior, gemm_accum)
+        let gemm_accum = env_truthy(&[
+            "TESSL_GEMM_ACCUM",
+            "METAL_RUNTIME_GEMM_ACCUM",
+            "METAL_NATIVE_GEMM_ACCUM",
+        ])
+        .unwrap_or(false);
+        // dX-only accumulate. Separate from `gemm_accum` because every NT-accum
+        // call site targets a fresh pre-zeroed activation-grad buffer, never a
+        // weight bank — the case the full flag was turned off for.
+        let gemm_accum_dx = env_truthy(&[
+            "TESSL_GEMM_ACCUM_DX",
+            "METAL_RUNTIME_GEMM_ACCUM_DX",
+            "METAL_NATIVE_GEMM_ACCUM_DX",
+        ])
+        .unwrap_or(false);
+        (gemm_interior, gemm_accum, gemm_accum_dx)
     })
 }
 
@@ -66,6 +82,7 @@ pub fn hazard_barriers() -> bool {
         return v == 1;
     }
     let from_env = env_truthy(&[
+        "TESSL_HAZARD_BARRIERS",
         "METAL_RUNTIME_HAZARD_BARRIERS",
         "METAL_NATIVE_HAZARD_BARRIERS",
     ])
@@ -77,6 +94,13 @@ pub fn hazard_barriers() -> bool {
 /// Use TensorOps `multiply_accumulate` for accumulate GEMMs. Default: false.
 pub fn gemm_accum() -> bool {
     flags().1
+}
+
+/// Accumulate-mode for the **dX** NT path only. Every caller accumulates into a
+/// fresh pre-zeroed activation-grad buffer, never a weight bank, so this is safe
+/// to enable independently of [`gemm_accum`].
+pub fn gemm_accum_dx() -> bool {
+    flags().2
 }
 
 /// -1 unset, 0 fine-grained RAW barriers, 1 phase-coarsened (default when hazard).
@@ -92,6 +116,7 @@ pub fn coarse_barriers() -> bool {
     }
     let from_env = env_truthy(&[
         "GEMMA_METAL_COARSE_BARRIERS",
+        "TESSL_COARSE_BARRIERS",
         "METAL_RUNTIME_COARSE_BARRIERS",
     ]);
     let on = from_env.unwrap_or_else(hazard_barriers);

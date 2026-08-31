@@ -233,6 +233,32 @@ impl Tensor {
         &self.runtime
     }
 
+    /// Build a tensor over an existing buffer at `byte_offset`.
+    ///
+    /// The `runtime` field is private, so this is the only way to construct a
+    /// `Tensor` from outside the crate. That is deliberate: the struct-literal
+    /// form it replaces performed no checks at all, so a caller could describe a
+    /// region larger than its buffer, or pair a buffer with a runtime that did
+    /// not allocate it. This runs the same `validate()` every dispatch relies on
+    /// before handing one back.
+    pub fn from_buffer(
+        runtime: &Arc<GpuRuntime>,
+        buffer: GpuBuffer,
+        shape: &[usize],
+        dtype: DType,
+        byte_offset: usize,
+    ) -> Result<Tensor, String> {
+        let t = Tensor {
+            buffer,
+            shape: shape.to_vec(),
+            dtype,
+            byte_offset,
+            runtime: Arc::clone(runtime),
+        };
+        t.validate()?;
+        Ok(t)
+    }
+
     /// View into the same buffer at an element offset (same dtype).
     pub fn view(&self, shape: &[usize], elem_offset: usize) -> Tensor {
         self.validate().expect("invalid source view");

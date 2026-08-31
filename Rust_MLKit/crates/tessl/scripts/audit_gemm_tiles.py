@@ -4,21 +4,28 @@ dispatches. A mismatch means the host launches the wrong number of threadgroups,
 silently leaving output tiles unwritten."""
 import re, sys, pathlib
 
-# Resolve crates from this script's own location, not the caller's cwd: the
-# audit is meant to be runnable from anywhere (CI step, pre-commit, a shell in
-# any subdirectory), and a path-dependent audit is one that gets skipped.
-REPO = pathlib.Path(__file__).resolve().parents[4]
+# Resolve everything from this script's own location, never the caller's cwd.
+# `scripts/` sits directly under the crate root both in this repository and in a
+# published .crate, so the audit runs from anywhere and survives packaging.
+CRATE = pathlib.Path(__file__).resolve().parents[1]
 
-# Both crates carry a mirrored copy of the GEMM kernels and dispatch; the audit
-# must see both or a drift between them goes unnoticed. Missing paths raise
-# rather than being skipped, so a rename cannot quietly shrink the audit's scope.
-CRATES = [
-    "Rust_MLKit/arch_02_value_resid/metal-native",   # package tessl-arch02
-    "Rust_MLKit/crates/tessl",                       # package tessl
-]
-for _c in CRATES:
-    if not (REPO / _c).is_dir():
-        raise SystemExit(f"audit_gemm_tiles: crate path missing: {_c}")
+# The GEMM kernels and dispatch have exactly one owner: this crate. The audit
+# used to compare two mirrored copies; the mirror is gone, so what remains is
+# the check that still matters — that each Rust TileGeom agrees with the SM/SN
+# compiled into the kernel it dispatches, and that COOP_BKC agrees with each
+# coop kernel's BKC.
+#
+# tessl-arch02 compiles these same sources through DEP_TESSL_KERNELS, so it
+# cannot drift by construction. A local copy reappearing there is itself the
+# regression, so fail if one shows up (skipped when the sibling is absent, as
+# it is inside a published crate).
+CRATES = [CRATE]
+_stale = CRATE.parents[2] / "arch_02_value_resid/metal-native/kernels/matmul_tensorops.metal"
+if _stale.exists():
+    raise SystemExit(
+        "audit_gemm_tiles: tessl-arch02 has its own matmul_tensorops.metal again. "
+        "It must compile tessl's copy via DEP_TESSL_KERNELS; a local one silently drifts."
+    )
 
 def strip_comments(src):
     """Comments carry example geometries that would otherwise match as code."""
@@ -84,9 +91,9 @@ NN_PAIRS = [
 
 bad = 0
 for crate in CRATES:
-    kt = kernel_tiles(REPO / crate / "kernels/matmul_tensorops.metal")
-    consts, pairs = rust_tiles(REPO / crate / "src/gemm.rs")
-    coop_bkc = rust_coop_bkc(REPO / crate / "src/gemm.rs")
+    kt = kernel_tiles(crate / "kernels/matmul_tensorops.metal")
+    consts, pairs = rust_tiles(crate / "src/gemm.rs")
+    coop_bkc = rust_coop_bkc(crate / "src/gemm.rs")
     print(f"\n=== {crate}")
     print(f"    tile constants: {consts}")
     print(f"    COOP_BKC = {coop_bkc}")

@@ -1,9 +1,12 @@
 # tessl GEMM: kernel selection, the coop gate, and how to check it
 
-Covers the TensorOps (MPP `matmul2d`) GEMM path shared by `tessl`
-(`crates/tessl`) and `tessl-arch02` (`arch_02_value_resid/metal-native`).
-Both crates carry a mirrored copy; they must stay identical, and
-`scripts/audit_gemm_tiles.py` checks that mechanically.
+Covers the TensorOps (MPP `matmul2d`) GEMM path, which lives in `tessl`
+(`crates/tessl`) and has exactly one copy.
+
+`tessl-arch02` (`arch_02_value_resid/metal-native`) used to carry a byte-identical
+fork of the kernels and of `gemm.rs` / `runtime.rs` / `tensor.rs` / `dispatch.rs`,
+kept in step by a static audit. It now depends on `tessl` and compiles tessl's
+kernel sources through `DEP_TESSL_KERNELS`, so there is nothing left to drift.
 
 ## Kernel selection
 
@@ -92,16 +95,17 @@ already made on numerics grounds.)
 ## Checking it
 
 ```bash
-# Static: every Rust TileGeom vs the kernel's constexpr SM/SN, every coop
-# kernel's constexpr BKC vs Rust's COOP_BKC, and both crates in sync.
-# Runs from any directory; fails loudly if a crate path is missing.
-python3 Rust_MLKit/arch_02_value_resid/metal-native/scripts/audit_gemm_tiles.py
+# Static: every Rust TileGeom vs the kernel's constexpr SM/SN, and every coop
+# kernel's constexpr BKC vs Rust's COOP_BKC. Resolves paths from its own
+# location, so it runs from any directory and survives `cargo package`. It also
+# fails if tessl-arch02 grows a local copy of the kernels again.
+python3 Rust_MLKit/crates/tessl/scripts/audit_gemm_tiles.py
 ```
 
 ```bash
 # Runtime: hand-picked adversarial shapes + a seeded fuzz that asserts its own
 # per-kernel coverage.
-cd Rust_MLKit/arch_02_value_resid/metal-native
+cd Rust_MLKit/crates/tessl
 cargo test --release --lib -- --test-threads=1 gemm_adversarial_shape_sweep gemm_randomized_shape_fuzz
 ```
 
@@ -120,12 +124,13 @@ in well under 1% of cases and it never dispatched those kernels at all.
 
 ## Benchmarking
 
-The A/B rig (`kernels/matmul_tensorops_tune.metal`, 92 measurement-only kernels)
-is **not** in the default metallib — linking it took the artifact from 0.87 MB to
-1.74 MB. Opt in:
+The A/B rig (`crates/tessl/kernels/tune/`, 92 measurement-only kernels) is
+**not** in the default metallib — linking it takes tessl's artifact from 0.20 MB
+to 1.07 MB. It sits in a subdirectory so neither build script's directory glob
+can pick it up by accident. Opt in:
 
 ```bash
-METAL_NATIVE_GEMM_TUNE=1 cargo build --release --bins
+TESSL_GEMM_TUNE=1 cargo build --release --bins
 ```
 
 Both tuning binaries `exit(2)` with that command when the variants are absent,
@@ -162,8 +167,8 @@ under this submit-and-wait protocol — tessl's wall time is flat from 4 MFLOP t
 
 1. Compile-time `SM`/`SN` must equal the `TileGeom` the host dispatches with,
    and `constexpr int BKC` must equal `COOP_BKC`.
-2. Pin it in `NN_PAIRS` in `audit_gemm_tiles.py`. The audit fails on any
-   `*_coop` kernel that is not pinned, because coop kernels are dispatched
+2. Pin it in `NN_PAIRS` in `scripts/audit_gemm_tiles.py`. The audit fails on
+   any `*_coop` kernel that is not pinned, because coop kernels are dispatched
    through a variable and the pipeline-literal scanner cannot see them.
 3. Route it through `tensorops_nn_kernel` so the fuzz's coverage assertion
    counts it.

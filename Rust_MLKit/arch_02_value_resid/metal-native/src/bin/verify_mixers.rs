@@ -363,7 +363,7 @@ fn verify_mamba2(rt: &Arc<GpuRuntime>) {
 }
 
 fn main() {
-    let rt = GpuRuntime::new().unwrap();
+    let rt = tessl_arch02::gpu_runtime().unwrap();
     verify_mingru(&rt);
     verify_mingru_vr(&rt);
     verify_mingru_vr_layer(&rt);
