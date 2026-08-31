@@ -109,10 +109,20 @@ fn main() -> Result<(), String> {
                 cast_f32_to_bf16(&a)?,
                 cast_f32_to_bf16(&b)?,
             ));
+            // tf32-class relaxed precision on f32 operands (opt-in --tf32 path).
+            lanes.push((
+                "tensorops-tf32".to_string(),
+                GemmBackend::TensorOps,
+                a.view(&[m, k], 0),
+                b.view(&[k, n], 0),
+            ));
         }
 
         for (bname, backend, la, lb) in &lanes {
             let (bname, backend) = (bname.as_str(), *backend);
+            // tf32 lane: same f32 operands, relaxed-precision kernels.
+            let relaxed = bname == "tensorops-tf32";
+            rt.set_relaxed_precision(relaxed);
             let samples = time_backend(&rt, la, lb, &c, backend, warmup, iters)?;
             let med = median(samples.clone());
             let best = samples.iter().cloned().fold(f64::INFINITY, f64::min);

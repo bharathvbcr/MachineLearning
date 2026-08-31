@@ -229,28 +229,26 @@ pub fn gemm(
     }
 
     let rt = a.runtime();
-    let kernel = if use_bf16 {
-        backend.kernel_name_bf16()
-    } else if use_relaxed_f32(rt, backend) {
-        backend.kernel_name_f32_relaxed()
-    } else if backend == GemmBackend::Simdgroup && (m % 16 != 0 || n % 16 != 0 || k % 8 != 0) {
-        "matmul_simdgroup_edges_f32"
-    } else {
-        backend.kernel_name_f32()
-    };
-    let pipeline = rt.pipeline(kernel)?;
-
     match backend {
+        // Cooperative-destination NN kernels (bf16 and relaxed f32): register
+        // accumulator, C written exactly once — no zero pre-pass to pack.
+        GemmBackend::TensorOps if use_bf16 || use_relaxed_f32(rt, backend) => {
+            let (kernel, tile) = nn_coop_kernel(m, n, k, use_bf16);
+            let pipeline = rt.pipeline(kernel)?;
+            dispatch_tensorops_nn_coop(rt, &pipeline, a, b, c, m, n, k, tile)?;
+        }
         GemmBackend::TensorOps => {
-            let tile = if use_bf16 || use_relaxed_f32(rt, backend) {
-                TILE_V2
-            } else {
-                TILE_F32
-            };
+            let pipeline = rt.pipeline(backend.kernel_name_f32())?;
             // Zero-tax: pack C-zero + matmul into one binder (~−1 binder/GEMM).
-            dispatch_tensorops_nn(rt, &pipeline, a, b, c, m, n, k, tile)?;
+            dispatch_tensorops_nn(rt, &pipeline, a, b, c, m, n, k, TILE_F32)?;
         }
         GemmBackend::Simdgroup => {
+            let kernel = if m % 16 != 0 || n % 16 != 0 || k % 8 != 0 {
+                "matmul_simdgroup_edges_f32"
+            } else {
+                backend.kernel_name_f32()
+            };
+            let pipeline = rt.pipeline(kernel)?;
             // Both simdgroup kernels overwrite every logical output element.
             // No pre-zero dispatch or barrier is needed (including offset views).
             let m_u = m as u32;
@@ -272,6 +270,81 @@ pub fn gemm(
     }
 
     Ok(())
+}
+
+
+/// Cooperative-destination NN tile geometries (must match the NN_COOP_KERNEL
+/// instantiations in matmul_tensorops.metal).
+const TILE_COOP_DEFAULT: TileGeom = TileGeom { sm: 128, sn: 64, simdgroups: 4 };
+const TILE_COOP_NARROW: TileGeom = TileGeom { sm: 64, sn: 64, simdgroups: 4 };
+const TILE_COOP_WIDE: TileGeom = TileGeom { sm: 256, sn: 64, simdgroups: 8 };
+
+/// Shape → coop NN kernel, from the 2026-08-30 M5 Pro tile tune
+/// (bench/results/bf16_tile_tune_m5pro_coop.txt): 64×64 sg4 wins narrow-N
+/// shapes by ~6%, 256×64 sg8 wins ≥4096² squares at K ≥ 2048 by ~5%,
+/// 128×64 sg4 everything else (0.96–1.19× of torch-MPS bf16 on the sweep).
+fn nn_coop_kernel(m: usize, n: usize, k: usize, bf16: bool) -> (&'static str, TileGeom) {
+    if n <= 512 {
+        (
+            if bf16 {
+                "matmul2d_tensorops_bf16_f32_64x64_sg4"
+            } else {
+                "matmul2d_tensorops_f32_relaxed_64x64_sg4"
+            },
+            TILE_COOP_NARROW,
+        )
+    } else if m >= 4096 && n >= 4096 && k >= 2048 {
+        (
+            if bf16 {
+                "matmul2d_tensorops_bf16_f32_256x64_sg8"
+            } else {
+                "matmul2d_tensorops_f32_relaxed_256x64_sg8"
+            },
+            TILE_COOP_WIDE,
+        )
+    } else {
+        (
+            if bf16 {
+                "matmul2d_tensorops_bf16_f32"
+            } else {
+                "matmul2d_tensorops_f32_relaxed"
+            },
+            TILE_COOP_DEFAULT,
+        )
+    }
+}
+
+/// Single-dispatch NN matmul for the cooperative-destination kernels: the
+/// kernel overwrites every in-bounds C element (register accumulator plus a
+/// bounds-checked store), so there is no zero pre-pass to pack.
+fn dispatch_tensorops_nn_coop(
+    rt: &GpuRuntime,
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    tile: TileGeom,
+) -> Result<(), String> {
+    let tiles_n = (n + tile.sn - 1) / tile.sn;
+    let tiles_m = (m + tile.sm - 1) / tile.sm;
+    let tg = morton_tg_count(tiles_n, tiles_m);
+    let tpt = threads_per_tg(pipeline, tile);
+    rt.with_binder(|bnd| {
+        bnd.set_pipeline(pipeline);
+        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
+        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
+        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_u32(m as u32, 3);
+        bnd.bind_u32(n as u32, 4);
+        bnd.bind_u32(k as u32, 5);
+        bnd.bind_u32(tiles_n as u32, 6);
+        bnd.bind_u32(tiles_m as u32, 7);
+        bnd.dispatch(mtl_size(tg, 1, 1), mtl_size(tpt, 1, 1));
+        Ok(())
+    })
 }
 
 /// Pack `zero_f32(C)` + TensorOps NN matmul into a single Metal 4 binder.
