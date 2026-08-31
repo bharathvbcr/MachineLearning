@@ -51,3 +51,15 @@ Variants are interior-only (exact divisibility) measurement kernels; the
 production kernel's ragged-edge paths are untouched. `get_destination_cooperative_tensor`
 (register-resident accumulator, per Apple's MPPTensorOpsMatMul2d.h) was not
 tested and should remove the remaining C traffic entirely.
+
+## Follow-up (2026-08-30): the "~20% validation cost" attribution was wrong
+
+Re-measured on a HEAD that *includes* the per-call GEMM validation, on an
+otherwise idle machine (40 iters, sync/iter): production bf16 medians land at
+or above the pristine baseline table — square_2048 10,897 vs 10,086;
+square_4096 10,385 vs 10,226; mlp_up 10,732 vs 10,388; mlp_down 11,658 vs
+10,503; tall_k1024 10,892 vs 11,153 GFLOP/s. Validation cost does not resolve
+above run-to-run variance at these shapes. The ~20% inflation in the original
+run came from the concurrent session's compile load on the same machine, not
+from the validation it was adding. "Measure on a quiet machine" stands;
+"validation is measurably not free" does not.

@@ -25,8 +25,10 @@ const SHAPES: &[(usize, usize, usize, &str)] = &[
     (4096, 4096, 1024, "tall_k1024"),
 ];
 
-/// Deterministic fill, bit-identical to the Python lane's `fill(n, seed)`.
-/// LCG in u64, mapped to [-1, 1). Avoids trusting cross-language RNG parity.
+/// Deterministic LCG fill in u64, mapped to [-1, 1). The Python timing lanes
+/// use constant 0.5 operands instead — GEMM timing is data-independent, so the
+/// lanes only share data where it matters: the parity check reads A/B from the
+/// .npy files this binary dumps.
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     let mut out = Vec::with_capacity(n);
