@@ -1,0 +1,139 @@
+name: tessl
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Rust_MLKit/crates/tessl/**'
+      - '.github/workflows/tessl.yml'
+  pull_request:
+    paths:
+      - 'Rust_MLKit/crates/tessl/**'
+      - '.github/workflows/tessl.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: Rust_MLKit/crates/tessl
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build, lint, and compile the shaders. Does NOT run the tests — but not for
+  # the reason you might assume, and the distinction decides what to do next.
+  #
+  # It is NOT that hosted runners lack a Metal device. They have one: the sibling
+  # sparsl repository runs its entire Metal suite, GPU dispatch included, on
+  # `macos-26` hosted runners. An earlier version of this file claimed otherwise
+  # and was wrong.
+  #
+  # The actual reason is narrower. tessl does not merely need a Metal device; it
+  # needs MPP TensorOps `matmul2d` on Apple silicon Neural Accelerators, and its
+  # tests `.expect("runtime")` with no graceful skip. Whether a virtualised
+  # hosted GPU exposes TensorOps is unverified. Turning the tests on here before
+  # knowing would be guessing at a red build.
+  #
+  # The probe step below answers it. Once a run shows a usable device, move
+  # `cargo test --release` into this job and keep `gpu` for measurement only.
+  #
+  # Meanwhile this job is far from empty: `build.rs` AOT-compiles
+  # `kernels/*.metal` into a metallib, so a shader that stops compiling turns it
+  # red — the most common way to break tessl without a Rust compiler error.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build + lint (no GPU on hosted runners)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show Xcode and macOS versions
+        run: |
+          sw_vers
+          xcodebuild -version
+
+      - name: Install the Metal Toolchain component
+        # Required by build.rs to run `xcrun metal`. On an image that already
+        # ships it this is close to a no-op. If it fails, the build step below
+        # fails with a clear message from build.rs rather than a mystery, which
+        # is why this is not silenced.
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Rust_MLKit/crates/tessl
+
+      # Style gates are non-blocking on purpose, and this is a temporary state
+      # with a number attached, not a permanent shrug.
+      #
+      # As of adding this workflow, tessl does not pass either gate: 10 files
+      # need rustfmt, and clippy reports 45 findings across five lint kinds
+      # (manual_div_ceil, needless_range_loop, unnecessary_cast,
+      # too_many_arguments, unusual_byte_groupings). All are stylistic — a newer
+      # clippy than the one the last cleanup pass ran against, not new defects.
+      #
+      # They are run here so the debt is visible on every push rather than
+      # invisible until someone remembers. Reformatting ten files and rewriting
+      # 45 call sites is its own change with its own review, not a side effect
+      # of adding CI. Drop `continue-on-error` on both steps once that lands.
+      - name: rustfmt (non-blocking, 10 files currently fail)
+        continue-on-error: true
+        run: cargo fmt --all --check
+      - name: clippy (non-blocking, 45 findings currently)
+        continue-on-error: true
+        run: cargo clippy --all-targets -- -D warnings
+      - name: clippy with quant-prep (non-blocking)
+        continue-on-error: true
+        run: cargo clippy --all-targets --features quant-prep -- -D warnings
+
+      - name: Probe the runner's Metal capabilities
+        # Informational, never a gate. Reports whether this runner has a device
+        # and what it is, which is the evidence needed to decide whether the
+        # tests can move here from the self-hosted job.
+        continue-on-error: true
+        run: |
+          system_profiler SPDisplaysDataType 2>/dev/null | head -20 || true
+          cargo run --release --bin probe_gemm_parity 2>&1 | head -30 || true
+
+      - name: Build (AOT-compiles the metallib)
+        # TESSL_SKIP_AOT is NOT used here on purpose. It points the build at a
+        # crate-root `default.metallib`, which is a gitignored local artefact
+        # and therefore absent on a fresh checkout — the skip would produce a
+        # build that links a metallib that does not exist.
+        run: cargo build --release --all-targets
+
+  # ---------------------------------------------------------------------------
+  # The real suite. Needs an Apple silicon machine with a Metal device.
+  #
+  # Gated on a repository variable, not merely on the `self-hosted` label: a job
+  # whose labels match no registered runner queues indefinitely rather than
+  # skipping. Set `HAS_METAL_RUNNER` to `true` under
+  # Settings -> Secrets and variables -> Actions -> Variables once a runner
+  # exists.
+  # ---------------------------------------------------------------------------
+  gpu:
+    name: full suite on bare-metal Apple silicon
+    if: ${{ vars.HAS_METAL_RUNNER == 'true' }}
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Rust_MLKit/crates/tessl
+      - name: Test (release)
+        run: cargo test --release
+      - name: Test with quant-prep
+        run: cargo test --release --features quant-prep
+      - name: Deep GEMM fuzz
+        # `gemm_fuzz_deep` is `#[ignore]`d so it stays out of the default run.
+        # A real GPU runner is the right place to actually pay for it.
+        run: cargo test --release -- --ignored gemm_fuzz_deep
