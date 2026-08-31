@@ -21,7 +21,7 @@ fn main() -> Result<(), String> {
     let n_tokens: usize = argv.get(2).and_then(|s| s.parse().ok()).unwrap_or(32);
 
     // Always-on before GPU create (GemmaGpu no longer clobbers an explicit set).
-    metal_runtime::ab_flags::set_hazard_barriers(false);
+    tessl::ab_flags::set_hazard_barriers(false);
 
     let golden_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("bench/results/golden_tokens_31b.json");
@@ -59,7 +59,7 @@ fn main() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     let model = GpuSynthModel::from_host_banks(banks).map_err(|e| e.to_string())?;
     let mut sess = GpuDecodeSession::new(model).map_err(|e| e.to_string())?;
-    metal_runtime::ab_flags::set_hazard_barriers(false);
+    tessl::ab_flags::set_hazard_barriers(false);
     // 31B free-decode without hidden capture collapses (even under always-on).
     // Capture (incl. CAPTURE_NOP) is required for MLX-matching greedy today.
     let skip_cap = std::env::var("GEMMA_METAL_NO_CAPTURE").ok().as_deref() == Some("1");
@@ -101,7 +101,7 @@ fn cksum(row: &[f32]) -> (f32, f32, Vec<f32>) {
 
 /// Free generate on the short prompt (no capture) — contrasts with `--short-dump`.
 fn free_gen_short() -> Result<(), String> {
-    metal_runtime::ab_flags::set_hazard_barriers(false);
+    tessl::ab_flags::set_hazard_barriers(false);
     let prompt = [2u32, 105, 4368, 1246];
     let n: usize = std::env::args()
         .nth(2)
@@ -128,11 +128,11 @@ fn free_gen_short() -> Result<(), String> {
     let model = GpuSynthModel::from_host_banks(banks).map_err(|e| e.to_string())?;
     let mut sess = GpuDecodeSession::new(model).map_err(|e| e.to_string())?;
     // Re-assert after GemmaGpu::new (must stick; prints help catch duplicate-static bugs).
-    metal_runtime::ab_flags::set_hazard_barriers(false);
+    tessl::ab_flags::set_hazard_barriers(false);
     eprintln!(
         "hazard_skip_auto={} explicitly_set={}",
-        metal_runtime::ab_flags::hazard_barriers(),
-        metal_runtime::ab_flags::hazard_barriers_explicitly_set()
+        tessl::ab_flags::hazard_barriers(),
+        tessl::ab_flags::hazard_barriers_explicitly_set()
     );
     if with_cap {
         sess.enable_hidden_capture(vec![0usize, 1, 2, 12, 23, 35, 46, 57])
@@ -183,7 +183,7 @@ fn free_gen_short() -> Result<(), String> {
 
 /// Localize target_next 929≠531: capture L0/L1 after short prompt prefill.
 fn short_dump() -> Result<(), String> {
-    metal_runtime::ab_flags::set_hazard_barriers(false);
+    tessl::ab_flags::set_hazard_barriers(false);
     let prompt = [2u32, 105, 4368, 1246];
     let dir = resolve_default_31b_mlx_cache().ok_or("no 31b cache")?;
     eprintln!("short-dump dir={}", dir.display());

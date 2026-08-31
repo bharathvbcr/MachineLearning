@@ -5,11 +5,11 @@
 //! Phase 5: MTP assistant / cross-KV / clustered head / verify (`mtp`).
 //! Phase 6: 31B config deltas + `serve` OpenAI stub.
 //!
-//! Depends on [`metal_runtime`] for Metal 4 encode / GEMM / MTLTensor prep.
+//! Depends on [`tessl`] for Metal 4 encode / GEMM / MTLTensor prep.
 
 #![allow(dead_code)]
 
-pub use metal_runtime;
+pub use tessl;
 
 pub mod config;
 pub mod diag;

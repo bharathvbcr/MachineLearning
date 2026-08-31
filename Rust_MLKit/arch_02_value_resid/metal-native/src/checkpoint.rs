@@ -86,7 +86,7 @@ fn load_bf16_bits(path: &Path, t: &Tensor) -> Result<(), String> {
         .chunks_exact(2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect();
-    let backing = t.buffer.contents_u16();
+    let mut backing = t.buffer.contents_u16();
     if backing.len() < bits.len() {
         return Err(format!(
             "bf16 destination {} has {} backing elements, needs {}",
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn bf16_shadow_io_preserves_logical_extent_bits() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let tensor = rt.alloc_tensor_bf16(&[600_001]).expect("bf16 tensor");
         tensor.buffer.contents_u16()[0] = 0x3f80;
         tensor.buffer.contents_u16()[600_000] = 0xbf80;
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[test]
     fn full_checkpoint_round_trip_restores_adam_muon_ema_and_cursor() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let cfg = ModelConfig::sota_toy();
         let mut w = init_weights_seeded(&rt, cfg.clone(), 42).expect("init");
         w.ensure_bf16_banks(&rt).expect("bf16 shadows");
@@ -1125,7 +1125,7 @@ mod tests {
 
     #[test]
     fn mamba_adam_slots_round_trip_through_checkpoint() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let mut cfg = ModelConfig::sota_toy();
         cfg.layer_mixers = expand_layer_mixers(&[MixerKind::Mamba2], cfg.num_layers);
         let w = init_weights_seeded(&rt, cfg.clone(), 42).expect("init");
@@ -1227,7 +1227,7 @@ mod tests {
 
     #[test]
     fn mamba_conv1d_weight_init_save_load_layout_matches() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let mut cfg = ModelConfig::sota_toy();
         cfg.layer_mixers = expand_layer_mixers(&[MixerKind::Mamba2], cfg.num_layers);
         let w = init_weights_seeded(&rt, cfg.clone(), 42).expect("init");
@@ -1252,7 +1252,7 @@ mod tests {
 
     #[test]
     fn mamba_conv1d_weight_adam_slots_preserve_layout() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let mut cfg = ModelConfig::sota_toy();
         cfg.layer_mixers = expand_layer_mixers(&[MixerKind::Mamba2], cfg.num_layers);
         let w = init_weights_seeded(&rt, cfg.clone(), 42).expect("init");

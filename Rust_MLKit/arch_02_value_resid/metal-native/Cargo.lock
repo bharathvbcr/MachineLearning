@@ -3,18 +3,6 @@
 version = 4
 
 [[package]]
-name = "arch02-metal-native"
-version = "0.1.0"
-dependencies = [
- "libc",
- "objc2",
- "objc2-foundation",
- "objc2-metal",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -180,6 +168,29 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tessl"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+]
+
+[[package]]
+name = "tessl-arch02"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
+ "serde",
+ "serde_json",
+ "tessl",
 ]
 
 [[package]]

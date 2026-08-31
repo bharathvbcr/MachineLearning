@@ -8,13 +8,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI8, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use metal_runtime::dispatch::{
+use tessl::dispatch::{
     dispatch_1d, dispatch_2d_tg, set_f32, set_gpu_buf, set_gpu_buf_offset, set_u32,
 };
 // softcap_logits retained for tests / external callers; decode uses fused argmax.
-use metal_runtime::gemm::{gemm, select_backend, GemmBackend};
-use metal_runtime::runtime::GpuRuntime;
-use metal_runtime::tensor::{GpuBuffer, Tensor};
+use tessl::gemm::{gemm, select_backend, GemmBackend};
+use tessl::runtime::GpuRuntime;
+use tessl::tensor::{GpuBuffer, Tensor};
 
 use crate::diag;
 use crate::error::{Error, Result};
@@ -510,7 +510,7 @@ impl IcbScalarPool {
     #[inline]
     pub fn bind_u32(
         &self,
-        bnd: &mut metal_runtime::dispatch::Binder<'_>,
+        bnd: &mut tessl::dispatch::Binder<'_>,
         off: usize,
         index: usize,
     ) {
@@ -520,7 +520,7 @@ impl IcbScalarPool {
     #[inline]
     pub fn bind_f32(
         &self,
-        bnd: &mut metal_runtime::dispatch::Binder<'_>,
+        bnd: &mut tessl::dispatch::Binder<'_>,
         off: usize,
         index: usize,
     ) {
@@ -812,14 +812,14 @@ impl GemmaGpu {
         // already called `set_hazard_barriers` (e.g. golden always-on / CaptureAlwaysOnGuard
         // setup) — overwriting forced 31B free-decode → 236773 while capture-on got 531.
         // Set METAL_RUNTIME_HAZARD_BARRIERS=0 to force golden always-on Device barriers.
-        if !metal_runtime::ab_flags::hazard_barriers_explicitly_set() {
+        if !tessl::ab_flags::hazard_barriers_explicitly_set() {
             let skip_auto = match std::env::var("METAL_RUNTIME_HAZARD_BARRIERS") {
                 Ok(v) if matches!(v.as_str(), "0" | "false" | "FALSE" | "no" | "off") => false,
                 _ => true,
             };
-            metal_runtime::ab_flags::set_hazard_barriers(skip_auto);
+            tessl::ab_flags::set_hazard_barriers(skip_auto);
         }
-        let skip_auto = metal_runtime::ab_flags::hazard_barriers();
+        let skip_auto = tessl::ab_flags::hazard_barriers();
         let ws = rt.memory_info().recommended_working_set;
         diag::log(
             "kernels",
@@ -961,8 +961,8 @@ fn dispatch_gemv_row(
             gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
             bnd.set_threadgroup_memory(0, tg_mem);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(groups, 1, 1),
-                metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                tessl::runtime::mtl_size(groups, 1, 1),
+                tessl::runtime::mtl_size(tptg, 1, 1),
             );
             Ok(())
         })
@@ -1008,8 +1008,8 @@ fn dispatch_gemv_blocked(
             gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
             bnd.set_threadgroup_memory(0, tg_mem);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg, 1, 1),
-                metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                tessl::runtime::mtl_size(n_tg, 1, 1),
+                tessl::runtime::mtl_size(tptg, 1, 1),
             );
             Ok(())
         })
@@ -1063,11 +1063,11 @@ pub fn gemv_q4_mlx(
         && group_size > 0
         && cols % group_size == 0
     {
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
         let x_bf16 = prepare_act_bf16(gpu, x, cols)?;
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
         return dispatch_gemv_simd(
@@ -1146,8 +1146,8 @@ fn dispatch_gemv_simd(
             gpu.icb_scalars.bind_u32(bnd, cols_off, 6);
             gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg, 1, 1),
-                metal_runtime::runtime::mtl_size(GEMV_SIMD_TPTG, 1, 1),
+                tessl::runtime::mtl_size(n_tg, 1, 1),
+                tessl::runtime::mtl_size(GEMV_SIMD_TPTG, 1, 1),
             );
             Ok(())
         })
@@ -1217,7 +1217,7 @@ pub fn kv_store_timestep_off(
     n: u32,
     dst_offset: u32,
 ) -> Result<()> {
-    use metal_runtime::dispatch::set_gpu_buf_offset;
+    use tessl::dispatch::set_gpu_buf_offset;
     let p = gpu
         .rt
         .pipeline(KernelId::KvStoreTimestep.entry_name())
@@ -1245,7 +1245,7 @@ pub fn kv_store_timestep_pair_off(
     n: u32,
     dst_offset: u32,
 ) -> Result<()> {
-    use metal_runtime::dispatch::set_gpu_buf_offset;
+    use tessl::dispatch::set_gpu_buf_offset;
     let p = gpu
         .rt
         .pipeline(KernelId::KvStoreTimestepPair.entry_name())
@@ -2360,12 +2360,12 @@ impl HotQuantBanks {
                 // as f32 (tape replay ~cmd 19 add_inplace blow-up, 2026-07-19).
                 let x_f32;
                 let x_ref = if x_is_bf16 {
-                    if metal_runtime::ab_flags::need_barrier(true) {
+                    if tessl::ab_flags::need_barrier(true) {
                         gpu.barrier()?;
                     }
                     x_f32 = gpu.act_f32_scratch(self.cols as usize)?;
                     cast_bf16_to_f32(gpu, x, &x_f32, self.cols)?;
-                    if metal_runtime::ab_flags::need_barrier(true) {
+                    if tessl::ab_flags::need_barrier(true) {
                         gpu.barrier()?;
                     }
                     &x_f32
@@ -2390,12 +2390,12 @@ impl HotQuantBanks {
                 HotGemvLayout::BlockedBn16 => {
                     let x_f32;
                     let x_ref = if x_is_bf16 {
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             gpu.barrier()?;
                         }
                         x_f32 = gpu.act_f32_scratch(self.cols as usize)?;
                         cast_bf16_to_f32(gpu, x, &x_f32, self.cols)?;
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             gpu.barrier()?;
                         }
                         &x_f32
@@ -2435,7 +2435,7 @@ impl HotQuantBanks {
                         )
                     } else if interleaved {
                         // Interleaved4 banks require the i4 simd kernel (no row-major peel fallback).
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             gpu.barrier()?;
                         }
                         let x_bf16 = if x_is_bf16 {
@@ -2444,7 +2444,7 @@ impl HotQuantBanks {
                             Some(prepare_act_bf16(gpu, x, self.cols)?)
                         };
                         let x_ref = x_bf16.as_ref().unwrap_or(x);
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             gpu.barrier()?;
                         }
                         dispatch_gemv_simd(
@@ -2464,12 +2464,12 @@ impl HotQuantBanks {
                         // bits into `float *x` when simd is off / shape-ineligible.
                         let x_f32;
                         let x_ref = if x_is_bf16 {
-                            if metal_runtime::ab_flags::need_barrier(true) {
+                            if tessl::ab_flags::need_barrier(true) {
                                 gpu.barrier()?;
                             }
                             x_f32 = gpu.act_f32_scratch(self.cols as usize)?;
                             cast_bf16_to_f32(gpu, x, &x_f32, self.cols)?;
-                            if metal_runtime::ab_flags::need_barrier(true) {
+                            if tessl::ab_flags::need_barrier(true) {
                                 gpu.barrier()?;
                             }
                             &x_f32
@@ -2656,7 +2656,7 @@ impl HotQuantBanks {
         layer_scale: f32,
     ) -> Result<()> {
         self.gemv_bf16_x(gpu, x_bf16, proj_scratch)?;
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
         rms_norm_residual_add_f32_scaled(
@@ -2714,7 +2714,7 @@ impl HotQuantBanks {
         y: &GpuBuffer,
         mi: u32,
     ) -> Result<()> {
-        use metal_runtime::dispatch::set_gpu_buf_offset;
+        use tessl::dispatch::set_gpu_buf_offset;
         // Row-major peel GEMV with x/y byte offsets.
         match self.scheme {
             crate::quant::QuantScheme::Q4Mlx { .. } => {
@@ -2746,8 +2746,8 @@ impl HotQuantBanks {
                         gpu.icb_scalars.bind_u32(bnd, cols_off, 6);
                         gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
                         bnd.dispatch(
-                            metal_runtime::runtime::mtl_size(n_tg, 1, 1),
-                            metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                            tessl::runtime::mtl_size(n_tg, 1, 1),
+                            tessl::runtime::mtl_size(tptg, 1, 1),
                         );
                         Ok(())
                     })
@@ -2841,7 +2841,7 @@ impl HotQuantBanks {
             return Ok(());
         }
         self.gemm_bf16_x(gpu, x_bf16, proj_scratch, m)?;
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
         rms_norm_residual_add_f32_scaled(
@@ -2863,7 +2863,7 @@ impl HotQuantBanks {
         resid: &GpuBuffer,
         mi: u32,
     ) -> Result<()> {
-        use metal_runtime::dispatch::set_gpu_buf_offset;
+        use tessl::dispatch::set_gpu_buf_offset;
         let interleaved = self.layout == HotGemvLayout::Interleaved4;
         let entry = if interleaved {
             "gemv_q4_mlx_simd_add_i4"
@@ -2889,8 +2889,8 @@ impl HotQuantBanks {
                 gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
                 set_gpu_buf_offset(bnd, resid, y_off, 8);
                 bnd.dispatch(
-                    metal_runtime::runtime::mtl_size(n_tg, 1, 1),
-                    metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                    tessl::runtime::mtl_size(n_tg, 1, 1),
+                    tessl::runtime::mtl_size(tptg, 1, 1),
                 );
                 Ok(())
             })
@@ -2920,11 +2920,11 @@ impl HotQuantBanks {
                 let x_ref = if x_is_bf16 {
                     x
                 } else {
-                    if metal_runtime::ab_flags::need_barrier(true) {
+                    if tessl::ab_flags::need_barrier(true) {
                         gpu.barrier()?;
                     }
                     x_bf16 = prepare_act_bf16(gpu, x, self.cols)?;
-                    if metal_runtime::ab_flags::need_barrier(true) {
+                    if tessl::ab_flags::need_barrier(true) {
                         gpu.barrier()?;
                     }
                     &x_bf16
@@ -2950,7 +2950,7 @@ impl HotQuantBanks {
                     self.gemv(gpu, x, scratch)?;
                 }
                 // RAW: scratch → resid add (phase-edge even under coarse).
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 add_inplace_f32(gpu, resid, scratch, self.rows)
@@ -3145,7 +3145,7 @@ pub fn fuse_gate_down_enabled() -> bool {
 // bookkeeping (`PingPongCbReplay::mark_live_step`) + probes `try_replay_ready`
 // (always NotWired — see `survey_cb_replay_api_gaps`). Metal 4 CB has no
 // replay-prior-encoding API; mini ICB smoke is separate
-// (`metal_runtime::icb_smoke`, default OFF). Default OFF.
+// (`tessl::icb_smoke`, default OFF). Default OFF.
 //
 //   GEMMA_METAL_ENCODE_ONCE=1
 
@@ -3159,7 +3159,7 @@ pub fn set_encode_once(on: bool) {
 
 /// Opt-in encode-once scaffold. Default OFF.
 ///
-/// When on: session probes [`metal_runtime::PingPongCbReplay::try_replay_ready`]
+/// When on: session probes [`tessl::PingPongCbReplay::try_replay_ready`]
 /// then advances the ledger via `mark_live_step` after each live decode encode.
 /// Does **not** skip host encode (MTL4 CB has no replay API; ICB stub NotWired).
 pub fn encode_once_enabled() -> bool {
@@ -3273,8 +3273,8 @@ pub fn persistent_interp_gate_down(
             set_u32(bnd, n_tg, 11);
             set_u32(bnd, PERSISTENT_INTERP_MAX_SPIN, 12);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg as usize, 1, 1),
-                metal_runtime::runtime::mtl_size(PERSISTENT_INTERP_TPTG, 1, 1),
+                tessl::runtime::mtl_size(n_tg as usize, 1, 1),
+                tessl::runtime::mtl_size(PERSISTENT_INTERP_TPTG, 1, 1),
             );
             Ok(())
         })
@@ -3356,8 +3356,8 @@ pub fn persistent_interp_gate_down_q4(
             set_u32(bnd, PERSISTENT_INTERP_MAX_SPIN, 21);
             set_u32(bnd, mid_bf16_flag, 22);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg as usize, 1, 1),
-                metal_runtime::runtime::mtl_size(GEMV_SIMD_TPTG, 1, 1),
+                tessl::runtime::mtl_size(n_tg as usize, 1, 1),
+                tessl::runtime::mtl_size(GEMV_SIMD_TPTG, 1, 1),
             );
             Ok(())
         })
@@ -3426,8 +3426,8 @@ pub fn persistent_interp_fa_o_proj(
             set_u32(bnd, PERSISTENT_INTERP_MAX_SPIN, 13);
             set_f32(bnd, scale, 14);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg as usize, 1, 1),
-                metal_runtime::runtime::mtl_size(PERSISTENT_INTERP_TPTG, 1, 1),
+                tessl::runtime::mtl_size(n_tg as usize, 1, 1),
+                tessl::runtime::mtl_size(PERSISTENT_INTERP_TPTG, 1, 1),
             );
             Ok(())
         })
@@ -3511,8 +3511,8 @@ pub fn gemv_q4_mlx_simd_qkv_bf16_x(
             gpu.icb_scalars.bind_u32(bnd, tg_q_off, 14);
             gpu.icb_scalars.bind_u32(bnd, tg_k_off, 15);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg, 1, 1),
-                metal_runtime::runtime::mtl_size(GEMV_SIMD_TPTG, 1, 1),
+                tessl::runtime::mtl_size(n_tg, 1, 1),
+                tessl::runtime::mtl_size(GEMV_SIMD_TPTG, 1, 1),
             );
             Ok(())
         })
@@ -3631,11 +3631,11 @@ fn gemv_q4_mlx_gate_up_gelu_impl(
             let x_ref = if x_is_bf16 {
                 x
             } else {
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 x_bf16 = prepare_act_bf16(gpu, x, gate.cols)?;
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 &x_bf16
@@ -3647,12 +3647,12 @@ fn gemv_q4_mlx_gate_up_gelu_impl(
             // bf16 under default FUSE_BF16 — expand before the fused dispatch.
             let x_f32;
             let x_ref = if x_is_bf16 {
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 x_f32 = gpu.act_f32_scratch(gate.cols as usize)?;
                 cast_bf16_to_f32(gpu, x, &x_f32, gate.cols)?;
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 &x_f32
@@ -3714,8 +3714,8 @@ pub fn gemv_q4_mlx_simd_add(
             gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
             set_gpu_buf(bnd, resid, 8);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg, 1, 1),
-                metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                tessl::runtime::mtl_size(n_tg, 1, 1),
+                tessl::runtime::mtl_size(tptg, 1, 1),
             );
             Ok(())
         })
@@ -3764,8 +3764,8 @@ pub fn gemv_q4_mlx_simd_gate_up_gelu(
             gpu.icb_scalars.bind_u32(bnd, gs_off, 10);
             gpu.icb_scalars.bind_u32(bnd, mid_bf16_off, 11);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg, 1, 1),
-                metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                tessl::runtime::mtl_size(n_tg, 1, 1),
+                tessl::runtime::mtl_size(tptg, 1, 1),
             );
             Ok(())
         })
@@ -3820,11 +3820,11 @@ fn gemv_q4_mlx_simd_kv_impl(
     let x_ref = if x_is_bf16 {
         x
     } else {
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
         x_bf16 = prepare_act_bf16(gpu, x, k.cols)?;
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
         &x_bf16
@@ -3864,8 +3864,8 @@ fn gemv_q4_mlx_simd_kv_impl(
             gpu.icb_scalars.bind_u32(bnd, gs_off, 11);
             gpu.icb_scalars.bind_u32(bnd, tg_k_off, 12);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg, 1, 1),
-                metal_runtime::runtime::mtl_size(GEMV_SIMD_TPTG, 1, 1),
+                tessl::runtime::mtl_size(n_tg, 1, 1),
+                tessl::runtime::mtl_size(GEMV_SIMD_TPTG, 1, 1),
             );
             Ok(())
         })
@@ -3920,8 +3920,8 @@ pub fn gemv_q4_mlx_blocked_gate_up_gelu(
             gpu.icb_scalars.bind_u32(bnd, mid_bf16_off, 11);
             bnd.set_threadgroup_memory(0, tg_mem);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg, 1, 1),
-                metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                tessl::runtime::mtl_size(n_tg, 1, 1),
+                tessl::runtime::mtl_size(tptg, 1, 1),
             );
             Ok(())
         })
@@ -3956,8 +3956,8 @@ pub fn softcap_sample(
             set_gpu_buf(bnd, &gpu.icb_scalars.softcap, 2);
             set_u32(bnd, n, 3);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(1, 1, 1),
-                metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                tessl::runtime::mtl_size(1, 1, 1),
+                tessl::runtime::mtl_size(tptg, 1, 1),
             );
             Ok(())
         })
@@ -4018,7 +4018,7 @@ pub fn softcap_argmax_encode_offset(
     out_token: &GpuBuffer,
     out_byte_off: usize,
 ) -> Result<()> {
-    use metal_runtime::dispatch::set_gpu_buf_offset;
+    use tessl::dispatch::set_gpu_buf_offset;
     if n == 0 {
         return Err(Error::Metal("softcap_argmax: n == 0".into()));
     }
@@ -4038,8 +4038,8 @@ pub fn softcap_argmax_encode_offset(
                 set_gpu_buf(bnd, &gpu.icb_scalars.softcap, 2);
                 set_u32(bnd, n, 3);
                 bnd.dispatch(
-                    metal_runtime::runtime::mtl_size(1, 1, 1),
-                    metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                    tessl::runtime::mtl_size(1, 1, 1),
+                    tessl::runtime::mtl_size(tptg, 1, 1),
                 );
                 Ok(())
             })
@@ -4073,8 +4073,8 @@ pub fn softcap_argmax_encode_offset(
                 set_gpu_buf(bnd, &gpu.icb_scalars.softcap, 2);
                 set_u32(bnd, n, 3);
                 bnd.dispatch(
-                    metal_runtime::runtime::mtl_size(1, 1, 1),
-                    metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                    tessl::runtime::mtl_size(1, 1, 1),
+                    tessl::runtime::mtl_size(tptg, 1, 1),
                 );
                 Ok(())
             })
@@ -4120,14 +4120,14 @@ pub fn softcap_argmax_encode_offset(
                     set_u32(bnd, has_idx, 5);
                     set_gpu_buf(bnd, &gpu.icb_scalars.softcap, 6);
                     bnd.dispatch(
-                        metal_runtime::runtime::mtl_size(groups as usize, 1, 1),
-                        metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                        tessl::runtime::mtl_size(groups as usize, 1, 1),
+                        tessl::runtime::mtl_size(tptg, 1, 1),
                     );
                     Ok(())
                 })
                 .map_err(map_metal)?;
         }
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
 
@@ -4207,7 +4207,7 @@ pub fn copy_f32_to_offset(
     dst_elem_offset: usize,
     n: u32,
 ) -> Result<()> {
-    use metal_runtime::dispatch::set_gpu_buf_offset;
+    use tessl::dispatch::set_gpu_buf_offset;
     if n == 0 {
         return Ok(());
     }
@@ -4249,7 +4249,7 @@ pub fn copy_f32_range(
     dst_elem_offset: usize,
     n: u32,
 ) -> Result<()> {
-    use metal_runtime::dispatch::set_gpu_buf_offset;
+    use tessl::dispatch::set_gpu_buf_offset;
     if n == 0 {
         return Ok(());
     }
@@ -4296,7 +4296,7 @@ pub fn copy_u32_to_index(
     dst: &GpuBuffer,
     dst_index: u32,
 ) -> Result<()> {
-    use metal_runtime::dispatch::set_gpu_buf_offset;
+    use tessl::dispatch::set_gpu_buf_offset;
     let p = gpu.rt.pipeline("copy_f32").map_err(map_metal)?;
     let off = (dst_index as usize).saturating_mul(4);
     if off + 4 > dst.nbytes() {
@@ -4320,7 +4320,7 @@ pub fn copy_u32_from_index(
     src_index: u32,
     dst: &GpuBuffer,
 ) -> Result<()> {
-    use metal_runtime::dispatch::set_gpu_buf_offset;
+    use tessl::dispatch::set_gpu_buf_offset;
     let p = gpu.rt.pipeline("copy_f32").map_err(map_metal)?;
     let off = (src_index as usize).saturating_mul(4);
     if off + 4 > src.nbytes() {
@@ -4387,8 +4387,8 @@ pub fn argmax_f32_pass(
             set_u32(bnd, has, 5);
             set_gpu_buf(bnd, &gpu.icb_scalars.softcap, 6);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(groups, 1, 1),
-                metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                tessl::runtime::mtl_size(groups, 1, 1),
+                tessl::runtime::mtl_size(tptg, 1, 1),
             );
             Ok(())
         })
@@ -4531,8 +4531,8 @@ pub fn embed_lookup_quant_n(
             set_u32(bnd, group_size, 7);
             set_u32(bnd, m, 8);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg, 1, 1),
-                metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                tessl::runtime::mtl_size(n_tg, 1, 1),
+                tessl::runtime::mtl_size(tptg, 1, 1),
             );
             Ok(())
         })
@@ -4578,8 +4578,8 @@ pub fn gemm_q4_mlx_simd_add(
             set_u32(bnd, m, 8);
             set_gpu_buf(bnd, resid, 9);
             bnd.dispatch(
-                metal_runtime::runtime::mtl_size(n_tg, 1, 1),
-                metal_runtime::runtime::mtl_size(tptg, 1, 1),
+                tessl::runtime::mtl_size(n_tg, 1, 1),
+                tessl::runtime::mtl_size(tptg, 1, 1),
             );
             Ok(())
         })
@@ -4976,7 +4976,7 @@ mod tests {
             eprintln!("skip: set GEMMA_METAL_BLOCKED_HOT_PARITY=1 to run");
             return;
         }
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let Some(gpu) = gpu_or_skip() else { return };
         if gpu.rt.pipeline("gemv_q4_mlx_blocked").is_err() {
             eprintln!("skip: gemv_q4_mlx_blocked not in metallib");

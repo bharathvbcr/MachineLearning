@@ -29,30 +29,60 @@ pub fn golden_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden")
 }
 
+/// Fail with instructions when the regenerable forward activations are absent.
+///
+/// `golden/fwd/` is ~80 MB of activations and is gitignored, so a fresh clone
+/// has every other golden but not these. Without this the tests die on a bare
+/// `No such file or directory` naming one `.npy`, which says nothing about how
+/// to get it. A check that cannot run has to say what would make it run.
+pub fn require_fwd_goldens(golden: &std::path::Path) {
+    let fwd = golden.join("fwd");
+    let probe = fwd.join("stem_after_smear.npy");
+    if probe.exists() {
+        return;
+    }
+    panic!(
+        "forward goldens missing at {}\n\
+         These activations are regenerable and therefore gitignored \
+         (.gitignore: golden/fwd/), so a fresh clone will not have them.\n\
+         Regenerate with:\n\
+         \n    python3 {}/scripts/export_goldens.py\n\n\
+         Every other golden directory (grads, inputs, optim_step3, weights_init) \
+         is committed and needs nothing.",
+        fwd.display(),
+        env!("CARGO_MANIFEST_DIR"),
+    );
+}
+
+/// Error reductions must preserve non-finite evidence instead of hiding NaNs.
+pub(crate) fn max_finite_error(acc: f32, value: f32) -> f32 {
+    if acc.is_finite() && value.is_finite() { acc.max(value) } else { f32::INFINITY }
+}
+
 pub fn max_abs_err(got: &[f32], exp: &[f32]) -> f32 {
-    got.iter()
-        .zip(exp.iter())
-        .map(|(g, e)| (g - e).abs())
-        .fold(0.0f32, f32::max)
+    if got.is_empty() || got.len() != exp.len() { return f32::INFINITY; }
+    got.iter().zip(exp).map(|(g, e)| (g - e).abs())
+        .fold(0.0, max_finite_error)
 }
 
 pub fn mean_abs_err(got: &[f32], exp: &[f32]) -> f32 {
-    if got.is_empty() {
-        return 0.0;
+    if got.is_empty() || got.len() != exp.len() { return f32::INFINITY; }
+    let mut sum = 0.0f64;
+    for (&g, &e) in got.iter().zip(exp) {
+        if !g.is_finite() || !e.is_finite() { return f32::INFINITY; }
+        sum += (f64::from(g) - f64::from(e)).abs();
     }
-    let s: f32 = got.iter().zip(exp.iter()).map(|(g, e)| (g - e).abs()).sum();
-    s / got.len() as f32
+    (sum / got.len() as f64) as f32
 }
 
 pub fn compare_f32(name: &str, got: &[f32], exp: &[f32], atol: f32) -> CompareResult {
-    assert_eq!(got.len(), exp.len(), "{name} length mismatch");
     let max_abs = max_abs_err(got, exp);
     let mean_abs = mean_abs_err(got, exp);
     CompareResult {
         name: name.to_string(),
         max_abs,
         mean_abs,
-        passed: max_abs <= atol,
+        passed: atol.is_finite() && atol >= 0.0 && max_abs.is_finite() && max_abs <= atol,
     }
 }
 
@@ -875,6 +905,11 @@ fn compare_muon_momentum(
 }
 
 #[cfg(test)]
+// The GEMM correctness tests (adversarial shape sweep, randomized shape fuzz,
+// the C-overwrite guards and the coop-gate boundary test) live with the code
+// they cover, in `tessl::gemm`. They used to be duplicated here against a
+// forked copy of gemm.rs; that fork is gone, so a second copy would only mean
+// two places to update and one of them going stale.
 mod tests {
     use super::*;
 
@@ -886,7 +921,8 @@ mod tests {
             "missing goldens at {}",
             golden.display()
         );
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        require_fwd_goldens(&golden);
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         eprintln!(
             "device={} tensorops={}",
             rt.device_name(),
@@ -906,7 +942,8 @@ mod tests {
     #[test]
     fn stem_only_parity() {
         let golden = golden_dir();
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        require_fwd_goldens(&golden);
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         let cfg = ModelConfig::sota_toy();
         let w = Weights::load_from_golden(&rt, &golden, cfg).unwrap();
         let ids = load_input_ids(&golden, 0).unwrap();
@@ -923,7 +960,7 @@ mod tests {
     #[test]
     fn bwd_parity_vs_goldens() {
         let golden = golden_dir();
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         eprintln!(
             "device={} tensorops={} flash=FA-2+L",
             rt.device_name(),
@@ -947,7 +984,7 @@ mod tests {
     fn qkv_post_bwd_exact_128m_dimensions() {
         use crate::dispatch::{dispatch_1d, set_f32, set_tensor, set_u32};
 
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let (b, t, h, hkv, d) = (1usize, 1usize, 24usize, 12usize, 32usize);
         let qn = b * t * h * d;
         let kn = b * t * hkv * d;
@@ -1051,12 +1088,10 @@ mod tests {
             "K tail remained zero; width truncation regressed"
         );
     }
-
-    /// Focused flash gate: tape must carry LSE, and attn-related grads stay ≤1e-4.
     #[test]
     fn flash_attn_lse_and_bwd_gate() {
         let golden = golden_dir();
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         let cfg = ModelConfig::sota_toy();
         let w = Weights::load_from_golden(&rt, &golden, cfg).unwrap();
         let ids = load_input_ids(&golden, 0).unwrap();
@@ -1110,7 +1145,7 @@ mod tests {
     #[test]
     fn late_checkpoint_flash_fd_scaffold() {
         let golden = golden_dir();
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         let late = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("out/step_2000_weights");
         let use_late = late.join("tok_emb/weight.npy").exists() || late.join("tok_emb.npy").exists();
         if use_late {
@@ -1128,7 +1163,7 @@ mod tests {
         let mut grads = Grads::zeros_like(&rt, &w).unwrap();
         backward_f32_opts(&rt, &w, &tape, &mut grads, false).unwrap();
         let g = grads.qo_bank.buffer.read_f32();
-        let max_abs = g.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let max_abs = g.iter().map(|x| x.abs()).fold(0.0f32, crate::parity::max_finite_error);
         assert!(
             max_abs.is_finite() && max_abs > 0.0,
             "qo_bank grad max_abs={max_abs}"
@@ -1139,7 +1174,7 @@ mod tests {
     #[test]
     fn finite_diff_spot_checks_test() {
         let golden = golden_dir();
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         let results = finite_diff_spot_checks(&rt, &golden).expect("fd");
         for (name, fd, analytic, ok) in &results {
             eprintln!(
@@ -1167,7 +1202,7 @@ mod tests {
             golden.join("optim_step3/params/tok_emb/weight.npy").exists(),
             "missing optim_step3 goldens"
         );
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         eprintln!(
             "device={} tensorops={}",
             rt.device_name(),
@@ -1201,7 +1236,7 @@ mod tests {
     fn clip_coef_stays_on_device() {
         // Sanity: clip writes a device coef without requiring host norm for the scale.
         let golden = golden_dir();
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         let cfg = ModelConfig::sota_toy();
         let w = Weights::load_from_golden(&rt, &golden, cfg).unwrap();
         let ids = load_input_ids(&golden, 0).unwrap();
@@ -1226,7 +1261,7 @@ mod tests {
     #[test]
     fn bf16_train_path_smoke() {
         let golden = golden_dir();
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         if !rt.has_tensorops() {
             eprintln!("skipping bf16 train smoke: no TensorOps");
             return;
@@ -1268,7 +1303,7 @@ mod tests {
     fn fa_bwd_row_d32_matches_generic() {
         use crate::dispatch::{dispatch_1d, set_f32, set_tensor, set_u32};
 
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         if rt.pipeline("flash_attn_bwd_dq_row_d32_f32").is_err() {
             eprintln!("skipping: Audit 7 FA bwd kernels not in metallib");
             return;
@@ -1390,7 +1425,7 @@ mod tests {
             a.iter()
                 .zip(c.iter())
                 .map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max)
+                .fold(0.0f32, crate::parity::max_finite_error)
         };
 
         let (rq, rk, rv) = run(
@@ -1447,7 +1482,7 @@ mod tests {
     fn glue_bwd_rowblock_matches_inline_atomics() {
         use crate::dispatch::{dispatch_1d, set_f32, set_tensor, set_u32};
 
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         if rt.pipeline("reduce_dscale_rowblock_f32").is_err() {
             eprintln!("skipping: Audit 8 rowblock kernels not in metallib");
             return;
@@ -1480,7 +1515,7 @@ mod tests {
             a.iter()
                 .zip(b.iter())
                 .map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max)
+                .fold(0.0f32, crate::parity::max_finite_error)
         };
 
         // ---- kernel 1: dscale ----
@@ -1611,7 +1646,7 @@ mod tests {
     fn fa_fwd_d32_matches_generic() {
         use crate::dispatch::{dispatch_2d_tg, set_f32, set_tensor, set_u32};
 
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         if rt.pipeline("flash_attn_fwd_d32_f32").is_err() {
             eprintln!("skipping: Audit 8 fwd flash kernels not in metallib");
             return;
@@ -1670,7 +1705,7 @@ mod tests {
             a.iter()
                 .zip(c.iter())
                 .map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max)
+                .fold(0.0f32, crate::parity::max_finite_error)
         };
         let (ro, rl) = run("flash_attn_fwd_f32", false);
         assert!(
@@ -1704,7 +1739,7 @@ mod tests {
     fn fa_fwd_blocksoft_close_to_sequential() {
         use crate::dispatch::{dispatch_2d_tg, set_f32, set_tensor, set_u32};
 
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         if rt.pipeline("flash_attn_fwd_blocksoft_d32_f32").is_err() {
             eprintln!("skipping: Phase G blocksoft kernels not in metallib");
             return;
@@ -1753,7 +1788,7 @@ mod tests {
             a.iter()
                 .zip(c.iter())
                 .map(|(x, y)| (x - y).abs())
-                .fold(0.0f32, f32::max)
+                .fold(0.0f32, crate::parity::max_finite_error)
         };
 
         let (ro, rl) = run("flash_attn_fwd_f32");
@@ -1779,7 +1814,7 @@ mod tests {
     #[test]
     fn bf16_flash_lse_smoke() {
         let golden = golden_dir();
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         if !rt.has_tensorops() || rt.pipeline("flash_attn_fwd_bf16").is_err() {
             eprintln!("skipping bf16 flash LSE smoke");
             return;
@@ -1809,7 +1844,7 @@ mod tests {
     /// Kept off default hot path (DECISIONS M8); `--flash-tensorops` enables fwd.
     #[test]
     fn flash_tensorops_online_sota_shape_smoke() {
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         if rt.pipeline("flash_attn_tensorops_online_f32").is_err() {
             eprintln!("skipping TensorOps online sota probe (kernel missing)");
             return;
@@ -1897,7 +1932,7 @@ mod tests {
     /// Not golden-gated; documents whether the probe is numerically usable.
     #[test]
     fn flash_tensorops_online_probe_smoke() {
-        let rt = GpuRuntime::new().expect("GpuRuntime");
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
         if rt.pipeline("flash_attn_tensorops_online_f32").is_err() {
             eprintln!("skipping TensorOps online probe (kernel missing)");
             return;
@@ -1985,5 +2020,24 @@ mod tests {
             max_err < 5e-3,
             "TensorOps online probe diverges from FA-2: err={max_err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn invalid_parity_evidence_never_passes() {
+        for (got,expected,atol) in [
+            (vec![f32::NAN],vec![0.0],1e-5),
+            (vec![f32::INFINITY],vec![f32::INFINITY],1e-5),
+            (vec![],vec![],1e-5),
+            (vec![0.0],vec![0.0,1.0],1e-5),
+            (vec![0.0],vec![0.0],f32::INFINITY),
+        ] {
+            let result=std::panic::catch_unwind(||compare_f32("bad",&got,&expected,atol));
+            assert!(result.is_ok(), "comparison should report failed evidence, not panic");
+            assert!(!result.unwrap().passed, "invalid evidence accepted");
+        }
     }
 }

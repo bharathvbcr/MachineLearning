@@ -4,7 +4,7 @@
 //! decode GEMV + RMS + FA + MLP + softcap on GPU. KV stays on GPU (store +
 //! optional ring densify); packed async encode batches layer dispatches.
 
-use metal_runtime::tensor::GpuBuffer;
+use tessl::tensor::GpuBuffer;
 use std::sync::OnceLock;
 
 use crate::config::{Gemma4TextConfig, LayerType};
@@ -117,8 +117,8 @@ impl CaptureAlwaysOnGuard {
                 prev_skip_auto: None,
             };
         }
-        let prev = metal_runtime::ab_flags::hazard_barriers();
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        let prev = tessl::ab_flags::hazard_barriers();
+        tessl::ab_flags::set_hazard_barriers(false);
         Self {
             prev_skip_auto: Some(prev),
         }
@@ -128,7 +128,7 @@ impl CaptureAlwaysOnGuard {
 impl Drop for CaptureAlwaysOnGuard {
     fn drop(&mut self) {
         if let Some(prev) = self.prev_skip_auto.take() {
-            metal_runtime::ab_flags::set_hazard_barriers(prev);
+            tessl::ab_flags::set_hazard_barriers(prev);
         }
     }
 }
@@ -996,10 +996,10 @@ pub struct GpuDecodeSession {
     argmax_tok: GpuBuffer,
     /// Absolute RoPE / KV write position (`u32×1`), written once per decode/verify step.
     /// Seed token is already GPU-resident (`seed_tok`). FA/kv_store still take CPU `u32`
-    /// constants today — see D16 / `metal_runtime::cb_replay`.
+    /// constants today — see D16 / `tessl::cb_replay`.
     pos_buf: GpuBuffer,
     /// Optional ping-pong CB replay scaffold (not wired into the decode graph).
-    encode_once: metal_runtime::PingPongCbReplay,
+    encode_once: tessl::PingPongCbReplay,
     /// Mini-only persistent-interpreter decode hook (lazy; see D17).
     persistent_interp: Option<PersistentInterpMiniHook>,
     /// Lazy scratch for Hot bounded-TG gate→down (D18; see [`fuse_gate_down_enabled`]).
@@ -1183,7 +1183,7 @@ impl GpuDecodeSession {
             seed_tok: model.gpu.rt.alloc_buffer(4).map_err(Error::Metal)?,
             argmax_tok: model.gpu.rt.alloc_buffer(4).map_err(Error::Metal)?,
             pos_buf: model.gpu.rt.alloc_buffer(4).map_err(Error::Metal)?,
-            encode_once: metal_runtime::PingPongCbReplay::new(),
+            encode_once: tessl::PingPongCbReplay::new(),
             icb_capture_watermark: None,
             icb_scalar_write_tape: None,
             persistent_interp: None,
@@ -1303,7 +1303,7 @@ impl GpuDecodeSession {
     }
 
     /// Device `h_ctx` buffer for GPU draft (prefix length = [`Self::conditioner_h_ctx_len`]).
-    pub fn conditioner_h_ctx_buf(&self) -> Result<&metal_runtime::tensor::GpuBuffer> {
+    pub fn conditioner_h_ctx_buf(&self) -> Result<&tessl::tensor::GpuBuffer> {
         let Some(ref c) = self.conditioner else {
             return Err(Error::Config("no GPU conditioner attached".into()));
         };
@@ -1366,7 +1366,7 @@ impl GpuDecodeSession {
             )?;
             if (scale - 1.0).abs() > 1e-12 {
                 // RAW: lookup writes `x`, then scale reads it (hazard mode skips auto barriers).
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     self.model.gpu.barrier()?;
                 }
                 scale_f32_inplace(&self.model.gpu, &self.x, scale, h as u32)?;
@@ -1423,9 +1423,9 @@ impl GpuDecodeSession {
         let mut icb_replay_prep = false;
         let mut icb_live_replay_noted = false;
         let mut capturing_layer_icb = false;
-        let mut binder_nop_guard: Option<metal_runtime::BinderEncodeNopGuard> = None;
+        let mut binder_nop_guard: Option<tessl::BinderEncodeNopGuard> = None;
         if encode_once_enabled()
-            && metal_runtime::decode_icb_enabled()
+            && tessl::decode_icb_enabled()
             && self.model.decode_icb_graph_eligible()
         {
             // Tape-direct dispatch is the honest default (execute_icb inherit ≈
@@ -1439,8 +1439,8 @@ impl GpuDecodeSession {
                     .ok()
                     .map(|v| matches!(v.as_str(), "1" | "true" | "icb"))
                     .unwrap_or(false)
-                || metal_runtime::icb_freeze_binds_enabled();
-            metal_runtime::set_icb_pipelines(want_icb_exec);
+                || tessl::icb_freeze_binds_enabled();
+            tessl::set_icb_pipelines(want_icb_exec);
             if self.encode_once.decode_icb_layer_graph() && self.encode_once.has_ready_slot() {
                 if head {
                     // Densify shape stable; Q4 fuse_bf16 now expands bf16→f32 before
@@ -1479,8 +1479,8 @@ impl GpuDecodeSession {
                     Ok(slot) => {
                         self.encode_once.on_gpu_complete(slot);
                     }
-                    Err(metal_runtime::CbReplayError::NotReady) => {}
-                    Err(metal_runtime::CbReplayError::NotWired) => {}
+                    Err(tessl::CbReplayError::NotReady) => {}
+                    Err(tessl::CbReplayError::NotWired) => {}
                     Err(e) => {
                         return Err(Error::Metal(format!("encode_once try_replay_icb: {e}")));
                     }
@@ -1489,8 +1489,8 @@ impl GpuDecodeSession {
         } else if encode_once_enabled() {
             match self.encode_once.try_replay_ready() {
                 Ok(_) => {}
-                Err(metal_runtime::CbReplayError::NotReady) => {}
-                Err(metal_runtime::CbReplayError::NotWired) => {}
+                Err(tessl::CbReplayError::NotReady) => {}
+                Err(tessl::CbReplayError::NotWired) => {}
                 Err(e) => {
                     return Err(Error::Metal(format!("encode_once try_replay: {e}")));
                 }
@@ -1555,7 +1555,7 @@ impl GpuDecodeSession {
             StepSeed::FromArgmax => {
                 crate::trace_op!("seed_from_argmax", "copy_u32 argmax_tok→seed_tok", {
                     copy_u32_one(&self.model.gpu, &self.argmax_tok, &self.seed_tok)?;
-                    if metal_runtime::ab_flags::need_barrier(true) {
+                    if tessl::ab_flags::need_barrier(true) {
                         self.model.gpu.barrier()?;
                     }
                 });
@@ -1605,11 +1605,11 @@ impl GpuDecodeSession {
                 .map(|t| !t.is_empty())
                 .unwrap_or(false);
         if capturing_layer_icb {
-            metal_runtime::begin_decode_icb_capture();
+            tessl::begin_decode_icb_capture();
             begin_icb_scalar_write_tape();
         }
         if icb_replay_prep && !skip_nop_layers {
-            binder_nop_guard = Some(metal_runtime::BinderEncodeNopGuard::enter());
+            binder_nop_guard = Some(tessl::BinderEncodeNopGuard::enter());
         }
 
         if skip_nop_layers {
@@ -1706,7 +1706,7 @@ impl GpuDecodeSession {
                     let n = Self::stats_f32(&self.normed.read_f32()[..self.model.hidden]);
                     eprintln!("[layer_probe] after rms_input finite={} nan={} min={:.4} max={:.4}", n.finite, n.nan, n.min, n.max);
                 }
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let x_bf16 = gpu.act_bf16_scratch(hidden as usize)?;
@@ -1959,7 +1959,7 @@ impl GpuDecodeSession {
                     }
                 }
                 // Phase edge: QKV proj → rope/norms.
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     crate::trace_op!("barrier_qkv", format!("layer={li}"), {
                         gpu.barrier()?;
                     });
@@ -2088,7 +2088,7 @@ impl GpuDecodeSession {
             if is_producer {
                 let gpu = &self.model.gpu;
                 // Phase edge: rope/norms → KV write (skipped when fused into rope).
-                if !fused_kv_store && metal_runtime::ab_flags::need_barrier(true) {
+                if !fused_kv_store && tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let kv_elems = (hkv * head_dim) as u64 * 4;
@@ -2165,7 +2165,7 @@ impl GpuDecodeSession {
                 let gpu = &self.model.gpu;
                 let layer = &self.model.layers[li];
                 // Phase edge: KV write/share → FA.
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let (k_fa, v_fa, kv_off, tkv) = crate::trace_op!(
@@ -2320,7 +2320,7 @@ impl GpuDecodeSession {
                         }
                     );
                 }
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let o_bf16 = gpu.act_bf16_scratch(o_elems as usize)?;
@@ -2346,7 +2346,7 @@ impl GpuDecodeSession {
                                 )?;
                             } else {
                                 layer.o_proj.gemv_bf16_x(gpu, &o_bf16, &self.attn_proj)?;
-                                if metal_runtime::ab_flags::need_barrier(true) {
+                                if tessl::ab_flags::need_barrier(true) {
                                     gpu.barrier()?;
                                 }
                                 rms_norm_f32(
@@ -2358,7 +2358,7 @@ impl GpuDecodeSession {
                                     hidden,
                                     eps,
                                 )?;
-                                if metal_runtime::ab_flags::need_barrier(true) {
+                                if tessl::ab_flags::need_barrier(true) {
                                     gpu.barrier()?;
                                 }
                                 ple_residual_add(gpu, &self.x, &self.normed, 1.0, hidden)?;
@@ -2395,7 +2395,7 @@ impl GpuDecodeSession {
                             .ple_q4
                             .as_ref()
                             .expect("fuse_ple implies ple_q4");
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             gpu.barrier()?;
                         }
                         crate::trace_op!(
@@ -2473,7 +2473,7 @@ impl GpuDecodeSession {
                     // Phase edge: o_resid (+ ple_lookup) → ple_residual (RAW on x).
                     // Fused lane already emitted this barrier and folded the add.
                     if !fuse_ple {
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             gpu.barrier()?;
                         }
                         crate::trace_op!(
@@ -2502,7 +2502,7 @@ impl GpuDecodeSession {
                 }
 
                 // Phase edge: residual → pre_ff (Gemma4) / post_attn (legacy) before MLP.
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let mlp_in_norm = layer.pre_ff_norm.as_ref().unwrap_or(&layer.post_attn_norm);
@@ -2539,7 +2539,7 @@ impl GpuDecodeSession {
                     eprintln!("[layer_probe] after rms_post_attn finite={} nan={} min={:.4} max={:.4}", n.finite, n.nan, n.min, n.max);
                 }
                 // Phase edge: post_attn → MLP.
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let x_bf16 = gpu.act_bf16_scratch(hidden as usize)?;
@@ -2572,7 +2572,7 @@ impl GpuDecodeSession {
                         }
                     );
                     if let Some(ref w) = layer.post_ff_norm {
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             gpu.barrier()?;
                         }
                         rms_norm_f32(gpu, &self.x, w, &self.normed, 1, hidden, eps)?;
@@ -2710,7 +2710,7 @@ impl GpuDecodeSession {
                         }
                     );
                 }
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let mid_bf16 = if fuse_bf16 {
@@ -2748,11 +2748,11 @@ impl GpuDecodeSession {
                                     )?;
                                 } else {
                                     layer.down_proj.gemv_bf16_x(gpu, &mid_bf16, &self.down)?;
-                                    if metal_runtime::ab_flags::need_barrier(true) {
+                                    if tessl::ab_flags::need_barrier(true) {
                                         gpu.barrier()?;
                                     }
                                     rms_norm_f32(gpu, &self.down, w, &self.normed, 1, hidden, eps)?;
-                                    if metal_runtime::ab_flags::need_barrier(true) {
+                                    if tessl::ab_flags::need_barrier(true) {
                                         gpu.barrier()?;
                                     }
                                     ple_residual_add(gpu, &self.x, &self.normed, 1.0, hidden)?;
@@ -2780,7 +2780,7 @@ impl GpuDecodeSession {
                 // Skipped when folded into fused down-proj postnorm (above).
                 let folded = fuse_dual_norm_enabled() && use_gemma4_dual_norm && has_post_ff;
                 if use_gemma4_dual_norm && (layer_scalar - 1.0).abs() > 1e-8 && !folded {
-                    if metal_runtime::ab_flags::need_barrier(true) {
+                    if tessl::ab_flags::need_barrier(true) {
                         gpu.barrier()?;
                     }
                     crate::trace_op!(
@@ -2849,7 +2849,7 @@ impl GpuDecodeSession {
                     let slot = self.capture.as_mut().and_then(|c| c.mark_layer(li));
                     if let (Some(slot), Some(ref row)) = (slot, self.capture_row.as_ref()) {
                         let force_barrier = capture_barrier_forced();
-                        if metal_runtime::ab_flags::hazard_barriers() {
+                        if tessl::ab_flags::hazard_barriers() {
                             self.model.gpu.synchronize()?;
                         } else if force_barrier {
                             self.model.gpu.barrier()?;
@@ -2873,10 +2873,10 @@ impl GpuDecodeSession {
         // live on replay — lm_head/softcap via ICB was observed to collapse argmax→0
         // even when residual stayed finite (token-parity triage 2026-07-19).
         if capturing_layer_icb {
-            if let Some(cap) = metal_runtime::take_decode_icb_capture() {
+            if let Some(cap) = tessl::take_decode_icb_capture() {
                 let n = cap.commands.len();
-                if n >= metal_runtime::DecodeIcb::MIN_LAYER_GRAPH_COMMANDS {
-                    match metal_runtime::DecodeIcb::from_commands(&self.model.gpu.rt, cap.commands)
+                if n >= tessl::DecodeIcb::MIN_LAYER_GRAPH_COMMANDS {
+                    match tessl::DecodeIcb::from_commands(&self.model.gpu.rt, cap.commands)
                     {
                         Ok(mut icb) => {
                             eprintln!(
@@ -2905,7 +2905,7 @@ impl GpuDecodeSession {
                             let _ = take_icb_scalar_write_tape();
                             // mini_copy_chain is a dispatch-freeze proof for mini dims only.
                             if self.model.is_synthetic_mini() {
-                                match metal_runtime::DecodeIcb::mini_copy_chain(
+                                match tessl::DecodeIcb::mini_copy_chain(
                                     &self.model.gpu.rt,
                                     64,
                                 ) {
@@ -2928,7 +2928,7 @@ impl GpuDecodeSession {
                     );
                     let _ = take_icb_scalar_write_tape();
                     if self.model.is_synthetic_mini() {
-                        match metal_runtime::DecodeIcb::mini_copy_chain(&self.model.gpu.rt, 64) {
+                        match tessl::DecodeIcb::mini_copy_chain(&self.model.gpu.rt, 64) {
                             Ok((icb, _)) => self.encode_once.attach_decode_icb(icb),
                             Err(e) => {
                                 eprintln!("encode_once: mini_copy_chain attach failed: {e}");
@@ -2963,12 +2963,12 @@ impl GpuDecodeSession {
                 Ok(slot) => {
                     self.encode_once.on_gpu_complete(slot);
                 }
-                Err(metal_runtime::CbReplayError::NotReady) => {
+                Err(tessl::CbReplayError::NotReady) => {
                     return Err(Error::Metal(
                         "encode_once: layer-graph replay expected Ready slot".into(),
                     ));
                 }
-                Err(metal_runtime::CbReplayError::NotWired) => {
+                Err(tessl::CbReplayError::NotWired) => {
                     return Err(Error::Metal(
                         "encode_once: layer-graph DecodeIcb not wired at replay".into(),
                     ));
@@ -2978,7 +2978,7 @@ impl GpuDecodeSession {
                 }
             }
             // Ensure residual is visible before live lm_head.
-            if metal_runtime::ab_flags::need_barrier(true) {
+            if tessl::ab_flags::need_barrier(true) {
                 self.model.gpu.barrier()?;
             }
         }
@@ -3009,7 +3009,7 @@ impl GpuDecodeSession {
                         let _ = prepare_act_bf16(gpu, &self.normed, hidden)?;
                     }
                 });
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let x_bf16 = gpu.act_bf16_scratch(hidden as usize)?;
@@ -3074,7 +3074,7 @@ impl GpuDecodeSession {
                 if readback {
                     capture_host_pending = true;
                 } else {
-                    if metal_runtime::ab_flags::need_barrier(true) {
+                    if tessl::ab_flags::need_barrier(true) {
                         self.model.gpu.barrier()?;
                     }
                     if let Some(ref mut cond) = self.conditioner {
@@ -3111,7 +3111,7 @@ impl GpuDecodeSession {
 
         if let Some(ref mut tr) = tracer {
             tr.end_token(TraceFlags {
-                hazard_barriers_auto: metal_runtime::ab_flags::hazard_barriers(),
+                hazard_barriers_auto: tessl::ab_flags::hazard_barriers(),
                 ple: false,
                 async_encode: true,
             });
@@ -3135,7 +3135,7 @@ impl GpuDecodeSession {
                 if let Some(ref row_buf) = self.capture_row {
                     // Softcap already drained. Now project FC → h_ctx, then host concat.
                     if let Some(ref mut cond) = self.conditioner {
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             self.model.gpu.barrier()?;
                         }
                         cond.project_row(&self.model.gpu, row_buf)?;
@@ -3200,12 +3200,12 @@ impl GpuDecodeSession {
     }
 
     /// Ping-pong CB replay scaffold (record/commit/reuse bookkeeping; replay not wired).
-    pub fn encode_once_scaffold(&self) -> &metal_runtime::PingPongCbReplay {
+    pub fn encode_once_scaffold(&self) -> &tessl::PingPongCbReplay {
         &self.encode_once
     }
 
     /// Mutable access for tests / harness inspecting live-encode counters.
-    pub fn encode_once_scaffold_mut(&mut self) -> &mut metal_runtime::PingPongCbReplay {
+    pub fn encode_once_scaffold_mut(&mut self) -> &mut tessl::PingPongCbReplay {
         &mut self.encode_once
     }
 
@@ -3774,7 +3774,7 @@ impl GpuDecodeSession {
                     rms_norm_f32(gpu, &self.x, &layer.input_norm, &self.normed, m_u, hidden, eps)?;
                     let _ = prepare_act_bf16(gpu, &self.normed, m_u * hidden)?;
                 }
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let x_bf16 = gpu.act_bf16_scratch((m * h_usz).max(1))?;
@@ -3792,7 +3792,7 @@ impl GpuDecodeSession {
                     k.gemm_bf16_x(gpu, &x_bf16, &self.k, m_u)?;
                     v.gemm_bf16_x(gpu, &x_bf16, &self.v, m_u)?;
                 }
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 rms_qkv_rope_ex_posbuf(
@@ -3830,7 +3830,7 @@ impl GpuDecodeSession {
 
             if is_producer {
                 let gpu = &self.model.gpu;
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 match &role {
@@ -3857,7 +3857,7 @@ impl GpuDecodeSession {
             {
                 let gpu = &self.model.gpu;
                 let layer = &self.model.layers[li];
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let (k_fa, v_fa, kv_off, tkv) = if is_producer {
@@ -3936,7 +3936,7 @@ impl GpuDecodeSession {
                 if !fuse_bf16 {
                     let _ = prepare_act_bf16(gpu, &self.o, o_elems)?;
                 }
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let o_bf16 = gpu.act_bf16_scratch(o_elems as usize)?;
@@ -3955,7 +3955,7 @@ impl GpuDecodeSession {
                         )?;
                     } else {
                         layer.o_proj.gemm_bf16_x(gpu, &o_bf16, &self.attn_proj, m_u)?;
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             gpu.barrier()?;
                         }
                         rms_norm_f32(
@@ -3967,7 +3967,7 @@ impl GpuDecodeSession {
                             hidden,
                             eps,
                         )?;
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             gpu.barrier()?;
                         }
                         ple_residual_add(gpu, &self.x, &self.normed, 1.0, m_u * hidden)?;
@@ -3991,7 +3991,7 @@ impl GpuDecodeSession {
                             mi as u32,
                             &self.seed_tok,
                         )?;
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             gpu.barrier()?;
                         }
                         if let Some(ref ple) = self.model.ple_q4 {
@@ -4022,18 +4022,18 @@ impl GpuDecodeSession {
                                 scale,
                             )?;
                         }
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             gpu.barrier()?;
                         }
                         // Add PLE into residual row mi (first ple_dim dims).
                         {
-                            use metal_runtime::dispatch::{dispatch_1d, set_gpu_buf, set_gpu_buf_offset, set_u32};
+                            use tessl::dispatch::{dispatch_1d, set_gpu_buf, set_gpu_buf_offset, set_u32};
                             let p = gpu.rt.pipeline("ple_residual_add").map_err(Error::Metal)?;
                             let x_off = mi * h_usz * 4;
                             dispatch_1d(&gpu.rt, &p, ple_dim as usize, |bnd| {
                                 set_gpu_buf_offset(bnd, &self.x, x_off, 0);
                                 set_gpu_buf(bnd, &self.ple_out, 1);
-                                metal_runtime::dispatch::set_f32(
+                                tessl::dispatch::set_f32(
                                     bnd,
                                     std::f32::consts::FRAC_1_SQRT_2,
                                     2,
@@ -4045,7 +4045,7 @@ impl GpuDecodeSession {
                     }
                 }
 
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 // Gemma4: pre_ff_norm before MLP; legacy/synth reuse post_attn_norm.
@@ -4073,7 +4073,7 @@ impl GpuDecodeSession {
                     )?;
                     let _ = prepare_act_bf16(gpu, &self.normed, m_u * hidden)?;
                 }
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let x_bf16 = gpu.act_bf16_scratch((m * h_usz).max(1))?;
@@ -4083,7 +4083,7 @@ impl GpuDecodeSession {
                     .gate_proj
                     .gemm_bf16_x(gpu, &x_bf16, &self.gate, m_u)?;
                 layer.up_proj.gemm_bf16_x(gpu, &x_bf16, &self.up, m_u)?;
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 if fuse_mlp {
@@ -4104,7 +4104,7 @@ impl GpuDecodeSession {
                     )?;
                     let _ = prepare_act_bf16(gpu, &self.mid, m_u * intermediate)?;
                 }
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 let mid_bf16 = if fuse_mlp {
@@ -4133,11 +4133,11 @@ impl GpuDecodeSession {
                             )?;
                         } else {
                             layer.down_proj.gemm_bf16_x(gpu, &mid_bf16, &self.down, m_u)?;
-                            if metal_runtime::ab_flags::need_barrier(true) {
+                            if tessl::ab_flags::need_barrier(true) {
                                 gpu.barrier()?;
                             }
                             rms_norm_f32(gpu, &self.down, w, &self.normed, m_u, hidden, eps)?;
-                            if metal_runtime::ab_flags::need_barrier(true) {
+                            if tessl::ab_flags::need_barrier(true) {
                                 gpu.barrier()?;
                             }
                             ple_residual_add(gpu, &self.x, &self.normed, 1.0, m_u * hidden)?;
@@ -4158,7 +4158,7 @@ impl GpuDecodeSession {
                 // MLX: layer_scalar multiplies full layer output after both residuals.
                 let folded = fuse_dual_norm_enabled() && use_gemma4_dual_norm && has_post_ff;
                 if use_gemma4_dual_norm && (layer_scalar - 1.0).abs() > 1e-8 && !folded {
-                    if metal_runtime::ab_flags::need_barrier(true) {
+                    if tessl::ab_flags::need_barrier(true) {
                         gpu.barrier()?;
                     }
                     scale_f32_inplace(gpu, &self.x, layer_scalar, m_u * hidden)?;
@@ -4179,7 +4179,7 @@ impl GpuDecodeSession {
                         (slot, capture_stage_gpu.as_ref(), capture_stride)
                     {
                         let force_barrier = capture_barrier_forced();
-                        if metal_runtime::ab_flags::hazard_barriers() {
+                        if tessl::ab_flags::hazard_barriers() {
                             self.model.gpu.synchronize()?;
                         } else if force_barrier {
                             self.model.gpu.barrier()?;
@@ -4223,7 +4223,7 @@ impl GpuDecodeSession {
                 )?;
                 let _ = prepare_act_bf16(gpu, &self.normed, m_u * hidden)?;
             }
-            if metal_runtime::ab_flags::need_barrier(true) {
+            if tessl::ab_flags::need_barrier(true) {
                 gpu.barrier()?;
             }
             let x_bf16 = gpu.act_bf16_scratch((m * h_usz).max(1))?;
@@ -4247,7 +4247,7 @@ impl GpuDecodeSession {
                     &self.verify_outs,
                     mi * 4,
                 )?;
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
             }
@@ -4267,7 +4267,7 @@ impl GpuDecodeSession {
                         stride as u32,
                     )?;
                     if let Some(ref mut cond) = self.conditioner {
-                        if metal_runtime::ab_flags::need_barrier(true) {
+                        if tessl::ab_flags::need_barrier(true) {
                             self.model.gpu.barrier()?;
                         }
                         cond.project_row(&self.model.gpu, row_buf)?;
@@ -4812,17 +4812,17 @@ mod tests {
             eprintln!("skip: Metal pipeline unavailable");
             return;
         }
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let mut sess = GpuDecodeSession::new(model).unwrap();
         let feed = [3u32, 4, 5];
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let mut sequential = Vec::with_capacity(feed.len());
         for &t in &feed {
             sequential.push(sess.step(t).unwrap());
         }
         assert_eq!(sess.pos(), feed.len());
         sess.reset();
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let ver = sess.step_verify(&feed).unwrap();
         assert_eq!(ver.pos0, 0);
         assert_eq!(ver.tokens, feed);
@@ -4937,7 +4937,7 @@ mod tests {
             eprintln!("skip: Metal pipeline unavailable");
             return;
         }
-        let nax = metal_runtime::nax_verify_readiness();
+        let nax = tessl::nax_verify_readiness();
         let mut sess = GpuDecodeSession::new(model).unwrap();
         // Prefill a little context so FA sees non-empty KV (then trim restores).
         let _ = sess.step(1);
@@ -5002,11 +5002,11 @@ mod tests {
                 "pos_buf": true,
                 "seed_tok_gpu": true,
                 "cb_replay_wired": false,
-                "api_gaps": metal_runtime::survey_cb_replay_api_gaps()
+                "api_gaps": tessl::survey_cb_replay_api_gaps()
                     .iter()
                     .map(|g| g.as_str())
                     .collect::<Vec<_>>(),
-                "api_gap_summary": metal_runtime::cb_replay_api_gap_summary(),
+                "api_gap_summary": tessl::cb_replay_api_gap_summary(),
                 "live_encodes": sess.encode_once_scaffold().live_encodes(),
                 "not_wired_hits": sess.encode_once_scaffold().not_wired_hits(),
                 "icb_stub": sess.encode_once_scaffold().icb_stub().status_line(),
@@ -5105,7 +5105,7 @@ mod tests {
         );
         assert_eq!(
             once.encode_once_scaffold().icb_stub().phase,
-            metal_runtime::IcbStubPhase::Planned
+            tessl::IcbStubPhase::Planned
         );
         assert!(once
             .encode_once_scaffold()
@@ -5133,9 +5133,9 @@ mod tests {
     #[test]
     fn decode_icb_mini_token_parity() {
         // Always-on before GemmaGpu::new so init does not latch skip-auto.
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         crate::kernels::set_encode_once(false);
-        metal_runtime::set_decode_icb(false);
+        tessl::set_decode_icb(false);
 
         let Ok(host) = SyntheticE4bGraph::mini_parity() else {
             return;
@@ -5171,7 +5171,7 @@ mod tests {
         }
 
         crate::kernels::set_encode_once(true);
-        metal_runtime::set_decode_icb(true);
+        tessl::set_decode_icb(true);
         let mut icb = GpuDecodeSession::new(model_icb).unwrap();
         let mut icb_out = Vec::with_capacity(seeds.len());
         let mut icb_x0 = (0.0f32, 0.0f32);
@@ -5201,7 +5201,7 @@ mod tests {
         assert!(
             layer_graph,
             "expected Binder layer-graph DecodeIcb (cmds>={})",
-            metal_runtime::DecodeIcb::MIN_LAYER_GRAPH_COMMANDS
+            tessl::DecodeIcb::MIN_LAYER_GRAPH_COMMANDS
         );
         assert_eq!(
             live_encodes, 1,
@@ -5277,9 +5277,9 @@ mod tests {
         );
 
         crate::kernels::set_encode_once(false);
-        metal_runtime::set_decode_icb(false);
-        metal_runtime::set_icb_pipelines(false);
-        metal_runtime::set_binder_encode_nop(false);
+        tessl::set_decode_icb(false);
+        tessl::set_icb_pipelines(false);
+        tessl::set_binder_encode_nop(false);
     }
 
     /// Rough free+purgeable RAM (bytes) from `vm_stat` — used to skip E4B Hot
@@ -5379,9 +5379,9 @@ mod tests {
     /// eligibility + layer-graph attach + ≥1 replay. No 31B.
     #[test]
     fn decode_icb_e4b_hot_smoke() {
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         crate::kernels::set_encode_once(false);
-        metal_runtime::set_decode_icb(false);
+        tessl::set_decode_icb(false);
 
         let Some(e4b) = crate::weights::resolve_default_e4b_mlx_cache() else {
             eprintln!("skip: no e4b mlx cache");
@@ -5434,14 +5434,14 @@ mod tests {
         );
 
         crate::kernels::set_encode_once(true);
-        metal_runtime::set_decode_icb(true);
+        tessl::set_decode_icb(true);
 
         let mut sess = match GpuDecodeSession::new(model) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("skip: session new failed: {e}");
                 crate::kernels::set_encode_once(false);
-                metal_runtime::set_decode_icb(false);
+                tessl::set_decode_icb(false);
                 return;
             }
         };
@@ -5455,9 +5455,9 @@ mod tests {
                 Err(e) => {
                     eprintln!("skip: e4b step failed: {e}");
                     crate::kernels::set_encode_once(false);
-                    metal_runtime::set_decode_icb(false);
-                    metal_runtime::set_icb_pipelines(false);
-                    metal_runtime::set_binder_encode_nop(false);
+                    tessl::set_decode_icb(false);
+                    tessl::set_icb_pipelines(false);
+                    tessl::set_binder_encode_nop(false);
                     return;
                 }
             }
@@ -5519,9 +5519,9 @@ mod tests {
         );
 
         crate::kernels::set_encode_once(false);
-        metal_runtime::set_decode_icb(false);
-        metal_runtime::set_icb_pipelines(false);
-        metal_runtime::set_binder_encode_nop(false);
+        tessl::set_decode_icb(false);
+        tessl::set_icb_pipelines(false);
+        tessl::set_binder_encode_nop(false);
 
         assert!(
             ok,
@@ -5536,9 +5536,9 @@ mod tests {
     /// `memory_pressure`, free+purgeable RAM ≲ 8 GiB, or competing Metal jobs.
     #[test]
     fn encode_once_e4b_hot_encode_ab() {
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         crate::kernels::set_encode_once(false);
-        metal_runtime::set_decode_icb(false);
+        tessl::set_decode_icb(false);
 
         if crate::weights::resolve_default_e4b_mlx_cache().is_none() {
             eprintln!("skip: no e4b mlx cache");
@@ -5573,7 +5573,7 @@ mod tests {
 
         // --- flag OFF (sequential Hot load #1) ---
         crate::kernels::set_encode_once(false);
-        metal_runtime::set_decode_icb(false);
+        tessl::set_decode_icb(false);
         let Some(model_off) = load_e4b_hot_model() else {
             eprintln!("skip: load/upload e4b (off) failed or Metal unavailable");
             return;
@@ -5618,11 +5618,11 @@ mod tests {
 
         // --- flag ON + DecodeIcb (sequential Hot load #2) ---
         crate::kernels::set_encode_once(true);
-        metal_runtime::set_decode_icb(true);
+        tessl::set_decode_icb(true);
         let Some(model_on) = load_e4b_hot_model() else {
             eprintln!("skip: load/upload e4b (on) failed or Metal unavailable");
             crate::kernels::set_encode_once(false);
-            metal_runtime::set_decode_icb(false);
+            tessl::set_decode_icb(false);
             return;
         };
         let mut sess_on = match GpuDecodeSession::new(model_on) {
@@ -5630,7 +5630,7 @@ mod tests {
             Err(e) => {
                 eprintln!("skip: session new (on) failed: {e}");
                 crate::kernels::set_encode_once(false);
-                metal_runtime::set_decode_icb(false);
+                tessl::set_decode_icb(false);
                 return;
             }
         };
@@ -5638,9 +5638,9 @@ mod tests {
             if let Err(e) = sess_on.step(t) {
                 eprintln!("skip: e4b warmup (on) failed: {e}");
                 crate::kernels::set_encode_once(false);
-                metal_runtime::set_decode_icb(false);
-                metal_runtime::set_icb_pipelines(false);
-                metal_runtime::set_binder_encode_nop(false);
+                tessl::set_decode_icb(false);
+                tessl::set_icb_pipelines(false);
+                tessl::set_binder_encode_nop(false);
                 return;
             }
         }
@@ -5650,9 +5650,9 @@ mod tests {
             if let Err(e) = sess_on.step(t) {
                 eprintln!("skip: e4b timed step (on) failed: {e}");
                 crate::kernels::set_encode_once(false);
-                metal_runtime::set_decode_icb(false);
-                metal_runtime::set_icb_pipelines(false);
-                metal_runtime::set_binder_encode_nop(false);
+                tessl::set_decode_icb(false);
+                tessl::set_icb_pipelines(false);
+                tessl::set_binder_encode_nop(false);
                 return;
             }
         }
@@ -5701,7 +5701,7 @@ mod tests {
         } else {
             0.0
         };
-        let gaps: Vec<&'static str> = metal_runtime::survey_cb_replay_api_gaps()
+        let gaps: Vec<&'static str> = tessl::survey_cb_replay_api_gaps()
             .iter()
             .map(|g| g.as_str())
             .collect();
@@ -5764,7 +5764,7 @@ mod tests {
             "last_set_address_calls": last_set,
             "last_bind_total": last_binds,
             "api_gaps": gaps,
-            "api_gap_summary": metal_runtime::cb_replay_api_gap_summary(),
+            "api_gap_summary": tessl::cb_replay_api_gap_summary(),
             "sequential_hot_loads": true,
             "no_31b": true,
             "no_fusion_ab_trace": true,
@@ -5779,9 +5779,9 @@ mod tests {
         );
 
         crate::kernels::set_encode_once(false);
-        metal_runtime::set_decode_icb(false);
-        metal_runtime::set_icb_pipelines(false);
-        metal_runtime::set_binder_encode_nop(false);
+        tessl::set_decode_icb(false);
+        tessl::set_icb_pipelines(false);
+        tessl::set_binder_encode_nop(false);
 
         assert!(ok, "E4B Hot encode A/B: {verdict}");
     }
@@ -5813,7 +5813,7 @@ mod tests {
 
         // --- flag OFF ---
         crate::kernels::set_encode_once(false);
-        metal_runtime::set_decode_icb(false);
+        tessl::set_decode_icb(false);
         let mut sess_off = GpuDecodeSession::new(model_off).unwrap();
         for &t in tokens.iter().take(warmup) {
             let _ = sess_off.step(t).unwrap();
@@ -5827,7 +5827,7 @@ mod tests {
 
         // --- flag ON + DecodeIcb layer-graph (head-on capture) ---
         crate::kernels::set_encode_once(true);
-        metal_runtime::set_decode_icb(true);
+        tessl::set_decode_icb(true);
         let mut sess_on = GpuDecodeSession::new(model_on).unwrap();
         for &t in tokens.iter().take(warmup) {
             let _ = sess_on.step(t).unwrap();
@@ -5853,7 +5853,7 @@ mod tests {
             .decode_icb()
             .map(|d| d.status_line())
             .unwrap_or_else(|| sess_on.encode_once_scaffold().icb_stub().status_line());
-        let gaps: Vec<&'static str> = metal_runtime::survey_cb_replay_api_gaps()
+        let gaps: Vec<&'static str> = tessl::survey_cb_replay_api_gaps()
             .iter()
             .map(|g| g.as_str())
             .collect();
@@ -5862,7 +5862,7 @@ mod tests {
         assert!(
             layer_graph,
             "expected Binder layer-graph DecodeIcb (cmds>={}), got {icb}",
-            metal_runtime::DecodeIcb::MIN_LAYER_GRAPH_COMMANDS
+            tessl::DecodeIcb::MIN_LAYER_GRAPH_COMMANDS
         );
         // One live capture step; remaining warmup+iters replay (no live_encodes++).
         assert!(
@@ -5960,7 +5960,7 @@ mod tests {
             "last_bind_total": last_binds,
             "set_address_ratio": set_ratio,
             "api_gaps": gaps,
-            "api_gap_summary": metal_runtime::cb_replay_api_gap_summary(),
+            "api_gap_summary": tessl::cb_replay_api_gap_summary(),
             "verdict": verdict,
         });
         let body = serde_json::to_string_pretty(&doc).expect("json");
@@ -5975,9 +5975,9 @@ mod tests {
         );
 
         crate::kernels::set_encode_once(false);
-        metal_runtime::set_decode_icb(false);
-        metal_runtime::set_icb_pipelines(false);
-        metal_runtime::set_binder_encode_nop(false);
+        tessl::set_decode_icb(false);
+        tessl::set_icb_pipelines(false);
+        tessl::set_binder_encode_nop(false);
     }
 
     /// Persistent-interp flag: mini `step_inner` exercises both stand-ins; tokens unchanged.

@@ -7,6 +7,7 @@ Ignore legacy README phase roadmaps as Apple-API truth; prefer these docs +
 
 | Doc | Use when |
 |-----|----------|
+| [`kernel_hardening.md`](kernel_hardening.md) | GEMM contracts, reproduced failures, measured clear removal, and publication gates |
 | [`machine_profile_m5_pro.md`](machine_profile_m5_pro.md) | Host facts: M5 Pro 20 GPU / 64 GB / NAX / wired budgets / DONE vs open |
 | [`mlx.md`](mlx.md) | MLX 0.32 cheat sheet (URLs → files; Audit 6 done vs steal next) |
 | [`metal4_mpp.md`](metal4_mpp.md) | Metal 4 encode-only, MPP §2.3 DONE vs open, residency, NAX util gate |

@@ -725,7 +725,7 @@ fn run_dflash_gates(run_31b: bool) {
     // --- Exactness harness (fresh session + short prompt; always-on barriers) -
     // Prior mini decode in this process can leave schedule state that flips
     // 506↔507 near-ties. Remake the Hot model so exactness matches the unit test.
-    metal_runtime::ab_flags::set_hazard_barriers(false);
+    tessl::ab_flags::set_hazard_barriers(false);
     println!("  exactness lane: fresh session + always-on barriers (prompt [3,4,5] n=6)");
     let exact_prompt = [3u32, 4, 5];
     let exact_new = 6usize;
@@ -745,7 +745,7 @@ fn run_dflash_gates(run_31b: bool) {
                 return;
             }
         };
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let mut es = match GpuDecodeSession::new(gpu_model) {
             Ok(s) => s,
             Err(e) => {
@@ -762,7 +762,7 @@ fn run_dflash_gates(run_31b: bool) {
         };
         es.enable_hidden_capture(host_draft_exact.cfg.target_layer_ids.clone())
             .ok();
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let greedy = match es.generate(&exact_prompt, exact_new) {
             Ok(g) => g,
             Err(e) => {
@@ -770,7 +770,7 @@ fn run_dflash_gates(run_31b: bool) {
                 return;
             }
         };
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let greedy2 = match es.generate(&exact_prompt, exact_new) {
             Ok(g) => g,
             Err(e) => {
@@ -787,7 +787,7 @@ fn run_dflash_gates(run_31b: bool) {
             );
         }
         es.disable_hidden_capture();
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let mut draft_exact =
             match DFlashGpuDraft::from_draft(&es.model.gpu, &host_draft_exact, max_ctx) {
                 Ok(d) => d,
@@ -845,7 +845,7 @@ fn run_dflash_gates(run_31b: bool) {
     }
 
     // Throughput sweep on the long-lived session (hazard skip-auto restored).
-    metal_runtime::ab_flags::set_hazard_barriers(true);
+    tessl::ab_flags::set_hazard_barriers(true);
 
     // Block-size sweep on GPU draft + verify
     let mut best_bs = DFLASH_DEFAULT_BLOCK;
@@ -908,7 +908,7 @@ fn run_dflash_gates(run_31b: bool) {
 
     println!("  mini greedy baseline (hazard skip-auto): {greedy_tps:.1} tok/s");
     // Always-on greedy retained for exactness comparison only.
-    metal_runtime::ab_flags::set_hazard_barriers(false);
+    tessl::ab_flags::set_hazard_barriers(false);
     sess.model.gpu.synchronize().ok();
     let _ = sess.generate(&prompt, max_new);
     sess.model.gpu.synchronize().ok();
@@ -916,7 +916,7 @@ fn run_dflash_gates(run_31b: bool) {
     let _ = sess.generate(&prompt, max_new);
     sess.model.gpu.synchronize().ok();
     let greedy_ao_tps = greedy_new as f64 / t_ao.elapsed().as_secs_f64().max(1e-9);
-    metal_runtime::ab_flags::set_hazard_barriers(true);
+    tessl::ab_flags::set_hazard_barriers(true);
     println!("  mini greedy always-on barriers: {greedy_ao_tps:.1} tok/s");
     println!(
         "  mini block retune: best_bs={best_bs} @ {best_tps:.1} tok/s  (MLX prior was 5)"
@@ -1095,8 +1095,8 @@ fn dump_31b_block1_intermediates(
     max_ctx: usize,
 ) -> Result<serde_json::Value, String> {
     // Dump under always-on so RAW capture copies and softcap/argmax match decode graph.
-    let prev_hazard = metal_runtime::ab_flags::hazard_barriers();
-    metal_runtime::ab_flags::set_hazard_barriers(false);
+    let prev_hazard = tessl::ab_flags::hazard_barriers();
+    tessl::ab_flags::set_hazard_barriers(false);
     let cond = DFlashGpuConditioner::from_draft(&sess.model.gpu, host_draft, max_ctx)
         .map_err(|e| format!("dump conditioner: {e}"))?;
     sess.attach_gpu_conditioner(cond)
@@ -1247,7 +1247,7 @@ fn dump_31b_block1_intermediates(
         host_h_ctx_last.iter().map(|x| x.abs()).sum::<f32>() / h as f32,
         0.069892f32
     );
-    metal_runtime::ab_flags::set_hazard_barriers(prev_hazard);
+    tessl::ab_flags::set_hazard_barriers(prev_hazard);
     sess.disable_hidden_capture();
     Ok(body)
 }
@@ -1257,7 +1257,7 @@ fn run_dflash_31b_inner() -> Result<serde_json::Value, String> {
     // (`GEMMA_METAL_31B_HAZARD=1`) still collapses short-prompt greedy → 236773
     // after NeoX RoPE fix; Lane B owns the hazard fix (F3).
     let use_hazard = std::env::var("GEMMA_METAL_31B_HAZARD").ok().as_deref() == Some("1");
-    metal_runtime::ab_flags::set_hazard_barriers(use_hazard);
+    tessl::ab_flags::set_hazard_barriers(use_hazard);
     let exact_always_on = !use_hazard
         || std::env::var("GEMMA_METAL_31B_EXACT_ALWAYS_ON")
             .ok()
@@ -1297,7 +1297,7 @@ fn run_dflash_31b_inner() -> Result<serde_json::Value, String> {
     let mut sess =
         GpuDecodeSession::new(gpu_model).map_err(|e| format!("31b session: {e}"))?;
     // Re-assert barrier lane after GemmaGpu::new (init must not clobber; belt-and-suspenders).
-    metal_runtime::ab_flags::set_hazard_barriers(use_hazard);
+    tessl::ab_flags::set_hazard_barriers(use_hazard);
     let mut host_draft =
         HostDFlashDraft::load_from_dir(&draft_dir).map_err(|e| format!("draft load: {e}"))?;
 
@@ -1363,7 +1363,7 @@ fn run_dflash_31b_inner() -> Result<serde_json::Value, String> {
         sess.attach_gpu_conditioner(cond)
             .map_err(|e| format!("attach cond warm: {e}"))?;
     }
-    metal_runtime::ab_flags::set_hazard_barriers(use_hazard);
+    tessl::ab_flags::set_hazard_barriers(use_hazard);
     let _ = sess.generate(&prompt, 2).map_err(|e| format!("warmup: {e}"))?;
     sess.model.gpu.synchronize().ok();
     let t_g = std::time::Instant::now();
@@ -1412,7 +1412,7 @@ fn run_dflash_31b_inner() -> Result<serde_json::Value, String> {
     // via GPU residency / CB packing even when FC is after argmax.
     // Dump runs LAST — draft propose_block can poison shared GPU scratch.
     if exact_always_on {
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         println!("  31B exactness lane: ALWAYS-ON + capture+conditioner");
     } else {
         println!("  31B exactness lane: hazard-ON + capture+conditioner (post-softcap FC)");
@@ -1424,7 +1424,7 @@ fn run_dflash_31b_inner() -> Result<serde_json::Value, String> {
             .map_err(|e| format!("attach cond for greedy exact: {e}"))?;
     }
     if exact_always_on {
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
     }
     let greedy = sess
         .generate(&prompt, max_new)
@@ -1460,13 +1460,13 @@ fn run_dflash_31b_inner() -> Result<serde_json::Value, String> {
     } else {
         println!("  31B draft path: GPU Q4Mlx");
     }
-    metal_runtime::ab_flags::set_hazard_barriers(use_hazard);
+    tessl::ab_flags::set_hazard_barriers(use_hazard);
     let mut best_bs = DFLASH_DEFAULT_BLOCK;
     let mut best_tps = 0.0f64;
     let mut sweep = Vec::new();
     let mut first_block_debug = serde_json::Value::Null;
     for &bs in &[3usize, 5] {
-        metal_runtime::ab_flags::set_hazard_barriers(use_hazard);
+        tessl::ab_flags::set_hazard_barriers(use_hazard);
         let cond = DFlashGpuConditioner::from_draft(&sess.model.gpu, &host_draft, max_ctx)
             .map_err(|e| format!("conditioner: {e}"))?;
         sess.attach_gpu_conditioner(cond)
@@ -1531,16 +1531,16 @@ fn run_dflash_31b_inner() -> Result<serde_json::Value, String> {
         draft.reset_cache();
     }
     if exact_always_on {
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
     } else {
-        metal_runtime::ab_flags::set_hazard_barriers(true);
+        tessl::ab_flags::set_hazard_barriers(true);
     }
     let cond = DFlashGpuConditioner::from_draft(&sess.model.gpu, &host_draft, max_ctx)
         .map_err(|e| format!("conditioner: {e}"))?;
     sess.attach_gpu_conditioner(cond)
         .map_err(|e| format!("attach cond: {e}"))?;
     if exact_always_on {
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
     }
     let (dflash_out, accepts) = if use_host_dense {
         generate_with_dflash_host(&mut sess, &mut host_draft, &prompt, max_new, Some(best_bs))
@@ -1549,7 +1549,7 @@ fn run_dflash_31b_inner() -> Result<serde_json::Value, String> {
         generate_with_dflash(&mut sess, &mut draft, &prompt, max_new, Some(best_bs))
             .map_err(|e| format!("dflash exactness: {e}"))?
     };
-    metal_runtime::ab_flags::set_hazard_barriers(use_hazard);
+    tessl::ab_flags::set_hazard_barriers(use_hazard);
     let n = greedy
         .len()
         .min(dflash_out.len())

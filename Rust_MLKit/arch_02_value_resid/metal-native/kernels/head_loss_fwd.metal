@@ -2,19 +2,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// logits_post = softcap * tanh(logits / softcap). In-place or out.
-kernel void softcap_f32(
-    device const float *pre [[buffer(0)]],
-    device float *post [[buffer(1)]],
-    constant float &softcap [[buffer(2)]],
-    constant uint &n [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    float z = pre[gid] / softcap;
-    post[gid] = softcap * tanh(z);
-}
-
 /// Per-row CE contribution: -log_softmax(logits)[target]. Writes [rows] then host/device reduces.
 kernel void ce_row_f32(
     device const float *logits [[buffer(0)]], // [rows, V]
@@ -91,3 +78,9 @@ kernel void softcap_ce_row_f32(
     const float log_prob = (orow[(uint)tgt] - m) - log(sum);
     row_loss[gid] = -log_prob;
 }
+
+// Note: zero_f32, copy_f32, copy_bf16, add_inplace_f32, transpose2d_f32,
+// cast_f32_to_bf16, cast_bf16_to_f32 and softcap_f32 are defined once, in
+// tessl/kernels/utils.metal, and linked into this metallib by build.rs.
+// They were byte-identical duplicates here; two definitions of one kernel
+// is a metallib link error waiting to happen, not a redundancy.

@@ -1,37 +1,6 @@
 // Phase 4: cast helpers, bf16 copy, fused RMSNorm+scale, bf16 flash (LSE).
 #include <metal_stdlib>
 using namespace metal;
-
-kernel void copy_bf16(
-    device const bfloat *in [[buffer(0)]],
-    device bfloat *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    out[gid] = in[gid];
-}
-
-kernel void cast_f32_to_bf16(
-    device const float *in [[buffer(0)]],
-    device bfloat *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    out[gid] = bfloat(in[gid]);
-}
-
-kernel void cast_bf16_to_f32(
-    device const bfloat *in [[buffer(0)]],
-    device float *out [[buffer(1)]],
-    constant uint &n [[buffer(2)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if (gid >= n) return;
-    out[gid] = float(in[gid]);
-}
-
 /// Fused RMSNorm + scalar scale (ln_scale_factor). One thread per row.
 /// f32 I/O; reduction accumulates in f32 (precision policy).
 kernel void rms_norm_scale_f32(
@@ -490,3 +459,9 @@ kernel void flash_attn_bwd_dkv_bf16(
         }
     }
 }
+
+// Note: zero_f32, copy_f32, copy_bf16, add_inplace_f32, transpose2d_f32,
+// cast_f32_to_bf16, cast_bf16_to_f32 and softcap_f32 are defined once, in
+// tessl/kernels/utils.metal, and linked into this metallib by build.rs.
+// They were byte-identical duplicates here; two definitions of one kernel
+// is a metallib link error waiting to happen, not a redundancy.

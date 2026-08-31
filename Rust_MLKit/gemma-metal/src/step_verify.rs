@@ -316,20 +316,20 @@ mod tests {
         let Ok(host) = SyntheticE4bGraph::mini_parity() else { return; };
         let Ok(model) = GpuSynthModel::from_synthetic(host, QuantScheme::q4_default()) else { return; };
         if !metal_ready(&model) { return; }
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let mut sess = GpuDecodeSession::new(model).unwrap();
         sess.enable_hidden_capture(vec![0, 1, 2]).unwrap();
         let prompt = [3u32, 4, 5, 6];
         let max_new = 8usize;
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let g1 = sess.generate(&prompt, max_new).unwrap();
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let g2 = sess.generate(&prompt, max_new).unwrap();
         if g1 != g2 {
             eprintln!("skip: capture-on greedy nondeterministic");
             return;
         }
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let (out, _) = generate_with_host_stub(&mut sess, &prompt, max_new, 3).unwrap();
         let n = g1.len().min(out.len()).saturating_sub(prompt.len());
         let stub = &out[prompt.len()..prompt.len() + n];

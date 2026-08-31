@@ -1,15 +1,15 @@
 //! Verification suite for MSL mixer implementations (minGRU, VR blend, Mamba2).
 //! Loads PyTorch `.npy` dumps from `golden/` and asserts output and gradient parity.
 
-use arch02_metal_native::gemm::{
+use tessl_arch02::gemm::{
     gemm_nt_accum_train, gemm_nt_train, gemm_tn_accum_train, gemm_train, select_backend,
 };
-use arch02_metal_native::mixers::{
+use tessl_arch02::mixers::{
     mamba2_bwd, mamba2_fwd, mingru_bwd, mingru_fwd, mingru_vr_blend_bwd, mingru_vr_blend_fwd,
 };
-use arch02_metal_native::npy::{read_npy, transpose_last2};
-use arch02_metal_native::runtime::GpuRuntime;
-use arch02_metal_native::tensor::Tensor;
+use tessl_arch02::npy::{read_npy, transpose_last2};
+use tessl_arch02::runtime::GpuRuntime;
+use tessl_arch02::tensor::Tensor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -363,7 +363,7 @@ fn verify_mamba2(rt: &Arc<GpuRuntime>) {
 }
 
 fn main() {
-    let rt = GpuRuntime::new().unwrap();
+    let rt = tessl_arch02::gpu_runtime().unwrap();
     verify_mingru(&rt);
     verify_mingru_vr(&rt);
     verify_mingru_vr_layer(&rt);

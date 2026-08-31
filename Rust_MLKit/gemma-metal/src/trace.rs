@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use metal_runtime::infer_trace;
+use tessl::infer_trace;
 
 /// 0=off, 1=host, 2=json, 3=sync
 static MODE: AtomicU8 = AtomicU8::new(0);

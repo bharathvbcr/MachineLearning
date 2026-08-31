@@ -5,7 +5,7 @@
   "layer_graph": true,
   "live_encodes": 1,
   "model": "e4b_hot",
-  "scalar_write_tape_ops": 2319,
+  "scalar_write_tape_ops": 2385,
   "seeds": [
     2,
     105,
@@ -17,10 +17,10 @@
     6641,
     175442,
     5238,
-    3305,
+    226392,
     6235
   ],
-  "unix_ts": 1784501938,
-  "verdict": "PASS: E4B Hot DecodeIcb layer-graph wired cmds=594 live=1 replays=4 scalar_ops=2319",
+  "unix_ts": 1788146214,
+  "verdict": "PASS: E4B Hot DecodeIcb layer-graph wired cmds=594 live=1 replays=4 scalar_ops=2385",
   "wired": true
 }

@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=kernels/");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-env-changed=METAL_NATIVE_SKIP_AOT");
 
@@ -52,6 +51,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let kernels_dir = manifest_dir.join("kernels");
+    track_kernel_sources(&kernels_dir);
 
     let sdk = xcrun_stdout(&["--sdk", "macosx", "--show-sdk-path"]);
     let metal = resolve_metal();
@@ -61,13 +61,23 @@ fn main() {
 
     // TensorOps kernels — Metal 4 dialect (macOS 26+ / MPP). Hard-fail: NAX GEMM
     // is the hot path; a simdgroup-only metallib is not acceptable.
-    let tensorops_sources = [
-        "matmul_tensorops.metal",
-        "matmul_tensorops_tune.metal",
-        "flash_attn_tensorops.metal",
+    // The shared GEMM kernels have exactly one source of truth: tessl's
+    // `kernels/` directory, published through its `links = "tessl"` key. This
+    // crate used to keep a byte-identical copy, kept in step only by a static
+    // audit; compiling tessl's file directly removes the thing that could drift.
+    let tessl_kernels = PathBuf::from(env::var("DEP_TESSL_KERNELS").expect(
+        "DEP_TESSL_KERNELS not set — tessl must be a direct dependency and \
+         declare `links = \"tessl\"`; without it this crate would silently \
+         build a metallib with no GEMM kernels in it",
+    ));
+    track_kernel_sources(&tessl_kernels);
+    let mut tensorops_sources: Vec<PathBuf> = vec![
+        tessl_kernels.join("matmul_tensorops.metal"),
+        kernels_dir.join("flash_attn_tensorops.metal"),
+        kernels_dir.join("matmul_batched.metal"),
     ];
-    for name in &tensorops_sources {
-        let src = kernels_dir.join(name);
+    for src in &tensorops_sources {
+        let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("<unnamed>");
         if !src.exists() {
             panic!(
                 "required TensorOps source missing: {}; Metal 4 / macOS 26 toolchain required",
@@ -104,8 +114,8 @@ fn main() {
     // (shader dialect, not encode path). Fallback is documented via cargo:warning.
     let skip: &[&str] = &[
         "matmul_tensorops.metal",
-        "matmul_tensorops_tune.metal",
         "flash_attn_tensorops.metal",
+        "matmul_batched.metal",
     ];
     let mut others: Vec<PathBuf> = fs::read_dir(&kernels_dir)
         .unwrap_or_else(|e| panic!("read kernels/: {e}"))
@@ -117,6 +127,19 @@ fn main() {
         })
         .collect();
     others.sort();
+    // tessl's remaining kernels (portable simdgroup GEMM + shared util ops).
+    // Same rule as above: compile tessl's copy, never a local duplicate.
+    let mut tessl_others: Vec<PathBuf> = fs::read_dir(&tessl_kernels)
+        .unwrap_or_else(|e| panic!("read tessl kernels/: {e}"))
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|s| s.to_str()) == Some("metal")
+                && p.file_name().and_then(|n| n.to_str()) != Some("matmul_tensorops.metal")
+        })
+        .collect();
+    tessl_others.sort();
+    others.extend(tessl_others);
 
     for src in &others {
         let stem = src.file_stem().unwrap().to_string_lossy();
@@ -154,7 +177,13 @@ fn main() {
         air_files.push(air);
     }
 
-    let metallib_out = out_dir.join("default.metallib");
+    // Metal can retain file-backed library data after loading. Never relink a
+    // pathname baked into a prior binary: each build owns an immutable artifact.
+    let build_id = format!("{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch").as_nanos());
+    let metallib_out = out_dir.join(format!("default-{build_id}.metallib"));
+    fs::File::create_new(&metallib_out).expect("reserve unique metallib output");
     let mut link = Command::new(&metallib);
     for air in &air_files {
         link.arg(air);
@@ -162,8 +191,13 @@ fn main() {
     link.arg("-o").arg(&metallib_out);
     run(&mut link, "metallib link");
 
+    // Publish the offline compatibility copy without truncating an inode that
+    // an existing runtime may still use. Do not hide failed publication.
     let crate_copy = manifest_dir.join("default.metallib");
-    let _ = std::fs::copy(&metallib_out, &crate_copy);
+    let staged_copy = manifest_dir.join(format!(".default-{build_id}.metallib"));
+    fs::File::create_new(&staged_copy).expect("reserve offline metallib staging file");
+    fs::copy(&metallib_out, &staged_copy).expect("stage offline metallib");
+    fs::rename(&staged_copy, &crate_copy).expect("publish offline metallib");
 
     println!(
         "cargo:rustc-env=METAL_NATIVE_METALLIB={}",
@@ -249,5 +283,28 @@ fn run(cmd: &mut Command, label: &str) {
         .unwrap_or_else(|e| panic!("{label}: failed to spawn: {e}"));
     if !status.success() {
         panic!("{label}: exited with {status}");
+    }
+}
+
+/// Emit `rerun-if-changed` for every `.metal` file, not just the directory.
+///
+/// A bare `cargo:rerun-if-changed=kernels/` tracks the *directory*, whose mtime
+/// only moves when a file is created, deleted or renamed — editing a kernel in
+/// place does not touch it. The result is a metallib that silently stays stale
+/// while `cargo test` reports a pass, which is how a broken kernel can look
+/// green. Listing the files individually is the only reliable form.
+fn track_kernel_sources(dir: &Path) {
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => panic!("read {} for change tracking: {e}", dir.display()),
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.is_dir() {
+            track_kernel_sources(&p);
+        } else if p.extension().and_then(|s| s.to_str()) == Some("metal") {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
     }
 }

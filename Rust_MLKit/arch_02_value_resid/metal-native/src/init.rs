@@ -249,7 +249,7 @@ fn write_burn_bank_matrix(
     py: &[f32],
 ) {
     assert_eq!(py.len(), in_dim * out_dim);
-    let dst = bank.buffer.contents_f32();
+    let mut dst = bank.buffer.contents_f32();
     let base = matrix_index * in_dim * out_dim;
     for o in 0..out_dim {
         for i in 0..in_dim {
@@ -399,12 +399,13 @@ pub fn init_weights_seeded(
                 // `[n_mamba, conv_dim, d_conv]` matches mamba2_conv1d kernel w(C, K); no linear transpose.
                 let conv_w = alloc_hot_zeroed(rt, &[n_mamba, conv_dim, d_conv])?;
                 let mut conv_slice = vec![0.0f32; conv_dim * d_conv];
-                let conv_dst = conv_w.buffer.contents_f32();
+                let mut conv_dst = conv_w.buffer.contents_f32();
                 for i in 0..n_mamba {
                     rng.fill_normal(&mut conv_slice, 0.02);
                     let base = i * conv_dim * d_conv;
                     conv_dst[base..base + conv_dim * d_conv].copy_from_slice(&conv_slice);
                 }
+                drop(conv_dst);
                 let conv_b = upload(rt, &[n_mamba, conv_dim], &vec![0.0; n_mamba * conv_dim])?;
 
                 let out_proj = alloc_hot_zeroed(rt, &[n_mamba, d_inner, c])?;

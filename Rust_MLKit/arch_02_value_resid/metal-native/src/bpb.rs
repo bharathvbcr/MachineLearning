@@ -199,13 +199,13 @@ fn row_ce_host(
         }
         tensor
     };
-    let flat = crate::tensor::Tensor {
-        buffer: logits.buffer.clone(),
-        shape: vec![rows, v],
-        dtype: logits.dtype,
-        byte_offset: logits.byte_offset,
-        runtime: Arc::clone(rt),
-    };
+    let flat = crate::tensor::Tensor::from_buffer(
+        rt,
+        logits.buffer.clone(),
+        &[rows, v],
+        logits.dtype,
+        logits.byte_offset,
+    )?;
     let row_loss = rt.alloc_tensor_f32(&[rows])?;
     let p = rt.pipeline("ce_row_f32")?;
     dispatch_1d(rt, &p, rows, |bnd| {

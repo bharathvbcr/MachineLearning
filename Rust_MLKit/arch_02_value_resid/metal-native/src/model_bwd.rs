@@ -700,13 +700,7 @@ pub fn backward_f32_opts_clip(
         let hash_idx = {
             let nbytes = bt * 4;
             let buf = rt.alloc_buffer(nbytes)?;
-            Tensor {
-                buffer: buf,
-                shape: vec![bt],
-                dtype: crate::tensor::DType::F32,
-                byte_offset: 0,
-                runtime: Arc::clone(rt),
-            }
+            Tensor::from_buffer(rt, buf, &[bt], crate::tensor::DType::F32, 0)?
         };
         {
             let p = rt.pipeline("stem_gather_f32")?;
@@ -790,13 +784,8 @@ pub fn backward_f32_opts_clip(
 fn reshape_view(t: &Tensor, shape: &[usize]) -> Tensor {
     let numel: usize = shape.iter().product();
     assert_eq!(numel, t.numel());
-    Tensor {
-        buffer: t.buffer.clone(),
-        shape: shape.to_vec(),
-        dtype: t.dtype,
-        byte_offset: t.byte_offset,
-        runtime: Arc::clone(t.runtime()),
-    }
+    Tensor::from_buffer(t.runtime(), t.buffer.clone(), shape, t.dtype, t.byte_offset)
+        .expect("these views are built over a buffer this crate just allocated")
 }
 
 fn upload(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Result<Tensor, String> {

@@ -2,9 +2,9 @@
 
 use std::path::PathBuf;
 
-use arch02_metal_native::engine::{EngineCreateConfig, TrainingEngine};
-use arch02_metal_native::log::mem_current_physical_mb;
-use arch02_metal_native::OptimizerKind;
+use tessl_arch02::engine::{EngineCreateConfig, TrainingEngine};
+use tessl_arch02::log::mem_current_physical_mb;
+use tessl_arch02::OptimizerKind;
 
 fn arg(args: &[String], key: &str) -> Option<String> {
     args.iter()
@@ -90,13 +90,21 @@ fn main() -> Result<(), String> {
     let actual = resumed.train_step(&input, &target)?;
     let actual_samples = samples(&resumed);
     let resumed_footprint = mem_current_physical_mb();
-    let weight_delta = expected_samples
-        .iter()
-        .zip(actual_samples.iter())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    let loss_delta = (expected.loss - actual.loss).abs();
-    let grad_delta = (expected.grad_norm - actual.grad_norm).abs();
+    const LOSS_ATOL: f32 = 1e-5;
+    let weight_compare = tessl_arch02::parity::compare_f32(
+        "sampled_weights", &actual_samples, &expected_samples,
+        tessl_arch02::optim::OPTIM_ATOL,
+    );
+    let loss_compare = tessl_arch02::parity::compare_f32(
+        "loss", &[actual.loss], &[expected.loss], LOSS_ATOL,
+    );
+    let grad_compare = tessl_arch02::parity::compare_f32(
+        "grad_norm", &[actual.grad_norm], &[expected.grad_norm],
+        tessl_arch02::optim::OPTIM_ATOL,
+    );
+    let weight_delta = weight_compare.max_abs;
+    let loss_delta = loss_compare.max_abs;
+    let grad_delta = grad_compare.max_abs;
     let max_footprint = uninterrupted_footprint.max(resumed_footprint);
     let swap_after_mb = swap_used_mb()?;
     // Ambient residual swap on macOS is common after any prior pressure. The
@@ -107,15 +115,14 @@ fn main() -> Result<(), String> {
     // Fresh Metal command queues may choose a different parallel reduction
     // order. Exact resume means replay equivalence within the native parity
     // contract, not bit-identical reduction bits.
-    const LOSS_ATOL: f32 = 1e-5;
     let mut failures = Vec::new();
-    if loss_delta > LOSS_ATOL {
+    if !loss_compare.passed {
         failures.push("loss_delta");
     }
-    if grad_delta > arch02_metal_native::optim::OPTIM_ATOL {
+    if !grad_compare.passed {
         failures.push("grad_norm_delta");
     }
-    if weight_delta > arch02_metal_native::optim::OPTIM_ATOL {
+    if !weight_compare.passed {
         failures.push("sampled_weight_max_delta");
     }
     if max_footprint >= 52.0 * 1024.0 {
@@ -132,13 +139,13 @@ fn main() -> Result<(), String> {
         "schema_version": 1,
         "optimizer": optimizer.as_str(),
         "parameter_count": resumed.weights.cfg.count_params(),
-        "checkpoint_version": arch02_metal_native::CHECKPOINT_VERSION,
+        "checkpoint_version": tessl_arch02::CHECKPOINT_VERSION,
         "loss_delta": loss_delta,
         "grad_norm_delta": grad_delta,
         "sampled_weight_max_delta": weight_delta,
         "resume_tolerances": {
             "loss_atol": LOSS_ATOL,
-            "gradient_and_weight_atol": arch02_metal_native::optim::OPTIM_ATOL,
+            "gradient_and_weight_atol": tessl_arch02::optim::OPTIM_ATOL,
         },
         "current_physical_mb": max_footprint,
         "swap_before_mb": swap_before_mb,

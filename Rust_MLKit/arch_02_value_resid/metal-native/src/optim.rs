@@ -1403,13 +1403,7 @@ fn muon_bank_tensorops(
         crate::ab_flags::optim_profile(),
         "muon_bank_detail",
     )?;
-    let flat = Tensor {
-        buffer: scratch.clone(),
-        shape: vec![scratch.nbytes() / 4],
-        dtype: DType::F32,
-        byte_offset: 0,
-        runtime: Arc::clone(rt),
-    };
+    let flat = Tensor::from_buffer(rt, scratch.clone(), &[scratch.nbytes() / 4], DType::F32, 0)?;
     let x = flat.view(&[batch, rows, cols], 0);
     let y = flat.view(&[batch, rows, cols], mat_bank);
     let gram = flat.view(&[batch, p, p], 2 * mat_bank);
@@ -2413,11 +2407,11 @@ mod ns5_tests {
             OptimizerKind::ScheduleFreeAdamw,
             OptimizerKind::Prodigy,
         ] {
-            let rt = GpuRuntime::new().expect("gpu");
+            let rt = crate::gpu_runtime().expect("gpu");
             let cfg = ModelConfig::sota_toy();
             let mut w = init_weights_seeded(&rt, cfg, 77).expect("weights");
             let grads = Grads::zeros_like(&rt, &w).expect("grads");
-            for value in grads.qo_bank.buffer.contents_f32() {
+            for value in grads.qo_bank.buffer.contents_f32().iter_mut() {
                 *value = 0.2;
             }
             let before = w.qo_bank.buffer.contents_f32()[0];
@@ -2565,7 +2559,7 @@ mod ns5_tests {
 
     #[test]
     fn metal_ns5_matches_numpy_fixture() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         // Generate same fixture as python seed 42
         // We embed a tiny deterministic check: square 4x4
         let n = 1u32;
@@ -2582,7 +2576,7 @@ mod ns5_tests {
             .iter()
             .zip(exp.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         eprintln!("4x4 ns5 max_abs={max_abs}");
         assert!(max_abs < 1e-4, "ns5 mismatch {max_abs}");
     }
@@ -2673,7 +2667,7 @@ mod ns5_tests {
 
     #[test]
     fn metal_polar_express_matches_host_fixture() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let data: Vec<f32> = (0..2 * 16 * 8)
             .map(|i| ((i % 23) as f32) * 0.011 - 0.10)
             .collect();
@@ -2696,13 +2690,13 @@ mod ns5_tests {
             .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         assert!(max_abs < 2e-3, "Polar Express mismatch {max_abs}");
     }
 
     #[test]
     fn metal_normuon_row_state_matches_host_fixture() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let (batch, rows, cols) = (2u32, 8u32, 16u32);
         let mat = rows as usize * cols as usize;
         let data: Vec<f32> = (0..batch as usize * mat)
@@ -2776,14 +2770,14 @@ mod ns5_tests {
             .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         assert!(max_abs < 2e-3, "NorMuon mismatch {max_abs}");
         assert!(row_state.buffer.contents_f32()[0] > 0.0);
     }
 
     #[test]
     fn metal_mona_two_steps_match_host_fixture() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let (rows, cols) = (8u32, 16u32);
         let mat = rows as usize * cols as usize;
         let g1_data: Vec<f32> = (0..mat).map(|i| (i % 17) as f32 * 0.01 - 0.08).collect();
@@ -2834,14 +2828,14 @@ mod ns5_tests {
             .iter()
             .zip(expected_param.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         assert!(max_abs < 3e-3, "MONA mismatch {max_abs}");
         assert!((acc.buffer.contents_f32()[0] - host_acc[0]).abs() < 1e-6);
     }
 
     #[test]
     fn metal_muown_first_step_matches_host_fixture() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let (rows, cols) = (8u32, 16u32);
         let mat = rows as usize * cols as usize;
         let initial: Vec<f32> = (0..mat).map(|i| (i % 31) as f32 * 0.004 - 0.06).collect();
@@ -2912,14 +2906,14 @@ mod ns5_tests {
             .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         assert!(max_abs < 3e-3, "Muown mismatch {max_abs}");
         assert!(mag_v.buffer.contents_f32()[0] > 0.0);
     }
 
     #[test]
     fn metal_ns5_tall_matrix() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let data: Vec<f32> = (0..128 * 64)
             .map(|i| ((i % 11) as f32) * 0.01 - 0.05)
             .collect();
@@ -2931,14 +2925,14 @@ mod ns5_tests {
             .iter()
             .zip(exp.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         eprintln!("128x64 ns5 max_abs={max_abs}");
         assert!(max_abs < 1e-3, "tall ns5 mismatch {max_abs}");
     }
 
     #[test]
     fn metal_ns3_matches_host_fixture() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let data: Vec<f32> = (0..3 * 16 * 8)
             .map(|i| ((i % 17) as f32) * 0.015 - 0.11)
             .collect();
@@ -2953,13 +2947,13 @@ mod ns5_tests {
             .iter()
             .zip(exp.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         assert!(max_abs < 1e-3, "ns3 mismatch {max_abs}");
     }
 
     #[test]
     fn metal_tensorops_batched_ns3_tall_and_wide_match_host() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         for &(n, rows, cols) in &[(3u32, 16u32, 8u32), (2, 8, 16)] {
             let matrix = rows as usize * cols as usize;
             let data: Vec<f32> = (0..n as usize * matrix)
@@ -2978,14 +2972,14 @@ mod ns5_tests {
                 .iter()
                 .zip(expected.iter())
                 .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
+                .fold(0.0f32, crate::parity::max_finite_error);
             assert!(max_abs < 1e-3, "TensorOps {rows}x{cols} mismatch {max_abs}");
         }
     }
 
     #[test]
     fn adamw_one_step_matches_host() {
-        let rt = GpuRuntime::new().expect("gpu");
+        let rt = crate::gpu_runtime().expect("gpu");
         let n = 128usize;
         let data: Vec<f32> = (0..n).map(|i| 0.01 * (i as f32)).collect();
         let grad: Vec<f32> = (0..n).map(|i| 0.001 * ((i % 5) as f32 - 2.0)).collect();
@@ -3025,7 +3019,7 @@ mod ns5_tests {
             .iter()
             .zip(ph.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         let mom_err = slot
             .exp_avg
             .buffer
@@ -3033,7 +3027,7 @@ mod ns5_tests {
             .iter()
             .zip(m.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         eprintln!("adamw param max_abs={max_abs} mom max_abs={mom_err}");
         assert!(max_abs < 1e-6 && mom_err < 1e-6);
     }

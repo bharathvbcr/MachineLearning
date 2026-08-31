@@ -56,6 +56,6 @@
     23
   ],
   "tokens_match": true,
-  "unix_ts": 1784506472,
+  "unix_ts": 1788148222,
   "verdict": "PASS: tape_execute tokens ≡ live (Q4 bf16→f32 cast; densify stable)"
 }
