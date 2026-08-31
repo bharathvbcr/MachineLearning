@@ -2584,11 +2584,26 @@ def mixer_flops_have_exactly_one_owner():
         model, _ = _toy_model(mixer=mixer, n_layer=4, block_size=128, **kw)
         assert model.flops_per_token() - 6 * model.num_params(non_embedding=True) \
             == mixer_flops_per_token(cfg), f"{mixer}: model term is not the shared one"
-        mfu = _mfu_from_toks(mixer, 1e5, cfg)
-        assert mfu > 0, f"{mixer} MFU is zero -- the probe lost the mixer term"
-    swa = _cfg(mixer="swa", n_layer=4, block_size=128, swa_window=32)
-    attn = _cfg(mixer="attention", n_layer=4, block_size=128)
-    assert _mfu_from_toks("swa", 1e5, swa) < _mfu_from_toks("attention", 1e5, attn)
+    import os
+    prev = os.environ.get("PEAK_FLOPS")
+    try:
+        os.environ["PEAK_FLOPS"] = "989.5e12"
+        for mixer, kw in (("attention", {}), ("swa", dict(swa_window=64)),
+                          ("mla", {}), ("mingru", {})):
+            cfg = _cfg(mixer=mixer, n_layer=4, block_size=128, **kw)
+            mfu = _mfu_from_toks(mixer, 1e5, cfg)
+            assert mfu > 0, f"{mixer} MFU is zero -- the probe lost the mixer term"
+        swa = _cfg(mixer="swa", n_layer=4, block_size=128, swa_window=32)
+        attn = _cfg(mixer="attention", n_layer=4, block_size=128)
+        assert _mfu_from_toks("swa", 1e5, swa) < _mfu_from_toks("attention", 1e5, attn)
+        # With no device and no PEAK_FLOPS it must degrade VISIBLY. 0.0% reads as
+        # a slow arm and a guessed peak reads as a fast one; nan reads as neither.
+        os.environ.pop("PEAK_FLOPS", None)
+        from .crossover_replicate import live_device_name
+        if not live_device_name():
+            assert math.isnan(_mfu_from_toks("attention", 1e5, attn))
+    finally:
+        os.environ.pop("PEAK_FLOPS", None) if prev is None else os.environ.update(PEAK_FLOPS=prev)
 
 
 @test
@@ -2829,6 +2844,82 @@ def mqar_workers_shard_the_grid_without_losing_or_duplicating_runs():
     assert _drop_workers_flag(["--out", "x", "--workers", "3", "--steps", "9"]) \
         == ["--out", "x", "--steps", "9"]
     assert _drop_workers_flag(["--workers=5", "--steps", "9"]) == ["--steps", "9"]
+
+
+@test
+def peak_flops_is_resolved_per_device_and_fails_closed():
+    """Four call sites did `setdefault(PEAK_FLOPS, GH200)`, which is right on
+    exactly one machine. Every suite here was measured on a GH200; the first run
+    on anything else would have silently rescaled every MFU it reported."""
+    import os
+    from . import crossover_replicate as cr
+
+    cases = {"NVIDIA H100 PCIe": "h100 pcie", "NVIDIA H100 80GB HBM3": "h100",
+             "NVIDIA A100-SXM4-80GB": "a100", "NVIDIA A100-SXM4-40GB": "a100",
+             "NVIDIA A10": "a10", "GH200 480GB": "gh200"}
+    for name, key in cases.items():
+        peak, got = cr.device_peak_flops(name)
+        assert got == key, f"{name} matched {got!r}, want {key!r}"
+        assert peak > 0
+    # H100 PCIe is a lower-clocked part and must not inherit the SXM figure --
+    # substring order in the table is load-bearing.
+    assert cr.device_peak_flops("NVIDIA H100 PCIe")[0] < \
+        cr.device_peak_flops("NVIDIA H100 80GB HBM3")[0]
+    # An unrecognised accelerator returns nothing rather than a plausible default.
+    assert cr.device_peak_flops("NVIDIA L40S") == (0.0, "")
+    assert cr.device_peak_flops("") == (0.0, "")
+
+    prev = os.environ.get("PEAK_FLOPS")
+    try:
+        os.environ.pop("PEAK_FLOPS", None)
+        if not cr.live_device_name():          # no CUDA here: must refuse, not guess
+            try:
+                cr.resolve_peak_flops()
+                raise AssertionError("unknown device must refuse a peak figure")
+            except SystemExit as e:
+                assert "refusing to assume" in str(e), e
+            assert cr.resolve_peak_flops(strict=False) == 0.0
+        os.environ["PEAK_FLOPS"] = "123e12"
+        assert cr.resolve_peak_flops() == 123e12, "an explicit PEAK_FLOPS must win"
+    finally:
+        os.environ.pop("PEAK_FLOPS", None) if prev is None else os.environ.update(PEAK_FLOPS=prev)
+
+
+@test
+def device_is_a_recipe_field_so_two_gpus_cannot_share_a_board():
+    """Hardware is the largest recipe axis in a paper about rankings moving with
+    the recipe, and it was the one `current_recipe` did not record: a GH200 suite
+    and an H100 suite produced byte-identical recipe.json."""
+    from . import crossover_replicate as cr
+
+    rec = cr.current_recipe()
+    assert "device" in rec, "device missing from the recorded recipe"
+    real = cr.live_device_name
+    try:
+        cr.live_device_name = lambda: "NVIDIA H100 80GB HBM3"
+        h100 = cr.current_recipe()
+        cr.live_device_name = lambda: "GH200 480GB"
+        gh200 = cr.current_recipe()
+    finally:
+        cr.live_device_name = real
+    assert h100["device"] != gh200["device"]
+    assert h100 != gh200, "two GPUs produce the same recipe fingerprint"
+
+
+@test
+def gpu_bundle_shares_the_peak_table_rather_than_copying_it():
+    """`scripts/gpu_bundle.py` kept a second copy of DEVICE_PEAK_FLOPS. Two
+    copies of a constant this repo has already had wrong once is how one of them
+    goes stale silently."""
+    import pathlib, re
+    src = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "gpu_bundle.py"
+    if not src.exists():
+        return
+    text = src.read_text(encoding="utf-8")
+    assert not re.search(r"^DEVICE_PEAK_FLOPS\s*=\s*\{", text, re.M), \
+        "gpu_bundle.py defines its own DEVICE_PEAK_FLOPS again"
+    assert "from nanolab.crossover_replicate import" in text and \
+        "DEVICE_PEAK_FLOPS" in text, "gpu_bundle.py no longer shares the table"
 
 
 def main():

@@ -137,6 +137,92 @@ QUEUE_NAME = "queue.json"
 GH200_PEAK_FLOPS = 989.5e12
 MEASURED_GH200_DENSE_BF16 = 786.6e12   # 8192^3 matmul, 2026-08-27, torch 2.7.0
 
+# bf16 DENSE peaks, never the sparsity-doubled marketing figure. Canonical here
+# because `scripts/gpu_bundle.py` already imports from this module and used to
+# keep a second copy of the same table.
+#
+# H100 SXM and GH200 share a die and a number; H100 PCIe is a lower-clocked part
+# and is NOT the same figure, which is why it has its own key. Treat every row
+# as a starting point, not a fact: this repo has already been burned once by a
+# peak constant that was 2x wrong for months (see above). `--measure-peak`
+# settles it on the box the way the GH200 row was settled.
+DEVICE_PEAK_FLOPS = {
+    "gh200": 989.5e12,
+    "h100 pcie": 756e12,        # checked before the h100 key: substring order matters
+    "h100": 989.5e12,
+    "a100": 312e12,
+    "a10": 125e12,
+}
+
+
+def device_peak_flops(name: str) -> tuple[float, str]:
+    """(peak, matched-key) for a device name, or (0.0, "") when unrecognised.
+
+    Returns zero rather than a default on purpose. An unknown accelerator that
+    silently inherits GH200's 989.5e12 produces an MFU column that looks fine and
+    is wrong by whatever the ratio happens to be -- the exact defect this repo
+    already found once.
+    """
+    low = (name or "").lower()
+    for key, peak in DEVICE_PEAK_FLOPS.items():
+        if key in low:
+            return peak, key
+    return 0.0, ""
+
+
+def live_device_name() -> str:
+    try:
+        import torch as _t
+        if _t.cuda.is_available():
+            return _t.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return ""
+
+
+def resolve_peak_flops(strict: bool = True) -> float:
+    """Peak bf16 dense FLOP/s for the accelerator actually present.
+
+    Was `os.environ.setdefault("PEAK_FLOPS", GH200_PEAK_FLOPS)` at four call
+    sites, which is correct on exactly one machine. Every suite in this repo was
+    measured on a GH200; the moment one is not, that default silently rescales
+    every MFU the run reports.
+    """
+    env = os.environ.get("PEAK_FLOPS")
+    if env:
+        return float(env)
+    name = live_device_name()
+    peak, key = device_peak_flops(name)
+    if peak:
+        os.environ["PEAK_FLOPS"] = str(peak)
+        return peak
+    if not strict:
+        return 0.0
+    raise SystemExit(
+        f"unknown accelerator {name or '<none detected>'!r}: refusing to assume "
+        f"a peak-FLOP figure, because every MFU this run prints would inherit it. "
+        f"Known: {sorted(DEVICE_PEAK_FLOPS)}. Measure it with "
+        f"`python -m nanolab.crossover_replicate measure-peak` and export "
+        f"PEAK_FLOPS, or export PEAK_FLOPS yourself.")
+
+
+def measure_dense_bf16(n: int = 8192, iters: int = 8) -> float:
+    """Achieved dense bf16 FLOP/s from an n^3 matmul -- how the GH200 row above
+    was settled after the tabulated value disagreed with reality by 2x."""
+    import torch as _t
+    if not _t.cuda.is_available():
+        raise SystemExit("measure-peak needs a CUDA device")
+    a = _t.randn(n, n, device="cuda", dtype=_t.bfloat16)
+    b = _t.randn(n, n, device="cuda", dtype=_t.bfloat16)
+    for _ in range(3):
+        a @ b
+    _t.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(iters):
+        a @ b
+    _t.cuda.synchronize()
+    return (2.0 * n ** 3 * iters) / (time.time() - t0)
+
 
 @dataclass(frozen=True)
 class Arm:
@@ -547,6 +633,11 @@ def current_recipe() -> dict:
         "lr_horizon": cluster_lr_horizon(),
         "arms": [a.name for a in selected_arms()],
         "prefix": job_prefix(),
+        # The largest recipe axis of all, and the one this module did not record.
+        # Two boxes produced identical recipe.json, so `lock_recipe` would have
+        # mixed a GH200 suite and an H100 suite in one directory without a word --
+        # in a repo whose paper is about rankings moving with the recipe.
+        "device": live_device_name() or None,
         "compile": False,
     }
 
@@ -1154,7 +1245,7 @@ def cmd_run(args) -> None:
         print(f"{job['id']} already done; pass --force to rerun")
         return
     cfg = job_config(job, out_root, smoke=args.smoke)
-    os.environ.setdefault("PEAK_FLOPS", str(GH200_PEAK_FLOPS))
+    resolve_peak_flops()
     if job_done(out_root, job["id"]) is False:
         ckpt = _run_dir(out_root, job["id"]) / "ckpt.pt"
         if ckpt.exists():
@@ -1202,7 +1293,7 @@ def cmd_launch(args) -> None:
     print(f"queue {queue}  pending≈{n_pending}  workers={args.workers}")
     workers = []
     env = os.environ.copy()
-    env.setdefault("PEAK_FLOPS", str(GH200_PEAK_FLOPS))
+    env.setdefault("PEAK_FLOPS", str(resolve_peak_flops()))
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("CROSSOVER_BATCH", str(cluster_batch()))
     env.setdefault("CROSSOVER_EVAL_ITERS", str(cluster_eval_iters()))
@@ -1245,7 +1336,7 @@ def cmd_launch(args) -> None:
 def cmd_worker(args) -> None:
     out_root = Path(args.out)
     queue = out_root / QUEUE_NAME
-    os.environ.setdefault("PEAK_FLOPS", str(GH200_PEAK_FLOPS))
+    resolve_peak_flops()
     while True:
         job = claim_job(queue, args.worker_id, out_root)
         if job is None:
@@ -2095,6 +2186,23 @@ def cmd_compute(args) -> None:
     cmd_status(args)
 
 
+def cmd_measure_peak(args) -> None:
+    name = live_device_name() or "<none detected>"
+    tabled, key = device_peak_flops(name)
+    got = measure_dense_bf16(args.n, args.iters)
+    print(f"device      : {name}")
+    print(f"measured    : {got/1e12:.1f} TFLOP/s dense bf16 ({args.n}^3 matmul)")
+    if tabled:
+        print(f"tabled ({key}): {tabled/1e12:.1f} TFLOP/s  -> achieved "
+              f"{got/tabled*100:.1f}% of peak")
+        if got > tabled:
+            print("  MEASURED EXCEEDS THE TABLE, which is impossible: the table "
+                  "row is wrong, exactly as the GH200 row once was.")
+    else:
+        print("tabled      : unknown device, no row")
+    print(f"\nexport PEAK_FLOPS={tabled or got:.0f}")
+
+
 def cmd_probe(args) -> None:
     """Exclusive-GPU batch sweep: tok/s, MFU, peak VRAM. Picks CROSSOVER_BATCH."""
     import torch
@@ -2165,8 +2273,12 @@ def _mfu_from_toks(mixer: str, tok_s: float, cfg) -> float:
     # charge every other mixer ZERO attention FLOPs, so adding a mixer produced
     # a quietly wrong MFU here and a correct one in model.py.
     flops = 6 * cfg.estimate_params() + mixer_flops_per_token(cfg)
-    peak = float(os.environ.get("PEAK_FLOPS", str(GH200_PEAK_FLOPS)))
-    return (flops * tok_s) / peak
+    # NaN, not 0.0 and not a guessed peak, when the device is unknown: a run
+    # command resolves PEAK_FLOPS strictly before any job starts, so reaching
+    # here without one means nobody established a device. `nan%` in the table is
+    # unmistakable; `0.0%` reads as a slow arm and a guess reads as a fast one.
+    peak = resolve_peak_flops(strict=False)
+    return (flops * tok_s) / peak if peak else float("nan")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2200,6 +2312,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="also write <out>/timing.json")
     sub.add_parser("compute", parents=[common])
     sub.add_parser("repack", parents=[common])
+    mp = sub.add_parser("measure-peak", parents=[common],
+                        help="achieved dense bf16 FLOP/s on this box")
+    mp.add_argument("--n", type=int, default=8192)
+    mp.add_argument("--iters", type=int, default=8)
     probe = sub.add_parser("probe", parents=[common])
     probe.add_argument("--batches", default="8,32,64,96,128")
     probe.add_argument("--mixers", default="attention,mingru,gdn,mamba2")
@@ -2270,6 +2386,7 @@ def main():
         "compute": cmd_compute,
         "repack": cmd_repack,
         "probe": cmd_probe,
+        "measure-peak": cmd_measure_peak,
         "plot": cmd_plot,
         "table": cmd_table,
         "locked20": cmd_locked20,

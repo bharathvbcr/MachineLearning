@@ -2069,19 +2069,17 @@ def cost_report(jobs: list[dict]) -> int:
 # consistently. We report the corrected figure here instead, naming the peak, and
 # derive it from the recorded value rather than re-deriving the model's FLOP count.
 TRAIN_PY_DEFAULT_PEAK = 46e12          # nanolab/train.py:_mfu, unset PEAK_FLOPS
-DEVICE_PEAK_FLOPS = {                  # bf16 DENSE, not the sparsity-doubled figure
-    "gh200": 989.5e12,
-    "h100": 989.5e12,
-    "a100": 312e12,
-    "a10": 125e12,
-}
+# Table lives in nanolab.crossover_replicate, which this file already imports
+# from. Two copies of a peak-FLOP figure is how one of them goes stale.
+from nanolab.crossover_replicate import (  # noqa: E402
+    DEVICE_PEAK_FLOPS, device_peak_flops as _device_peak_flops,
+)
 
 
 def device_peak_flops(name: str) -> tuple[float, str]:
-    low = (name or "").lower()
-    for key, peak in DEVICE_PEAK_FLOPS.items():
-        if key in low:
-            return peak, key
+    peak, key = _device_peak_flops(name)
+    if peak:
+        return peak, key
     return TRAIN_PY_DEFAULT_PEAK, "unknown (falling back to train.py's default)"
 
 
