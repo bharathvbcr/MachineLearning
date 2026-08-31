@@ -845,6 +845,19 @@ impl GpuRuntime {
     where
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
     {
+        self.with_binder_barriers(None, f)
+    }
+
+    /// Like [`Self::with_binder`], with the binder's auto-barrier mode forced
+    /// for this scope only. `None` latches the process-global flag once at
+    /// binder construction; `Some(true)` skips per-dispatch auto barriers (the
+    /// caller packs explicit RAW barriers — DecodeIcb tape encode). Scope-local
+    /// on purpose: flipping the global instead would drop the trailing barrier
+    /// of any op another thread encodes concurrently.
+    pub fn with_binder_barriers<F>(&self, skip_auto: Option<bool>, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
+    {
         // DecodeIcb replay prep: skip Metal encode; caller still runs push_u32 /
         // KV host bookkeeping outside the binder closure.
         if crate::decode_icb::binder_encode_nop() {
@@ -853,13 +866,13 @@ impl GpuRuntime {
         self.flush_residency();
         let async_on = self.async_encode_enabled();
         if async_on {
-            self.encode_into_batch_m4(f)?;
+            self.encode_into_batch_m4(skip_auto, f)?;
             if let Ok(mut c) = self.dispatch_count.lock() {
                 *c += 1;
             }
             return Ok(());
         }
-        self.with_binder_sync(f)
+        self.with_binder_sync(skip_auto, f)
     }
 
     fn ensure_m4_cb_open(&self, batch: &mut Option<ActiveMetal4Batch>) -> Result<(), String> {
@@ -932,7 +945,7 @@ impl GpuRuntime {
         Ok(())
     }
 
-    fn encode_into_batch_m4<F>(&self, f: F) -> Result<(), String>
+    fn encode_into_batch_m4<F>(&self, skip_auto: Option<bool>, f: F) -> Result<(), String>
     where
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
     {
@@ -968,6 +981,7 @@ impl GpuRuntime {
                 &m4.argument_table.table,
                 &m4.const_staging,
                 &mut cursor,
+                skip_auto.unwrap_or_else(crate::ab_flags::hazard_barriers),
             );
             f(&mut binder)?;
         }
@@ -987,7 +1001,7 @@ impl GpuRuntime {
         Ok(())
     }
 
-    fn with_binder_sync<F>(&self, f: F) -> Result<(), String>
+    fn with_binder_sync<F>(&self, skip_auto: Option<bool>, f: F) -> Result<(), String>
     where
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
     {
@@ -997,7 +1011,7 @@ impl GpuRuntime {
             *self.async_encode.lock().map_err(|e| e.to_string())? = true;
         }
         let result = (|| {
-            self.encode_into_batch_m4(f)?;
+            self.encode_into_batch_m4(skip_auto, f)?;
             self.synchronize()
         })();
         if !was_async {

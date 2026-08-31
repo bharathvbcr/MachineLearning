@@ -302,7 +302,9 @@ fn dispatch_tensorops_nn(
         bnd.bind_u32(numel as u32, 1);
         bnd.dispatch(mtl_size(z_groups, 1, 1), mtl_size(z_tpt, 1, 1));
         // Explicit barrier only when auto per-dispatch barriers are off.
-        if crate::ab_flags::hazard_barriers() {
+        // Ask the binder, not the global flag — the binder's latched mode is
+        // what decided whether the zero dispatch already got a barrier.
+        if bnd.needs_explicit_barriers() {
             bnd.barrier();
         }
 
@@ -514,8 +516,8 @@ fn gemm_tn_splitk_f32_opts(
     let partitions: Vec<u32> = (0..k as u32).step_by(k_tile as usize).collect();
 
     // Zero once (optional) + all K-partitions in one binder.
-    let need_explicit = crate::ab_flags::hazard_barriers();
     rt.with_binder(|bnd| {
+        let need_explicit = bnd.needs_explicit_barriers();
         if zero_first {
             bnd.set_pipeline(&zero_p);
             bnd.bind_tensor(c, 0);
@@ -581,8 +583,8 @@ fn gemm_tn_splitk_bf16_opts(
     let k_tile = 256u32;
     let partitions: Vec<u32> = (0..k as u32).step_by(k_tile as usize).collect();
 
-    let need_explicit = crate::ab_flags::hazard_barriers();
     rt.with_binder(|bnd| {
+        let need_explicit = bnd.needs_explicit_barriers();
         if zero_first {
             bnd.set_pipeline(&zero_p);
             bnd.bind_tensor(c, 0);

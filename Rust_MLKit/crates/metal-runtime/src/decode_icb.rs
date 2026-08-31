@@ -968,8 +968,9 @@ impl DecodeIcb {
         // Skip auto-barriers during tape encode; replay captured `barrier_after`
         // markers instead. Forcing always-on here inflated E4B barriers ~364→599
         // and regressed product tok/s despite lower host encode_us (D16).
-        let prev_hazard = crate::ab_flags::hazard_barriers();
-        crate::ab_flags::set_hazard_barriers(true);
+        // Scope-local via with_binder_barriers — flipping the process-global
+        // flag here would drop the trailing auto barrier of ops other threads
+        // encode concurrently.
         let triage = env_truthy(&["GEMMA_METAL_ICB_TRIAGE"]).unwrap_or(false);
         let mut sticky = StickyArgTable::new();
         let mut execute_icb_calls = 0u64;
@@ -981,7 +982,7 @@ impl DecodeIcb {
             let total = self.commands.len();
             for i in 0..total {
                 let cmd = &self.commands[i];
-                rt.with_binder(|bnd| {
+                rt.with_binder_barriers(Some(true), |bnd| {
                     let mut s = StickyArgTable::new();
                     // Eager `then_some(tables[i])` panics when freeze leaves tables empty.
                     let prebuilt = if use_prebuilt {
@@ -1019,7 +1020,7 @@ impl DecodeIcb {
             // Freeze + range-batch: one executeCommandsInBuffer per safe span
             // between barrier_after markers (inclusive of the barrier cmd).
             let cmds = &self.commands;
-            rt.with_binder(|bnd| {
+            rt.with_binder_barriers(Some(true), |bnd| {
                 let mut i = 0usize;
                 while i < cmds.len() {
                     let start = i;
@@ -1055,7 +1056,7 @@ impl DecodeIcb {
         } else {
             // Pack all tape cmds into one binder scope (A2 sticky / prebuilt / freeze).
             let tables = &self.prebuilt_tables;
-            rt.with_binder(|bnd| {
+            rt.with_binder_barriers(Some(true), |bnd| {
                 for (i, cmd) in self.commands.iter().enumerate() {
                     let prebuilt = if use_prebuilt {
                         Some(tables[i].as_ref())
@@ -1071,7 +1072,6 @@ impl DecodeIcb {
                 Ok(())
             })
         };
-        crate::ab_flags::set_hazard_barriers(prev_hazard);
         exec_result?;
         self.last_bind_total = sticky.bind_total;
         self.last_set_address_calls = sticky.set_calls;
@@ -1406,12 +1406,57 @@ impl Drop for BinderEncodeNopGuard {
     }
 }
 
+/// Serializes tests whose behavior or assertions depend on the process-global
+/// ICB / replay flags, and restores every flag on drop (including the -1
+/// read-env state, which the raw setters cannot express). Cargo runs tests on
+/// parallel threads in one process; without this, one test's `set_*` toggle is
+/// visible to every other test mid-flight.
+#[cfg(test)]
+pub(crate) struct IcbFlagsTestGuard {
+    saved: [i8; 6],
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl IcbFlagsTestGuard {
+    pub(crate) fn lock() -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A panicking guard-holder already restored its flags in drop; the
+        // poison carries no extra meaning here.
+        let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        Self {
+            saved: [
+                DECODE_ICB.load(Ordering::Relaxed),
+                ICB_FREEZE_BINDS.load(Ordering::Relaxed),
+                ICB_RANGE_BATCH.load(Ordering::Relaxed),
+                ICB_COARSE_RANGES.load(Ordering::Relaxed),
+                ICB_PIPELINES.load(Ordering::Relaxed),
+                BINDER_ENCODE_NOP.load(Ordering::Relaxed),
+            ],
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for IcbFlagsTestGuard {
+    fn drop(&mut self) {
+        DECODE_ICB.store(self.saved[0], Ordering::Relaxed);
+        ICB_FREEZE_BINDS.store(self.saved[1], Ordering::Relaxed);
+        ICB_RANGE_BATCH.store(self.saved[2], Ordering::Relaxed);
+        ICB_COARSE_RANGES.store(self.saved[3], Ordering::Relaxed);
+        ICB_PIPELINES.store(self.saved[4], Ordering::Relaxed);
+        BINDER_ENCODE_NOP.store(self.saved[5], Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn decode_icb_flag_default_off() {
+        let _flags = IcbFlagsTestGuard::lock();
         set_decode_icb(false);
         assert!(!decode_icb_enabled());
         set_decode_icb(true);
@@ -1421,6 +1466,7 @@ mod tests {
 
     #[test]
     fn decode_icb_multi_copy_f32() {
+        let _flags = IcbFlagsTestGuard::lock();
         let rt = GpuRuntime::new().expect("runtime");
         let (mut dec, c) = DecodeIcb::mini_copy_chain(&rt, 32).expect("mini copy chain");
         assert_eq!(dec.command_count(), 2);
@@ -1468,7 +1514,8 @@ mod tests {
     #[test]
     fn decode_icb_freeze_binds_zero_arg_table() {
         // Opt-in freeze: classic setKernelBuffer → execute_icb with 0 setArgumentTable.
-        // Uses from_commands_ex(freeze=true) — no global flag race with parallel tests.
+        // execute() under freeze also reads the range-batch globals, so hold the guard.
+        let _flags = IcbFlagsTestGuard::lock();
         let rt = GpuRuntime::new().expect("runtime");
         let (mut dec, c) =
             DecodeIcb::mini_copy_chain_ex(&rt, 32, true).expect("mini copy chain freeze");
@@ -1495,6 +1542,7 @@ mod tests {
     fn decode_icb_range_batch_merges_safe_spans() {
         // Three independent copies (no mid-span RAW) + barrier after last:
         // freeze×N = 3 execute_icb; freeze+range_batch = 1.
+        let _flags = IcbFlagsTestGuard::lock();
         let rt = GpuRuntime::new().expect("runtime");
         let n = 32usize;
         let src = rt.alloc_buffer_hot(n * 4).unwrap();
@@ -1571,6 +1619,7 @@ mod tests {
     fn decode_icb_coarse_ranges_elides_disjoint_keeps_raw() {
         // Disjoint a→b vs c→d: spurious mid barrier elided.
         // Dependent b→e after a→b: RAW barrier kept.
+        let _flags = IcbFlagsTestGuard::lock();
         let rt = GpuRuntime::new().expect("runtime");
         let n = 32usize;
         let a = rt.alloc_buffer_hot(n * 4).unwrap();
