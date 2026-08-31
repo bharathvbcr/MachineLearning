@@ -927,6 +927,37 @@ pub fn gemm_f32_cpu(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f
 mod tests {
     use super::*;
     use crate::GpuRuntime;
+    use std::sync::Arc;
+
+    /// TensorOps is a hard requirement, not an optional extra: tessl is
+    /// Apple-silicon-only and its README requires Neural Accelerators, so a
+    /// metallib without `matmul2d_tensorops_f32` is a broken build, not a
+    /// configuration to tolerate. These tests used to `return` silently when the
+    /// probe came back false, which made "skipped" and "passed" print the same
+    /// `ok` — the entire TensorOps half of the suite could stop running without
+    /// a single red line. Assert instead, the way `stress_tests` already does.
+    fn tensorops_runtime() -> Arc<GpuRuntime> {
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        assert!(
+            rt.has_tensorops(),
+            "matmul2d_tensorops_f32 missing from the metallib on device {}: \
+             tessl requires Neural Accelerators, so this is a broken build \
+             (rebuild kernels via build.rs), not a testable configuration",
+            rt.device_name()
+        );
+        rt
+    }
+
+    /// Same rule one level down: a metallib that loaded but lacks the specific
+    /// kernel a test drives means build.rs emitted a stale or partial kernel
+    /// set. That must fail, not vacuously pass.
+    fn require_pipeline(rt: &GpuRuntime, name: &str) {
+        assert!(
+            rt.pipeline(name).is_ok(),
+            "kernel {name} missing from the metallib; rebuild it rather than \
+             letting the test that covers it report `ok` without running"
+        );
+    }
 
     fn max_abs_err(got: &[f32], exp: &[f32]) -> f32 {
         assert_eq!(got.len(), exp.len(), "parity length mismatch");
@@ -1009,23 +1040,15 @@ mod tests {
     }
 
     #[test]
-    fn gemm_tensorops_32_if_available() {
-        let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        if !rt.has_tensorops() {
-            eprintln!("skipping TensorOps test: kernel not in metallib");
-            return;
-        }
+    fn gemm_tensorops_32() {
+        tensorops_runtime();
         run_case(32, 32, 64, GemmBackend::TensorOps);
         run_case(64, 32, 32, GemmBackend::TensorOps);
     }
 
     #[test]
-    fn gemm_bf16_tensorops_if_available() {
-        let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        if !rt.has_tensorops() {
-            eprintln!("skipping bf16 TensorOps test");
-            return;
-        }
+    fn gemm_bf16_tensorops() {
+        let rt = tensorops_runtime();
         rt.set_precision(crate::runtime::PrecisionMode::Bf16);
         let m = 32usize;
         let n = 32usize;
@@ -1057,11 +1080,7 @@ mod tests {
     /// Phase H: `gemm_train` under Bf16 casts f32 masters → bf16 TensorOps.
     #[test]
     fn gemm_train_bf16_casts_f32_operands() {
-        let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        if !rt.has_tensorops() {
-            eprintln!("skipping gemm_train bf16 test");
-            return;
-        }
+        let rt = tensorops_runtime();
         rt.set_precision(PrecisionMode::Bf16);
         let m = 32usize;
         let n = 32usize;
@@ -1091,16 +1110,9 @@ mod tests {
     /// Kept behind a flag for train; documents whether 1e-5 goldens survive.
     #[test]
     fn gemm_relaxed_precision_numerics() {
-        let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        if !rt.has_tensorops() {
-            eprintln!("skipping relaxed_precision test");
-            return;
-        }
-        // Ensure pipeline exists (metallib rebuilt with Phase H kernel).
-        if rt.pipeline("matmul2d_tensorops_f32_relaxed").is_err() {
-            eprintln!("skipping: matmul2d_tensorops_f32_relaxed not in metallib");
-            return;
-        }
+        let rt = tensorops_runtime();
+        // Phase H kernel: present in every metallib build.rs currently emits.
+        require_pipeline(&rt, "matmul2d_tensorops_f32_relaxed");
         let m = 64usize;
         let n = 64usize;
         let k = 128usize;
@@ -1158,11 +1170,7 @@ mod tests {
     #[test]
     fn gemm_train_bf16_awkward_k() {
         // sota shapes: bigram_dim=48, ve_dim=24 — must not NaN under bf16 TensorOps.
-        let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        if !rt.has_tensorops() {
-            eprintln!("skipping awkward-K bf16 test");
-            return;
-        }
+        let rt = tensorops_runtime();
         rt.set_precision(PrecisionMode::Bf16);
         for (m, n, k) in [(64usize, 128usize, 48usize), (64, 128, 24), (4096, 128, 48)] {
             let mut a_f = vec![0.0f32; m * k];
@@ -1192,15 +1200,8 @@ mod tests {
 
     #[test]
     fn gemm_tn_nt_bf16_train_smoke() {
-        let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        if !rt.has_tensorops() {
-            eprintln!("skipping tn/nt bf16 smoke");
-            return;
-        }
-        if rt.pipeline("matmul2d_tensorops_tn_bf16_f32").is_err() {
-            eprintln!("skipping: tn/nt bf16 kernels missing");
-            return;
-        }
+        let rt = tensorops_runtime();
+        require_pipeline(&rt, "matmul2d_tensorops_tn_bf16_f32");
         rt.set_precision(PrecisionMode::Bf16);
         let m = 32usize;
         let n = 32usize;
@@ -1279,11 +1280,7 @@ mod tests {
 
     #[test]
     fn gemm_tn_nt_tensorops_descriptors() {
-        let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        if !rt.has_tensorops() {
-            eprintln!("skipping tn/nt descriptor test");
-            return;
-        }
+        let rt = tensorops_runtime();
         for (m, n, k) in [(32usize, 32, 64), (64, 128, 128), (128, 128, 256)] {
             let mut a_km = vec![0.0f32; k * m];
             let mut b_kn = vec![0.0f32; k * n];
@@ -1331,11 +1328,7 @@ mod tests {
 
     #[test]
     fn gemm_tn_splitk_tall_dw_shape() {
-        let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        if !rt.has_tensorops() {
-            eprintln!("skipping split-K test");
-            return;
-        }
+        let rt = tensorops_runtime();
         // dW-shaped: M=N=128, K=4096 (BT).
         let m = 128usize;
         let n = 128usize;
@@ -1363,11 +1356,7 @@ mod tests {
 
     #[test]
     fn gemm_tn_splitk_mlp_dw_shape() {
-        let rt = GpuRuntime::new().expect("GpuRuntime::new");
-        if !rt.has_tensorops() {
-            eprintln!("skipping MLP split-K test");
-            return;
-        }
+        let rt = tensorops_runtime();
         // MLP-up dW: M=128, N=384, K=4096
         let m = 128usize;
         let n = 384usize;
