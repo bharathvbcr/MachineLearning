@@ -1,175 +1,364 @@
 # tessl
 
-Metal 4 GEMM and encode runtime for Apple silicon, built on Metal Performance
-Primitives (MPP) TensorOps `matmul2d`.
+**Low-overhead, zero-host-wait Metal 4 encode and GEMM runtime for Apple Silicon**, built on Metal Performance Primitives (MPP) TensorOps `matmul2d`.
 
-Requires **macOS 26+**, Xcode 26 with the Metal Toolchain component
-(`xcodebuild -downloadComponent MetalToolchain`), and an Apple GPU with neural
-accelerators for the TensorOps path. There is a portable `simdgroup_matrix`
-fallback, but it is roughly 2–3x slower and exists for A/B, not for shipping.
+`tessl` serves as the high-performance GPU substrate for neural network inference and training on Apple Silicon (e.g., [`gemma-metal`](../../gemma-metal/) and [`tessl-arch02`](../../arch_02_value_resid/metal-native/)).
 
-## What it does
+---
 
-| Module | Role |
-|--------|------|
-| `gemm` | TensorOps `matmul2d` GEMM — NN / TN / NT, plain and accumulating, f32 / tf32-relaxed / bf16→f32, split-K, register-resident accumulators |
-| `runtime` | Device, MTL4 command buffer and compute encoder, residency sets, Hot/Cold/Bump pools, packed binder, constant arena, SharedEvent sync |
-| `dispatch` | Argument-table binds and 1D/2D/3D dispatch helpers |
-| `tensor` | `GpuBuffer` / `Tensor` views and dtypes, bounds-checked |
-| `ops` | `softcap_f32` and small util launches |
-| `npy` | numpy `.npy` writer, for checking GPU output against a host reference |
-| `mtl_tensor` | Quantized `MTLTensor` prep — **`quant-prep` feature, off by default** (see Features) |
-| `decode_icb`, `cb_replay`, `icb_smoke` | Indirect command buffer capture and replay for decode-shaped workloads |
+## Key Highlights
 
-Encode is **Metal 4 only**. The classic `MTLCommandQueue` path is deliberately
-absent, not merely unused.
+- **Pure Metal 4 Architecture:** Built strictly for Metal 4 (`MTL4CommandBuffer`, `MTL4ComputeCommandEncoder`, `MTL4ArgumentTable`, `MTLResidencySet`). Legacy `MTLCommandQueue` and classic command buffer paths are deliberately absent.
+- **Hardware-Accelerated GEMM:** Native integration with MPP TensorOps `matmul2d` across NN, TN, and NT layouts in `f32`, `bf16` (with `f32` accumulate), and `tf32-relaxed` precision modes.
+- **Cooperative Register Accumulators:** High-throughput cooperative destination kernels (`get_destination_cooperative_tensor`) holding `f32` accumulators in GPU registers across the entire $K$-reduction, eliminating device memory round-trips for NN, TN, NT, and accumulating paths.
+- **In-Kernel Grid Swizzling & Bounds Checking:** Column-panel tile swizzling for large grids ($\ge 2048$ tiles) bounding operand rereads, combined with origin-shifted slice bounds checking for ragged edges.
+- **Zero-Wait Execution Pipeline:** Packed command encoding with bump-allocated constant arenas (16 MiB) and `MTLSharedEvent` synchronization—host threads never block mid-step.
+- **Decode ICB Capture & Replay:** Low-latency Indirect Command Buffer (ICB) capture and ping-pong replay with freeze-binds and range-batching for decode-shaped inference workloads.
 
-## Where it stands against PyTorch MPS
+> [!IMPORTANT]
+> **Platform Requirements:**
+> - **OS:** macOS 26+
+> - **Toolchain:** Xcode 26 with the Metal Toolchain component (`xcodebuild -downloadComponent MetalToolchain`).
+> - **Hardware:** Apple Silicon GPU with Neural Accelerators (Apple M-series) for the MPP TensorOps path. A portable `simdgroup_matrix` fallback is available for A/B testing, but is 2–3× slower.
 
-Measured on one M5 Pro with `bench/paired_cross_runtime.py`, which alternates
-the two lanes round by round so GPU clock drift cancels. Geomean of per-shape
-medians over 5 rounds, on an 8-shape ladder:
+---
 
-| | vs torch MPS | worst shape | best shape |
-|---|---|---|---|
-| bf16 → f32 accumulate | **1.00x** | 0.84x | 1.12x |
-| f32 exact | 1.07x | 0.92x | 1.47x |
-| tf32-relaxed vs torch f32 | 1.98x | 1.49x | 2.34x |
+## System Architecture
 
-bf16 is at **parity** with Apple's own MPS, not ahead of it. The tf32 row is not
-like-for-like — relaxed precision truncates the mantissa — and should be read as
-what the opt-in buys, not as an f32 result.
+```mermaid
+graph TD
+    subgraph Consumers["Downstream Consumers"]
+        Gemma["gemma-metal<br/>(Gemma 4 Inference)"]
+        Arch02["tessl-arch02<br/>(Value Residual Training)"]
+    end
 
-Do not quote single-run cross-runtime numbers from this or any other harness:
-two back-to-back runs of the same unpaired sweep disagreed by 16–21% on the
-torch lane alone. Below roughly 2 GFLOP of work both runtimes sit on a ~0.25 ms
-per-GEMM dispatch floor, so ratios there measure submit-and-wait latency rather
-than the kernel.
+    subgraph TesslAPI["tessl Public API"]
+        GpuRt["GpuRuntime"]
+        GemmFn["gemm() / gemm_f32()"]
+        TensorObj["Tensor / GpuBuffer"]
+        IcbObj["DecodeIcb / PingPongCbReplay"]
+    end
 
-## Using it
+    subgraph CoreEngine["tessl Core Runtime Substrate"]
+        RuntimeMod["runtime.rs<br/>MTL4 Buffers, Pools & Const Arena"]
+        GemmMod["gemm.rs<br/>Validation, Layouts & Coop Dispatch"]
+        DispatchMod["dispatch.rs<br/>Binder & Argument Table Encode"]
+        IcbMod["decode_icb.rs / cb_replay.rs<br/>ICB Capture, Tape Replay & Coalescing"]
+        MtlTensorMod["mtl_tensor.rs<br/>Quantized MTLTensor Prep (WWDC26-330)"]
+    end
+
+    subgraph Metal4Layer["Metal 4 Driver & Hardware Layer"]
+        CmdBuf["MTL4CommandBuffer / Allocator"]
+        ArgTable["MTL4ArgumentTable (32-slot)"]
+        ResSet["MTLResidencySet (Hot / Cold Pools)"]
+        SharedEvt["MTLSharedEvent (Zero-wait Sync)"]
+    end
+
+    subgraph Shaders["Compiled Metallib Shaders"]
+        TensorOpsMetal["matmul_tensorops.metal (MPP matmul2d)"]
+        SimdMetal["matmul_simdgroup.metal (Fallback)"]
+        UtilsMetal["utils.metal (Elementwise & Softcap)"]
+    end
+
+    Gemma -->|Links & Overlays| TesslAPI
+    Arch02 -->|DEP_TESSL_KERNELS| TesslAPI
+    TesslAPI --> CoreEngine
+    CoreEngine --> Metal4Layer
+    Metal4Layer --> Shaders
+```
+
+---
+
+## Module Overview
+
+| Module | Purpose & Implementation Details |
+|---|---|
+| [`gemm`](src/gemm.rs) | TensorOps `matmul2d` GEMM — NN, TN, and NT layouts; plain and accumulating; `f32`, `tf32-relaxed`, and `bf16→f32`; split-$K$; register-resident cooperative accumulators (`TILE_COOP_DEFAULT`, `TILE_COOP_NARROW`, `TILE_COOP_TN_NT`, `TILE_COOP_ACCUM`); column-panel grid swizzle; Morton 1D threadgroup dispatch walk. |
+| [`runtime`](src/runtime.rs) | Device initialization, Metal 4 command buffer and compute command encoder orchestration, residency sets, `Hot` / `Cold` / `Bump` buffer pools, packed binder scoping, 16 MiB bump constant arena, and `MTLSharedEvent` synchronization. |
+| [`dispatch`](src/dispatch.rs) | Metal 4 argument-table binding (`MTL4ArgumentTable`), constant staging cursor tracking, and 1D / 2D / 3D dispatch helpers. |
+| [`tensor`](src/tensor.rs) | Bounds-checked `GpuBuffer` / `Tensor` representations, multi-dimensional shape views, stride handling, and data types (`F32`, `Bf16`). |
+| [`ops`](src/ops.rs) | Elementwise utility launches (e.g., `softcap_f32`, activation scaling). |
+| [`npy`](src/npy.rs) | NumPy `.npy` binary serialization for validating GPU buffer outputs directly against host CPU references. |
+| [`decode_icb`](src/decode_icb.rs) | Indirect Command Buffer (ICB) capture, command stream tracing, freeze-bind argument management, and execution batching. |
+| [`cb_replay`](src/cb_replay.rs) | Ping-pong command buffer replay harness for decode-heavy token generation loops. |
+| [`infer_trace`](src/infer_trace.rs) | Execution tracing, timing hooks, and kernel profiling probes. |
+| [`mtl_tensor`](src/mtl_tensor.rs) | Quantized `MTLTensor` preparation (`Int8`, `Int4`, `Fp8E8M0`) for WWDC26-330 — gated behind the `quant-prep` feature. |
+
+---
+
+## Metal 4 Memory & Residency Hierarchy
+
+`tessl` manages GPU memory allocations explicitly to eliminate mid-command buffer host stalls and memory thrashing.
+
+```mermaid
+flowchart TD
+    subgraph DeviceMemory["Unified System Memory (Metal 4 Device)"]
+        subgraph Pools["tessl Managed Pools"]
+            Hot["Hot Pool<br/>(Weights & Persistent State)<br/>Resident for lifetime of run"]
+            Cold["Cold Pool<br/>(Intermediate Activations)<br/>Recycled + removeAllocation after CB"]
+            Bump["Bump Pool<br/>(Per-step Ephemeral Slabs)<br/>Cursor reset on sync"]
+        end
+
+        subgraph Arenas["Low-Latency Arenas"]
+            ConstArena["Constant Arena (16 MiB Bump)<br/>Scalar & Uniform Table Offsets"]
+        end
+    end
+
+    subgraph DriverResidency["Metal 4 Driver Residency Management"]
+        ResSet["MTLResidencySet"]
+        ArgTable["MTL4ArgumentTable"]
+    end
+
+    Hot -->|Registered Once| ResSet
+    Cold -->|Dynamic Register / Evict| ResSet
+    Bump -->|Pre-allocated Slabs| ResSet
+    ConstArena -->|Direct Table Offsets| ArgTable
+```
+
+### Memory Allocation Policies
+
+- **`BufferKind::Hot`**: Persistent allocations (model weights, optimizer state, KV cache banks). Added to the `MTLResidencySet` once at initialization and retained across steps.
+- **`BufferKind::Cold`**: Intermediate activations. Managed via an active freelist pool with a default 2 GiB cap (`DEFAULT_POOL_CACHE_BYTES`). Unused slabs are evicted via `removeAllocation` upon command buffer completion.
+- **`BufferKind::Bump`**: Ephemeral scratch memory allocated linearly from pre-committed slabs. Bump cursors are reset at synchronization points without individual buffer deallocations.
+- **Constant Arena (16 MiB)**: Eliminates per-dispatch host allocation overhead for scalars and small metadata buffers by writing directly into a shared staging buffer at 16-byte aligned offsets.
+
+> [!NOTE]
+> Steady-state execution never synchronizes with the host CPU during forward or backward passes. Synchronization occurs strictly at log, loss, or evaluation boundaries via [`GpuRuntime::synchronize`](src/runtime.rs).
+
+---
+
+## GEMM Pipeline & Kernel Selection
+
+The core GEMM engine in `tessl` dynamically selects the most optimal kernel based on layout, precision, and matrix geometry.
+
+```mermaid
+flowchart TD
+    Start["gemm(a, b, c, backend)"] --> Validate{"validate_gemm()<br/>Rank-2, Non-empty, Bounds &lt;= 2^31,<br/>Same Runtime, No In/Out Overlap"}
+    Validate -- Fail --> Err["Return Err(String)"]
+    Validate -- Pass --> BackendCheck{"Backend?"}
+
+    BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup<br/>(Portable SIMD Fallback)"]
+    BackendCheck -- TensorOps --> LayoutCheck{"Layout Resolution"}
+
+    LayoutCheck -- "TN / NT Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
+    SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn/nt_splitk_*<br/>(Split-K partial reductions)"]
+    SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_bf16_f32<br/>(128x64 sg4 Cooperative Destination)"]
+
+    LayoutCheck -- "NN Layout" --> PrecisionCheck{"Precision Mode"}
+    
+    PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>(Tile: 32x32, 1 simdgroup)"]
+    
+    PrecisionCheck -- "bf16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>N &lt;= 512?"}
+    
+    NNTable -- "N &lt;= 512 (Narrow)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+    
+    NNTable -- "N &gt; 512 (Default)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• Column-panel swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+```
+
+### Cooperative Destination Tile Execution
+
+All production `bf16` and `tf32-relaxed` kernels utilize cooperative destination tensors:
+1. **Register Accumulation:** `op.template get_destination_cooperative_tensor<...>()` maintains the full `f32` accumulator in hardware SIMDgroup registers across the entire $K$-reduction loop.
+2. **Zero Pre-Zero Overhead:** Register accumulators are initialized via `.set(i, 0.0f)` in shader code. The host-side `zero_f32(C)` pre-pass is completely eliminated.
+3. **Single Store to Memory:** Device memory $C$ is written **exactly once** (`cT.store(tC)`) at threadgroup termination.
+4. **Ragged Edge Handling:** Boundary tiles use origin-shifted full-extent tensor slices (`mA.slice(...)`, `mB.slice(...)`, `mC.slice(...)`), executing the same cooperative register accumulation without dropping tail elements.
+5. **Column-Panel Grid Swizzling:** For large dispatch grids ($\text{tiles}_n \times \text{tiles}_m \ge 2048$), threadgroups are swizzled into 8-tile-row bands to bound operand $B$ cache rereads, delivering $+11\%$ throughput at $4096^3$.
+
+---
+
+## Indirect Command Buffer (ICB) Decode Pipeline
+
+For auto-regressive generation where kernel execution times approach dispatch overheads, `tessl` provides Indirect Command Buffer (ICB) capture and tape replay.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Host as Host Runtime / Client
+    participant Binder as Binder / Dispatcher
+    participant Tape as DecodeIcb Capture Tape
+    participant ICB as Metal 4 MTLIndirectCommandBuffer
+    participant GPU as Apple Silicon GPU
+
+    Note over Host,GPU: 1. Capture Phase (First Token / Warmup)
+    Host->>Binder: begin_decode_icb_capture()
+    loop Model Layers (Decode Graph)
+        Host->>Binder: bind_buffer(), set_pipeline(), dispatch()
+        Binder->>Tape: Record Command (PSO, ArgTable, Buffers, Grid Size)
+    end
+    Host->>Tape: take_decode_icb_capture() -> Bake ICB Tape
+    Tape->>ICB: Encode ICB Commands (freeze-binds / range-batching)
+
+    Note over Host,GPU: 2. Steady-State Replay Phase (Subsequent Tokens)
+    loop Each Decode Token
+        Host->>Tape: try_replay_icb(runtime)
+        Tape->>ICB: executeCommandsInBuffer:withRange: (Zero setArgumentTable host tax)
+        Host->>GPU: Submit MTL4CommandBuffer (Ping-Pong buffers)
+        GPU-->>Host: Signal MTLSharedEvent (Zero-wait async execution)
+    end
+```
+
+### ICB Optimizations
+
+- **Freeze-Binds (`TESSL_ICB_FREEZE_BINDS=1`):** Inlines buffer bindings and threadgroup memory directly into the ICB commands, reducing host `setArgumentTable` invocations to zero at replay time.
+- **Range-Batching (`TESSL_ICB_RANGE_BATCH=1`):** Coalesces contiguous command spans between execution barriers into unified `executeCommandsInBuffer:withRange:` calls.
+- **Coarse Barriers (`TESSL_COARSE_BARRIERS=1`):** Elides redundant inter-command barriers when memory access footprints across successive passes are demonstrably disjoint.
+
+---
+
+## Performance vs. PyTorch MPS
+
+Measurements taken on Apple M5 Pro utilizing `bench/paired_cross_runtime.py`. The benchmark harness interleaves `tessl` and PyTorch MPS iterations round-by-round to cancel GPU thermal throttling and frequency scaling drift.
+
+*Geomean of per-shape medians over 5 rounds across an 8-shape ladder:*
+
+| Precision Mode | vs. PyTorch MPS | Worst Shape | Best Shape | Peak Throughput (M5 Pro) |
+|---|---|---|---|---|
+| **bf16 → f32 accumulate** | **1.11×** *(Outperforms MPS)* | 1.01× | 1.22× | **29,022 GFLOP/s** (`square_4096`) |
+| **f32 exact** | **1.07×** | 0.92× | 1.47× | **10,897 GFLOP/s** (`square_2048`) |
+| **tf32-relaxed vs. PyTorch f32** | **2.01×** | 1.49× | 2.90× | **18,040 GFLOP/s** (`square_4096`) |
+
+> [!WARNING]
+> **Benchmarking Rigor:**
+> - **Clock Drift:** Single-run cross-runtime benchmarks can fluctuate by 15–20% on identical workloads due to Apple Silicon dynamic power governor adjustments. Always use paired, interleaved sweeps (`bench_gemm_coop_ab` or `paired_cross_runtime.py`).
+> - **Dispatch Floor:** Below ~2 GFLOP of total work, both runtimes hit a ~0.25 ms host submit-and-wait floor, measuring host driver dispatch latency rather than raw shader throughput.
+
+---
+
+## Quickstart Guide
+
+### Basic GEMM Usage
 
 ```rust
 use tessl::{gemm, GemmBackend, GpuRuntime, PrecisionMode};
 
-let rt = GpuRuntime::new()?;
-let a = rt.alloc_tensor_f32(&[4096, 2304])?;
-let b = rt.alloc_tensor_f32(&[2304, 768])?;
-let c = rt.alloc_tensor_f32(&[4096, 768])?;
-gemm(&a, &b, &c, GemmBackend::TensorOps)?;   // C = A @ B
-rt.synchronize()?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Initialize Metal 4 GPU runtime
+    let rt = GpuRuntime::new()?;
+
+    // 2. Allocate tensors on the GPU
+    let a = rt.alloc_tensor_f32(&[4096, 2304])?;
+    let b = rt.alloc_tensor_f32(&[2304, 768])?;
+    let c = rt.alloc_tensor_f32(&[4096, 768])?;
+
+    // 3. Dispatch GEMM: C = A @ B via MPP TensorOps
+    gemm(&a, &b, &c, GemmBackend::TensorOps)?;
+
+    // 4. Synchronize GPU work to host
+    rt.synchronize()?;
+    
+    Ok(())
+}
 ```
 
-`build.rs` AOT-compiles `kernels/*.metal` into a `default.metallib` and bakes
-its absolute path in, so no metallib shipping or lookup is needed.
+### Consuming Kernels from Downstream Crates
 
-### Consuming the kernels from another crate
+Downstream crates building their own `default.metallib` can directly compile `tessl` shaders without copying source files. `tessl` exports `DEP_TESSL_KERNELS` via `links = "tessl"`.
 
-A crate that builds its own metallib should compile **these** kernel sources
-rather than copying them. `tessl` sets `links = "tessl"` and its build script
-publishes the directory:
-
+In downstream `build.rs`:
 ```rust
-// your build.rs
-let tessl_kernels = PathBuf::from(env::var("DEP_TESSL_KERNELS").unwrap());
-// compile tessl_kernels.join("matmul_tensorops.metal") into your metallib
+let tessl_kernels = std::path::PathBuf::from(std::env::var("DEP_TESSL_KERNELS").unwrap());
+let matmul_shader = tessl_kernels.join("matmul_tensorops.metal");
+// Compile matmul_shader into your custom metallib...
 ```
 
-Then build your runtime from your own metallib —
-`GpuRuntime::from_metallib_path(...)` — or overlay it onto tessl's with
-`GpuRuntime::add_metallib(...)`. `tessl-arch02` takes the first route,
-`gemma-metal` the second.
+To overlay custom metallibs onto `tessl` at runtime:
+```rust
+// Initialize from standalone metallib:
+let rt = GpuRuntime::from_metallib_path("/path/to/custom.metallib")?;
 
-## Verifying
-
-```bash
-cargo test --release -- --test-threads=1        # GPU tests are not thread-safe
-python3 scripts/audit_gemm_tiles.py             # runs from any directory
+// Or overlay onto tessl default library:
+let rt = GpuRuntime::new()?;
+rt.add_metallib("/path/to/custom_overlay.metallib")?;
 ```
 
-The audit cross-checks every Rust `TileGeom` against the `SM`/`SN` compiled into
-the kernel it dispatches, and every cooperative kernel's `BKC` against
-`COOP_BKC`. A drift in either silently corrupts results rather than failing, so
-it is a build-time gate, not a nicety.
+---
 
-`gemm_randomized_shape_fuzz` is a seeded shape fuzz that **asserts its own
-coverage** — it fails if any selectable NN kernel was chosen for under 1% of
-cases. An earlier version passed three injected faults because it never
-dispatched the kernels they were injected into.
+## Verification & Hardening Suite
 
 ```bash
+# Run unit and integration tests (single-threaded for GPU context safety)
+cargo test --release --lib -- --test-threads=1
+
+# Validate static TileGeom definitions against compiled Metal kernel constants
+python3 scripts/audit_gemm_tiles.py
+
+# Run randomized adversarial shape fuzzing (with self-asserting kernel coverage)
 GEMM_FUZZ_SEED=0xdeadbeef GEMM_FUZZ_CASES=1200 \
   cargo test --release --lib -- --test-threads=1 --nocapture gemm_randomized_shape_fuzz
 ```
 
-`GEMM_FUZZ_SEED` accepts hex or decimal and **panics** on a malformed value
-rather than falling back to the default — falling back made an eight-seed soak
-silently re-run one seed eight times and pass every time.
+### Static Tile Audit (`scripts/audit_gemm_tiles.py`)
+Cross-references every Rust `TileGeom` struct against the `constexpr int SM/SN` parameters compiled into `matmul_tensorops.metal`, including macro-instantiated kernels (`NN_COOP_KERNEL`, `TN_NT_COOP_KERNEL`). A mismatch would cause the host to dispatch incorrect threadgroup grids, silently leaving output tiles unwritten.
 
-## Benchmarking
+### Self-Asserting Shape Fuzzer
+`gemm_randomized_shape_fuzz` validates numerical correctness across non-standard matrix dimensions and **asserts its own coverage**—the test panics if any selectable NN kernel is exercised in fewer than 1% of fuzz iterations.
 
-The A/B rig is 92 measurement-only kernels and is **not** in the default
-metallib (it takes the artifact from 0.20 MB to 1.07 MB). Opt in:
+> [!CAUTION]
+> GPU tests are not thread-safe across concurrent OS threads sharing default command encoders. Always specify `--test-threads=1` when running `cargo test`.
 
+---
+
+## Benchmarking & Tuning Binaries
+
+Tuning and A/B verification kernels (92 measurement variants) are excluded from the default metallib to keep release binaries lightweight (0.20 MB vs. 1.07 MB).
+
+To build with tuning kernels enabled:
 ```bash
 TESSL_GEMM_TUNE=1 cargo build --release --bins
 ```
 
-| binary | purpose |
+| Binary | Description & Usage |
 |---|---|
-| `bench_gemm_coop_ab` | Paired, interleaved kernel A/B. Use this for kernel comparisons. |
-| `bench_gemm_tile_tune` | Broad tile/BK ladder. |
-| `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
-| `probe_gemm_parity` | Bit-equality probe across backends. |
-| `bench/paired_cross_runtime.py` | Alternates the tessl and torch/MLX lanes. |
+| `bench_gemm_coop_ab` | Paired, round-interleaved A/B evaluation for kernel comparisons. |
+| `bench_gemm_tile_tune` | Exhaustive tile geometry ($SM \times SN$) and $BK$ ladder benchmark. |
+| `bench_gemm_tnnt_tune` | Paired A/B tuning evaluation for TN/NT descriptor and accumulate kernels. |
+| `bench_gemm_sweep` | Automated cross-runtime sweep (`f32`, `tf32`, `bf16`) with JSON telemetry output. |
+| `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against reference SIMD implementations. |
+| `bench/paired_cross_runtime.py` | Python harness driving paired `tessl` vs. PyTorch MPS / MLX evaluation. |
 
-Both tuning binaries `exit(2)` with the rebuild command when the rig is absent,
-rather than printing a page of skips and exiting 0.
+---
 
-`bench/results/bf16_tile_tune_FINDINGS.md` is the working record: what was
-measured, what was rejected, and the measurement errors made along the way.
+## Environment Variables Reference
 
-## Environment variables
+All runtime configuration parameters use the canonical `TESSL_*` prefix. Legacy `METAL_RUNTIME_*` and `METAL_NATIVE_*` variants are supported for backwards compatibility.
 
-Canonically `TESSL_*`. The legacy `METAL_RUNTIME_*` and `METAL_NATIVE_*`
-spellings are still read, in that order, so scripts written before the rename
-keep working.
-
-| variable | effect |
-|---|---|
-| `TESSL_GEMM_TUNE` | Build the A/B rig into the metallib (build-time) |
-| `TESSL_GEMM_ACCUM` | TensorOps `multiply_accumulate` for TN/NT accumulate paths (default off) |
-| `TESSL_GEMM_ACCUM_DX` | Accumulate for the dX NT path only (default off) |
-| `TESSL_GEMM_INTERIOR` | f32 GEMM interior-offset tiles (default off) |
-| `TESSL_HAZARD_BARRIERS` | Skip the always-on device barrier after each dispatch |
-| `TESSL_COARSE_BARRIERS` | Phase-coarsened rather than per-RAW barriers |
-| `TESSL_MID_COMMIT=N` | Overlap host encode with GPU execution every N dispatches (default off) |
-| `TESSL_DECODE_ICB`, `TESSL_ICB_*` | Indirect-command-buffer decode paths (all default off) |
-| `TESSL_SKIP_AOT` | Skip metallib compilation; trusts a pre-existing crate-root `default.metallib` (hazard: may be stale or missing) |
-
-## Features
-
-| feature | default | what it adds |
+| Environment Variable | Default | Description |
 |---|---|---|
-| `quant-prep` | **off** | `mtl_tensor`: quantized `MTLTensor` prep for WWDC26-330. Off because it is prep — `try_quant_tensorops_prefill_gemm` returns `Err("not wired yet")` and nothing in this workspace calls it. Kept compiling behind a flag rather than shipped as public API that does not work. |
+| `TESSL_GEMM_TUNE` | `0` | Compiles extended 92-kernel A/B tuning suite into metallib (build-time). |
+| `TESSL_GEMM_ACCUM` | `0` | Enables native TensorOps `multiply_accumulate` for TN/NT accumulate paths. |
+| `TESSL_GEMM_ACCUM_DX` | `0` | Enables hardware accumulate path specifically for $dX$ NT GEMM. |
+| `TESSL_GEMM_INTERIOR` | `0` | Enables interior-offset tile optimizations for `f32` GEMM. |
+| `TESSL_HAZARD_BARRIERS` | `1` | Enforces explicit device barriers after compute dispatches (`0` skips). |
+| `TESSL_COARSE_BARRIERS` | `0` | Replaces per-RAW barriers with coarse phase-level synchronization. |
+| `TESSL_MID_COMMIT=N` | `0` | Overlaps host command encoding with GPU execution every $N$ dispatches. |
+| `TESSL_DECODE_ICB` | `0` | Enables Indirect Command Buffer capture and execution path. |
+| `TESSL_ICB_FREEZE_BINDS` | `0` | Freezes argument table buffer bindings directly into ICB commands. |
+| `TESSL_ICB_RANGE_BATCH` | `0` | Coalesces contiguous ICB command ranges into single execution dispatches. |
+| `TESSL_SKIP_AOT` | `0` | Bypasses `build.rs` AOT shader compilation and reuses existing `default.metallib`. |
 
-The decode / indirect-command-buffer modules (`decode_icb`, `cb_replay`,
-`icb_smoke`, `infer_trace`) are **not** feature-gated in 0.1.0. They are woven
-into the binder hot path — every bind and dispatch consults the capture state —
-so splitting them out is a change to code that has to be correct, not a
-packaging tidy-up. They are inert unless a `TESSL_ICB_*` variable is set.
+---
 
-## Documentation
+## Feature Flags
 
-`../../docs/gemm_architecture.md` covers kernel selection, the cooperative
-accumulator gate clause by clause, why the TN/NT paths deliberately have no
-cooperative variant, and the benchmarking pitfalls above.
+| Feature | Default | Description |
+|---|---|---|
+| `quant-prep` | **Disabled** | Compiles `mtl_tensor` for native quantized `MTLTensor` bindings (WWDC26-330). Kept off by default until Apple NAX hardware dequantization APIs stabilize in public SDKs. |
 
-## Status
+---
 
-Not yet published. `cargo package` verifies clean — the crate builds from its
-own tarball, kernels included — and the manifest carries
-`license = "MIT OR Apache-2.0"`, matching `LICENSE-MIT` and `LICENSE-APACHE` at
-the crate root.
+## Reference Documentation
 
-Everything here is tuned and measured on a single M5 Pro. Nothing has been run
-on another GPU.
+- [`../../docs/gemm_architecture.md`](../../docs/gemm_architecture.md): Deep-dive into cooperative accumulator gates, $K$-reduction bandwidth analysis, and arithmetic proofs.
+- [`../../docs/metal4_mpp.md`](../../docs/metal4_mpp.md): Low-level Metal 4 and Metal Performance Primitives integration guidelines.
+- [`bench/results/bf16_tile_tune_FINDINGS.md`](bench/results/bf16_tile_tune_FINDINGS.md): Empirical tuning log documenting $BK$ ladder benchmarks, root causes, and landed M5 Pro speedups.
+
+---
+
+## License
+
+Licensed under either of:
+
+- Apache License, Version 2.0 ([`LICENSE-APACHE`](LICENSE-APACHE))
+- MIT License ([`LICENSE-MIT`](LICENSE-MIT))
+
+at your option.

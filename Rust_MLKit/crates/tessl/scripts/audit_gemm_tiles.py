@@ -47,6 +47,15 @@ def kernel_tiles(metal):
                      int(sn.group(1)) if sn else None,
                      1 if one and not sg else (int(sg.group(1)) if sg else None),
                      int(bk.group(1)) if bk else None)
+
+    for m in re.finditer(r'NN_COOP_KERNEL\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\w+)\s*\)', src):
+        name = m.group(1)
+        out[name] = (int(m.group(3)), int(m.group(4)), int(m.group(5)), None)
+
+    for m in re.finditer(r'TN_NT_COOP_KERNEL\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\w+)\s*\)', src):
+        name = m.group(1)
+        out[name] = (int(m.group(3)), int(m.group(4)), int(m.group(5)), None)
+
     return out
 
 def rust_coop_bkc(rs):
@@ -69,24 +78,27 @@ def rust_tiles(rs):
     for i, l in enumerate(lines):
         km = re.search(r'pipeline\("([a-z0-9_]+)"\)', l)
         if not km: continue
+        kname = km.group(1)
+        if not kname.startswith("matmul"): continue
         for j in range(i, min(i + 8, len(lines))):
             tm = re.search(r'\b(TILE_\w+)\b', lines[j])
             if tm:
-                pairs.append((km.group(1), tm.group(1), j + 1)); break
+                pairs.append((kname, tm.group(1), j + 1)); break
     return consts, pairs
 
-# NN paths select their kernel through `backend.kernel_name_*()`, so they never
-# appear as a pipeline("literal") and must be pinned by hand.
+# NN and coop paths select their kernel through helper functions / expressions,
+# so they do not always appear as a literal pipeline("name") next to TILE_*,
+# and are pinned by hand.
 NN_PAIRS = [
     ("matmul2d_tensorops_f32", "TILE_F32"),
-    ("matmul2d_tensorops_f32_relaxed", "TILE_F32R_NN"),
-    ("matmul2d_tensorops_bf16_f32", "TILE_BF16_NN"),
-    # The register-accumulator kernels are selected by the same string literals
-    # and MUST share their blocked sibling's tile: `use_coop_nn` proves every
-    # tile is interior using that TileGeom, and the kernel then has no ragged
-    # branch to fall back on. A drift here leaves output tiles unwritten.
-    ("matmul2d_tensorops_bf16_f32_coop", "TILE_BF16_NN"),
-    ("matmul2d_tensorops_f32_relaxed_coop", "TILE_F32R_NN"),
+    ("matmul2d_tensorops_bf16_f32", "TILE_COOP_DEFAULT"),
+    ("matmul2d_tensorops_bf16_f32_64x64_sg4", "TILE_COOP_NARROW"),
+    ("matmul2d_tensorops_f32_relaxed", "TILE_COOP_DEFAULT"),
+    ("matmul2d_tensorops_f32_relaxed_64x64_sg4", "TILE_COOP_NARROW"),
+    ("matmul2d_tensorops_tn_bf16_f32", "TILE_COOP_TN_NT"),
+    ("matmul2d_tensorops_nt_bf16_f32", "TILE_COOP_TN_NT"),
+    ("matmul2d_tensorops_tn_accum_bf16_f32", "TILE_COOP_ACCUM"),
+    ("matmul2d_tensorops_nt_accum_bf16_f32", "TILE_COOP_ACCUM"),
 ]
 
 bad = 0

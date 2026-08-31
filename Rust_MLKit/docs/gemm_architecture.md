@@ -166,12 +166,23 @@ under this submit-and-wait protocol — tessl's wall time is flat from 4 MFLOP t
 ## Adding a coop kernel
 
 1. Compile-time `SM`/`SN` must equal the `TileGeom` the host dispatches with,
-   and `constexpr int BKC` must equal `COOP_BKC`.
-2. Pin it in `NN_PAIRS` in `scripts/audit_gemm_tiles.py`. The audit fails on
-   any `*_coop` kernel that is not pinned, because coop kernels are dispatched
-   through a variable and the pipeline-literal scanner cannot see them.
-3. Route it through `tensorops_nn_kernel` so the fuzz's coverage assertion
-   counts it.
-4. Verify the net can fail: inject a fault (BKC drift, tile drift, drop the
-   store, seed the accumulator non-zero, skip every other K block, offset a
-   column) and confirm the sweep or fuzz catches it before trusting a pass.
+   and `constexpr int BKC` must equal `COOP_BKC` (if using explicit K loop blocking).
+2. Pin it in `NN_PAIRS` in `scripts/audit_gemm_tiles.py`. The audit verifies both
+   explicit `kernel void` and macro-instantiated (`NN_COOP_KERNEL`, `TN_NT_COOP_KERNEL`)
+   tiles against Rust constants.
+3. Route it through `nn_coop_kernel` / `src/gemm.rs` so tests and benches exercise it.
+4. Verify the net can fail: inject a fault (tile drift, drop store, offset column)
+   and confirm the test suite catches it before trusting a pass.
+
+## Round 2 Evolution (2026-08-30)
+
+In Round 2, cooperative destination tensors (`get_destination_cooperative_tensor`)
+were expanded across all primary GEMM paths:
+- **TN & NT bf16 descriptors:** Landed cooperative destination kernels (`TILE_COOP_TN_NT` 128×64 sg4),
+  yielding 1.5–2.0× speedups over single dynamic-K multiply kernels.
+- **Accumulate kernels:** Replaced `multiply_accumulate` with cooperative zero→run→load-add-store
+  bias pattern (`TILE_COOP_ACCUM` 64×64 sg4), cutting memory traffic to 1 read + 1 write total.
+- **NN Grid Swizzle:** Added column-panel swizzling (8 tile-rows per band) for large grids
+  (`tiles_n * tiles_m >= 2048`), delivering 29,022 GFLOP/s at $4096^3$ on M5 Pro.
+- **Edge Slices:** Ragged boundary tiles execute origin-shifted slices with register accumulation,
+  eliminating the need for separate pre-zeroing passes.
