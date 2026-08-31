@@ -11,8 +11,8 @@
 //! breaks cryptex Metal Toolchain resolution on Xcode 26+. Use `xcrun metal`
 //! plus an explicit `-isysroot`.
 //!
-//! `METAL_RUNTIME_SKIP_AOT` hazard: when set, this script skips compilation and
-//! points `METAL_RUNTIME_METALLIB` at the crate-root `default.metallib`. That
+//! `TESSL_SKIP_AOT` hazard: when set, this script skips compilation and
+//! points `TESSL_METALLIB` at the crate-root `default.metallib`. That
 //! file may be stale or missing — only use for intentional offline/CI skips
 //! after a known-good metallib is already present at the crate root.
 
@@ -23,6 +23,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
+    println!("cargo:rerun-if-env-changed=TESSL_SKIP_AOT");
     println!("cargo:rerun-if-env-changed=METAL_RUNTIME_SKIP_AOT");
     println!("cargo:rerun-if-env-changed=TESSL_GEMM_TUNE");
     println!("cargo:rerun-if-env-changed=METAL_NATIVE_GEMM_TUNE");
@@ -32,12 +33,13 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-link-lib=framework=Foundation");
 
-    if env::var_os("METAL_RUNTIME_SKIP_AOT").is_some() {
-        println!("cargo:warning=METAL_RUNTIME_SKIP_AOT set; skipping metallib AOT");
+    // Legacy spelling still honoured: this one is set by hand in CI/offline runs.
+    if env::var_os("TESSL_SKIP_AOT").is_some() || env::var_os("METAL_RUNTIME_SKIP_AOT").is_some() {
+        println!("cargo:warning=TESSL_SKIP_AOT set; skipping metallib AOT");
         let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
         let crate_lib = manifest_dir.join("default.metallib");
         println!(
-            "cargo:rustc-env=METAL_RUNTIME_METALLIB={}",
+            "cargo:rustc-env=TESSL_METALLIB={}",
             crate_lib.display()
         );
         return;
@@ -90,7 +92,7 @@ fn main() {
                 "-mmacosx-version-min=26.0",
                 "-c",
             ])
-            .arg(&src)
+            .arg(src)
             .arg("-o")
             .arg(&air)
             .status()
@@ -163,16 +165,26 @@ fn main() {
     link.arg("-o").arg(&metallib_out);
     run(&mut link, "metallib link");
 
-    // Publish the offline compatibility copy without truncating an inode that
-    // an existing runtime may still use. Do not hide failed publication.
-    let crate_copy = manifest_dir.join("default.metallib");
-    let staged_copy = manifest_dir.join(format!(".default-{build_id}.metallib"));
-    fs::File::create_new(&staged_copy).expect("reserve offline metallib staging file");
-    fs::copy(&metallib_out, &staged_copy).expect("stage offline metallib");
-    fs::rename(&staged_copy, &crate_copy).expect("publish offline metallib");
+    // Offline compatibility copy at the crate root, for the TESSL_SKIP_AOT path.
+    //
+    // This writes outside OUT_DIR, which Cargo forbids while verifying a package
+    // ("Source directory was modified by build.rs during cargo publish") — it
+    // made `cargo package` fail outright. Skipped when building from a packaging
+    // directory, where the copy is useless anyway: a consumer building tessl
+    // from a registry always compiles the metallib fresh into OUT_DIR, and only
+    // this repository's offline/CI runs ever set TESSL_SKIP_AOT.
+    if !is_packaging_dir(&manifest_dir) {
+        // Do not truncate an inode a running process may still have mapped;
+        // stage beside it and rename. Failure is surfaced, never swallowed.
+        let crate_copy = manifest_dir.join("default.metallib");
+        let staged_copy = manifest_dir.join(format!(".default-{build_id}.metallib"));
+        fs::File::create_new(&staged_copy).expect("reserve offline metallib staging file");
+        fs::copy(&metallib_out, &staged_copy).expect("stage offline metallib");
+        fs::rename(&staged_copy, &crate_copy).expect("publish offline metallib");
+    }
 
     println!(
-        "cargo:rustc-env=METAL_RUNTIME_METALLIB={}",
+        "cargo:rustc-env=TESSL_METALLIB={}",
         metallib_out.display()
     );
 }
@@ -277,4 +289,19 @@ fn track_kernel_sources(dir: &Path) {
             println!("cargo:rerun-if-changed={}", p.display());
         }
     }
+}
+
+/// True when this build is Cargo verifying a package tarball.
+///
+/// `cargo package` unpacks into `<target>/package/<name>-<version>/` and builds
+/// there, then fails the run if the build script touched anything in that
+/// directory. Detecting it by path is the available signal — Cargo exposes no
+/// "am I packaging" variable — and it is precise: a normal checkout is not
+/// nested under `target/package/`.
+fn is_packaging_dir(manifest_dir: &Path) -> bool {
+    let mut it = manifest_dir.components().rev();
+    // .../target/package/<name>-<version>
+    it.next().is_some()
+        && it.next().map(|c| c.as_os_str() == "package").unwrap_or(false)
+        && it.next().map(|c| c.as_os_str() == "target").unwrap_or(false)
 }

@@ -14,6 +14,15 @@ license = "MIT OR Apache-2.0"
 # sources instead of keeping a copy that silently drifts.
 links = "tessl"
 
+[features]
+default = []
+# Quantized MTLTensor prep (WWDC26-330). Off by default because it is exactly
+# that — prep. `try_quant_tensorops_prefill_gemm` returns
+# Err("not wired yet"), and nothing in this workspace calls the module. It is
+# kept compiling behind a flag rather than shipped as public API that does not
+# work yet.
+quant-prep = []
+
 [dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSError", "NSData", "NSValue", "NSRange"] }

@@ -29,6 +29,31 @@ pub fn golden_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("golden")
 }
 
+/// Fail with instructions when the regenerable forward activations are absent.
+///
+/// `golden/fwd/` is ~80 MB of activations and is gitignored, so a fresh clone
+/// has every other golden but not these. Without this the tests die on a bare
+/// `No such file or directory` naming one `.npy`, which says nothing about how
+/// to get it. A check that cannot run has to say what would make it run.
+pub fn require_fwd_goldens(golden: &std::path::Path) {
+    let fwd = golden.join("fwd");
+    let probe = fwd.join("stem_after_smear.npy");
+    if probe.exists() {
+        return;
+    }
+    panic!(
+        "forward goldens missing at {}\n\
+         These activations are regenerable and therefore gitignored \
+         (.gitignore: golden/fwd/), so a fresh clone will not have them.\n\
+         Regenerate with:\n\
+         \n    python3 {}/scripts/export_goldens.py\n\n\
+         Every other golden directory (grads, inputs, optim_step3, weights_init) \
+         is committed and needs nothing.",
+        fwd.display(),
+        env!("CARGO_MANIFEST_DIR"),
+    );
+}
+
 /// Error reductions must preserve non-finite evidence instead of hiding NaNs.
 pub(crate) fn max_finite_error(acc: f32, value: f32) -> f32 {
     if acc.is_finite() && value.is_finite() { acc.max(value) } else { f32::INFINITY }
@@ -896,6 +921,7 @@ mod tests {
             "missing goldens at {}",
             golden.display()
         );
+        require_fwd_goldens(&golden);
         let rt = crate::gpu_runtime().expect("GpuRuntime");
         eprintln!(
             "device={} tensorops={}",
@@ -916,6 +942,7 @@ mod tests {
     #[test]
     fn stem_only_parity() {
         let golden = golden_dir();
+        require_fwd_goldens(&golden);
         let rt = crate::gpu_runtime().expect("GpuRuntime");
         let cfg = ModelConfig::sota_toy();
         let w = Weights::load_from_golden(&rt, &golden, cfg).unwrap();

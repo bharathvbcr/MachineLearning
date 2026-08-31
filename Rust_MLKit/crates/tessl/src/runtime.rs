@@ -166,11 +166,11 @@ impl BufferPool {
         device: &ProtocolObject<dyn MTLDevice>,
         nbytes: usize,
     ) -> Result<(Retained<ProtocolObject<dyn MTLBuffer>>, bool), String> {
-        if nbytes > isize::MAX as usize || nbytes > device.maxBufferLength() as usize {
+        if nbytes > isize::MAX as usize || nbytes > device.maxBufferLength() {
             return Err(format!("buffer request {nbytes} exceeds host/device allocation limit"));
         }
         let key = Self::bucket(nbytes);
-        if key < nbytes || key > device.maxBufferLength() as usize {
+        if key < nbytes || key > device.maxBufferLength() {
             return Err("rounded buffer size exceeds device limit".into());
         }
         if let Some(v) = self.freelist.get_mut(&key) {
@@ -187,7 +187,7 @@ impl BufferPool {
     }
 
     fn recycle(&mut self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
-        let key = Self::bucket(buffer.length() as usize);
+        let key = Self::bucket(buffer.length());
         if key > self.max_cache_bytes.saturating_sub(self.cached_bytes) {
             // Drop buffer (let ARC release) — over cache cap.
             return;
@@ -253,12 +253,14 @@ pub struct Metal4EncodePackage {
 }
 
 /// Soft mid-token commit threshold (dispatches since last commit).
-/// Default off (`0`). Enable with `METAL_RUNTIME_MID_COMMIT=N` (e.g. 128–256).
+/// Default off (`0`). Enable with `TESSL_MID_COMMIT=N` (e.g. 128–256);
+    /// `METAL_RUNTIME_MID_COMMIT` is still read for compatibility.
 /// Free-allocator pick avoids the wait-storm when the peer slot is still busy.
 fn mid_commit_threshold() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("METAL_RUNTIME_MID_COMMIT")
+        std::env::var("TESSL_MID_COMMIT")
+            .or_else(|_| std::env::var("METAL_RUNTIME_MID_COMMIT"))
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
@@ -766,7 +768,7 @@ impl GpuRuntime {
         // Align to 16 bytes for TensorOps.
         let align = 16;
         let cursor = (state.cursor + align - 1) & !(align - 1);
-        if !cursor.checked_add(nbytes).is_some_and(|end| end <= state.capacity) {
+        if cursor.checked_add(nbytes).is_none_or(|end| end > state.capacity) {
             return Err(format!(
                 "bump arena exhausted: need {} more bytes (cursor={cursor}, cap={})",
                 nbytes, state.capacity
@@ -1258,7 +1260,7 @@ fn resolve_two_timestamps(
     }
     .ok_or_else(|| "resolveCounterRange returned nil".to_string())?;
     let need = 2 * std::mem::size_of::<MTL4TimestampHeapEntry>();
-    let bytes = data.length() as usize;
+    let bytes = data.length();
     if bytes < need {
         return Err(format!("timestamp resolve too small: {bytes} bytes (need {need})"));
     }
@@ -1391,9 +1393,9 @@ mod tests {
             std::ptr::write_bytes(q as *mut u8, 0, n * 4);
         }
         let pipe = rt.pipeline("copy_f32").unwrap();
-        let width = pipe.threadExecutionWidth() as usize;
+        let width = pipe.threadExecutionWidth();
         let tpt = width.min(n).max(1);
-        let groups = (n + tpt - 1) / tpt;
+        let groups = n.div_ceil(tpt);
         rt.with_binder(|bnd| {
             bnd.set_pipeline(&pipe);
             bnd.bind_gpu_buf(&src, 0);
@@ -1477,7 +1479,7 @@ mod tests {
             assert_eq!(dst_out[i], 100.0 + i as f32, "second copy mismatch at {i}");
         }
         assert_eq!(*rt.metal4.const_cursor.lock().unwrap(), 0);
-        assert!(rt.metal4.const_staging.length() as usize >= METAL4_CONST_ARENA_BYTES);
+        assert!(rt.metal4.const_staging.length() >= METAL4_CONST_ARENA_BYTES);
     }
 
     #[test]
@@ -1500,9 +1502,9 @@ mod tests {
             std::ptr::write_bytes(q as *mut u8, 0, n * 4);
         }
         let pipe = rt.pipeline("copy_f32").expect("pipe");
-        let width = pipe.threadExecutionWidth() as usize;
+        let width = pipe.threadExecutionWidth();
         let tpt = width.min(n).max(1);
-        let groups = (n + tpt - 1) / tpt;
+        let groups = n.div_ceil(tpt);
         rt.with_binder(|bnd| {
             bnd.set_pipeline(&pipe);
             bnd.bind_buf(src.metal(), pad * 4, 0);
@@ -1523,7 +1525,7 @@ mod tests {
                 "offset bind mismatch at {i}: got {v} want {expect}"
             );
         }
-        assert!(rt.metal4.const_staging.length() as usize >= METAL4_CONST_ARENA_BYTES);
+        assert!(rt.metal4.const_staging.length() >= METAL4_CONST_ARENA_BYTES);
         // Multi-const staging via Binder const arena.
         rt.set_async_encode(true).unwrap();
         rt.with_binder(|bnd| {

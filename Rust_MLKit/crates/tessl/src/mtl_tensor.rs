@@ -95,8 +95,14 @@ pub struct GpuTensor {
     pub tensor: Retained<ProtocolObject<dyn MTLTensor>>,
     pub dtype: MTLTensorDataType,
     pub dims: Vec<usize>,
-    /// When buffer-backed, keep the storage alive.
+    // Lifetime anchors, never read: the MTLTensor above borrows this storage,
+    // and the runtime owns the allocator that storage came from. Dropping
+    // either while `tensor` is live is a use-after-free, so they are held, not
+    // used. Scoped `allow` rather than a crate-level one, which would hide the
+    // next genuinely dead field.
+    #[allow(dead_code)]
     pub(crate) storage: Option<GpuBuffer>,
+    #[allow(dead_code)]
     pub(crate) runtime: Arc<GpuRuntime>,
 }
 
@@ -166,7 +172,7 @@ pub unsafe fn tensor_from_buffer(
     let mtl_dtype = dtype.to_mtl()?;
     let desc = make_descriptor(dims, mtl_dtype, MTLTensorUsage::Compute)?;
     let align = rt.device.tensorSizeAndAlignWithDescriptor(&desc);
-    if byte_offset % (align.align as usize) != 0 {
+    if byte_offset % align.align != 0 {
         return Err(format!(
             "tensor buffer offset {byte_offset} not aligned to {}",
             align.align

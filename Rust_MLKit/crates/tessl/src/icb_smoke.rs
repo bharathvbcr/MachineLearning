@@ -1,5 +1,5 @@
 //! Mini compute ICB smoke (opt-in): encode `copy_f32` once via classic
-//! `setKernelBuffer`, then [`MTL4ComputeCommandEncoder::executeCommandsInBuffer`]
+//! `setKernelBuffer`, then `MTL4ComputeCommandEncoder::executeCommandsInBuffer`
 //! on later steps.
 //!
 //! ## Status
@@ -48,7 +48,7 @@ pub fn icb_smoke_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = env_truthy(&["METAL_RUNTIME_ICB_SMOKE", "GEMMA_METAL_ICB_SMOKE"]).unwrap_or(false);
+    let on = env_truthy(&["TESSL_ICB_SMOKE", "METAL_RUNTIME_ICB_SMOKE", "GEMMA_METAL_ICB_SMOKE"]).unwrap_or(false);
     ICB_SMOKE.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
 }
@@ -184,9 +184,9 @@ impl IcbCopySmoke {
                 cmd.setKernelBuffer_offset_atIndex(self.n_buf.metal(), 0, 2);
             }
         }
-        let width = self.pipeline.threadExecutionWidth() as usize;
+        let width = self.pipeline.threadExecutionWidth();
         let tpt = width.min(self.n).max(1);
-        let groups = (self.n + tpt - 1) / tpt;
+        let groups = self.n.div_ceil(tpt);
         cmd.concurrentDispatchThreadgroups_threadsPerThreadgroup(
             mtl_size(groups, 1, 1),
             mtl_size(tpt, 1, 1),

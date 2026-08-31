@@ -5,10 +5,10 @@
 //! TensorOps/simdgroup GEMM, util kernels. **Metal 4-only** encode — residency,
 //! packed encoder, no host-zero mid-CB (Audit 4/6 lessons preserved).
 //!
-//! Quantized `MTLTensor` hooks (WWDC26-330) live in [`mtl_tensor`] — prep only;
-//! full Gemma decode / GEMV / FA lands in `gemma-metal`.
+//! Quantized `MTLTensor` hooks (WWDC26-330) live in `mtl_tensor`, behind the
+//! off-by-default `quant-prep` feature — prep only, the prefill entry point
+//! still returns an error. Full Gemma decode / GEMV / FA lands in `gemma-metal`.
 
-#![allow(dead_code)]
 
 pub mod ab_flags;
 pub mod cb_replay;
@@ -17,6 +17,7 @@ pub mod dispatch;
 pub mod gemm;
 pub mod icb_smoke;
 pub mod infer_trace;
+#[cfg(feature = "quant-prep")]
 pub mod mtl_tensor;
 pub mod npy;
 pub mod ops;
@@ -40,6 +41,7 @@ pub use icb_smoke::{
     icb_smoke_enabled, run_copy_f32_smoke, set_icb_smoke, IcbBindBridge, IcbCopySmoke,
 };
 pub use gemm::{gemm, gemm_f32, GemmBackend};
+#[cfg(feature = "quant-prep")]
 pub use mtl_tensor::{nax_verify_readiness, NaxVerifyReadiness, QuantDType};
 pub use ops::softcap_f32;
 pub use runtime::{BufferKind, DeviceMemoryInfo, GpuRuntime, PrecisionMode};
@@ -47,5 +49,5 @@ pub use tensor::{DType, GpuBuffer, Tensor};
 
 /// Metallib produced by `build.rs` (absolute path baked at compile time).
 pub fn metallib_path() -> &'static str {
-    env!("METAL_RUNTIME_METALLIB")
+    env!("TESSL_METALLIB")
 }

@@ -117,7 +117,13 @@ impl GpuBuffer {
         &self.inner.buffer
     }
 
-    pub(crate) fn kind(&self) -> BufferKind {
+    /// Which residency pool this buffer came from.
+    ///
+    /// Callers choose a [`BufferKind`] at allocation time; this reads it back,
+    /// which matters when a buffer is handed around and the recycling
+    /// behaviour on drop (Cold recycles, Hot stays resident, Bump does not)
+    /// affects what the holder may do with it.
+    pub fn kind(&self) -> BufferKind {
         self.inner.kind
     }
 
@@ -285,10 +291,9 @@ impl Tensor {
     pub(crate) fn validate(&self) -> Result<(), String> {
         let bytes = checked_nbytes(&self.shape, self.dtype)?;
         if self.byte_offset % self.dtype.size_of() != 0
-            || !self
+            || self
                 .byte_offset
-                .checked_add(bytes)
-                .is_some_and(|end| end <= self.buffer.nbytes())
+                .checked_add(bytes).is_none_or(|end| end > self.buffer.nbytes())
         {
             return Err("tensor view is misaligned or out of bounds".into());
         }

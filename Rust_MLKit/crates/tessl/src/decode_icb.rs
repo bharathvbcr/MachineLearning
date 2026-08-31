@@ -58,7 +58,7 @@ pub fn decode_icb_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = env_truthy(&["METAL_RUNTIME_DECODE_ICB", "GEMMA_METAL_DECODE_ICB"]).unwrap_or(false);
+    let on = env_truthy(&["TESSL_DECODE_ICB", "METAL_RUNTIME_DECODE_ICB", "GEMMA_METAL_DECODE_ICB"]).unwrap_or(false);
     DECODE_ICB.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
 }
@@ -210,7 +210,7 @@ impl StickyArgTable {
 /// Default **ON** — freeze Buf binds into per-command MTL4 argument tables.
 fn prebuilt_tables_enabled() -> bool {
     env_truthy(&[
-        "METAL_RUNTIME_ICB_PREBUILT_TABLES",
+        "TESSL_ICB_PREBUILT_TABLES", "METAL_RUNTIME_ICB_PREBUILT_TABLES",
         "GEMMA_METAL_ICB_PREBUILT_TABLES",
     ])
     .unwrap_or(true)
@@ -235,7 +235,7 @@ pub fn icb_freeze_binds_enabled() -> bool {
         return v == 1;
     }
     let on = env_truthy(&[
-        "METAL_RUNTIME_ICB_FREEZE_BINDS",
+        "TESSL_ICB_FREEZE_BINDS", "METAL_RUNTIME_ICB_FREEZE_BINDS",
         "GEMMA_METAL_ICB_FREEZE_BINDS",
     ])
     .unwrap_or(false);
@@ -263,7 +263,7 @@ pub fn icb_range_batch_enabled() -> bool {
         return v == 1;
     }
     let on = env_truthy(&[
-        "METAL_RUNTIME_ICB_RANGE_BATCH",
+        "TESSL_ICB_RANGE_BATCH", "METAL_RUNTIME_ICB_RANGE_BATCH",
         "GEMMA_METAL_ICB_RANGE_BATCH",
     ])
     .unwrap_or(false);
@@ -290,7 +290,7 @@ pub fn icb_coarse_ranges_enabled() -> bool {
         return v == 1;
     }
     if let Some(on) = env_truthy(&[
-        "METAL_RUNTIME_ICB_COARSE_RANGES",
+        "TESSL_ICB_COARSE_RANGES", "METAL_RUNTIME_ICB_COARSE_RANGES",
         "GEMMA_METAL_ICB_COARSE_RANGES",
     ]) {
         ICB_COARSE_RANGES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
@@ -477,7 +477,7 @@ impl DecodeIcb {
                         continue;
                     }
                     let id = Self::buf_id(buf);
-                    if ambient.iter().any(|&a| a == id) {
+                    if ambient.contains(&id) {
                         continue;
                     }
                     ids.push(id);
@@ -502,7 +502,7 @@ impl DecodeIcb {
                         continue;
                     }
                     let id = Self::buf_id(buf);
-                    if seen.iter().any(|&s| s == id) {
+                    if seen.contains(&id) {
                         continue;
                     }
                     seen.push(id);
@@ -540,7 +540,7 @@ impl DecodeIcb {
                 }
                 Some(ids) => {
                     for id in ids {
-                        if !span.iter().any(|&x| x == id) {
+                        if !span.contains(&id) {
                             span.push(id);
                         }
                     }
@@ -719,8 +719,8 @@ impl DecodeIcb {
             std::ptr::write_bytes(zc, 0, n * 4);
         }
         let pipe = pipeline_icb(rt, "copy_f32")?;
-        let tpt = (pipe.threadExecutionWidth() as usize).min(n).max(1);
-        let groups = (n + tpt - 1) / tpt;
+        let tpt = pipe.threadExecutionWidth().min(n).max(1);
+        let groups = n.div_ceil(tpt);
         let tg = mtl_size(groups, 1, 1);
         let tptg = mtl_size(tpt, 1, 1);
         let buf = |index, buf: &GpuBuffer| DecodeIcbBind::Buf {
@@ -944,7 +944,7 @@ impl DecodeIcb {
             self.barriers_coarsened = true;
         }
         let use_icb_exec = freeze
-            || env_truthy(&["METAL_RUNTIME_ICB_EXECUTE", "GEMMA_METAL_ICB_EXECUTE"])
+            || env_truthy(&["TESSL_ICB_EXECUTE", "METAL_RUNTIME_ICB_EXECUTE", "GEMMA_METAL_ICB_EXECUTE"])
                 .unwrap_or(false);
         let need_opt = !self.optimized;
         let icb = self.icb.clone();
@@ -970,7 +970,7 @@ impl DecodeIcb {
         // and regressed product tok/s despite lower host encode_us (D16).
         let prev_hazard = crate::ab_flags::hazard_barriers();
         crate::ab_flags::set_hazard_barriers(true);
-        let triage = env_truthy(&["GEMMA_METAL_ICB_TRIAGE"]).unwrap_or(false);
+        let triage = env_truthy(&["TESSL_ICB_TRIAGE", "GEMMA_METAL_ICB_TRIAGE"]).unwrap_or(false);
         let mut sticky = StickyArgTable::new();
         let mut execute_icb_calls = 0u64;
         let mut execute_icb_cmds = 0u64;
@@ -1370,7 +1370,7 @@ pub fn icb_pipelines_enabled() -> bool {
     if v >= 0 {
         return v == 1;
     }
-    let on = env_truthy(&["METAL_RUNTIME_ICB_PIPELINES", "GEMMA_METAL_ICB_PIPELINES"])
+    let on = env_truthy(&["TESSL_ICB_PIPELINES", "METAL_RUNTIME_ICB_PIPELINES", "GEMMA_METAL_ICB_PIPELINES"])
         .unwrap_or(false);
     ICB_PIPELINES.store(if on { 1 } else { 0 }, Ordering::Relaxed);
     on
@@ -1513,8 +1513,8 @@ mod tests {
             }
         }
         let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb");
-        let tpt = (pipe.threadExecutionWidth() as usize).min(n).max(1);
-        let groups = (n + tpt - 1) / tpt;
+        let tpt = pipe.threadExecutionWidth().min(n).max(1);
+        let groups = n.div_ceil(tpt);
         let tg = crate::runtime::mtl_size(groups, 1, 1);
         let tptg = crate::runtime::mtl_size(tpt, 1, 1);
         let buf = |index, buf: &GpuBuffer| DecodeIcbBind::Buf {
@@ -1560,10 +1560,9 @@ mod tests {
         }
         set_icb_range_batch(false);
         eprintln!(
-            "decode_icb_range_batch_merges_safe_spans: n={} batch={} | {}",
+            "decode_icb_range_batch_merges_safe_spans: n={} batch={} | ok",
             dec_n.status_line(),
-            dec_b.status_line(),
-            "ok"
+            dec_b.status_line()
         );
     }
 
@@ -1596,8 +1595,8 @@ mod tests {
             }
         }
         let pipe = pipeline_icb(&rt, "copy_f32").expect("copy_f32 icb");
-        let tpt = (pipe.threadExecutionWidth() as usize).min(n).max(1);
-        let groups = (n + tpt - 1) / tpt;
+        let tpt = pipe.threadExecutionWidth().min(n).max(1);
+        let groups = n.div_ceil(tpt);
         let tg = crate::runtime::mtl_size(groups, 1, 1);
         let tptg = crate::runtime::mtl_size(tpt, 1, 1);
         let buf = |index, buf: &GpuBuffer| DecodeIcbBind::Buf {

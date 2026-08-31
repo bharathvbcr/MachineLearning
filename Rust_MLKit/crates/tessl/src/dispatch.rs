@@ -53,7 +53,7 @@ impl<'a> Binder<'a> {
         let (Some(start), Some(end)) = (start, end) else {
             self.fail("constant arena offset overflow"); return 0;
         };
-        if bytes.is_empty() || end > self.const_staging.length() as usize {
+        if bytes.is_empty() || end > self.const_staging.length() {
             self.fail("constant arena exhausted or empty payload"); return 0;
         }
         // SAFETY: checked the entire destination range before writing.
@@ -134,7 +134,7 @@ impl<'a> Binder<'a> {
 
     pub fn set_pipeline(&mut self, pipeline: &ProtocolObject<dyn MTLComputePipelineState>) {
         if self.error.is_some() { return; }
-        self.max_threads = Some(pipeline.maxTotalThreadsPerThreadgroup() as usize);
+        self.max_threads = Some(pipeline.maxTotalThreadsPerThreadgroup());
         self.enc.setComputePipelineState(pipeline);
         if crate::decode_icb::decode_icb_capture_active() {
             // Retain via pipeline cache clone path: callers pass cache Retained refs.
@@ -159,7 +159,7 @@ impl<'a> Binder<'a> {
         index: usize,
     ) {
         if !self.valid_index(index) { return; }
-        if offset >= buf.length() as usize {
+        if offset >= buf.length() {
             self.fail("buffer binding offset out of bounds"); return;
         }
         let Some(addr) = buf.gpuAddress().checked_add(offset as u64) else {
@@ -199,7 +199,8 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Bind an `MTLResourceID` (e.g. [`crate::mtl_tensor::GpuTensor`]) at a buffer index.
+    /// Bind an `MTLResourceID` (e.g. a `GpuTensor` from the `quant-prep`
+    /// feature's `mtl_tensor` module) at a buffer index.
     ///
     /// # Safety
     /// `index` must be within the argument table's buffer bind count.
@@ -398,9 +399,9 @@ pub fn dispatch_1d(
         return Ok(());
     }
     if n > u32::MAX as usize { return Err("1D dispatch exceeds uint indexing".into()); }
-    let width = pipeline.threadExecutionWidth() as usize;
+    let width = pipeline.threadExecutionWidth();
     let tpt = width.min(n).max(1);
-    let groups = (n + tpt - 1) / tpt;
+    let groups = n.div_ceil(tpt);
     rt.with_binder(|bnd| {
         bnd.set_pipeline(pipeline);
         encode_bufs(bnd);
@@ -423,7 +424,7 @@ pub fn dispatch_2d(
     if [nx, ny].iter().any(|&n| n > u32::MAX as usize) {
         return Err("dispatch extent exceeds uint indexing".into());
     }
-    let width = pipeline.threadExecutionWidth() as usize;
+    let width = pipeline.threadExecutionWidth();
     let tx = width.min(nx).max(1);
     let groups_x = nx.div_ceil(tx);
     rt.with_binder(|bnd| {
@@ -449,7 +450,7 @@ pub fn dispatch_3d(
     if [nx, ny, nz].iter().any(|&n| n > u32::MAX as usize) {
         return Err("dispatch extent exceeds uint indexing".into());
     }
-    let width = pipeline.threadExecutionWidth() as usize;
+    let width = pipeline.threadExecutionWidth();
     let tx = width.min(nx).max(1);
     let groups_x = nx.div_ceil(tx);
     rt.with_binder(|bnd| {
@@ -532,7 +533,7 @@ mod audit_tests {
     #[test]
     fn oversized_constants_return_error_instead_of_panicking() {
         let rt=GpuRuntime::new().unwrap();
-        let bytes=vec![0u8;rt.metal4.const_staging.length() as usize+1];
+        let bytes=vec![0u8;rt.metal4.const_staging.length()+1];
         let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
             rt.with_binder(|b| { b.bind_bytes(&bytes,0); Ok(()) })));
         assert!(result.is_ok(), "Result API panicked on full arena");

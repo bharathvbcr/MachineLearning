@@ -124,7 +124,7 @@ fn run(
     let p = rt.pipeline(arm.kernel)?;
     let tiles_n = n / arm.sn;
     let tiles_m = m / arm.sm;
-    let tpt = p.threadExecutionWidth() as usize * arm.nsg;
+    let tpt = p.threadExecutionWidth() * arm.nsg;
     rt.with_binder(|bnd| {
         bnd.set_pipeline(&p);
         bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
@@ -159,7 +159,7 @@ fn time_once(
 
 
 /// The variant kernels live in `matmul_tensorops_tune.metal`, which is only
-/// linked when `METAL_NATIVE_GEMM_TUNE=1` was set at build time. Without it
+/// linked when `TESSL_GEMM_TUNE=1` was set at build time. Without it
 /// every candidate would report `skip(pipe)` and the run would exit 0 having
 /// measured nothing — so check once, up front, and say exactly what to do.
 fn require_tune_kernels(rt: &std::sync::Arc<GpuRuntime>, probe: &str) {

@@ -18,7 +18,7 @@ fallback, but it is roughly 2–3x slower and exists for A/B, not for shipping.
 | `tensor` | `GpuBuffer` / `Tensor` views and dtypes, bounds-checked |
 | `ops` | `softcap_f32` and small util launches |
 | `npy` | numpy `.npy` writer, for checking GPU output against a host reference |
-| `mtl_tensor` | Quantized `MTLTensor` prep (Int8 today; Int4/FP8 pending SDK) |
+| `mtl_tensor` | Quantized `MTLTensor` prep — **`quant-prep` feature, off by default** (see Features) |
 | `decode_icb`, `cb_replay`, `icb_smoke` | Indirect command buffer capture and replay for decode-shaped workloads |
 
 Encode is **Metal 4 only**. The classic `MTLCommandQueue` path is deliberately
@@ -142,7 +142,21 @@ keep working.
 | `TESSL_GEMM_INTERIOR` | f32 GEMM interior-offset tiles (default off) |
 | `TESSL_HAZARD_BARRIERS` | Skip the always-on device barrier after each dispatch |
 | `TESSL_COARSE_BARRIERS` | Phase-coarsened rather than per-RAW barriers |
-| `METAL_RUNTIME_SKIP_AOT` | Skip metallib compilation; trusts a pre-existing `default.metallib` (hazard: may be stale) |
+| `TESSL_MID_COMMIT=N` | Overlap host encode with GPU execution every N dispatches (default off) |
+| `TESSL_DECODE_ICB`, `TESSL_ICB_*` | Indirect-command-buffer decode paths (all default off) |
+| `TESSL_SKIP_AOT` | Skip metallib compilation; trusts a pre-existing crate-root `default.metallib` (hazard: may be stale or missing) |
+
+## Features
+
+| feature | default | what it adds |
+|---|---|---|
+| `quant-prep` | **off** | `mtl_tensor`: quantized `MTLTensor` prep for WWDC26-330. Off because it is prep — `try_quant_tensorops_prefill_gemm` returns `Err("not wired yet")` and nothing in this workspace calls it. Kept compiling behind a flag rather than shipped as public API that does not work. |
+
+The decode / indirect-command-buffer modules (`decode_icb`, `cb_replay`,
+`icb_smoke`, `infer_trace`) are **not** feature-gated in 0.1.0. They are woven
+into the binder hot path — every bind and dispatch consults the capture state —
+so splitting them out is a change to code that has to be correct, not a
+packaging tidy-up. They are inert unless a `TESSL_ICB_*` variable is set.
 
 ## Documentation
 
@@ -152,5 +166,10 @@ cooperative variant, and the benchmarking pitfalls above.
 
 ## Status
 
-Not yet published. `Cargo.toml` carries `publish = false` and no `license`
-field: a license has to be chosen before this can go to a registry.
+Not yet published. `cargo package` verifies clean — the crate builds from its
+own tarball, kernels included — and the manifest carries
+`license = "MIT OR Apache-2.0"`, matching `LICENSE-MIT` and `LICENSE-APACHE` at
+the crate root.
+
+Everything here is tuned and measured on a single M5 Pro. Nothing has been run
+on another GPU.

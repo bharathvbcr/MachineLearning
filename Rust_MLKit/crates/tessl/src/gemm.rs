@@ -315,7 +315,7 @@ fn use_relaxed_f32(rt: &GpuRuntime, backend: GemmBackend) -> bool {
         && rt.has_tensorops()
 }
 
-/// C[M,N] = A[M,K] @ B[K,N]. Overwrites C.
+/// `C[M,N]` = `A[M,K]` @ `B[K,N]`. Overwrites C.
 ///
 /// - f32×f32→f32 always supported (exact or relaxed via runtime flag)
 /// - bf16×bf16→f32 accum (C must be f32) via TensorOps when available
@@ -399,13 +399,13 @@ fn dispatch_tensorops_nn(
 ) -> Result<(), String> {
     let zero_p = rt.pipeline("zero_f32")?;
     let numel = c.numel();
-    let tiles_n = (n + tile.sn - 1) / tile.sn;
-    let tiles_m = (m + tile.sm - 1) / tile.sm;
+    let tiles_n = n.div_ceil(tile.sn);
+    let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
     let tpt = threads_per_tg(pipeline, tile);
-    let z_width = zero_p.threadExecutionWidth() as usize;
+    let z_width = zero_p.threadExecutionWidth();
     let z_tpt = z_width.min(numel).max(1);
-    let z_groups = (numel + z_tpt - 1) / z_tpt;
+    let z_groups = numel.div_ceil(z_tpt);
 
     rt.with_binder(|bnd| {
         if zero_c {
@@ -471,8 +471,8 @@ fn dispatch_tensorops_accum(
     tile: TileGeom,
     bind_interior: bool,
 ) -> Result<(), String> {
-    let tiles_n = (n + tile.sn - 1) / tile.sn;
-    let tiles_m = (m + tile.sm - 1) / tile.sm;
+    let tiles_n = n.div_ceil(tile.sn);
+    let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
     let tpt = threads_per_tg(pipeline, tile);
 
@@ -531,7 +531,7 @@ pub fn gemm_train(
     gemm_f32(a, b, c, backend)
 }
 
-/// C[M,N] = A[K,M]^T @ B[K,N] (TN). A is stored [K,M], B [K,N].
+/// `C[M,N]` = `A[K,M]`^T @ `B[K,N]` (TN). A is stored `[K,M]`, B `[K,N]`.
 pub fn gemm_tn_f32(
     a_km: &Tensor,
     b_kn: &Tensor,
@@ -616,14 +616,14 @@ fn gemm_tn_splitk_f32_opts(
     let pipeline = rt.pipeline("matmul2d_tensorops_tn_splitk_f32")?;
     let zero_p = rt.pipeline("zero_f32")?;
     let tile = TILE_F32;
-    let tiles_n = (n + tile.sn - 1) / tile.sn;
-    let tiles_m = (m + tile.sm - 1) / tile.sm;
+    let tiles_n = n.div_ceil(tile.sn);
+    let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
     let tpt = threads_per_tg(&pipeline, tile);
     let numel = c.numel();
-    let z_width = zero_p.threadExecutionWidth() as usize;
+    let z_width = zero_p.threadExecutionWidth();
     let z_tpt = z_width.min(numel).max(1);
-    let z_groups = (numel + z_tpt - 1) / z_tpt;
+    let z_groups = numel.div_ceil(z_tpt);
     let k_tile = 256u32;
     let partitions: Vec<u32> = (0..k as u32).step_by(k_tile as usize).collect();
 
@@ -684,14 +684,14 @@ fn gemm_tn_splitk_bf16_opts(
     let pipeline = rt.pipeline("matmul2d_tensorops_tn_splitk_bf16_f32")?;
     let zero_p = rt.pipeline("zero_f32")?;
     let tile = TILE_V2;
-    let tiles_n = (n + tile.sn - 1) / tile.sn;
-    let tiles_m = (m + tile.sm - 1) / tile.sm;
+    let tiles_n = n.div_ceil(tile.sn);
+    let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
     let tpt = threads_per_tg(&pipeline, tile);
     let numel = c.numel();
-    let z_width = zero_p.threadExecutionWidth() as usize;
+    let z_width = zero_p.threadExecutionWidth();
     let z_tpt = z_width.min(numel).max(1);
-    let z_groups = (numel + z_tpt - 1) / z_tpt;
+    let z_groups = numel.div_ceil(z_tpt);
     let k_tile = 256u32;
     let partitions: Vec<u32> = (0..k as u32).step_by(k_tile as usize).collect();
 
@@ -729,7 +729,7 @@ fn gemm_tn_splitk_bf16_opts(
     Ok(())
 }
 
-/// C[M,N] = A[M,K] @ B[N,K]^T (NT). B is stored [N,K] (e.g. W[in,out]).
+/// `C[M,N]` = `A[M,K]` @ `B[N,K]`^T (NT). B is stored `[N,K]` (e.g. `W[in,out]`).
 pub fn gemm_nt_f32(
     a_mk: &Tensor,
     b_nk: &Tensor,
@@ -785,7 +785,7 @@ pub fn gemm_nt_train(
     gemm_nt_f32(a_mk, b_nk, c, backend)
 }
 
-/// C += A[K,M]^T @ B[K,N] (TN accumulate). No C zero — for dW into grad banks
+/// C += `A[K,M]`^T @ `B[K,N]` (TN accumulate). No C zero — for dW into grad banks
 /// and dx accumulate into a pre-zeroed buffer.
 pub fn gemm_tn_accum_train(
     a_km: &Tensor,
@@ -832,7 +832,7 @@ pub fn gemm_tn_accum_train(
     Ok(())
 }
 
-/// C += A[M,K] @ B[N,K]^T (NT accumulate). No C zero.
+/// C += `A[M,K]` @ `B[N,K]`^T (NT accumulate). No C zero.
 ///
 /// All call sites are **dX-class** accumulations into fresh pre-zeroed
 /// activation-grad buffers (never weight banks), so this path additionally
@@ -890,7 +890,7 @@ fn threads_per_tg(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     tile: TileGeom,
 ) -> usize {
-    let width = pipeline.threadExecutionWidth() as usize;
+    let width = pipeline.threadExecutionWidth();
     width * tile.simdgroups
 }
 
@@ -899,9 +899,9 @@ fn threadgroup_geometry_simdgroup(
     m: usize,
     n: usize,
 ) -> (usize, usize, usize) {
-    let width = pipeline.threadExecutionWidth() as usize;
-    let tg_w = (n + 15) / 16;
-    let tg_h = (m + 15) / 16;
+    let width = pipeline.threadExecutionWidth();
+    let tg_w = n.div_ceil(16);
+    let tg_h = m.div_ceil(16);
     (tg_w, tg_h, width * 4)
 }
 

@@ -1,4 +1,4 @@
-//! Lightweight inference-path counters for [`gemma_metal::trace`].
+//! Lightweight inference-path counters for `gemma_metal::trace`.
 //! Off by default — atomics only touch when [`set_enabled`] is true.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

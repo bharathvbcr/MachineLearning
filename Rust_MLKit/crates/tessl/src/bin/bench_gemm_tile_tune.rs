@@ -157,10 +157,10 @@ fn run_variant(
     let zero_p = rt.pipeline("zero_f32")?;
     let tiles_n = n / v.sn;
     let tg = tiles_n * (m / v.sm);
-    let tpt = p.threadExecutionWidth() as usize * v.nsg;
+    let tpt = p.threadExecutionWidth() * v.nsg;
     let numel = c.numel();
-    let z_tpt = (zero_p.threadExecutionWidth() as usize).min(numel).max(1);
-    let z_groups = (numel + z_tpt - 1) / z_tpt;
+    let z_tpt = zero_p.threadExecutionWidth().min(numel).max(1);
+    let z_groups = numel.div_ceil(z_tpt);
     let needs_zero = v.needs_zero;
     rt.with_binder(|bnd| {
         if needs_zero {
@@ -186,7 +186,7 @@ fn run_variant(
 
 
 /// The variant kernels live in `matmul_tensorops_tune.metal`, which is only
-/// linked when `METAL_NATIVE_GEMM_TUNE=1` was set at build time. Without it
+/// linked when `TESSL_GEMM_TUNE=1` was set at build time. Without it
 /// every candidate would report `skip(pipe)` and the run would exit 0 having
 /// measured nothing — so check once, up front, and say exactly what to do.
 fn require_tune_kernels(rt: &std::sync::Arc<GpuRuntime>, probe: &str) {
@@ -211,7 +211,7 @@ fn main() -> Result<(), String> {
     for v in VARIANTS {
         match rt.pipeline(v.kernel) {
             Ok(p) => {
-                let w = p.threadExecutionWidth() as usize;
+                let w = p.threadExecutionWidth();
                 println!("{:<32}{:>12}{:>14}{:>16}", v.kernel,
                          p.maxTotalThreadsPerThreadgroup(),
                          p.staticThreadgroupMemoryLength(),
