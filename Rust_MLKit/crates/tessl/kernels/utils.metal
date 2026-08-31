@@ -83,6 +83,19 @@ kernel void softcap_f32(
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= n) return;
-    float z = pre[gid] / softcap;
+    // Clamp before `tanh`, not after.
+    //
+    // Metal's `tanh` is evaluated through `exp(2z)`, which leaves float range
+    // around |z| ~= 44: the result goes to `inf` and then to `NaN`. Measured at
+    // cap=30 this kernel was correct through pre=1250, returned `inf` near
+    // pre=1300, and `NaN` from pre=1350 — on the one input class softcapping
+    // exists to tame. A single NaN logit poisons its whole softmax row, so the
+    // failure is far wider than the element that produced it.
+    //
+    // In f32, `tanh(z)` has already rounded to exactly +/-1 by |z| ~= 8.7
+    // (1 - tanh(z) drops below 2^-24 there), so clamping at 16 is well past
+    // saturation and changes no representable result. NaN input still
+    // propagates as NaN: that is the caller's data, not an overflow.
+    float z = clamp(pre[gid] / softcap, -16.0f, 16.0f);
     post[gid] = softcap * tanh(z);
 }
