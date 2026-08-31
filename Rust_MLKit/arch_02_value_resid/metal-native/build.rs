@@ -26,6 +26,7 @@ fn main() {
     println!("cargo:rerun-if-changed=kernels/");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-env-changed=METAL_NATIVE_SKIP_AOT");
+    println!("cargo:rerun-if-env-changed=METAL_NATIVE_GEMM_TUNE");
 
     // CoreGraphics is required for MTLCreateSystemDefaultDevice.
     println!("cargo:rustc-link-lib=framework=CoreGraphics");
@@ -61,11 +62,18 @@ fn main() {
 
     // TensorOps kernels — Metal 4 dialect (macOS 26+ / MPP). Hard-fail: NAX GEMM
     // is the hot path; a simdgroup-only metallib is not acceptable.
-    let tensorops_sources = [
-        "matmul_tensorops.metal",
-        "matmul_tensorops_tune.metal",
-        "flash_attn_tensorops.metal",
-    ];
+    // `matmul_tensorops_tune.metal` is the GEMM A/B rig: 92 measurement-only
+    // kernels that nothing in the library dispatches. Linking them into the
+    // default metallib grew it from 0.22 MB to 1.09 MB — a 5x artifact every
+    // process loads so that a benchmark can find its variants. Opt in with
+    // METAL_NATIVE_GEMM_TUNE=1 when running `bench_gemm_tile_tune` or
+    // `bench_gemm_coop_ab`; those binaries fail with this instruction when the
+    // variants are absent, so a tuning run cannot quietly measure nothing.
+    let want_tune = env::var_os("METAL_NATIVE_GEMM_TUNE").is_some();
+    let mut tensorops_sources = vec!["matmul_tensorops.metal", "flash_attn_tensorops.metal"];
+    if want_tune {
+        tensorops_sources.push("matmul_tensorops_tune.metal");
+    }
     for name in &tensorops_sources {
         let src = kernels_dir.join(name);
         if !src.exists() {
@@ -154,7 +162,13 @@ fn main() {
         air_files.push(air);
     }
 
-    let metallib_out = out_dir.join("default.metallib");
+    // Metal can retain file-backed library data after loading. Never relink a
+    // pathname baked into a prior binary: each build owns an immutable artifact.
+    let build_id = format!("{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch").as_nanos());
+    let metallib_out = out_dir.join(format!("default-{build_id}.metallib"));
+    fs::File::create_new(&metallib_out).expect("reserve unique metallib output");
     let mut link = Command::new(&metallib);
     for air in &air_files {
         link.arg(air);
@@ -162,8 +176,13 @@ fn main() {
     link.arg("-o").arg(&metallib_out);
     run(&mut link, "metallib link");
 
+    // Publish the offline compatibility copy without truncating an inode that
+    // an existing runtime may still use. Do not hide failed publication.
     let crate_copy = manifest_dir.join("default.metallib");
-    let _ = std::fs::copy(&metallib_out, &crate_copy);
+    let staged_copy = manifest_dir.join(format!(".default-{build_id}.metallib"));
+    fs::File::create_new(&staged_copy).expect("reserve offline metallib staging file");
+    fs::copy(&metallib_out, &staged_copy).expect("stage offline metallib");
+    fs::rename(&staged_copy, &crate_copy).expect("publish offline metallib");
 
     println!(
         "cargo:rustc-env=METAL_NATIVE_METALLIB={}",

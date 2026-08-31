@@ -1,5 +1,5 @@
 [package]
-name = "metal-runtime"
+name = "tessl"
 version = "0.1.0"
 edition = "2021"
 description = "Shared Metal 4 encode runtime + TensorOps GEMM (extracted from arch_02 metal-native)"

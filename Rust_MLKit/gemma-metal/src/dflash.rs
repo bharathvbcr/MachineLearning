@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use safetensors::SafeTensors;
 
-use metal_runtime::tensor::GpuBuffer;
+use tessl::tensor::GpuBuffer;
 
 use crate::config::LayerType;
 use crate::error::{Error, Result};
@@ -299,7 +299,7 @@ impl DFlashGpuConditioner {
         let h = self.hidden as u32;
         // Conditioner fc is plain Q4 — f32 GEMV (bf16 feed poisons shared GPU).
         self.fc.gemv(gpu, concat_row, &self.fc_out)?;
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
         rms_norm_f32(
@@ -788,14 +788,14 @@ impl DFlashGpuDraft {
         }
         for ti in 0..t {
             copy_f32_from_offset(gpu, x_rows, ti * x_stride, &self.row_x, cols as u32)?;
-            if metal_runtime::ab_flags::need_barrier(true) {
+            if tessl::ab_flags::need_barrier(true) {
                 gpu.barrier()?;
             }
             // Draft Hot banks are plain Q4 — f32 GEMV only. Feeding bf16 into
             // `gemv_q4` (via gemv_bf16_x) poisons activations and the shared
             // GemmaGpu command stream used by the target session.
             banks.gemv(gpu, &self.row_x, &self.row_y)?;
-            if metal_runtime::ab_flags::need_barrier(true) {
+            if tessl::ab_flags::need_barrier(true) {
                 gpu.barrier()?;
             }
             copy_f32_to_offset(gpu, &self.row_y, y_rows, ti * y_stride, rows as u32)?;
@@ -908,20 +908,20 @@ impl DFlashGpuDraft {
                     &self.row_x,
                     h as u32,
                 )?;
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 self.layers[li]
                     .k_proj
                     .gemv(gpu, &self.row_x, &self.row_y)?;
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 copy_f32_to_offset(gpu, &self.row_y, &self.k, ti * kv_dim, kv_dim as u32)?;
                 self.layers[li]
                     .v_proj
                     .gemv(gpu, &self.row_x, &self.row_y)?;
-                if metal_runtime::ab_flags::need_barrier(true) {
+                if tessl::ab_flags::need_barrier(true) {
                     gpu.barrier()?;
                 }
                 copy_f32_to_offset(gpu, &self.row_y, &self.v, ti * kv_dim, kv_dim as u32)?;
@@ -978,7 +978,7 @@ impl DFlashGpuDraft {
             h as u32,
             eps,
         )?;
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
         self.gemv_rows(
@@ -1068,7 +1068,7 @@ impl DFlashGpuDraft {
                 kv_dim as u32,
             )?;
         }
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
         let win = match window {
@@ -1093,7 +1093,7 @@ impl DFlashGpuDraft {
             q_pos,
             kv_abs0,
         )?;
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
 
@@ -1108,11 +1108,11 @@ impl DFlashGpuDraft {
             h,
         )?;
         copy_f32_n(gpu, &self.x, &self.resid, (l * h) as u32)?;
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
         ple_residual_add(gpu, &self.resid, &self.attn_flat, 1.0, (l * h) as u32)?;
-        if metal_runtime::ab_flags::need_barrier(true) {
+        if tessl::ab_flags::need_barrier(true) {
             gpu.barrier()?;
         }
 
@@ -1128,7 +1128,7 @@ impl DFlashGpuDraft {
                 h as u32,
                 eps,
             )?;
-            if metal_runtime::ab_flags::need_barrier(true) {
+            if tessl::ab_flags::need_barrier(true) {
                 gpu.barrier()?;
             }
             self.layers[li]
@@ -1137,17 +1137,17 @@ impl DFlashGpuDraft {
             self.layers[li]
                 .up_proj
                 .gemv(gpu, &self.x_normed, &self.up)?;
-            if metal_runtime::ab_flags::need_barrier(true) {
+            if tessl::ab_flags::need_barrier(true) {
                 gpu.barrier()?;
             }
             mlp_silu(gpu, &self.gate, &self.up, &self.mid, inter as u32)?;
-            if metal_runtime::ab_flags::need_barrier(true) {
+            if tessl::ab_flags::need_barrier(true) {
                 gpu.barrier()?;
             }
             self.layers[li]
                 .down_proj
                 .gemv(gpu, &self.mid, &self.row_y)?;
-            if metal_runtime::ab_flags::need_barrier(true) {
+            if tessl::ab_flags::need_barrier(true) {
                 gpu.barrier()?;
             }
             copy_f32_from_offset(gpu, &self.resid, ti * h, &self.row_x, h as u32)?;
@@ -1174,7 +1174,7 @@ impl DFlashGpuDraft {
                 h as u32,
                 self.cfg.rms_norm_eps,
             )?;
-            if metal_runtime::ab_flags::need_barrier(true) {
+            if tessl::ab_flags::need_barrier(true) {
                 gpu.barrier()?;
             }
             if let Some(ref lm) = self.lm_head {
@@ -1964,10 +1964,10 @@ fn generate_with_dflash_inner(
     // Force always-on Dispatch barriers for the exactness lane. Real HF drafts
     // (31B) stay on the product hazard lane so exactness baselines match
     // capture-on greedy; always-on+capture previously collapsed 31B streams.
-    let prev_hazard = metal_runtime::ab_flags::hazard_barriers();
+    let prev_hazard = tessl::ab_flags::hazard_barriers();
     let mini = draft.is_synthetic_mini();
     if mini && mini_force_always_on {
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
     }
     let result = (|| -> Result<(Vec<u32>, Vec<BlockAccept>)> {
         draft.bind_from_session(&sess.model.gpu, sess)?;
@@ -1993,7 +1993,7 @@ fn generate_with_dflash_inner(
             sess.disable_hidden_capture();
             if !mini_force_always_on {
                 // Speed lane: ambient hazard after capture is gone.
-                metal_runtime::ab_flags::set_hazard_barriers(prev_hazard);
+                tessl::ab_flags::set_hazard_barriers(prev_hazard);
             }
         }
 
@@ -2073,7 +2073,7 @@ fn generate_with_dflash_inner(
         sess.disable_hidden_capture();
         Ok((out, accepts))
     })();
-    metal_runtime::ab_flags::set_hazard_barriers(prev_hazard);
+    tessl::ab_flags::set_hazard_barriers(prev_hazard);
     result
 }
 
@@ -2315,21 +2315,21 @@ mod tests {
         if !metal_ready(&model) {
             return;
         }
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let mut sess = GpuDecodeSession::new(model).unwrap();
         let prompt = [3u32, 4, 5];
         let max_new = 6usize;
         let off1 = sess.generate(&prompt, max_new).unwrap();
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let off2 = sess.generate(&prompt, max_new).unwrap();
         if off1 != off2 {
             eprintln!("note: capture-off unstable under parallel hazard races ({off1:?}); soft-skip");
             return;
         }
         sess.enable_hidden_capture(vec![0, 1, 2]).unwrap();
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let on1 = sess.generate(&prompt, max_new).unwrap();
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let on2 = sess.generate(&prompt, max_new).unwrap();
         if on1 != on2 {
             eprintln!("note: capture-on unstable under parallel hazard races ({on1:?}); soft-skip");
@@ -2412,7 +2412,7 @@ mod tests {
             return;
         };
         // Always-on barriers for bit-stable A/B (product 31B uses hazard ON).
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let banks = crate::weights::load_from_hf_dir(
             &target,
             crate::weights::LoadOptions {
@@ -2444,7 +2444,7 @@ mod tests {
         let mut sess = GpuDecodeSession::new(model).unwrap();
 
         let prefill = |s: &mut GpuDecodeSession| {
-            metal_runtime::ab_flags::set_hazard_barriers(false);
+            tessl::ab_flags::set_hazard_barriers(false);
             s.reset();
             for &t in &prompt {
                 s.step_prefill(t).unwrap();
@@ -2508,7 +2508,7 @@ mod tests {
         if !metal_ready(&model) {
             return;
         }
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         for m in 2usize..=VERIFY_MAX_M {
             let mut sess_g = GpuDecodeSession::new(
                 GpuSynthModel::from_synthetic(
@@ -2600,7 +2600,7 @@ mod tests {
         if model.gpu.rt.pipeline(crate::kernels::KernelId::FlashAttnSwaH128.entry_name()).is_err() {
             return;
         }
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let mut sess = GpuDecodeSession::new(model).unwrap();
         let host_draft = HostDFlashDraft::synthetic_mini().unwrap();
         let mut draft = DFlashGpuDraft::from_draft(&sess.model.gpu, &host_draft, 64).unwrap();
@@ -2669,16 +2669,16 @@ mod tests {
             eprintln!("skip: h128 FA / mlp_silu not in metallib");
             return;
         }
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let mut sess = GpuDecodeSession::new(model).unwrap();
         let prompt = [3u32, 4, 5];
         let max_new = 6usize;
         let host_draft = HostDFlashDraft::synthetic_mini().unwrap();
         let layers = host_draft.cfg.target_layer_ids.clone();
         sess.enable_hidden_capture(layers).unwrap();
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let g1 = sess.generate(&prompt, max_new).unwrap();
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let g2 = sess.generate(&prompt, max_new).unwrap();
         if g1 != g2 {
             eprintln!(
@@ -2687,7 +2687,7 @@ mod tests {
             return;
         }
         sess.disable_hidden_capture();
-        metal_runtime::ab_flags::set_hazard_barriers(false);
+        tessl::ab_flags::set_hazard_barriers(false);
         let mut draft =
             DFlashGpuDraft::from_draft(&sess.model.gpu, &host_draft, 64).unwrap();
         let cond =

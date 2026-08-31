@@ -1,7 +1,7 @@
 //! Decisive check: do the TensorOps and simdgroup GEMM lanes agree bit-for-bit?
 //! Separate C buffers (no reuse), compared in-process against a CPU f64 reference.
-use arch02_metal_native::gemm::{cast_f32_to_bf16, gemm, gemm_f32_cpu, GemmBackend};
-use arch02_metal_native::runtime::GpuRuntime;
+use tessl_arch02::gemm::{cast_f32_to_bf16, gemm, gemm_f32_cpu, GemmBackend};
+use tessl_arch02::runtime::GpuRuntime;
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);

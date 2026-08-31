@@ -116,7 +116,28 @@ The submission-oriented track, mirroring techniques from the public leaderboard:
 .
 |-- Rust_MLKit/                      # native Apple-silicon ML systems work
 |   |-- gemma-metal/                 # Rust + Metal Gemma inference and benchmarks
-|   |-- crates/metal-runtime/        # reusable Metal runtime components
+|   |-- crates/tessl/        # reusable Metal runtime components
+
+### Crate naming
+
+The Metal GEMM/runtime crates are named `tessl`. They were renamed from
+`metal-runtime` / `arch02-metal-native`; dated audits, `DECISIONS.md`,
+`experiment-notes/` and `docs/kernel_hardening_evidence.json` still use the old
+names and were deliberately **not** rewritten, since they record what was true
+when they were written.
+
+| directory | package | lib |
+|---|---|---|
+| `Rust_MLKit/crates/tessl/` | `tessl` | `tessl` |
+| `Rust_MLKit/arch_02_value_resid/metal-native/` | `tessl-arch02` | `tessl_arch02` |
+
+The `arch_02_value_resid/metal-native/` directory keeps its name (it is the
+arch_02 experiment's trainer), and the `METAL_NATIVE_*` / `METAL_RUNTIME_*`
+environment variables are unchanged so existing scripts keep working.
+
+See [`Rust_MLKit/docs/gemm_architecture.md`](Rust_MLKit/docs/gemm_architecture.md)
+for the GEMM kernel-selection path, the cooperative-accumulator gate, and how to
+verify and benchmark it.
 |   |-- arch_01_gated_value_resid/   # gated-attention + value-residual port
 |   |-- arch_02_value_resid/         # value-residual Rust/Metal/MLX implementations
 |   `-- arch_03_aprdh_adaptive/      # adaptive raw-byte architecture research

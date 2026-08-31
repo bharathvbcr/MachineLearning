@@ -101,17 +101,22 @@ kernel void matmul2d_tensorops_f32_relaxed(
     constant uint &tiles_m [[buffer(7)]],
     uint tgpig [[threadgroup_position_in_grid]])
 {
-    constexpr int SM = 64;
-    constexpr int SN = 32;
-    constexpr int BK = 128;
+    constexpr int SM = 128;
+    constexpr int SN = 64;
+    constexpr int BK = 256;
     constexpr auto desc =
         matmul2d_descriptor(SM, SN, dynamic_length_v<int>, false, false, true,
                             matmul2d_descriptor::mode::multiply);
     constexpr auto desc_bk =
         matmul2d_descriptor(SM, SN, BK, false, false, true,
                             matmul2d_descriptor::mode::multiply_accumulate);
+    // Block 0 overwrites rather than accumulates, so C needs no pre-zero.
+    constexpr auto desc_bk_first =
+        matmul2d_descriptor(SM, SN, BK, false, false, true,
+                            matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroups<4>> op;
     matmul2d<desc_bk, execution_simdgroups<4>> op_bk;
+    matmul2d<desc_bk_first, execution_simdgroups<4>> op_bk_first;
 
     uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
@@ -130,7 +135,12 @@ kernel void matmul2d_tensorops_f32_relaxed(
                              array<int, 2>{1, (int)K});
             auto tB = tensor(B + k * (int)N + tx, dextents<int, 2>{SN, BK},
                              array<int, 2>{1, (int)N});
-            op_bk.run(tA, tB, tC);
+            // use_bk implies K >= BK, so block 0 always runs and seeds C.
+            if (k == 0) {
+                op_bk_first.run(tA, tB, tC);
+            } else {
+                op_bk.run(tA, tB, tC);
+            }
         }
         if (k < (int)K) {
             int k_rem = (int)K - k;
@@ -161,6 +171,69 @@ kernel void matmul2d_tensorops_f32_relaxed(
         auto tC = mC.slice(tx, ty);
         op.run(tA, tB, tC);
     }
+}
+
+/// NN relaxed-f32 with a register-resident (cooperative_tensor) accumulator.
+///
+/// Same fix, same reason as `matmul2d_tensorops_bf16_f32_coop`: the blocked
+/// kernel above re-reads and re-writes a device-memory C tile once per K block,
+/// so C traffic grows with K/BK while the useful work grows with K. Holding the
+/// accumulator in registers across the whole K loop makes C traffic one store.
+///
+/// Measured with a paired, interleaved A/B (`bench_gemm_coop_ab`) so GPU clock
+/// drift cancels: at M=N=2048 the median speedup over the blocked kernel is
+/// 1.08x at K=512 rising to 1.10-1.13x at K>=768. Below K=512 the blocked
+/// kernel runs at most one full block plus a tail — already a single C store —
+/// and this kernel loses (0.93x at K=256), which is what `COOP_MIN_K` encodes.
+///
+/// The host guarantees the preconditions (M%SM==0, N%SN==0, K%BKC==0,
+/// K>=COOP_MIN_K), so there are no ragged or short-K branches here. Kept as a
+/// separate kernel rather than a branch inside the blocked one so neither pays
+/// for the other's `matmul2d` instantiations.
+kernel void matmul2d_tensorops_f32_relaxed_coop(
+    device float *A [[buffer(0)]],
+    device float *B [[buffer(1)]],
+    device float *C [[buffer(2)]],
+    constant uint &M [[buffer(3)]],
+    constant uint &N [[buffer(4)]],
+    constant uint &K [[buffer(5)]],
+    constant uint &tiles_n [[buffer(6)]],
+    constant uint &tiles_m [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]])
+{
+    constexpr int SM = 128;
+    constexpr int SN = 64;
+    constexpr int BKC = 128;
+    constexpr auto desc_c = matmul2d_descriptor(
+        SM, SN, BKC, false, false, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc_c, execution_simdgroups<4>> op_c;
+
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+
+    auto tA0 = tensor(A + ty * (int)K, dextents<int, 2>{BKC, SM},
+                      array<int, 2>{1, (int)K});
+    auto tB0 = tensor(B + tx, dextents<int, 2>{SN, BKC},
+                      array<int, 2>{1, (int)N});
+    auto cT = op_c.template get_destination_cooperative_tensor<
+        decltype(tA0), decltype(tB0), float>();
+#pragma unroll
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+        if (cT.is_valid_element(i)) { cT[i] = 0.0f; }
+    }
+    for (int k = 0; k + BKC <= (int)K; k += BKC) {
+        auto tA = tensor(A + ty * (int)K + k, dextents<int, 2>{BKC, SM},
+                         array<int, 2>{1, (int)K});
+        auto tB = tensor(B + k * (int)N + tx, dextents<int, 2>{SN, BKC},
+                         array<int, 2>{1, (int)N});
+        op_c.run(tA, tB, cT);
+    }
+    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
+                     array<int, 2>{1, (int)N});
+    cT.store(tC);
 }
 
 /// C[M,N] = A_stored[K,M]^T @ B[K,N] (TN).
@@ -400,16 +473,21 @@ kernel void matmul2d_tensorops_bf16_f32(
     uint tgpig [[threadgroup_position_in_grid]])
 {
     constexpr int SM = 64;
-    constexpr int SN = 32;
-    constexpr int BK = 128;
+    constexpr int SN = 64;
+    constexpr int BK = 256;
     constexpr auto desc =
         matmul2d_descriptor(SM, SN, dynamic_length_v<int>, false, false, false,
                             matmul2d_descriptor::mode::multiply);
     constexpr auto desc_bk =
         matmul2d_descriptor(SM, SN, BK, false, false, false,
                             matmul2d_descriptor::mode::multiply_accumulate);
+    // Block 0 overwrites rather than accumulates, so C needs no pre-zero.
+    constexpr auto desc_bk_first =
+        matmul2d_descriptor(SM, SN, BK, false, false, false,
+                            matmul2d_descriptor::mode::multiply);
     matmul2d<desc, execution_simdgroups<4>> op;
     matmul2d<desc_bk, execution_simdgroups<4>> op_bk;
+    matmul2d<desc_bk_first, execution_simdgroups<4>> op_bk_first;
 
     uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
@@ -428,7 +506,12 @@ kernel void matmul2d_tensorops_bf16_f32(
                              array<int, 2>{1, (int)K});
             auto tB = tensor(B + k * (int)N + tx, dextents<int, 2>{SN, BK},
                              array<int, 2>{1, (int)N});
-            op_bk.run(tA, tB, tC);
+            // use_bk implies K >= BK, so block 0 always runs and seeds C.
+            if (k == 0) {
+                op_bk_first.run(tA, tB, tC);
+            } else {
+                op_bk.run(tA, tB, tC);
+            }
         }
         if (k < (int)K) {
             int k_rem = (int)K - k;
@@ -460,6 +543,66 @@ kernel void matmul2d_tensorops_bf16_f32(
         op.run(tA, tB, tC);
     }
 }
+/// NN bf16 with a register-resident (cooperative_tensor) accumulator.
+///
+/// The blocked kernel accumulates into a device-memory C tile once per K block,
+/// so C traffic scales with K/BK — the entire remaining gap versus PyTorch MPS
+/// lived there. Holding the accumulator in registers makes C traffic a single
+/// store, independent of K.
+///
+/// Kept separate from `matmul2d_tensorops_bf16_f32` rather than added as a
+/// branch: merging them would put four `matmul2d` instantiations in one kernel
+/// for no gain, since the host can already decide between them from (M,N,K)
+/// alone. (An earlier revision of this comment attributed a ~25% cost to that
+/// register pressure; that number came from a stale benchmark binary and was
+/// never actually measured. The split stands on the host-side gate, not on it.)
+/// The host guarantees the preconditions (M%SM==0, N%SN==0, K%BKC==0,
+/// K>=COOP_MIN_K), so this kernel has no ragged or short-K branches.
+kernel void matmul2d_tensorops_bf16_f32_coop(
+    device bfloat *A [[buffer(0)]],
+    device bfloat *B [[buffer(1)]],
+    device float *C [[buffer(2)]],
+    constant uint &M [[buffer(3)]],
+    constant uint &N [[buffer(4)]],
+    constant uint &K [[buffer(5)]],
+    constant uint &tiles_n [[buffer(6)]],
+    constant uint &tiles_m [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]])
+{
+    constexpr int SM = 64;
+    constexpr int SN = 64;
+    constexpr int BKC = 128;
+    constexpr auto desc_c = matmul2d_descriptor(
+        SM, SN, BKC, false, false, false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc_c, execution_simdgroups<4>> op_c;
+
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+
+    auto tA0 = tensor(A + ty * (int)K, dextents<int, 2>{BKC, SM},
+                      array<int, 2>{1, (int)K});
+    auto tB0 = tensor(B + tx, dextents<int, 2>{SN, BKC},
+                      array<int, 2>{1, (int)N});
+    auto cT = op_c.template get_destination_cooperative_tensor<
+        decltype(tA0), decltype(tB0), float>();
+#pragma unroll
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+        if (cT.is_valid_element(i)) { cT[i] = 0.0f; }
+    }
+    for (int k = 0; k + BKC <= (int)K; k += BKC) {
+        auto tA = tensor(A + ty * (int)K + k, dextents<int, 2>{BKC, SM},
+                         array<int, 2>{1, (int)K});
+        auto tB = tensor(B + k * (int)N + tx, dextents<int, 2>{SN, BKC},
+                         array<int, 2>{1, (int)N});
+        op_c.run(tA, tB, cT);
+    }
+    auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
+                     array<int, 2>{1, (int)N});
+    cT.store(tC);
+}
 
 kernel void matmul2d_tensorops_tn_bf16_f32(
     device bfloat *A [[buffer(0)]],
@@ -472,8 +615,8 @@ kernel void matmul2d_tensorops_tn_bf16_f32(
     constant uint &tiles_m [[buffer(7)]],
     uint tgpig [[threadgroup_position_in_grid]])
 {
-    constexpr int SM = 64;
-    constexpr int SN = 32;
+    constexpr int SM = 128;
+    constexpr int SN = 64;
     constexpr auto desc =
         matmul2d_descriptor(SM, SN, dynamic_length_v<int>, true, false, false,
                             matmul2d_descriptor::mode::multiply);
@@ -515,8 +658,8 @@ kernel void matmul2d_tensorops_nt_bf16_f32(
     constant uint &tiles_m [[buffer(7)]],
     uint tgpig [[threadgroup_position_in_grid]])
 {
-    constexpr int SM = 64;
-    constexpr int SN = 32;
+    constexpr int SM = 128;
+    constexpr int SN = 64;
     constexpr auto desc =
         matmul2d_descriptor(SM, SN, dynamic_length_v<int>, false, true, false,
                             matmul2d_descriptor::mode::multiply);
@@ -559,8 +702,8 @@ kernel void matmul2d_tensorops_tn_accum_bf16_f32(
     constant uint &tiles_m [[buffer(7)]],
     uint tgpig [[threadgroup_position_in_grid]])
 {
-    constexpr int SM = 64;
-    constexpr int SN = 32;
+    constexpr int SM = 128;
+    constexpr int SN = 64;
     constexpr auto desc =
         matmul2d_descriptor(SM, SN, dynamic_length_v<int>, true, false, false,
                             matmul2d_descriptor::mode::multiply_accumulate);
@@ -604,7 +747,7 @@ kernel void matmul2d_tensorops_nt_accum_bf16_f32(
     uint tgpig [[threadgroup_position_in_grid]])
 {
     constexpr int SM = 64;
-    constexpr int SN = 32;
+    constexpr int SN = 64;
     constexpr auto desc =
         matmul2d_descriptor(SM, SN, dynamic_length_v<int>, false, true, false,
                             matmul2d_descriptor::mode::multiply_accumulate);

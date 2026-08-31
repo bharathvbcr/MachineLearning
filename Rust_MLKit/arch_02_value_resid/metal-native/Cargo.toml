@@ -1,11 +1,12 @@
 [package]
-name = "arch02-metal-native"
+name = "tessl-arch02"
 version = "0.1.0"
 edition = "2021"
 description = "From-scratch Metal training stack for arch_02 (Phase 4: bf16 + full-run)"
 publish = false
 
 [lib]
+name = "tessl_arch02"
 crate-type = ["rlib", "cdylib", "staticlib"]
 
 [[bin]]

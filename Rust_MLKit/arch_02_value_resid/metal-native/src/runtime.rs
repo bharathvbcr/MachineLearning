@@ -24,6 +24,7 @@ use objc2_metal::{
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Const arena for Metal 4 scalar binds (distinct offsets; reset after sync).
 const METAL4_CONST_ARENA_BYTES: usize = 1024 * 1024;
@@ -127,7 +128,13 @@ impl BufferPool {
         device: &ProtocolObject<dyn MTLDevice>,
         nbytes: usize,
     ) -> Result<(Retained<ProtocolObject<dyn MTLBuffer>>, bool), String> {
+        if nbytes > isize::MAX as usize || nbytes > device.maxBufferLength() as usize {
+            return Err(format!("buffer request {nbytes} exceeds host/device allocation limit"));
+        }
         let key = Self::bucket(nbytes);
+        if key < nbytes || key > device.maxBufferLength() as usize {
+            return Err("rounded buffer size exceeds device limit".into());
+        }
         if let Some(v) = self.freelist.get_mut(&key) {
             if let Some(b) = v.pop() {
                 self.cached_bytes = self.cached_bytes.saturating_sub(key);
@@ -143,7 +150,7 @@ impl BufferPool {
 
     fn recycle(&mut self, buffer: Retained<ProtocolObject<dyn MTLBuffer>>) {
         let key = Self::bucket(buffer.length() as usize);
-        if self.cached_bytes + key > self.max_cache_bytes {
+        if key > self.max_cache_bytes.saturating_sub(self.cached_bytes) {
             // Drop buffer (let ARC release) — over cache cap.
             return;
         }
@@ -212,7 +219,23 @@ struct BumpState {
 }
 
 /// Shared GPU runtime for the metal-native crate (Metal 4 encode required).
+/// Exclusive CPU/GPU access lease. Busy/reentrant access fails instead of blocking.
+pub(crate) struct RuntimeAccess(Arc<AtomicBool>);
+impl Drop for RuntimeAccess {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+}
+
+/// Metal encoder objects are thread-affine; do not add unsafe Send/Sync.
+/// Host mapping also excludes same-thread reentry into encode and submission.
+///
+/// ```compile_fail,E0277
+/// use tessl_arch02::runtime::GpuRuntime;
+/// fn require_send<T: Send>() {}
+/// require_send::<GpuRuntime>();
+/// ```
 pub struct GpuRuntime {
+    access_busy: Arc<AtomicBool>,
+    encode_failed: AtomicBool,
     pub device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub library: Retained<ProtocolObject<dyn MTLLibrary>>,
     /// Metal 4 encode package (required; init fails if unavailable).
@@ -247,6 +270,28 @@ pub struct GpuRuntime {
 }
 
 impl GpuRuntime {
+    fn acquire_access(&self) -> Result<RuntimeAccess, String> {
+        if self.encode_failed.load(Ordering::Acquire) {
+            return Err("runtime is poisoned after encode/submit failure; recreate it".into());
+        }
+        self.access_busy.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| "runtime busy: another host mapping, encoder, or submit is active".to_string())?;
+        let access = RuntimeAccess(Arc::clone(&self.access_busy));
+        if self.encode_failed.load(Ordering::Acquire) {
+            return Err("runtime poisoned by an earlier encoding/submission failure".into());
+        }
+        Ok(access)
+    }
+
+    pub(crate) fn host_access(&self) -> Result<RuntimeAccess, String> {
+        let access = self.acquire_access()?;
+        if let Err(e) = self.commit_m4(true) {
+            self.encode_failed.store(true, Ordering::Release);
+            return Err(e);
+        }
+        Ok(access)
+    }
+
     pub fn new() -> Result<Arc<Self>, String> {
         Self::from_metallib_path(Path::new(crate::metallib_path()))
     }
@@ -290,6 +335,8 @@ impl GpuRuntime {
         };
 
         let rt = Arc::new(Self {
+            access_busy: Arc::new(AtomicBool::new(false)),
+            encode_failed: AtomicBool::new(false),
             device,
             library,
             metal4,
@@ -532,13 +579,8 @@ impl GpuRuntime {
                 return Ok(());
             }
         }
-        // Recycle the previous slab into the pool before replacing.
-        if let Some(old) = bump.take() {
-            self.unregister_residency(old.buffer.metal());
-            if let Ok(mut pool) = self.pool.lock() {
-                pool.recycle(old.buffer.inner.buffer.clone());
-            }
-        }
+        // Allocate first: failure preserves the old arena. Replacing its owner
+        // releases the old slab only after every outstanding view has dropped.
         let buffer = self.alloc_buffer_kind(cap, BufferKind::Bump)?;
         *bump = Some(BumpState {
             buffer,
@@ -553,6 +595,7 @@ impl GpuRuntime {
         self: &Arc<Self>,
         shape: &[usize],
     ) -> Result<crate::tensor::Tensor, String> {
+        let _access = self.acquire_access()?;
         let nbytes = crate::tensor::checked_nbytes(shape, crate::tensor::DType::F32)?;
         let mut bump = self.bump.lock().map_err(|e| e.to_string())?;
         let state = bump
@@ -585,11 +628,19 @@ impl GpuRuntime {
         })
     }
 
-    /// Reset bump cursor to 0. Caller must ensure no in-flight GPU work still
-    /// references bump views (typically after [`Self::synchronize`]).
+    /// Synchronize and reset the bump cursor. Retained views keep their old slab;
+    /// a fresh slab is allocated when resetting would otherwise alias them.
     pub fn bump_reset(&self) {
-        if let Ok(mut bump) = self.bump.lock() {
-            if let Some(b) = bump.as_mut() {
+        let _access = self.host_access().expect("bump reset requires exclusive completed GPU work");
+        let mut bump = self.bump.lock().expect("bump state poisoned");
+        if let Some(b) = bump.as_mut() {
+            // Keep the old arena alive until its last outstanding view drops.
+            if Arc::strong_count(&b.buffer.inner) == 1 {
+                b.cursor = 0;
+            } else {
+                let buffer = self.alloc_buffer_kind(b.capacity, BufferKind::Bump)
+                    .expect("cannot replace bump arena with outstanding views");
+                b.buffer = buffer;
                 b.cursor = 0;
             }
         }
@@ -635,7 +686,7 @@ impl GpuRuntime {
     ) -> Result<crate::tensor::Tensor, String> {
         let nbytes = crate::tensor::checked_nbytes(shape, crate::tensor::DType::F32)?;
         let buf = self.alloc_buffer_kind(nbytes, kind)?;
-        buf.zero();
+        unsafe { buf.zero_unsubmitted() };
         Ok(crate::tensor::Tensor {
             buffer: buf,
             shape: shape.to_vec(),
@@ -666,7 +717,7 @@ impl GpuRuntime {
     ) -> Result<crate::tensor::Tensor, String> {
         let nbytes = crate::tensor::checked_nbytes(shape, crate::tensor::DType::BF16)?;
         let buf = self.alloc_buffer_kind(nbytes, kind)?;
-        buf.zero();
+        unsafe { buf.zero_unsubmitted() };
         Ok(crate::tensor::Tensor {
             buffer: buf,
             shape: shape.to_vec(),
@@ -685,16 +736,22 @@ impl GpuRuntime {
     where
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
     {
+        let _access = self.acquire_access()?;
         self.flush_residency();
         let async_on = self.async_encode_enabled();
         if async_on {
-            self.encode_into_batch_m4(f)?;
+            if let Err(error) = self.encode_into_batch_m4(f) {
+                self.encode_failed.store(true, Ordering::Release);
+                return Err(error);
+            }
             if let Ok(mut c) = self.dispatch_count.lock() {
                 *c += 1;
             }
             return Ok(());
         }
-        self.with_binder_sync(f)
+        let result = self.with_binder_sync(f);
+        if result.is_err() { self.encode_failed.store(true, Ordering::Release); }
+        result
     }
 
     fn ensure_m4_cb_open(&self, batch: &mut Option<ActiveMetal4Batch>) -> Result<(), String> {
@@ -761,8 +818,20 @@ impl GpuRuntime {
                 &m4.argument_table.table,
                 &m4.const_staging,
                 &mut cursor,
+                m4.argument_table.max_buffers as usize,
+                self,
             );
-            f(&mut binder)?;
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut binder).and_then(|_| binder.finish()))) {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => {
+                    self.encode_failed.store(true, Ordering::Release);
+                    return Err(e);
+                },
+                Err(panic) => {
+                    self.encode_failed.store(true, Ordering::Release);
+                    std::panic::resume_unwind(panic);
+                }
+            }
         }
         let hit_cap = {
             let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
@@ -771,7 +840,7 @@ impl GpuRuntime {
             batch.dispatches >= 512
         };
         if hit_cap {
-            self.commit(/*wait*/ true)?;
+            self.commit_m4(/*wait*/ true)?;
         }
         Ok(())
     }
@@ -787,7 +856,7 @@ impl GpuRuntime {
         }
         let result = (|| {
             self.encode_into_batch_m4(f)?;
-            self.synchronize()
+            self.commit_m4(true)
         })();
         if !was_async {
             *self.async_encode.lock().map_err(|e| e.to_string())? = false;
@@ -800,7 +869,10 @@ impl GpuRuntime {
 
     /// End encoding and commit without waiting (multi-step / low-sync path).
     pub fn commit(&self, wait: bool) -> Result<(), String> {
-        self.commit_m4(wait)
+        let _access = self.acquire_access()?;
+        let result = self.commit_m4(wait);
+        if result.is_err() { self.encode_failed.store(true, Ordering::Release); }
+        result
     }
 
     fn commit_m4(&self, wait: bool) -> Result<(), String> {
@@ -1191,5 +1263,36 @@ mod tests {
         assert!(cursor > 0, "const arena cursor should advance");
         rt.synchronize().unwrap();
         assert_eq!(*rt.metal4.const_cursor.lock().unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn callback_panic_poisoning_rejects_reuse() {
+        let rt = GpuRuntime::new().unwrap();
+        rt.set_async_encode(true).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.with_binder(|_| panic!("injected callback panic"))
+        }));
+        assert!(result.is_err());
+        assert!(rt.commit(true).is_err());
+        assert!(rt.with_binder(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn callback_failure_poisoning_prevents_partial_submission() {
+        let rt=GpuRuntime::new().unwrap();
+        rt.set_async_encode(true).unwrap();
+        assert!(rt.with_binder(|_| Err("injected encode failure".into())).is_err());
+        assert!(rt.synchronize().is_err(), "failed batch was submitted as success");
+    }
+    #[test]
+    fn oversized_raw_allocations_fail_without_panicking() {
+        let rt=GpuRuntime::new().unwrap();
+        let outcome=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||rt.alloc_buffer(usize::MAX)));
+        assert!(outcome.is_ok(), "allocation arithmetic panicked");
+        assert!(outcome.unwrap().is_err());
     }
 }

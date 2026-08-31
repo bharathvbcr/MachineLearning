@@ -1,4 +1,4 @@
-# Developer guide — gemma-metal + metal-runtime
+# Developer guide — gemma-metal + tessl
 
 For agents continuing real-weight load / parity / product tok/s. Reality of the tree.
 
@@ -114,7 +114,7 @@ Version: `gemma-metal-0.1.0-phase6`.
 | `gemv_q4` / `gemv_q4_mlx` | Vectorized 1-thread/row decode GEMV (+ `*_tiled` legacy) |
 | `kv_store_timestep` / `kv_ring_densify` | GPU-resident KV |
 | `rms_norm_f32` | Residual / hidden RMS |
-| `add_inplace_f32` | From metal-runtime utils (residual add) |
+| `add_inplace_f32` | From tessl utils (residual add) |
 | Hot `upload_quant_hot` | Q4/Q8 → `BufferKind::Hot` residency |
 
 ### Remaining gaps

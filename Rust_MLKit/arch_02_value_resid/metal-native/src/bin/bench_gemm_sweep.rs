@@ -6,10 +6,10 @@
 //!
 //! `--dump-parity DIR` writes A/B/C as .npy for the numeric check in the Python lane.
 
-use arch02_metal_native::gemm::{cast_f32_to_bf16, gemm, GemmBackend};
-use arch02_metal_native::npy::write_npy_f32;
-use arch02_metal_native::runtime::GpuRuntime;
-use arch02_metal_native::tensor::Tensor;
+use tessl_arch02::gemm::{cast_f32_to_bf16, gemm, GemmBackend};
+use tessl_arch02::npy::write_npy_f32;
+use tessl_arch02::runtime::GpuRuntime;
+use tessl_arch02::tensor::Tensor;
 use std::path::Path;
 use std::time::Instant;
 
@@ -67,6 +67,19 @@ fn time_backend(
     Ok(samples)
 }
 
+/// `BENCH_SHAPES="MxNxK,MxNxK,..."` overrides the built-in ladder so this lane
+/// and the Python lane can be pointed at an identical diagnostic grid.
+fn shapes_from_env() -> Option<Vec<(usize, usize, usize, String)>> {
+    let raw = std::env::var("BENCH_SHAPES").ok()?;
+    let mut out = Vec::new();
+    for spec in raw.split(',').filter(|s| !s.trim().is_empty()) {
+        let d: Vec<usize> = spec.trim().split('x').map(|v| v.parse().unwrap()).collect();
+        assert_eq!(d.len(), 3, "BENCH_SHAPES entry must be MxNxK, got {spec}");
+        out.push((d[0], d[1], d[2], format!("{}x{}x{}", d[0], d[1], d[2])));
+    }
+    Some(out)
+}
+
 fn main() -> Result<(), String> {
     let rt = GpuRuntime::new()?;
     let warmup: usize = std::env::var("BENCH_WARMUP").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
@@ -82,8 +95,14 @@ fn main() -> Result<(), String> {
         eprintln!("warning: TensorOps absent from metallib; simdgroup lane only");
     }
 
+    let owned = shapes_from_env();
+    let shapes: Vec<(usize, usize, usize, String)> = match owned {
+        Some(v) => v,
+        None => SHAPES.iter().map(|&(m, n, k, l)| (m, n, k, l.to_string())).collect(),
+    };
+
     let mut rows: Vec<String> = Vec::new();
-    for &(m, n, k, label) in SHAPES {
+    for (m, n, k, label) in shapes.iter().map(|(m, n, k, l)| (*m, *n, *k, l.as_str())) {
         let a = rt.alloc_tensor_f32(&[m, k])?;
         let b = rt.alloc_tensor_f32(&[k, n])?;
         let c = rt.alloc_tensor_f32(&[m, n])?;
@@ -99,6 +118,13 @@ fn main() -> Result<(), String> {
             lanes.push((format!("{bname}-f32"), backend, a.view(&[m, k], 0), b.view(&[k, n], 0)));
         }
         if rt.has_tensorops() {
+            // tf32-class relaxed f32 (`--tf32` / set_relaxed_precision).
+            lanes.push((
+                "tensorops-f32relaxed".to_string(),
+                GemmBackend::TensorOps,
+                a.view(&[m, k], 0),
+                b.view(&[k, n], 0),
+            ));
             // bf16 operands, f32 accumulate — the path `gemm_train` takes under
             // PrecisionMode::Bf16. Cast is hoisted out of the timed region.
             lanes.push((
@@ -111,6 +137,10 @@ fn main() -> Result<(), String> {
 
         for (bname, backend, la, lb) in &lanes {
             let (bname, backend) = (bname.as_str(), *backend);
+            // The tf32-class path is opt-in at runtime, so it is invisible to a
+            // sweep that only toggles dtype. Without this lane the relaxed-f32
+            // kernels never appear in any cross-runtime comparison.
+            rt.set_relaxed_precision(bname.ends_with("-f32relaxed"));
             let samples = time_backend(&rt, la, lb, &c, backend, warmup, iters)?;
             let med = median(samples.clone());
             let best = samples.iter().cloned().fold(f64::INFINITY, f64::min);

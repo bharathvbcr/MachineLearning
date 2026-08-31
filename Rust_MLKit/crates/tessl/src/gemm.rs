@@ -16,12 +16,20 @@ use crate::runtime::{mtl_size, GpuRuntime, PrecisionMode};
 use crate::tensor::{DType, Tensor};
 
 #[derive(Clone, Copy)]
-enum Layout { NN, TN, NT }
+enum Layout {
+    NN,
+    TN,
+    NT,
+}
 
 /// All public GEMM paths validate before casting, allocating scratch, or encoding.
 /// MPP uses signed 32-bit extents/offset arithmetic; reject larger matrices.
 fn validate_gemm(
-    a: &Tensor, b: &Tensor, c: &Tensor, layout: Layout, allow_bf16: bool,
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    layout: Layout,
+    allow_bf16: bool,
 ) -> Result<(usize, usize, usize), String> {
     for t in [a, b, c] {
         t.validate()?;
@@ -32,12 +40,12 @@ fn validate_gemm(
             return Err("GEMM exceeds signed 32-bit kernel indexing".into());
         }
     }
-    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime()) ||
-        !std::sync::Arc::ptr_eq(a.runtime(), c.runtime()) {
+    if !std::sync::Arc::ptr_eq(a.runtime(), b.runtime())
+        || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime())
+    {
         return Err("GEMM tensors must belong to the same runtime".into());
     }
-    if c.dtype != DType::F32 || (!allow_bf16 &&
-        (a.dtype != DType::F32 || b.dtype != DType::F32)) {
+    if c.dtype != DType::F32 || (!allow_bf16 && (a.dtype != DType::F32 || b.dtype != DType::F32)) {
         return Err("GEMM operand dtype does not match the selected precision path".into());
     }
     let (m, k, k2, n) = match layout {
@@ -77,6 +85,97 @@ const TILE_F32: TileGeom = TileGeom {
 const TILE_V2: TileGeom = TileGeom {
     sm: 64,
     sn: 32,
+    simdgroups: 4,
+};
+/// NN bf16 only. Must track `matmul2d_tensorops_bf16_f32`'s compile-time SM/SN;
+/// the TN/NT/split-K bf16 kernels still use TILE_V2.
+const TILE_BF16_NN: TileGeom = TileGeom {
+    sm: 64,
+    sn: 64,
+    simdgroups: 4,
+};
+
+/// Preconditions shared by both `*_coop` NN kernels (bf16 and relaxed-f32).
+/// They hold the C accumulator in registers for the whole K loop, so they have
+/// no ragged or short-K branches: every tile must be interior, and K must
+/// divide into `COOP_BKC` blocks.
+///
+/// `COOP_MIN_K` is where the win starts, and it is structural rather than
+/// tuned. Both blocked kernels use BK=256, so below K=512 they run at most one
+/// full block plus a tail — already a single C store — and the coop kernel only
+/// adds the cost of zeroing the register accumulator. Paired interleaved
+/// measurement (`bench_gemm_coop_ab`, which cancels clock drift) agrees: at
+/// K=256 the coop kernels are 0.90x (bf16) and 0.93x (relaxed) of blocked,
+/// crossing over to 1.02-1.13x from K=512 up.
+const COOP_BKC: usize = 128;
+const COOP_MIN_K: usize = 512;
+
+/// True when the `*_coop` kernel compiled for `tile` may be dispatched. `tile`
+/// must be the same TileGeom the caller then dispatches with, so that the
+/// interior guarantee this returns is the one the kernel actually relies on.
+fn use_coop_nn(tile: TileGeom, m: usize, n: usize, k: usize) -> bool {
+    // `>= tile` as well as `% tile == 0`: divisibility alone also accepts M or
+    // N of zero, and this predicate is the kernels' only guard.
+    m >= tile.sm
+        && m % tile.sm == 0
+        && n >= tile.sn
+        && n % tile.sn == 0
+        && k >= COOP_MIN_K
+        && k % COOP_BKC == 0
+}
+
+/// The TensorOps NN kernel `gemm` dispatches for these dimensions.
+///
+/// Factored out of `gemm` for two reasons: the coop gate then has exactly one
+/// evaluation site, and tests can ask which path a shape *actually* takes
+/// instead of assuming. A shape fuzz that silently never reaches the coop
+/// kernels would pass just as loudly as one that covers them.
+pub(crate) fn tensorops_nn_kernel(bf16: bool, relaxed: bool, m: usize, n: usize, k: usize) -> &'static str {
+    if bf16 {
+        if use_coop_nn(TILE_BF16_NN, m, n, k) {
+            "matmul2d_tensorops_bf16_f32_coop"
+        } else {
+            "matmul2d_tensorops_bf16_f32"
+        }
+    } else if relaxed {
+        if use_coop_nn(TILE_F32R_NN, m, n, k) {
+            "matmul2d_tensorops_f32_relaxed_coop"
+        } else {
+            "matmul2d_tensorops_f32_relaxed"
+        }
+    } else {
+        "matmul2d_tensorops_f32"
+    }
+}
+/// NN relaxed-f32 only. Must track `matmul2d_tensorops_f32_relaxed`'s SM/SN.
+/// Wider than the bf16 tile: f32 operands are 2x the bytes, so the same tile
+/// carries half the arithmetic intensity. sg4 over sg8 — sg8 measured faster on
+/// square shapes but regressed narrow-N (mlp_down, N=768) below baseline.
+const TILE_F32R_NN: TileGeom = TileGeom {
+    sm: 128,
+    sn: 64,
+    simdgroups: 4,
+};
+/// Plain (non-accumulating) TN/NT bf16. Must track the SM/SN compiled into
+/// `matmul2d_tensorops_{tn,nt}_bf16_f32`. The split-K and `_accum_` bf16
+/// kernels are separate and stay on TILE_V2.
+const TILE_TNNT_BF16: TileGeom = TileGeom {
+    sm: 128,
+    sn: 64,
+    simdgroups: 4,
+};
+/// Accumulating dW path (`matmul2d_tensorops_tn_accum_bf16_f32`). Measured
+/// separately from the plain kernels: TN-accum and NT-accum peak at different
+/// tiles, and each regresses below baseline on the other's choice.
+const TILE_TNACC_BF16: TileGeom = TileGeom {
+    sm: 128,
+    sn: 64,
+    simdgroups: 4,
+};
+/// Accumulating dX path (`matmul2d_tensorops_nt_accum_bf16_f32`).
+const TILE_NTACC_BF16: TileGeom = TileGeom {
+    sm: 64,
+    sn: 64,
     simdgroups: 4,
 };
 
@@ -152,9 +251,14 @@ pub fn cast_f32_to_bf16(src: &Tensor) -> Result<Tensor, String> {
 pub fn cast_f32_to_bf16_into(src: &Tensor, dst: &Tensor) -> Result<(), String> {
     validate_cast_input(src, DType::F32)?;
     dst.validate()?;
-    if dst.dtype != DType::BF16 || src.shape != dst.shape ||
-        !std::sync::Arc::ptr_eq(src.runtime(), dst.runtime()) || src.overlaps(dst) {
-        return Err("cast destination must match shape/runtime, be bf16, and not overlap source".into());
+    if dst.dtype != DType::BF16
+        || src.shape != dst.shape
+        || !std::sync::Arc::ptr_eq(src.runtime(), dst.runtime())
+        || src.overlaps(dst)
+    {
+        return Err(
+            "cast destination must match shape/runtime, be bf16, and not overlap source".into(),
+        );
     }
     let rt = src.runtime();
     let p = rt.pipeline("cast_f32_to_bf16")?;
@@ -229,10 +333,11 @@ pub fn gemm(
     }
 
     let rt = a.runtime();
+    // bf16 already implies TensorOps: the check above rejects any other backend.
     let kernel = if use_bf16 {
-        backend.kernel_name_bf16()
+        tensorops_nn_kernel(true, false, m, n, k)
     } else if use_relaxed_f32(rt, backend) {
-        backend.kernel_name_f32_relaxed()
+        tensorops_nn_kernel(false, true, m, n, k)
     } else if backend == GemmBackend::Simdgroup && (m % 16 != 0 || n % 16 != 0 || k % 8 != 0) {
         "matmul_simdgroup_edges_f32"
     } else {
@@ -242,13 +347,16 @@ pub fn gemm(
 
     match backend {
         GemmBackend::TensorOps => {
-            let tile = if use_bf16 || use_relaxed_f32(rt, backend) {
-                TILE_V2
+            let tile = if use_bf16 {
+                TILE_BF16_NN
+            } else if use_relaxed_f32(rt, backend) {
+                TILE_F32R_NN
             } else {
                 TILE_F32
             };
             // Zero-tax: pack C-zero + matmul into one binder (~−1 binder/GEMM).
-            dispatch_tensorops_nn(rt, &pipeline, a, b, c, m, n, k, tile)?;
+            let seeds_c = use_bf16 || use_relaxed_f32(rt, backend);
+            dispatch_tensorops_nn(rt, &pipeline, a, b, c, m, n, k, tile, !seeds_c)?;
         }
         GemmBackend::Simdgroup => {
             // Both simdgroup kernels overwrite every logical output element.
@@ -285,6 +393,9 @@ fn dispatch_tensorops_nn(
     n: usize,
     k: usize,
     tile: TileGeom,
+    // False only for kernels whose first K block uses `mode::multiply` and so
+    // seed C themselves; every other NN kernel accumulates from block 0.
+    zero_c: bool,
 ) -> Result<(), String> {
     let zero_p = rt.pipeline("zero_f32")?;
     let numel = c.numel();
@@ -297,13 +408,15 @@ fn dispatch_tensorops_nn(
     let z_groups = (numel + z_tpt - 1) / z_tpt;
 
     rt.with_binder(|bnd| {
-        bnd.set_pipeline(&zero_p);
-        bnd.bind_tensor(c, 0);
-        bnd.bind_u32(numel as u32, 1);
-        bnd.dispatch(mtl_size(z_groups, 1, 1), mtl_size(z_tpt, 1, 1));
-        // Explicit barrier only when auto per-dispatch barriers are off.
-        if crate::ab_flags::hazard_barriers() {
-            bnd.barrier();
+        if zero_c {
+            bnd.set_pipeline(&zero_p);
+            bnd.bind_tensor(c, 0);
+            bnd.bind_u32(numel as u32, 1);
+            bnd.dispatch(mtl_size(z_groups, 1, 1), mtl_size(z_tpt, 1, 1));
+            // Explicit barrier only when auto per-dispatch barriers are off.
+            if crate::ab_flags::hazard_barriers() {
+                bnd.barrier();
+            }
         }
 
         bnd.set_pipeline(pipeline);
@@ -340,8 +453,9 @@ fn dispatch_tensorops_tn_nt(
     k: usize,
     tile: TileGeom,
 ) -> Result<(), String> {
-    // Same binder packing as NN.
-    dispatch_tensorops_nn(rt, pipeline, a, b, c, m, n, k, tile)
+    // Same binder packing as NN. Plain TN/NT kernels are single-shot
+    // `mode::multiply`, so they seed C themselves — no zero pre-pass.
+    dispatch_tensorops_nn(rt, pipeline, a, b, c, m, n, k, tile, false)
 }
 
 /// TensorOps matmul with `mode::multiply_accumulate` — no C zero (1 binder).
@@ -475,7 +589,7 @@ pub fn gemm_tn_train(
             return gemm_tn_splitk_bf16(&a_bf, &b_bf, c, k);
         }
         let pipeline = rt.pipeline("matmul2d_tensorops_tn_bf16_f32")?;
-        return dispatch_tensorops_tn_nt(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_V2);
+        return dispatch_tensorops_tn_nt(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_TNNT_BF16);
     }
     gemm_tn_f32(a_km, b_kn, c, backend)
 }
@@ -666,7 +780,7 @@ pub fn gemm_nt_train(
         let n = b_bf.shape[0];
         assert_eq!(c.shape, &[m, n]);
         let pipeline = rt.pipeline("matmul2d_tensorops_nt_bf16_f32")?;
-        return dispatch_tensorops_tn_nt(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_V2);
+        return dispatch_tensorops_tn_nt(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_TNNT_BF16);
     }
     gemm_nt_f32(a_mk, b_nk, c, backend)
 }
@@ -691,7 +805,7 @@ pub fn gemm_tn_accum_train(
         }
         let pipeline = rt.pipeline("matmul2d_tensorops_tn_accum_bf16_f32")?;
         return dispatch_tensorops_accum(
-            rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_V2, /*bind_interior=*/ false,
+            rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_TNACC_BF16, /*bind_interior=*/ false,
         );
     }
 
@@ -734,7 +848,7 @@ pub fn gemm_nt_accum_train(
         let b_bf = ensure_bf16(b_nk)?;
         let pipeline = rt.pipeline("matmul2d_tensorops_nt_accum_bf16_f32")?;
         return dispatch_tensorops_accum(
-            rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_V2, /*bind_interior=*/ false,
+            rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_NTACC_BF16, /*bind_interior=*/ false,
         );
     }
 
@@ -803,6 +917,56 @@ pub fn gemm_f32_cpu(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f
 
 #[cfg(test)]
 mod tests {
+
+    /// The `*_coop` kernels have no ragged, short-K or tail branch: they trust
+    /// `use_coop_nn` completely. Every rejection below is a case where the
+    /// kernel would produce a wrong answer with no error reported, so this
+    /// pins the predicate rather than the kernels' behaviour under it.
+    #[test]
+    fn coop_nn_gate_rejects_every_shape_the_kernels_cannot_handle() {
+        let bf16 = TILE_BF16_NN;
+        let f32r = TILE_F32R_NN;
+
+        // Accepted: exactly on the boundary, and comfortably past it.
+        assert!(use_coop_nn(bf16, 128, 128, COOP_MIN_K));
+        assert!(use_coop_nn(bf16, 4096, 768, 2304));
+        assert!(use_coop_nn(f32r, 256, 192, 768));
+        assert!(use_coop_nn(f32r, 4096, 768, 4096));
+
+        // K below the crossover: the blocked kernel does at most one full block
+        // plus a tail there and measured faster.
+        assert!(!use_coop_nn(bf16, 128, 128, COOP_MIN_K - 1));
+        assert!(!use_coop_nn(bf16, 128, 128, 384));
+        assert!(!use_coop_nn(f32r, 128, 128, 256));
+
+        // K not a whole number of BKC blocks: the kernel's `k + BKC <= K` loop
+        // would drop the tail and silently under-compute.
+        assert!(!use_coop_nn(bf16, 128, 128, COOP_MIN_K + 8));
+        assert!(!use_coop_nn(bf16, 128, 128, 520));
+        assert!(!use_coop_nn(f32r, 256, 128, 1000));
+        for k in [513usize, 575, 639, 767, 1151] {
+            assert!(!use_coop_nn(bf16, 128, 128, k), "K={k} is not a BKC multiple");
+        }
+
+        // Ragged tiles: the kernel has no edge path, so a partial tile would
+        // read and write outside the logical matrix.
+        assert!(!use_coop_nn(bf16, 127, 128, 1024));
+        assert!(!use_coop_nn(bf16, 128, 127, 1024));
+        assert!(!use_coop_nn(f32r, 64, 128, 1024), "M=64 is ragged for a 128-row tile");
+        assert!(!use_coop_nn(f32r, 128, 32, 1024), "N=32 is ragged for a 64-col tile");
+
+        // The two NN tiles differ, and using the wrong one is a live hazard:
+        // M=192 is interior for bf16 (64 rows) but ragged for relaxed (128).
+        assert!(use_coop_nn(bf16, 192, 64, 1152));
+        assert!(!use_coop_nn(f32r, 192, 64, 1152));
+
+        // Degenerate shapes must never reach a kernel with no edge path.
+        assert!(!use_coop_nn(bf16, 0, 128, 1024));
+        assert!(!use_coop_nn(bf16, 128, 0, 1024));
+        assert!(!use_coop_nn(bf16, 1, 1, 1));
+        assert!(!use_coop_nn(f32r, 1, 1, 4096));
+    }
+
     use super::*;
     use crate::GpuRuntime;
 
@@ -813,6 +977,511 @@ mod tests {
             .zip(exp.iter())
             .map(|(g, e)| (g - e).abs())
             .fold(0.0f32, f32::max)
+    }
+
+    /// Same invariant as the bf16 case, for the relaxed-precision (tf32-class)
+    /// f32 NN GEMM: its first K block uses `mode::multiply`, so the host skips
+    /// `zero_f32(C)`. Regressing that, or desyncing the kernel's SM/SN from
+    /// TILE_F32R_NN, leaves stale C behind.
+    #[test]
+    fn relaxed_f32_gemm_nn_overwrites_c_without_prezero() {
+        let rt = GpuRuntime::new().expect("GpuRuntime");
+        if !rt.has_tensorops() {
+            eprintln!("skip: metallib has no TensorOps");
+            return;
+        }
+        rt.set_relaxed_precision(true);
+        let (m, n, k) = (256usize, 128usize, 512usize);
+        let a = rt.alloc_tensor_f32(&[m, k]).unwrap();
+        let b = rt.alloc_tensor_f32(&[k, n]).unwrap();
+        let ah: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) / 32.0).collect();
+        let bh: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 - 6.0) / 32.0).collect();
+        a.buffer.write_f32(&ah);
+        b.buffer.write_f32(&bh);
+
+        let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+        c.buffer.write_f32(&vec![1.0e30f32; m * n]); // garbage a zero-pass would hide
+        gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
+        rt.synchronize().unwrap();
+        let got = c.buffer.read_f32()[..m * n].to_vec();
+        rt.set_relaxed_precision(false);
+
+        let mut worst = 0f64;
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f64;
+                for kk in 0..k {
+                    acc += ah[i * k + kk] as f64 * bh[kk * n + j] as f64;
+                }
+                assert!(got[i * n + j].is_finite(), "C[{i},{j}] not finite — stale value survived");
+                worst = worst.max((got[i * n + j] as f64 - acc).abs());
+            }
+        }
+        // tf32-class mantissa truncation, so looser than exact f32 but far
+        // tighter than any surviving-garbage failure.
+        assert!(worst < 1e-1, "relaxed NN GEMM max abs err {worst:.3e} — C was not fully overwritten");
+    }
+
+    /// Randomized shape fuzz across the NN dispatch paths.
+    ///
+    /// `gemm_adversarial_shape_sweep` pins a hand-picked list, which only ever
+    /// proves the cases someone thought of. The `*_coop` gate has four
+    /// independent conditions (M tile, N tile, K floor, K divisibility) over two
+    /// different tiles, and the kernels behind it have no ragged or tail path —
+    /// so the interesting failures live at combinations of boundaries, not at
+    /// any single one. This samples those combinations directly.
+    ///
+    /// Deterministic: a failure prints the seed and shape, and re-running with
+    /// `GEMM_FUZZ_SEED` reproduces it exactly. `GEMM_FUZZ_CASES` scales the run
+    /// for a longer soak without editing the test.
+    #[test]
+    fn gemm_randomized_shape_fuzz() {
+        use crate::gemm::{cast_f32_to_bf16, gemm, tensorops_nn_kernel, GemmBackend};
+        use crate::runtime::PrecisionMode;
+        use std::collections::BTreeMap;
+        let rt = GpuRuntime::new().expect("GpuRuntime");
+        if !rt.has_tensorops() {
+            eprintln!("skip: metallib has no TensorOps");
+            return;
+        }
+        // Parse strictly and panic on a malformed value. Falling back to the
+        // default would make a soak over several seeds silently re-run one
+        // seed and still report success — a check that could not run must not
+        // look like a check that ran and passed.
+        fn env_u64(name: &str, default: u64) -> u64 {
+            match std::env::var(name) {
+                Err(_) => default,
+                Ok(v) => {
+                    let t = v.trim();
+                    let parsed = t
+                        .strip_prefix("0x")
+                        .or_else(|| t.strip_prefix("0X"))
+                        .map(|h| u64::from_str_radix(h, 16))
+                        .unwrap_or_else(|| t.parse::<u64>());
+                    parsed.unwrap_or_else(|e| panic!("{name}={v:?} is not a valid integer: {e}"))
+                }
+            }
+        }
+        let seed = env_u64("GEMM_FUZZ_SEED", 0x5eed_1234_abcd_ef01);
+        let cases = env_u64("GEMM_FUZZ_CASES", 120) as usize;
+
+        let mut s = seed;
+        let mut next = move || -> u64 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            s >> 16
+        };
+        // Oversample tile and gate boundaries: a uniform draw over 1..320 almost
+        // never lands on 64/128/512, which is exactly where the gate flips.
+        //
+        // Independent per-dimension sampling is not enough on its own. The coop
+        // gate needs M, N and K to satisfy their conditions *simultaneously*,
+        // so drawing each at ~1/5 leaves the coop kernels reached in well under
+        // 1% of cases — a run that covers them only by luck. One case in three
+        // is therefore built to satisfy the gate by construction, and the
+        // coverage assertion at the end refuses to pass a run that missed.
+        let dim = |r: u64| -> usize {
+            let anchors = [32usize, 64, 96, 128, 192, 256, 320];
+            match r % 4 {
+                0 => 1 + (r / 4) as usize % 320,
+                1 => anchors[(r / 4) as usize % anchors.len()],
+                2 => anchors[(r / 4) as usize % anchors.len()].saturating_sub(1).max(1),
+                _ => anchors[(r / 4) as usize % anchors.len()] + 1,
+            }
+        };
+        // K additionally straddles COOP_MIN_K (512) and COOP_BKC (128).
+        let kdim = |r: u64| -> usize {
+            let anchors = [
+                1usize, 127, 128, 129, 255, 256, 383, 384, 511, 512, 513, 640, 767, 768, 1024,
+            ];
+            match r % 3 {
+                0 => 1 + (r / 3) as usize % 800,
+                _ => anchors[(r / 3) as usize % anchors.len()],
+            }
+        };
+        // Gate-satisfying by construction, for both NN tiles (128x64 is the
+        // stricter of the two, so these also satisfy the 64x64 tile).
+        let gated = |r: u64| -> (usize, usize, usize) {
+            let m = 128 * (1 + (r % 3) as usize);
+            let n = 64 * (1 + ((r / 3) % 4) as usize);
+            let k = 128 * (4 + ((r / 12) % 5) as usize);
+            (m, n, k)
+        };
+
+        let val = |i: usize, salt: usize| -> f32 {
+            (((i * 2654435761 + salt * 40503) % 1021) as f32 - 510.0) / 512.0
+        };
+        const SENTINEL: f32 = 1.0e30;
+
+        let mut checked = 0usize;
+        let mut path_hits: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for case in 0..cases {
+            let r = next();
+            let (m, n, k) = if r % 3 == 0 {
+                gated(next())
+            } else {
+                (dim(next()), dim(next()), kdim(next()))
+            };
+
+            let a_h: Vec<f32> = (0..m * k).map(|i| val(i, 1)).collect();
+            let b_h: Vec<f32> = (0..k * n).map(|i| val(i, 2)).collect();
+            let mut refv = vec![0f64; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0f64;
+                    for kk in 0..k {
+                        acc += a_h[i * k + kk] as f64 * b_h[kk * n + j] as f64;
+                    }
+                    refv[i * n + j] = acc;
+                }
+            }
+            let refmax = refv.iter().fold(0f64, |a, x| a.max(x.abs())).max(1e-30);
+
+            let a = rt.alloc_tensor_f32(&[m, k]).unwrap();
+            let b = rt.alloc_tensor_f32(&[k, n]).unwrap();
+            a.buffer.write_f32(&a_h);
+            b.buffer.write_f32(&b_h);
+            let a_bf = cast_f32_to_bf16(&a).unwrap();
+            let b_bf = cast_f32_to_bf16(&b).unwrap();
+
+            for &(label, bf16, relaxed, tol) in &[
+                ("NN f32", false, false, 1e-4f64),
+                ("NN relaxed", false, true, 2e-2),
+                ("NN bf16", true, false, 2e-2),
+            ] {
+                rt.set_precision(if bf16 {
+                    PrecisionMode::Bf16
+                } else {
+                    PrecisionMode::F32
+                });
+                rt.set_relaxed_precision(relaxed);
+                *path_hits
+                    .entry(tensorops_nn_kernel(bf16, relaxed, m, n, k))
+                    .or_default() += 1;
+
+                let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+                c.buffer.write_f32(&vec![SENTINEL; m * n]);
+                let res = if bf16 {
+                    gemm(&a_bf, &b_bf, &c, GemmBackend::TensorOps)
+                } else {
+                    gemm(&a, &b, &c, GemmBackend::TensorOps)
+                };
+                res.unwrap_or_else(|e| {
+                    panic!("case {case} seed {seed:#x} {label} {m}x{n}x{k}: dispatch failed: {e}")
+                });
+                rt.synchronize().unwrap();
+                let got = c.buffer.read_f32();
+                for idx in 0..m * n {
+                    let g = got[idx] as f64;
+                    // A sentinel that survived means a tile was never written —
+                    // the specific failure the coop kernels' missing ragged path
+                    // would produce if the gate ever admitted a partial tile.
+                    assert!(
+                        g.abs() < 1e20,
+                        "case {case} seed {seed:#x} {label} {m}x{n}x{k}: \
+                         C[{idx}] still holds the sentinel — tile never written"
+                    );
+                    let rel = (g - refv[idx]).abs() / refmax;
+                    assert!(
+                        rel < tol,
+                        "case {case} seed {seed:#x} {label} {m}x{n}x{k}: \
+                         C[{idx}] rel err {rel:.3e} (got {g}, want {})",
+                        refv[idx]
+                    );
+                }
+                checked += 1;
+            }
+        }
+        rt.set_precision(PrecisionMode::F32);
+        rt.set_relaxed_precision(false);
+        eprintln!(
+            "gemm_randomized_shape_fuzz: {checked} (path, shape) combinations, seed {seed:#x}"
+        );
+        for (kern, hits) in &path_hits {
+            eprintln!("  {kern:<44} {hits:>6}");
+        }
+        assert!(checked >= cases * 3);
+        // Coverage is asserted, not assumed. Every kernel `gemm` can select for
+        // an NN shape must have been exercised, or this run proved nothing
+        // about the ones it skipped.
+        for kern in [
+            "matmul2d_tensorops_f32",
+            "matmul2d_tensorops_f32_relaxed",
+            "matmul2d_tensorops_f32_relaxed_coop",
+            "matmul2d_tensorops_bf16_f32",
+            "matmul2d_tensorops_bf16_f32_coop",
+        ] {
+            let hits = path_hits.get(kern).copied().unwrap_or(0);
+            assert!(
+                hits * 100 >= cases,
+                "seed {seed:#x}: {kern} was selected for only {hits} of {cases} cases —                  the fuzz did not meaningfully exercise it"
+            );
+        }
+    }
+
+    /// Adversarial sweep over every TensorOps GEMM dispatch path.
+    ///
+    /// Shapes are chosen to break tiling assumptions: degenerate (1), primes,
+    /// one-off-tile-boundary (63/65/127/129/257), exact tile multiples, extreme
+    /// aspect ratios, and the split-K trigger region. Every output buffer is
+    /// pre-seeded with a huge sentinel so any tile the kernel fails to write is
+    /// caught rather than silently reading as a plausible number. Accumulating
+    /// paths are seeded with a known addend and checked for C0 + A@B.
+    #[test]
+    fn gemm_adversarial_shape_sweep() {
+        use crate::runtime::PrecisionMode;
+        let rt = GpuRuntime::new().expect("GpuRuntime");
+        if !rt.has_tensorops() {
+            eprintln!("skip: metallib has no TensorOps");
+            return;
+        }
+        const SENTINEL: f32 = 1.0e30;
+        // (M, N, K)
+        let shapes: &[(usize, usize, usize)] = &[
+            (1, 1, 1),
+            (1, 1, 512),
+            (1, 384, 256),
+            (384, 1, 256),
+            (3, 5, 7),
+            (31, 33, 65),
+            (63, 65, 127),
+            (127, 129, 33),
+            (128, 128, 256),
+            (129, 65, 257),
+            (200, 100, 300),
+            (255, 257, 129),
+            (65, 512, 33),
+            (128, 128, 2048),   // split-K trigger region
+            (384, 128, 2304),   // split-K trigger region
+            (128, 128, 520),    // K >= COOP_MIN_K but K % BKC != 0 -> blocked fallback
+            (128, 128, 512),    // exactly COOP_MIN_K -> cooperative path
+            (128, 128, 384),    // just under COOP_MIN_K -> blocked path
+            (192, 64, 1152),    // M%64==0 but M%128!=0: bf16 coop fires, relaxed
+                                // falls back — the two NN tiles differ and a
+                                // gate that used the wrong one would corrupt here
+            (256, 192, 768),    // both NN coop kernels fire; N not a tile multiple of 128
+            (128, 192, 1152),   // relaxed coop at a real mlp K
+            (256, 128, 640),    // K % 128 == 0 but K % 256 != 0. If either coop
+                                // kernel's BKC were 256, its `k + BKC <= K` loop
+                                // would silently drop the last 128 of K while the
+                                // host gate still admitted the shape.
+            (128, 64, 4096),    // long K, both coop paths, many blocks
+        ];
+        let val = |i: usize, salt: usize| -> f32 {
+            (((i * 2654435761 + salt * 40503) % 1021) as f32 - 510.0) / 512.0
+        };
+
+        let mut checked = 0usize;
+        for &(m, n, k) in shapes {
+            let a_nn: Vec<f32> = (0..m * k).map(|i| val(i, 1)).collect();
+            let b_nn: Vec<f32> = (0..k * n).map(|i| val(i, 2)).collect();
+            // Reference in f64 from the NN orientation; TN/NT feed transposed
+            // storage of the same logical matrices so the reference is shared.
+            let mut refv = vec![0f64; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0f64;
+                    for kk in 0..k {
+                        acc += a_nn[i * k + kk] as f64 * b_nn[kk * n + j] as f64;
+                    }
+                    refv[i * n + j] = acc;
+                }
+            }
+            let refmax = refv.iter().fold(0f64, |a, x| a.max(x.abs())).max(1e-30);
+
+            // Storage variants of the same logical A/B.
+            let a_km: Vec<f32> = (0..k * m).map(|idx| a_nn[(idx % m) * k + idx / m]).collect();
+            let b_nk: Vec<f32> = (0..n * k).map(|idx| b_nn[(idx % k) * n + idx / k]).collect();
+
+            let mk = |shape: &[usize], host: &[f32]| {
+                let t = rt.alloc_tensor_f32(shape).unwrap();
+                t.buffer.write_f32(host);
+                t
+            };
+
+            // (label, needs_bf16, relaxed, run)
+            for &(label, bf16, relaxed) in &[
+                ("NN f32", false, false),
+                ("NN relaxed", false, true),
+                ("NN bf16", true, false),
+                ("TN f32", false, false),
+                ("TN bf16", true, false),
+                ("NT f32", false, false),
+                ("NT bf16", true, false),
+                ("TNacc bf16", true, false),
+                ("NTacc bf16", true, false),
+            ] {
+                rt.set_precision(if bf16 { PrecisionMode::Bf16 } else { PrecisionMode::F32 });
+                rt.set_relaxed_precision(relaxed);
+
+                let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+                let accum = label.contains("acc");
+                let c0: Vec<f32> = if accum {
+                    (0..m * n).map(|i| val(i, 9)).collect()
+                } else {
+                    vec![SENTINEL; m * n]
+                };
+                c.buffer.write_f32(&c0);
+
+                let res = if label.starts_with("NN") {
+                    let a = mk(&[m, k], &a_nn);
+                    let b = mk(&[k, n], &b_nn);
+                    if bf16 {
+                        let (ab, bb) = (cast_f32_to_bf16(&a).unwrap(), cast_f32_to_bf16(&b).unwrap());
+                        gemm(&ab, &bb, &c, GemmBackend::TensorOps)
+                    } else {
+                        gemm(&a, &b, &c, GemmBackend::TensorOps)
+                    }
+                } else if label.starts_with("TNacc") {
+                    let (a, b) = (mk(&[k, m], &a_km), mk(&[k, n], &b_nn));
+                    gemm_tn_accum_train(&a, &b, &c, GemmBackend::TensorOps)
+                } else if label.starts_with("NTacc") {
+                    let (a, b) = (mk(&[m, k], &a_nn), mk(&[n, k], &b_nk));
+                    gemm_nt_accum_train(&a, &b, &c, GemmBackend::TensorOps)
+                } else if label.starts_with("TN") {
+                    let (a, b) = (mk(&[k, m], &a_km), mk(&[k, n], &b_nn));
+                    if bf16 { gemm_tn_train(&a, &b, &c, GemmBackend::TensorOps) }
+                    else { gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps) }
+                } else {
+                    let (a, b) = (mk(&[m, k], &a_nn), mk(&[n, k], &b_nk));
+                    if bf16 { gemm_nt_train(&a, &b, &c, GemmBackend::TensorOps) }
+                    else { gemm_nt_f32(&a, &b, &c, GemmBackend::TensorOps) }
+                };
+                if let Err(e) = res {
+                    panic!("{label} {m}x{n}x{k} dispatch failed: {e}");
+                }
+                rt.synchronize().unwrap();
+                let got = c.buffer.read_f32()[..m * n].to_vec();
+
+                let tol = if bf16 { 6e-2 } else if relaxed { 1e-2 } else { 1e-4 };
+                for i in 0..m * n {
+                    let want = refv[i] + if accum { c0[i] as f64 } else { 0.0 };
+                    assert!(
+                        got[i].is_finite() && got[i] != SENTINEL,
+                        "{label} {m}x{n}x{k}: C[{i}] = {} — tile never written",
+                        got[i]
+                    );
+                    let rel = (got[i] as f64 - want).abs() / refmax;
+                    assert!(
+                        rel < tol,
+                        "{label} {m}x{n}x{k}: C[{i}] rel err {rel:.3e} (got {}, want {want})",
+                        got[i]
+                    );
+                }
+                checked += 1;
+            }
+        }
+        rt.set_precision(PrecisionMode::F32);
+        rt.set_relaxed_precision(false);
+        eprintln!("adversarial sweep: {checked} (path, shape) combinations verified");
+    }
+
+    /// Plain TN/NT GEMMs are single-shot `mode::multiply`, so the host skips
+    /// `zero_f32(C)`. The tile ladder that justified this only ran exactly
+    /// divisible shapes, so this deliberately uses ragged M/N to exercise the
+    /// out-of-bounds slice path, with garbage in C. bf16 and exact-f32, TN and NT.
+    #[test]
+    fn tn_nt_gemm_overwrites_ragged_c_without_prezero() {
+        use crate::runtime::PrecisionMode;
+        let rt = GpuRuntime::new().expect("GpuRuntime");
+        if !rt.has_tensorops() {
+            eprintln!("skip: metallib has no TensorOps");
+            return;
+        }
+        let (m, n, k) = (200usize, 100usize, 300usize);
+        let ah: Vec<f32> = (0..k * m.max(n) * 2).map(|i| ((i % 17) as f32 - 8.0) / 32.0).collect();
+        let bh: Vec<f32> = (0..k * m.max(n) * 2).map(|i| ((i % 13) as f32 - 6.0) / 32.0).collect();
+
+        for &bf16 in &[false, true] {
+            rt.set_precision(if bf16 { PrecisionMode::Bf16 } else { PrecisionMode::F32 });
+            for &tn in &[true, false] {
+                let ash = if tn { vec![k, m] } else { vec![m, k] };
+                let bsh = if tn { vec![k, n] } else { vec![n, k] };
+                let a = rt.alloc_tensor_f32(&ash).unwrap();
+                let b = rt.alloc_tensor_f32(&bsh).unwrap();
+                a.buffer.write_f32(&ah[..ash[0] * ash[1]]);
+                b.buffer.write_f32(&bh[..bsh[0] * bsh[1]]);
+
+                let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+                c.buffer.write_f32(&vec![1.0e30f32; m * n]);
+                match (tn, bf16) {
+                    (true, true) => gemm_tn_train(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
+                    (true, false) => gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
+                    (false, true) => gemm_nt_train(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
+                    (false, false) => gemm_nt_f32(&a, &b, &c, GemmBackend::TensorOps).unwrap(),
+                }
+                rt.synchronize().unwrap();
+                let got = c.buffer.read_f32()[..m * n].to_vec();
+
+                let mut worst = 0f64;
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut acc = 0f64;
+                        for kk in 0..k {
+                            let av = if tn { ah[kk * m + i] } else { ah[i * k + kk] };
+                            let bv = if tn { bh[kk * n + j] } else { bh[j * k + kk] };
+                            acc += av as f64 * bv as f64;
+                        }
+                        assert!(got[i * n + j].is_finite(),
+                            "{} {} C[{i},{j}] not finite — stale value survived a ragged tile",
+                            if tn { "TN" } else { "NT" }, if bf16 { "bf16" } else { "f32" });
+                        worst = worst.max((got[i * n + j] as f64 - acc).abs());
+                    }
+                }
+                let tol = if bf16 { 1e-1 } else { 1e-2 };
+                assert!(worst < tol, "{} {} ragged max abs err {worst:.3e} — C was not fully overwritten",
+                    if tn { "TN" } else { "NT" }, if bf16 { "bf16" } else { "f32" });
+            }
+        }
+        rt.set_precision(PrecisionMode::F32);
+    }
+
+    /// The NN bf16 GEMM skips the host `zero_f32(C)` pre-pass because its first
+    /// K block uses `mode::multiply`. If that regresses to `multiply_accumulate`
+    /// (or the kernel's SM/SN desyncs from TILE_BF16_NN, leaving tiles
+    /// unwritten), stale C survives — so seed C with garbage and require an
+    /// exact-overwrite result.
+    #[test]
+    fn bf16_gemm_nn_overwrites_c_without_prezero() {
+        let rt = GpuRuntime::new().expect("GpuRuntime");
+        if !rt.has_tensorops() {
+            eprintln!("skip: metallib has no TensorOps");
+            return;
+        }
+        // K > BK(256) so the blocked accumulate path runs; non-square so a
+        // tiles_n/tiles_m mixup cannot alias into a passing result.
+        let (m, n, k) = (256usize, 128usize, 512usize);
+        let a = rt.alloc_tensor_f32(&[m, k]).unwrap();
+        let b = rt.alloc_tensor_f32(&[k, n]).unwrap();
+        let ah: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) / 32.0).collect();
+        let bh: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 - 6.0) / 32.0).collect();
+        a.buffer.write_f32(&ah);
+        b.buffer.write_f32(&bh);
+        let a_bf = cast_f32_to_bf16(&a).unwrap();
+        let b_bf = cast_f32_to_bf16(&b).unwrap();
+
+        let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+        c.buffer.write_f32(&vec![1.0e30f32; m * n]); // garbage a zero-pass would hide
+        gemm(&a_bf, &b_bf, &c, GemmBackend::TensorOps).unwrap();
+        rt.synchronize().unwrap();
+        let got = c.buffer.read_f32()[..m * n].to_vec();
+
+        let round = |x: &f32| crate::tensor::bf16_bits_to_f32(crate::tensor::f32_to_bf16_bits(*x));
+        let abf: Vec<f32> = ah.iter().map(round).collect();
+        let bbf: Vec<f32> = bh.iter().map(round).collect();
+        let mut worst = 0f64;
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0f64;
+                for kk in 0..k {
+                    acc += abf[i * k + kk] as f64 * bbf[kk * n + j] as f64;
+                }
+                assert!(got[i * n + j].is_finite(), "C[{i},{j}] not finite — stale value survived");
+                worst = worst.max((got[i * n + j] as f64 - acc).abs());
+            }
+        }
+        assert!(worst < 1e-2, "bf16 NN GEMM max abs err {worst:.3e} — C was not fully overwritten");
     }
 
     #[test]
@@ -1273,104 +1942,236 @@ mod tests {
 mod contract_tests {
     use super::*;
 
+    #[test]
+    fn stress_seeded_shapes_precision_transposes_and_guards() {
+        let rt = GpuRuntime::new().unwrap();
+        assert!(rt.has_tensorops(), "stress requires TensorOps, no capability skip");
+        rt.set_async_encode(true).unwrap();
+        let edges = [1, 3, 7, 8, 15, 16, 17, 31, 32, 33, 63, 65];
+        let mut seed = 0x42ab_19d3u32;
+        let mut random = || {
+            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+            ((seed % 17) as f32 - 8.0) / 32.0
+        };
+        let mut cases = 0;
+        for case in 0..24 {
+            let (m, n, k) = (edges[case % 12], edges[(case * 5 + 3) % 12],
+                if case < 12 { edges[(case * 7 + 1) % 12] } else { 257 });
+            for backend in [GemmBackend::Simdgroup, GemmBackend::TensorOps] {
+                for precision in [PrecisionMode::F32, PrecisionMode::Bf16] {
+                    rt.set_precision(precision);
+                    for transpose in 0..3 {
+                        let ashape = if transpose == 1 { [k, m] } else { [m, k] };
+                        let bshape = if transpose == 2 { [n, k] } else { [k, n] };
+                        let av: Vec<f32> = (0..m*k).map(|_| random()).collect();
+                        let bv: Vec<f32> = (0..k*n).map(|_| random()).collect();
+                        let a = rt.alloc_tensor_f32(&ashape).unwrap();
+                        let b = rt.alloc_tensor_f32(&bshape).unwrap();
+                        let bank = rt.alloc_tensor_f32(&[m*n+8]).unwrap();
+                        a.buffer.write_f32(&av); b.buffer.write_f32(&bv);
+                        let mut poison = vec![f32::NAN; m*n+8];
+                        poison[..4].fill(-777.0); poison[m*n+4..].fill(777.0);
+                        bank.buffer.write_f32(&poison);
+                        let c = bank.view(&[m,n],4);
+                        let launch = match transpose { 0 => gemm_train, 1 => gemm_tn_train,
+                            _ => gemm_nt_train };
+                        launch(&a,&b,&c,backend).unwrap();
+                        let got = bank.buffer.read_f32();
+                        assert_eq!(&got[..4], &[-777.0;4]);
+                        assert_eq!(&got[m*n+4..], &[777.0;4]);
+                        for row in 0..m { for col in 0..n {
+                            let expected: f64 = (0..k).map(|p| {
+                                f64::from(av[if transpose==1 {p*m+row} else {row*k+p}]) *
+                                f64::from(bv[if transpose==2 {col*k+p} else {p*n+col}])
+                            }).sum();
+                            let actual = got[4+row*n+col];
+                            assert!(actual.is_finite() && (f64::from(actual)-expected).abs()<1e-4,
+                                "case={case} shape={m}x{n}x{k} transpose={transpose} {backend:?} {precision:?}: {actual} vs {expected}");
+                        }}
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 288);
+        eprintln!("STRESS_GEMM cases={cases} seed=0x42ab19d3");
+    }
+
     type Launch = fn(&Tensor, &Tensor, &Tensor, GemmBackend) -> Result<(), String>;
     const LAUNCHES: &[Launch] = &[
-        gemm, gemm_train, gemm_tn_f32, gemm_nt_f32, gemm_tn_train,
-        gemm_nt_train, gemm_tn_accum_train, gemm_nt_accum_train,
+        gemm,
+        gemm_train,
+        gemm_tn_f32,
+        gemm_nt_f32,
+        gemm_tn_train,
+        gemm_nt_train,
+        gemm_tn_accum_train,
+        gemm_nt_accum_train,
     ];
+
+    /// Isolate the removed clear with alternating paired measurements on one build.
+    #[test]
+    #[ignore = "manual wall-clock benchmark; run alone on an idle GPU"]
+    fn benchmark_simdgroup_zero_cost() {
+        use std::time::Instant;
+        let rt = GpuRuntime::new().unwrap();
+        for d in [16, 128, 512] {
+            let a = rt.alloc_tensor_f32(&[d, d]).unwrap();
+            let b = rt.alloc_tensor_f32(&[d, d]).unwrap();
+            let c = rt.alloc_tensor_f32(&[d, d]).unwrap();
+            a.buffer.write_f32(&vec![0.125; d * d]);
+            b.buffer.write_f32(&vec![0.125; d * d]);
+            let zero = rt.pipeline("zero_f32").unwrap();
+            let run = |clear: bool| {
+                if clear {
+                    crate::dispatch::dispatch_1d(&rt, &zero, d * d, |bnd| {
+                        crate::dispatch::set_tensor(bnd, &c, 0);
+                        crate::dispatch::set_u32(bnd, (d * d) as u32, 1);
+                    })
+                    .unwrap();
+                }
+                gemm(&a, &b, &c, GemmBackend::Simdgroup).unwrap();
+                rt.synchronize().unwrap();
+            };
+            for _ in 0..10 {
+                run(true);
+                run(false);
+            }
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            for i in 0..100 {
+                for clear in if i % 2 == 0 {
+                    [true, false]
+                } else {
+                    [false, true]
+                } {
+                    let start = Instant::now();
+                    run(clear);
+                    let us = start.elapsed().as_secs_f64() * 1e6;
+                    if clear {
+                        before.push(us)
+                    } else {
+                        after.push(us)
+                    };
+                }
+            }
+            assert!(c.buffer.read_f32().iter().all(|&x| x == d as f32 / 64.0));
+            before.sort_by(f64::total_cmp);
+            after.sort_by(f64::total_cmp);
+            let old = (before[49] + before[50]) * 0.5;
+            let new = (after[49] + after[50]) * 0.5;
+            eprintln!("SIMDGROUP_AB d={d} samples=100 clear_us={old:.3} overwrite_us={new:.3} speedup={:.3}",old/new);
+        }
+    }
 
     #[test]
     fn rejects_invalid_metadata_and_mixed_runtimes() {
         let rt = GpuRuntime::new().unwrap();
         let other = GpuRuntime::new().unwrap();
-        let a = rt.alloc_tensor_f32(&[16,16]).unwrap();
-        let b = rt.alloc_tensor_f32(&[16,16]).unwrap();
-        let c = rt.alloc_tensor_f32(&[16,16]).unwrap();
-        let foreign = other.alloc_tensor_f32(&[16,16]).unwrap();
+        let a = rt.alloc_tensor_f32(&[16, 16]).unwrap();
+        let b = rt.alloc_tensor_f32(&[16, 16]).unwrap();
+        let c = rt.alloc_tensor_f32(&[16, 16]).unwrap();
+        let foreign = other.alloc_tensor_f32(&[16, 16]).unwrap();
         let mut cases = Vec::new();
         for (shape, offset, dtype) in [
-            (vec![0,16],0,DType::F32), (vec![16,16],1,DType::F32),
-            (vec![16,16],4,DType::F32), (vec![usize::MAX,usize::MAX],0,DType::F32),
-            (vec![16,16],0,DType::BF16), (vec![16,15],0,DType::F32),
+            (vec![0, 16], 0, DType::F32),
+            (vec![16, 16], 1, DType::F32),
+            (vec![16, 16], 4, DType::F32),
+            (vec![usize::MAX, usize::MAX], 0, DType::F32),
+            (vec![16, 16], 0, DType::BF16),
+            (vec![16, 15], 0, DType::F32),
         ] {
             let mut bad = c.clone();
-            bad.shape = shape; bad.byte_offset = offset; bad.dtype = dtype;
+            bad.shape = shape;
+            bad.byte_offset = offset;
+            bad.dtype = dtype;
             cases.push(bad);
         }
         for precision in [PrecisionMode::F32, PrecisionMode::Bf16] {
             rt.set_precision(precision);
             for launch in LAUNCHES {
                 for bad in &cases {
-                    assert!(launch(&a,&b,bad,GemmBackend::TensorOps).is_err());
+                    assert!(launch(&a, &b, bad, GemmBackend::TensorOps).is_err());
                 }
-                assert!(launch(&a,&foreign,&c,GemmBackend::TensorOps).is_err());
+                assert!(launch(&a, &foreign, &c, GemmBackend::TensorOps).is_err());
                 // A mismatched inner dimension must fail before any bf16 cast.
-                let bad_b = b.view(&[16,15], 0);
-                assert!(launch(&a,&bad_b,&c,GemmBackend::TensorOps).is_err());
+                let bad_b = b.view(&[16, 15], 0);
+                assert!(launch(&a, &bad_b, &c, GemmBackend::TensorOps).is_err());
             }
         }
-        assert_eq!(rt.take_dispatch_count(),0);
+        assert_eq!(rt.take_dispatch_count(), 0);
     }
 
     #[test]
     fn disjoint_bank_views_work_and_overlap_is_rejected() {
         let rt = GpuRuntime::new().unwrap();
-        let bank = rt.alloc_tensor_f32(&[3*256]).unwrap();
-        bank.buffer.write_f32(&vec![1.0;3*256]);
-        let a = bank.view(&[16,16],0);
-        let b = bank.view(&[16,16],256);
-        let c = bank.view(&[16,16],512);
+        let bank = rt.alloc_tensor_f32(&[3 * 256]).unwrap();
+        bank.buffer.write_f32(&vec![1.0; 3 * 256]);
+        let a = bank.view(&[16, 16], 0);
+        let b = bank.view(&[16, 16], 256);
+        let c = bank.view(&[16, 16], 512);
         for launch in LAUNCHES {
-            let overlap = bank.view(&[16,16],128);
-            assert!(launch(&a,&b,&overlap,GemmBackend::TensorOps).is_err());
+            let overlap = bank.view(&[16, 16], 128);
+            assert!(launch(&a, &b, &overlap, GemmBackend::TensorOps).is_err());
         }
         rt.take_dispatch_count();
-        gemm(&a,&b,&c,GemmBackend::Simdgroup).unwrap();
+        gemm(&a, &b, &c, GemmBackend::Simdgroup).unwrap();
         rt.synchronize().unwrap();
-        assert_eq!(rt.take_dispatch_count(),1, "simdgroup must not pre-zero C");
+        assert_eq!(rt.take_dispatch_count(), 1, "simdgroup must not pre-zero C");
         let got = bank.buffer.read_f32();
-        assert!(got[..512].iter().all(|&x| x==1.0));
-        assert!(got[512..].iter().all(|&x| x==16.0));
+        assert!(got[..512].iter().all(|&x| x == 1.0));
+        assert!(got[512..].iter().all(|&x| x == 16.0));
     }
 
     #[test]
     fn transpose_edges_precision_and_accumulation() {
         let rt = GpuRuntime::new().unwrap();
-        assert!(rt.has_tensorops(), "TensorOps coverage requires the actual metallib");
-        for (m,n,k) in [(1,3,1),(17,31,9),(33,65,129),(17,31,2049)] {
+        assert!(
+            rt.has_tensorops(),
+            "TensorOps coverage requires the actual metallib"
+        );
+        for (m, n, k) in [(1, 3, 1), (17, 31, 9), (33, 65, 129), (17, 31, 2049)] {
             for backend in [GemmBackend::Simdgroup, GemmBackend::TensorOps] {
                 for precision in [PrecisionMode::F32, PrecisionMode::Bf16] {
                     rt.set_precision(precision);
-                    for (tn, accum) in [(true,false),(false,false),(true,true),(false,true)] {
-                        let ashape = if tn { [k,m] } else { [m,k] };
-                        let bshape = if tn { [k,n] } else { [n,k] };
-                        let av: Vec<f32> = (0..m*k).map(|i| (i%13) as f32/16.0-0.25).collect();
-                        let bv: Vec<f32> = (0..n*k).map(|i| (i%7) as f32/16.0-0.125).collect();
+                    for (tn, accum) in [(true, false), (false, false), (true, true), (false, true)]
+                    {
+                        let ashape = if tn { [k, m] } else { [m, k] };
+                        let bshape = if tn { [k, n] } else { [n, k] };
+                        let av: Vec<f32> =
+                            (0..m * k).map(|i| (i % 13) as f32 / 16.0 - 0.25).collect();
+                        let bv: Vec<f32> =
+                            (0..n * k).map(|i| (i % 7) as f32 / 16.0 - 0.125).collect();
                         let a = rt.alloc_tensor_f32(&ashape).unwrap();
                         let b = rt.alloc_tensor_f32(&bshape).unwrap();
-                        let bank = rt.alloc_tensor_f32(&[m*n+8]).unwrap();
-                        a.buffer.write_f32(&av); b.buffer.write_f32(&bv);
-                        bank.buffer.write_f32(&vec![2.0;m*n+8]);
-                        let c = bank.view(&[m,n],4);
-                        let launch: Launch = match (tn,accum) {
-                            (true,false)=>gemm_tn_train, (false,false)=>gemm_nt_train,
-                            (true,true)=>gemm_tn_accum_train, (false,true)=>gemm_nt_accum_train,
+                        let bank = rt.alloc_tensor_f32(&[m * n + 8]).unwrap();
+                        a.buffer.write_f32(&av);
+                        b.buffer.write_f32(&bv);
+                        bank.buffer.write_f32(&vec![2.0; m * n + 8]);
+                        let c = bank.view(&[m, n], 4);
+                        let launch: Launch = match (tn, accum) {
+                            (true, false) => gemm_tn_train,
+                            (false, false) => gemm_nt_train,
+                            (true, true) => gemm_tn_accum_train,
+                            (false, true) => gemm_nt_accum_train,
                         };
-                        launch(&a,&b,&c,backend).unwrap();
+                        launch(&a, &b, &c, backend).unwrap();
                         rt.synchronize().unwrap();
                         let got = bank.buffer.read_f32();
-                        assert_eq!(&got[..4],&[2.0;4]);
-                        assert_eq!(&got[m*n+4..],&[2.0;4]);
-                        for row in 0..m { for col in 0..n {
-                            let mut expected = if accum {2.0} else {0.0};
-                            for p in 0..k {
-                                expected += av[if tn {p*m+row} else {row*k+p}]
-                                    *bv[if tn {p*n+col} else {col*k+p}];
-                            }
-                            let x=got[4+row*n+col];
-                            assert!(x.is_finite() && (x-expected).abs()<1e-4,
+                        assert_eq!(&got[..4], &[2.0; 4]);
+                        assert_eq!(&got[m * n + 4..], &[2.0; 4]);
+                        for row in 0..m {
+                            for col in 0..n {
+                                let mut expected = if accum { 2.0 } else { 0.0 };
+                                for p in 0..k {
+                                    expected += av[if tn { p * m + row } else { row * k + p }]
+                                        * bv[if tn { p * n + col } else { col * k + p }];
+                                }
+                                let x = got[4 + row * n + col];
+                                assert!(x.is_finite() && (x-expected).abs()<1e-4,
                                 "{m}x{n}x{k} {backend:?} {precision:?} TN={tn} accum={accum}: {x} vs {expected}");
-                        }}
+                            }
+                        }
                     }
                 }
             }
@@ -1380,10 +2181,11 @@ mod contract_tests {
     #[test]
     fn casts_reject_dtype_and_shape_before_encoding() {
         let rt = GpuRuntime::new().unwrap();
-        let a = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let a = rt.alloc_tensor_f32(&[16, 16]).unwrap();
         let b = rt.alloc_tensor_bf16(&[256]).unwrap();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-            cast_f32_to_bf16_into(&a, &b)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cast_f32_to_bf16_into(&a, &b)
+        }));
         assert!(result.is_ok(), "cast Result API panicked");
         assert!(result.unwrap().is_err());
         assert!(cast_bf16_to_f32(&a).is_err());
@@ -1394,15 +2196,16 @@ mod contract_tests {
     #[test]
     fn rejects_bad_rank_without_panicking_or_encoding() {
         let rt = GpuRuntime::new().unwrap();
-        let a = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let a = rt.alloc_tensor_f32(&[16, 16]).unwrap();
         let b = a.deep_copy().unwrap();
         let c = a.deep_copy().unwrap();
         rt.synchronize().unwrap();
         let bad = a.view(&[256], 0);
         for launch in LAUNCHES {
             rt.take_dispatch_count();
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
-                launch(&bad, &b, &c, GemmBackend::TensorOps)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                launch(&bad, &b, &c, GemmBackend::TensorOps)
+            }));
             assert!(result.is_ok(), "public Result API panicked");
             assert!(result.unwrap().is_err(), "invalid rank accepted");
             assert_eq!(rt.take_dispatch_count(), 0);
@@ -1412,8 +2215,8 @@ mod contract_tests {
     #[test]
     fn rejects_output_alias_before_encoding() {
         let rt = GpuRuntime::new().unwrap();
-        let a = rt.alloc_tensor_f32(&[16,16]).unwrap();
-        let b = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let a = rt.alloc_tensor_f32(&[16, 16]).unwrap();
+        let b = rt.alloc_tensor_f32(&[16, 16]).unwrap();
         for launch in LAUNCHES {
             rt.take_dispatch_count();
             assert!(launch(&a, &b, &a, GemmBackend::TensorOps).is_err());
@@ -1424,9 +2227,9 @@ mod contract_tests {
     #[test]
     fn rejects_wrong_dtype_on_transpose_paths() {
         let rt = GpuRuntime::new().unwrap();
-        let mut a = rt.alloc_tensor_f32(&[16,16]).unwrap();
-        let b = rt.alloc_tensor_f32(&[16,16]).unwrap();
-        let c = rt.alloc_tensor_f32(&[16,16]).unwrap();
+        let mut a = rt.alloc_tensor_f32(&[16, 16]).unwrap();
+        let b = rt.alloc_tensor_f32(&[16, 16]).unwrap();
+        let c = rt.alloc_tensor_f32(&[16, 16]).unwrap();
         a.dtype = DType::BF16; // backing allocation remains large enough for old buggy path
         assert!(gemm_tn_f32(&a, &b, &c, GemmBackend::TensorOps).is_err());
         assert!(gemm_nt_f32(&a, &b, &c, GemmBackend::TensorOps).is_err());
@@ -1435,27 +2238,36 @@ mod contract_tests {
     #[test]
     fn simdgroup_edges_and_offset_guards() {
         let rt = GpuRuntime::new().unwrap();
-        for (m,n,k) in [(1,1,1),(7,9,3),(16,16,16),(17,31,9),(33,65,129)] {
-            let av: Vec<f32> = (0..m*k).map(|i| (i%13) as f32 / 16.0 - 0.25).collect();
-            let bv: Vec<f32> = (0..k*n).map(|i| (i%7) as f32 / 16.0 - 0.125).collect();
-            let a = rt.alloc_tensor_f32(&[m,k]).unwrap();
-            let b = rt.alloc_tensor_f32(&[k,n]).unwrap();
-            let bank = rt.alloc_tensor_f32(&[m*n+8]).unwrap();
+        for (m, n, k) in [
+            (1, 1, 1),
+            (7, 9, 3),
+            (16, 16, 16),
+            (17, 31, 9),
+            (33, 65, 129),
+        ] {
+            let av: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 / 16.0 - 0.25).collect();
+            let bv: Vec<f32> = (0..k * n).map(|i| (i % 7) as f32 / 16.0 - 0.125).collect();
+            let a = rt.alloc_tensor_f32(&[m, k]).unwrap();
+            let b = rt.alloc_tensor_f32(&[k, n]).unwrap();
+            let bank = rt.alloc_tensor_f32(&[m * n + 8]).unwrap();
             a.buffer.write_f32(&av);
             b.buffer.write_f32(&bv);
-            let mut poisoned = vec![f32::NAN; m*n+8];
+            let mut poisoned = vec![f32::NAN; m * n + 8];
             poisoned[..4].fill(123.0);
-            poisoned[m*n+4..].fill(123.0);
+            poisoned[m * n + 4..].fill(123.0);
             bank.buffer.write_f32(&poisoned);
-            let c = bank.view(&[m,n], 4);
-            gemm(&a,&b,&c,GemmBackend::Simdgroup).unwrap();
+            let c = bank.view(&[m, n], 4);
+            gemm(&a, &b, &c, GemmBackend::Simdgroup).unwrap();
             rt.synchronize().unwrap();
             let got = bank.buffer.read_f32();
-            assert_eq!(&got[..4], &[123.0;4]);
-            assert_eq!(&got[m*n+4..], &[123.0;4]);
-            let expected = gemm_f32_cpu(&av,&bv,m,n,k);
-            for (x,y) in got[4..m*n+4].iter().zip(expected) {
-                assert!(x.is_finite() && (x-y).abs()<1e-4, "{m}x{n}x{k}: {x} vs {y}");
+            assert_eq!(&got[..4], &[123.0; 4]);
+            assert_eq!(&got[m * n + 4..], &[123.0; 4]);
+            let expected = gemm_f32_cpu(&av, &bv, m, n, k);
+            for (x, y) in got[4..m * n + 4].iter().zip(expected) {
+                assert!(
+                    x.is_finite() && (x - y).abs() < 1e-4,
+                    "{m}x{n}x{k}: {x} vs {y}"
+                );
             }
         }
     }

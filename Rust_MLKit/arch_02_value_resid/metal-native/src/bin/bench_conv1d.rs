@@ -1,7 +1,7 @@
 //! Isolated Mamba2 Conv1D forward timing (no full model overhead).
 
-use arch02_metal_native::mixers::mamba2_conv1d_fwd;
-use arch02_metal_native::runtime::GpuRuntime;
+use tessl_arch02::mixers::mamba2_conv1d_fwd;
+use tessl_arch02::runtime::GpuRuntime;
 use std::sync::Arc;
 use std::time::Instant;
 

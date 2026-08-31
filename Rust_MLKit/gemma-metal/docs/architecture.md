@@ -34,7 +34,7 @@ Both paths are **real FA-2 tiled kernels** (GPU-tested vs CPU causal refs; see [
 
 | Phase | Op | Where |
 |-------|-----|-------|
-| Prefill (M≫1) | TensorOps / simdgroup **GEMM** (± quant MTLTensor later) | `metal-runtime` |
+| Prefill (M≫1) | TensorOps / simdgroup **GEMM** (± quant MTLTensor later) | `tessl` |
 | Decode (M=1) | Dedicated **GEMV + inline dequant** | `gemma-metal` kernels |
 
 Do **not** drive decode through M=1 TensorOps 32×32 tiles — bandwidth-bound occupancy waste (BaseRT lesson). Prefill may try native quant MTLTensor (WWDC26-330); decode stays hand GEMV until proven otherwise.
@@ -82,11 +82,11 @@ Primary Mac speed lever after honest INT4 decode.
 
 ## Encode substrate
 
-`metal-runtime`: Metal 4-only CB/encoder, Hot/Cold residency, packed binder, const arena, GEMM, `softcap_f32`, MTLTensor prep hooks. Gemma overlay metallib compiled by `gemma-metal/build.rs`.
+`tessl`: Metal 4-only CB/encoder, Hot/Cold residency, packed binder, const arena, GEMM, `softcap_f32`, MTLTensor prep hooks. Gemma overlay metallib compiled by `gemma-metal/build.rs`.
 
 ```mermaid
 flowchart LR
-  rt[metal-runtime encode plus GEMM]
+  rt[tessl encode plus GEMM]
   banks[Q4 Hot banks plus PLE split]
   kv[Dual KV rings]
   gemv[GEMV decode]

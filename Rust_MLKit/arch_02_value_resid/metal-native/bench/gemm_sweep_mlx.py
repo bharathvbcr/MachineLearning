@@ -23,6 +23,20 @@ SHAPES = [
     (4096, 4096, 1024, "tall_k1024"),
 ]
 
+def shapes_from_env():
+    """BENCH_SHAPES="MxNxK,..." — same override the Rust lane honours, so both
+    lanes can be pointed at an identical diagnostic grid."""
+    import os
+    raw = os.environ.get("BENCH_SHAPES")
+    if not raw:
+        return None
+    out = []
+    for spec in filter(None, (x.strip() for x in raw.split(","))):
+        m, n, k = (int(v) for v in spec.split("x"))
+        out.append((m, n, k, f"{m}x{n}x{k}"))
+    return out
+
+
 def bench_mlx(shapes, warmup, iters, dtype="f32"):
     import mlx.core as mx
     mdt = {"f32": mx.float32, "bf16": mx.bfloat16}[dtype]
@@ -138,12 +152,13 @@ def main():
         return
 
     lanes = args.lanes.split(",")
+    shapes = shapes_from_env() or SHAPES
     rows = []
     for dt in args.dtypes.split(","):
         if "mlx" in lanes:
-            rows += bench_mlx(SHAPES, args.warmup, args.iters, dt)
+            rows += bench_mlx(shapes, args.warmup, args.iters, dt)
         if "torch" in lanes:
-            rows += bench_torch(SHAPES, args.warmup, args.iters, dt)
+            rows += bench_torch(shapes, args.warmup, args.iters, dt)
     out = json.dumps(rows, indent=2)
     if args.out:
         with open(args.out, "w") as f:

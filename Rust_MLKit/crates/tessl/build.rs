@@ -134,7 +134,13 @@ fn main() {
         air_files.push(air);
     }
 
-    let metallib_out = out_dir.join("default.metallib");
+    // Metal can retain file-backed library data after loading. Never relink a
+    // pathname baked into a prior binary: each build owns an immutable artifact.
+    let build_id = format!("{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch").as_nanos());
+    let metallib_out = out_dir.join(format!("default-{build_id}.metallib"));
+    fs::File::create_new(&metallib_out).expect("reserve unique metallib output");
     let mut link = Command::new(&metallib);
     for air in &air_files {
         link.arg(air);
@@ -142,8 +148,13 @@ fn main() {
     link.arg("-o").arg(&metallib_out);
     run(&mut link, "metallib link");
 
+    // Publish the offline compatibility copy without truncating an inode that
+    // an existing runtime may still use. Do not hide failed publication.
     let crate_copy = manifest_dir.join("default.metallib");
-    let _ = std::fs::copy(&metallib_out, &crate_copy);
+    let staged_copy = manifest_dir.join(format!(".default-{build_id}.metallib"));
+    fs::File::create_new(&staged_copy).expect("reserve offline metallib staging file");
+    fs::copy(&metallib_out, &staged_copy).expect("stage offline metallib");
+    fs::rename(&staged_copy, &crate_copy).expect("publish offline metallib");
 
     println!(
         "cargo:rustc-env=METAL_RUNTIME_METALLIB={}",

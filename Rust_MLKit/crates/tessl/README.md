@@ -5,7 +5,7 @@ Shared **Metal 4-only** encode substrate extracted from
 dragging training bwd / Muon / XSA / VE.
 
 **Training stays in metal-native.** Do not train models in this crate. Optional
-future: metal-native depends on metal-runtime for encode; today this is a
+future: metal-native depends on tessl for encode; today this is a
 **duplicate extract** (metal-native left intact).
 
 ## What was extracted
@@ -40,13 +40,13 @@ Kernels (AOT via `build.rs`): `matmul_tensorops.metal`, `matmul_simdgroup.metal`
 ## How to test
 
 ```bash
-cd Rust_MLKit/crates/metal-runtime
+cd Rust_MLKit/crates/tessl
 cargo test
 cargo test --release
 ```
 
 GPU tests need a Metal 4 capable Mac (macOS 26+). Metallib path:
-`metal_runtime::metallib_path()`.
+`tessl::metallib_path()`.
 
 ## Consumers
 

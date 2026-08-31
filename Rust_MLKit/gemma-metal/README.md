@@ -18,9 +18,9 @@ Product lane is **honest INT4 (+ MTP later)**, not challenge frontier PPL-burn.
 
 | Crate | Role |
 |-------|------|
-| [`../crates/metal-runtime/`](../crates/metal-runtime/) | Shared Metal 4 encode, residency, packed binder, TensorOps/simdgroup **GEMM** (prefill), util ops, MTLTensor prep |
+| [`../crates/tessl/`](../crates/tessl/) | Shared Metal 4 encode, residency, packed binder, TensorOps/simdgroup **GEMM** (prefill), util ops, MTLTensor prep |
 | **`gemma-metal`** (this crate) | Gemma graph: Q4 banks, PLE split, dual KV, decode **GEMV**, dual FA, tokenizer, benches |
-| `arch_02_value_resid/metal-native/` | **Training** stays here — do not train in gemma-metal / metal-runtime |
+| `arch_02_value_resid/metal-native/` | **Training** stays here — do not train in gemma-metal / tessl |
 
 Reuse the runtime substrate (~encode/GEMM). Do **not** drag bwd/Muon/XSA/VE or fork metal-native.
 
@@ -28,7 +28,7 @@ Reuse the runtime substrate (~encode/GEMM). Do **not** drag bwd/Muon/XSA/VE or f
 
 ```
 Rust_MLKit/
-  crates/metal-runtime/   # Phase 0b extract
+  crates/tessl/   # Phase 0b extract
   gemma-metal/            # this product crate
     src/                  # config … gpu_model, mtp, kernels, …
     src/bin/bench.rs      # Phase 4 speed harness
@@ -44,7 +44,7 @@ Rust_MLKit/
 | Phase | Plan | In tree |
 |-------|------|---------|
 | **0** Baselines + gates | Measure LiteRT/MLX/Ollama | **Done** — measured rows in [`docs/gates.md`](docs/gates.md) |
-| **0b** Extract `metal-runtime` | Encode + GEMM + MTLTensor hooks | **Done** |
+| **0b** Extract `tessl` | Encode + GEMM + MTLTensor hooks | **Done** |
 | **1** Scaffold | Q4 banks, PLE split, dual KV, tokenizer | **Done** |
 | **2** E4B hot kernels | Real GEMV / dual FA / PLE / MLP | **Done** |
 | **3** Parity | HF/MLX logits | **Partial** — synthetic host forward + JSON stubs; **no** real-weight HF/MLX logit parity |

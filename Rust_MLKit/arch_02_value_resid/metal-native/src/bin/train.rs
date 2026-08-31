@@ -16,30 +16,30 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use arch02_metal_native::bpb::{eval_sliding, TokenByteLut};
-use arch02_metal_native::checkpoint::{
+use tessl_arch02::bpb::{eval_sliding, TokenByteLut};
+use tessl_arch02::checkpoint::{
     collect_divergence_norms_device, load_optim_state_python_npy,
     read_training_checkpoint_meta, save_optim_state_python_npy,
     save_training_checkpoint, save_weights_python_npy, TrainingCheckpointMeta,
     CHECKPOINT_VERSION,
 };
-use arch02_metal_native::data::{load_shard, PrefetchLoader};
-use arch02_metal_native::init::{fineweb_token_skip, init_weights_seeded};
-use arch02_metal_native::log::{
+use tessl_arch02::data::{load_shard, PrefetchLoader};
+use tessl_arch02::init::{fineweb_token_skip, init_weights_seeded};
+use tessl_arch02::log::{
     mem_current_physical_mb, mem_rss_mb, MetricsLogger, Phase, Profiler, StepMetrics,
 };
-use arch02_metal_native::model_bwd::{backward_f32_opts_clip, Grads};
-use arch02_metal_native::model_fwd::{forward_f32_uploaded, DualInputBuffers};
-use arch02_metal_native::optim::{
+use tessl_arch02::model_bwd::{backward_f32_opts_clip, Grads};
+use tessl_arch02::model_fwd::{forward_f32_uploaded, DualInputBuffers};
+use tessl_arch02::optim::{
     copy_ema_into_weights, optim_step, zero_grads, ClipMode, LrSchedule, OptimHyperparams,
     OptimState,
 };
-use arch02_metal_native::OptimizerKind;
-use arch02_metal_native::parity::golden_dir;
-use arch02_metal_native::runtime::{GpuRuntime, PrecisionMode};
-use arch02_metal_native::research::{capture_weight_snapshot, collect_research_telemetry};
-use arch02_metal_native::tape::Tape;
-use arch02_metal_native::weights::{ModelConfig, Weights};
+use tessl_arch02::OptimizerKind;
+use tessl_arch02::parity::golden_dir;
+use tessl_arch02::runtime::{GpuRuntime, PrecisionMode};
+use tessl_arch02::research::{capture_weight_snapshot, collect_research_telemetry};
+use tessl_arch02::tape::Tape;
+use tessl_arch02::weights::{ModelConfig, Weights};
 
 fn arg(args: &[String], key: &str) -> Option<String> {
     args.iter()
@@ -253,9 +253,9 @@ fn main() -> Result<(), String> {
     
     if let Some(m) = arg(&args, "--mixer") {
         cfg.mixer = match m.as_str() {
-            "mingru" => arch02_metal_native::weights::MixerKind::MinGRU,
-            "mamba2" => arch02_metal_native::weights::MixerKind::Mamba2,
-            "attention" => arch02_metal_native::weights::MixerKind::Attention,
+            "mingru" => tessl_arch02::weights::MixerKind::MinGRU,
+            "mamba2" => tessl_arch02::weights::MixerKind::Mamba2,
+            "attention" => tessl_arch02::weights::MixerKind::Attention,
             _ => return Err(format!("Unknown mixer {}", m)),
         };
     }
@@ -264,14 +264,14 @@ fn main() -> Result<(), String> {
     }
     if let Some(spec) = arg(&args, "--layer-mixers") {
         if spec.trim().is_empty() {
-            cfg.layer_mixers = arch02_metal_native::weights::default_hybrid_pattern(cfg.num_layers);
+            cfg.layer_mixers = tessl_arch02::weights::default_hybrid_pattern(cfg.num_layers);
         } else {
             let kinds: Result<Vec<_>, _> = spec
                 .split(',')
-                .map(arch02_metal_native::weights::MixerKind::parse)
+                .map(tessl_arch02::weights::MixerKind::parse)
                 .collect();
             cfg.layer_mixers =
-                arch02_metal_native::weights::expand_layer_mixers(&kinds?, cfg.num_layers);
+                tessl_arch02::weights::expand_layer_mixers(&kinds?, cfg.num_layers);
         }
         eprintln!(
             "hybrid layer_mixers (L={}): {:?}",
@@ -391,7 +391,7 @@ fn main() -> Result<(), String> {
     eprintln!(
         "flash: FA-2 tiled online-softmax + L tape (bf16-input/f32-accum under \
          PrecisionMode::Bf16; TensorOps multi-block probe not default — DECISIONS M8){}",
-        if arch02_metal_native::ab_flags::fa_blocksoft() {
+        if tessl_arch02::ab_flags::fa_blocksoft() {
             "; FA_BLOCKSOFT=1 (blockwise rowmax+rescale Soft quality probe)"
         } else {
             ""
@@ -504,7 +504,7 @@ fn main() -> Result<(), String> {
         );
     } else if let Some(ref op) = load_optim {
         state.step = start_step;
-        arch02_metal_native::load_muon_momentum_python_npy(&rt, &mut state, op)?;
+        tessl_arch02::load_muon_momentum_python_npy(&rt, &mut state, op)?;
         eprintln!("load-optim={} (legacy Muon-only restore)", op.display());
     } else if start_step > 0 {
         state.step = start_step;
@@ -605,8 +605,8 @@ fn main() -> Result<(), String> {
         } else {
             // Cycle golden synthetic batches.
             let bi = step_i % 3;
-            let ids = arch02_metal_native::parity::load_input_ids(&golden, bi)?;
-            let tgts = arch02_metal_native::parity::load_target_ids(&golden, bi)?;
+            let ids = tessl_arch02::parity::load_input_ids(&golden, bi)?;
+            let tgts = tessl_arch02::parity::load_target_ids(&golden, bi)?;
             // Golden is B=16; if tok-mult>1, tile the batch.
             if w.cfg.batch > 16 {
                 let reps = w.cfg.batch / 16;
