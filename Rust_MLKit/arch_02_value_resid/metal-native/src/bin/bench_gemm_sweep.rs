@@ -25,8 +25,10 @@ const SHAPES: &[(usize, usize, usize, &str)] = &[
     (4096, 4096, 1024, "tall_k1024"),
 ];
 
-/// Deterministic fill, bit-identical to the Python lane's `fill(n, seed)`.
-/// LCG in u64, mapped to [-1, 1). Avoids trusting cross-language RNG parity.
+/// Deterministic LCG fill in u64, mapped to [-1, 1). The Python timing lanes
+/// use constant 0.5 operands instead — GEMM timing is data-independent, so the
+/// lanes only share data where it matters: the parity check reads A/B from the
+/// .npy files this binary dumps.
 fn fill(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
     let mut out = Vec::with_capacity(n);
@@ -107,10 +109,20 @@ fn main() -> Result<(), String> {
                 cast_f32_to_bf16(&a)?,
                 cast_f32_to_bf16(&b)?,
             ));
+            // tf32-class relaxed precision on f32 operands (opt-in --tf32 path).
+            lanes.push((
+                "tensorops-tf32".to_string(),
+                GemmBackend::TensorOps,
+                a.view(&[m, k], 0),
+                b.view(&[k, n], 0),
+            ));
         }
 
         for (bname, backend, la, lb) in &lanes {
             let (bname, backend) = (bname.as_str(), *backend);
+            // tf32 lane: same f32 operands, relaxed-precision kernels.
+            let relaxed = bname == "tensorops-tf32";
+            rt.set_relaxed_precision(relaxed);
             let samples = time_backend(&rt, la, lb, &c, backend, warmup, iters)?;
             let med = median(samples.clone());
             let best = samples.iter().cloned().fold(f64::INFINITY, f64::min);

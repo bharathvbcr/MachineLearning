@@ -783,6 +783,9 @@ mod tests {
     /// Mini DecodeIcb: `try_replay_icb` → `execute_icb` (opt-in; default OFF).
     #[test]
     fn decode_icb_mini_replay() {
+        // Serializes against every other test that touches the ICB globals and
+        // restores the flag (including read-env) on drop, panic included.
+        let _flags = crate::decode_icb::IcbFlagsTestGuard::lock();
         crate::set_decode_icb(true);
         let rt = crate::GpuRuntime::new().expect("runtime");
         let (dicb, out) = crate::DecodeIcb::mini_copy_chain(&rt, 32).expect("mini DecodeIcb");
@@ -820,6 +823,5 @@ mod tests {
         }
         assert_eq!(pp.icb_replays(), 2);
         eprintln!("decode_icb_mini_replay: {}", pp.status_line());
-        crate::set_decode_icb(false);
     }
 }

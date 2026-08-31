@@ -26,7 +26,15 @@ const VARIANTS: &[Variant] = &[
     Variant { kernel: "mm_bf16_64x64_bk256_sg4",      sm: 64, sn: 64, bk: 256, nsg: 4, needs_zero: false },
     Variant { kernel: "mm_bf16_128x64_bk256_sg8",     sm: 128, sn: 64, bk: 256, nsg: 8, needs_zero: false },
     Variant { kernel: "mm_bf16_128x128_bk256_sg4",    sm: 128, sn: 128, bk: 256, nsg: 4, needs_zero: false },
-]; 
+    // Cooperative destination tensor: register accumulator, C written once,
+    // single dynamic-K run. bk: 1 so the divisibility gate never skips on K.
+    Variant { kernel: "mm_bf16_coop_64x32_sg4",    sm: 64,  sn: 32,  bk: 1, nsg: 4, needs_zero: false },
+    Variant { kernel: "mm_bf16_coop_64x64_sg4",    sm: 64,  sn: 64,  bk: 1, nsg: 4, needs_zero: false },
+    Variant { kernel: "mm_bf16_coop_128x64_sg4",   sm: 128, sn: 64,  bk: 1, nsg: 4, needs_zero: false },
+    Variant { kernel: "mm_bf16_coop_128x64_sg8",   sm: 128, sn: 64,  bk: 1, nsg: 8, needs_zero: false },
+    Variant { kernel: "mm_bf16_coop_128x128_sg8",  sm: 128, sn: 128, bk: 1, nsg: 8, needs_zero: false },
+    Variant { kernel: "mm_bf16_coop_256x64_sg8",   sm: 256, sn: 64,  bk: 1, nsg: 8, needs_zero: false },
+];
 
 const SHAPES: &[(usize, usize, usize, &str)] = &[
     (2048, 2048, 2048, "square_2048"),
@@ -34,6 +42,11 @@ const SHAPES: &[(usize, usize, usize, &str)] = &[
     (8192, 3072, 768, "mlp_up"),
     (8192, 768, 3072, "mlp_down"),
     (4096, 4096, 1024, "tall_k1024"),
+    // Small / narrow shapes: do big tiles starve the grid?
+    (512, 512, 512, "square_512"),
+    (1024, 1024, 1024, "square_1024"),
+    (4096, 128, 2048, "narrow_n128"),
+    (1024, 256, 1024, "narrow_n256"),
 ];
 
 fn fill(n: usize, seed: u64) -> Vec<f32> {

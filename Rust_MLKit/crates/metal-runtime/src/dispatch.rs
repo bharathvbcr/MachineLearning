@@ -29,6 +29,10 @@ pub struct Binder<'a> {
     /// Pointer identity of the last adopted / latched argument table (skip redundant
     /// `setArgumentTable` when the same table is reused across tape cmds).
     last_arg_table_ptr: Option<usize>,
+    /// Auto-barrier mode latched for this binder scope. Reading the global once
+    /// at construction keeps every dispatch and explicit-barrier decision in one
+    /// scope consistent even if another thread changes the flag mid-encode.
+    skip_auto_barriers: bool,
 }
 
 impl<'a> Binder<'a> {
@@ -37,6 +41,7 @@ impl<'a> Binder<'a> {
         table: &'a ProtocolObject<dyn MTL4ArgumentTable>,
         const_staging: &'a ProtocolObject<dyn MTLBuffer>,
         const_cursor: &'a mut usize,
+        skip_auto_barriers: bool,
     ) -> Self {
         Self {
             enc,
@@ -46,7 +51,17 @@ impl<'a> Binder<'a> {
             last_pipeline: None,
             arg_table_latched: false,
             last_arg_table_ptr: None,
+            skip_auto_barriers,
         }
+    }
+
+    /// True when this scope skips the per-dispatch auto barrier, so packed
+    /// multi-dispatch ops must insert [`Self::barrier`] at their RAW edges.
+    /// Call sites must use this rather than re-reading the global flag — the
+    /// two can disagree while another thread toggles the flag.
+    #[inline]
+    pub fn needs_explicit_barriers(&self) -> bool {
+        self.skip_auto_barriers
     }
 
     /// Latch the persistent argument table onto the encoder (idempotent).
@@ -225,7 +240,7 @@ impl<'a> Binder<'a> {
         if crate::decode_icb::decode_icb_capture_active() {
             crate::decode_icb::capture_note_dispatch(threadgroups, threads_per_tg);
         }
-        if !crate::ab_flags::hazard_barriers() {
+        if !self.skip_auto_barriers {
             self.enc
                 .barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                     MTLStages::Dispatch,
@@ -292,7 +307,7 @@ impl<'a> Binder<'a> {
                 .executeCommandsInBuffer_withRange(icb, range);
         }
         crate::infer_trace::on_dispatch();
-        if !crate::ab_flags::hazard_barriers() {
+        if !self.skip_auto_barriers {
             self.enc
                 .barrierAfterEncoderStages_beforeEncoderStages_visibilityOptions(
                     MTLStages::Dispatch,
@@ -351,6 +366,10 @@ pub fn set_f32(bnd: &mut Binder<'_>, v: f32, index: usize) {
 }
 
 /// Dispatch `n` threads with automatic threadgroup sizing.
+///
+/// Callers bind `n as u32` for the kernels' `uint` element counts, so a count
+/// past `u32::MAX` would silently wrap to a partial pass — reject it here at
+/// the one seam every 1D op flows through.
 pub fn dispatch_1d(
     rt: &GpuRuntime,
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -359,6 +378,9 @@ pub fn dispatch_1d(
 ) -> Result<(), String> {
     if n == 0 {
         return Ok(());
+    }
+    if n > u32::MAX as usize {
+        return Err("dispatch_1d exceeds u32 kernel element indexing".into());
     }
     let width = pipeline.threadExecutionWidth() as usize;
     let tpt = width.min(n).max(1);
@@ -424,5 +446,17 @@ mod tests {
         for i in 0..n {
             assert_eq!(out[i], (i as f32) * 2.0);
         }
+    }
+
+    #[test]
+    fn dispatch_1d_rejects_u32_overflow_before_encoding() {
+        let rt = GpuRuntime::new().expect("runtime");
+        let pipe = rt.pipeline("copy_f32").unwrap();
+        rt.take_dispatch_count();
+        let result = dispatch_1d(&rt, &pipe, u32::MAX as usize + 1, |_| {
+            panic!("encode closure must not run for an oversized dispatch");
+        });
+        assert!(result.is_err(), "oversized dispatch_1d accepted");
+        assert_eq!(rt.take_dispatch_count(), 0);
     }
 }
