@@ -8,6 +8,21 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **Quantized int8 GEMM with fused dequantization**: `nn::gemm_i8_dequant`.
+  `int8 x int8` accumulates into `int32` natively on TensorOps, and every
+  product fits, so the integer result carries **no rounding at all** — tested by
+  exact equality against an integer reference, not a tolerance. The per-column
+  dequantization is applied in registers between the accumulate and the store.
+  `k` above 131072 is refused, past which a full-range accumulation could wrap
+  the int32 silently.
+- **Corrected a misdiagnosis this crate had been repeating.** Quantized
+  TensorOps was documented as blocked because `MTLTensorDataType::Int4` is
+  unbound in objc2-metal 0.3. That binding gates host-created `MTLTensor`
+  descriptors, and every kernel here builds tensors from raw device pointers
+  instead, so it never applied. TensorOps supports
+  `uint8_t/int8_t/uint4b_format/int4b_format` per the header's own diagnostic;
+  what actually blocks Int4 is the shader-side tensor constructor for a
+  sub-byte element type.
 - **Strided batched GEMM**: `gemm_batched` with `BatchedGemm` and
   `BatchStrides`. The batch is the grid's second dimension, so it costs a
   pointer offset per threadgroup and nothing else — every element is

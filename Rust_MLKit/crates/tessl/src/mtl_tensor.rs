@@ -39,9 +39,10 @@ impl QuantDType {
         match self {
             QuantDType::Int8 => Ok(MTLTensorDataType::Int8),
             QuantDType::Int4 => Err(
-                "NAX/TensorOps Q4 unbound: MTLTensorDataType Int4 not in objc2-metal 0.3 \
-                 (WWDC26-330). Decode stays on hand simdgroup Q4 GEMV/GEMM; do not claim \
-                 TensorOps Int4 is shipped. Await SDK / binding bump."
+                "MTLTensorDataType Int4 is not in objc2-metal 0.3 (WWDC26-330), so a \
+                 host-created Int4 MTLTensor cannot be described. Note this gates only \
+                 the host descriptor path: TensorOps itself accepts int4b_format, and \
+                 kernels building tensors from device pointers are unaffected."
                     .into(),
             ),
             QuantDType::Fp8E8M0 => Err(
@@ -87,19 +88,27 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
     }
 }
 
-/// Whether a quantized TensorOps prefill GEMM exists in this crate.
+/// Whether a quantized TensorOps prefill GEMM exists **through this module's
+/// host-side `MTLTensor` path**.
 ///
-/// It does not. There was a `try_quant_tensorops_prefill_gemm` whose entire
-/// body was `Err("not wired yet")`, with every parameter underscored, no
-/// caller, and no test — a function signature standing in for a design note.
-/// Callers planning around this read the flag; nothing is served by also
-/// offering them something to call that can only fail.
+/// It does not, and the distinction matters more than the flag. There was a
+/// `try_quant_tensorops_prefill_gemm` whose entire body was `Err`, with no
+/// caller and no test; it is gone.
 ///
-/// What is missing is upstream, not here: `MTLTensorDataType::Int4` is unbound
-/// in objc2-metal 0.3 (see [`QuantDType::to_mtl`]), so the dtype this path
-/// needs cannot be named yet. The rest of this module — [`GpuTensor`],
-/// [`alloc_device_tensor`], [`bind_mtl_tensor`] — is working code that will
-/// carry it when the binding lands.
+/// What was missing was misdiagnosed here for some time. The note used to say
+/// quantized TensorOps was blocked because `MTLTensorDataType::Int4` is unbound
+/// in objc2-metal 0.3. That binding gates *host-created* `MTLTensor`
+/// descriptors, which is what this module builds — and it is irrelevant to a
+/// kernel that constructs its tensors from raw device pointers, which is what
+/// every kernel in `kernels/` does.
+///
+/// So quantized TensorOps is **not** blocked in general:
+/// [`crate::nn::gemm_i8_dequant`] ships an `int8 x int8 -> int32` GEMM with the
+/// dequantization fused, needing nothing from this module. The header's own
+/// diagnostic lists the supported cooperative source types as
+/// `uint8_t/int8_t/uint4b_format/int4b_format/float/half/bfloat`, so Int4 is
+/// supported by TensorOps too; what is missing there is the shader-side tensor
+/// constructor for a sub-byte element type, not an objc2 binding.
 pub const QUANT_PREFILL_GEMM_WIRED: bool = false;
 
 /// Owned MTLTensor handle (device-allocated or buffer-backed).

@@ -562,6 +562,94 @@ NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, tru
 /// not use — and the tuned geometries above are the crate's most measured
 /// code. `EPILOGUE` is a template parameter, so these share one source with
 /// them and the plain path compiles to exactly what it did before.
+/// Quantized int8 GEMM with the dequantization fused.
+///
+/// `C[m,n] = (A_i8 @ B_i8) * a_scale * b_scale[n]`
+///
+/// MPP TensorOps accumulates `int8_t x int8_t` into `int32_t` natively — the
+/// header's own diagnostic lists the supported cooperative source types as
+/// `uint8_t/int8_t/uint4b_format/int4b_format/float/half/bfloat`. The products
+/// are exact in int32 for any K below 2^17 at full int8 range, so the
+/// accumulation carries no rounding at all, unlike the f32 paths.
+///
+/// The dequantization happens in registers between the accumulate and the
+/// store, for the same reason the epilogue does: applied afterwards it would be
+/// a separate full read and write of C.
+///
+/// `b_scale` is per output column, which is where a per-channel weight scale
+/// lives. It is read through the row-stride-0 broadcast the epilogue uses.
+template <int SM, int SN, int NSG>
+inline void mm_i8_dequant_coop(device int8_t *A, device int8_t *B, device float *C,
+                               device const float *b_scale, float a_scale,
+                               uint M, uint N, uint K, uint tiles_n,
+                               uint tiles_m, uint tgpig) {
+    constexpr auto d = matmul2d_descriptor(
+        SM, SN, dynamic_length_v<int>, false, false, false,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<d, execution_simdgroups<NSG>> op;
+
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+
+    auto mA = tensor(A, dextents<int, 2>{(int)K, (int)M}, array<int, 2>{1, (int)K});
+    auto mB = tensor(B, dextents<int, 2>{(int)N, (int)K}, array<int, 2>{1, (int)N});
+    auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
+    auto tA = mA.slice(0, ty);
+    auto tB = mB.slice(tx, 0);
+    auto tC = mC.slice(tx, ty);
+
+    auto acc = op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(tA)>,
+        metal::remove_addrspace_t<decltype(tB)>, int32_t>();
+#pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i) acc.set(i, 0);
+    op.run(tA, tB, acc);
+
+    auto outT = op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(tA)>,
+        metal::remove_addrspace_t<decltype(tB)>, float>();
+    if (b_scale) {
+        auto mScale = tensor(const_cast<device float *>(b_scale),
+                             dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, 0});
+        auto tScale = mScale.slice(tx, ty);
+        auto scaleT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA)>,
+            metal::remove_addrspace_t<decltype(tB)>, float>();
+        scaleT.load(tScale);
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < outT.get_capacity(); ++i)
+            if (acc.is_valid_element(i))
+                outT[i] = (float)acc[i] * a_scale * scaleT[i];
+    } else {
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < outT.get_capacity(); ++i)
+            if (acc.is_valid_element(i)) outT[i] = (float)acc[i] * a_scale;
+    }
+    outT.store(tC);
+}
+
+#define I8_DEQUANT_KERNEL(NAME, SM, SN, NSG)                                   \
+    kernel void NAME(device int8_t *A [[buffer(0)]],                           \
+                     device int8_t *B [[buffer(1)]],                           \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     constant uint &tiles_m [[buffer(7)]],                     \
+                     device const float *b_scale [[buffer(8)]],                \
+                     constant float &a_scale [[buffer(9)]],                    \
+                     constant uint &has_scale [[buffer(10)]],                  \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        mm_i8_dequant_coop<SM, SN, NSG>(A, B, C, has_scale ? b_scale : nullptr,\
+                                        a_scale, M, N, K, tiles_n, tiles_m,    \
+                                        tgpig);                                \
+    }
+
+I8_DEQUANT_KERNEL(matmul2d_tensorops_i8_f32, 128, 64, 4)
+
 /// Strided batched NN GEMM.
 ///
 /// The grid gains a second dimension: `tgpig.y` is the batch index, and each

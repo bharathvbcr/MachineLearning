@@ -2402,3 +2402,91 @@ fn row_reduce(
         set_u32(bnd, cols, 2);
     })
 }
+
+// ------------------------------------------------- Quantized int8 GEMM ---
+
+/// `C[m,n] = (A_i8 @ B_i8) * a_scale * b_scale[n]`, dequantized in registers.
+///
+/// MPP TensorOps accumulates `int8 x int8` into `int32` natively. The products
+/// are exact in int32 for any `k` below 2^17 at full int8 range, so unlike the
+/// f32 paths this accumulation carries **no rounding at all** — the only
+/// approximation is the caller's quantization of the operands.
+///
+/// `b_scale` is per output column, which is where a per-channel weight scale
+/// lives, and is optional. The dequantization is applied between the
+/// accumulate and the store, while the values are still in registers; applied
+/// afterwards it would be an extra full read and write of `C`.
+///
+/// # Why this is not behind `quant-prep`
+///
+/// It does not need a host-side `MTLTensor`. The kernel builds its tensors from
+/// raw device pointers, so `MTLTensorDataType::Int8` being bound or not is
+/// irrelevant here — that binding is for descriptors this path never creates.
+/// The same is true of Int4: `metal::int4b_format` exists in the shading
+/// language and TensorOps accepts it, and what is actually missing is the
+/// tensor constructor for a sub-byte element type, not an objc2 binding.
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_i8_dequant(
+    rt: &Arc<GpuRuntime>,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    c: &GpuBuffer,
+    m: u32,
+    n: u32,
+    k: u32,
+    a_scale: f32,
+    b_scale: Option<&GpuBuffer>,
+) -> Result<(), String> {
+    if m == 0 || n == 0 || k == 0 {
+        return Err("gemm_i8_dequant: m, n and k must be non-zero".into());
+    }
+    if !a_scale.is_finite() {
+        return Err(format!(
+            "gemm_i8_dequant: a_scale must be finite, got {a_scale}"
+        ));
+    }
+    // int32 accumulation is exact only while the running sum fits. Full-range
+    // int8 products reach 127*127 = 16129, so k above 2^31/16129 could
+    // overflow; refusing well below that keeps the "no rounding" claim true
+    // rather than nearly true.
+    const MAX_K_EXACT: u32 = 131_072;
+    if k > MAX_K_EXACT {
+        return Err(format!(
+            "gemm_i8_dequant: k = {k} exceeds {MAX_K_EXACT}, past which an int32 \
+             accumulator can overflow at full int8 range and the result wraps \
+             silently rather than saturating"
+        ));
+    }
+    require::<i8>(a, elems(m, k, "gemm_i8_dequant")?, "gemm_i8_dequant a")?;
+    require::<i8>(b, elems(k, n, "gemm_i8_dequant")?, "gemm_i8_dequant b")?;
+    require::<f32>(c, elems(m, n, "gemm_i8_dequant")?, "gemm_i8_dequant c")?;
+    if let Some(sc) = b_scale {
+        require::<f32>(sc, n as usize, "gemm_i8_dequant b_scale")?;
+    }
+
+    let p = rt.pipeline("matmul2d_tensorops_i8_f32")?;
+    // Geometry must match the I8_DEQUANT_KERNEL instantiation.
+    const SM: usize = 128;
+    const SN: usize = 64;
+    let tiles_n = (n as usize).div_ceil(SN);
+    let tiles_m = (m as usize).div_ceil(SM);
+    let groups = tiles_n * tiles_m;
+    let tptg = 32 * 4; // NSG = 4 simdgroups
+    let has_scale = u32::from(b_scale.is_some());
+    // Buffer 8 is declared, so it must be bound even when unread: Metal faults
+    // on a declared-but-unbound buffer. `has_scale` gates the dereference.
+    let scale_buf = b_scale.unwrap_or(c);
+    dispatch_tg_1d(rt, &p, groups, tptg, None, |bnd| {
+        set_gpu_buf(bnd, a, 0);
+        set_gpu_buf(bnd, b, 1);
+        set_gpu_buf(bnd, c, 2);
+        set_u32(bnd, m, 3);
+        set_u32(bnd, n, 4);
+        set_u32(bnd, k, 5);
+        set_u32(bnd, tiles_n as u32, 6);
+        set_u32(bnd, tiles_m as u32, 7);
+        set_gpu_buf(bnd, scale_buf, 8);
+        set_f32(bnd, a_scale, 9);
+        set_u32(bnd, has_scale, 10);
+    })
+}
