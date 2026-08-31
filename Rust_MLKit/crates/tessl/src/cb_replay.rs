@@ -799,8 +799,8 @@ mod tests {
         let got = unsafe {
             std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n)
         };
-        for i in 0..n {
-            assert_eq!(got[i], (i as f32) + 1.0, "mismatch at {i}");
+        for (i, v) in got.iter().take(n).enumerate() {
+            assert_eq!(*v, (i as f32) + 1.0, "mismatch at {i}");
         }
         // Second replay without re-encode.
         pp.on_gpu_complete(CbSlot::A);
@@ -815,8 +815,8 @@ mod tests {
         let got2 = unsafe {
             std::slice::from_raw_parts(out.metal().contents().as_ptr() as *const f32, n)
         };
-        for i in 0..n {
-            assert_eq!(got2[i], (i as f32) + 1.0);
+        for (i, v) in got2.iter().take(n).enumerate() {
+            assert_eq!(*v, (i as f32) + 1.0);
         }
         assert_eq!(pp.icb_replays(), 2);
         eprintln!("decode_icb_mini_replay: {}", pp.status_line());

@@ -20,6 +20,15 @@ use tessl::tensor::Tensor;
 use objc2_metal::MTLComputePipelineState;
 use std::time::Instant;
 
+/// M, N, K travelling together. Three adjacent `usize` parameters transpose
+/// silently at a call site; a named-field struct does not.
+#[derive(Clone, Copy)]
+struct Shape {
+    m: usize,
+    n: usize,
+    k: usize,
+}
+
 #[derive(Clone, Copy)]
 struct Arm {
     kernel: &'static str,
@@ -101,7 +110,7 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-fn median(v: &mut Vec<f64>) -> f64 {
+fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = v.len();
     if n % 2 == 1 {
@@ -117,10 +126,9 @@ fn run(
     a: &Tensor,
     b: &Tensor,
     c: &Tensor,
-    m: usize,
-    n: usize,
-    k: usize,
+    shape: Shape,
 ) -> Result<(), String> {
+    let Shape { m, n, k } = shape;
     let p = rt.pipeline(arm.kernel)?;
     let tiles_n = n / arm.sn;
     let tiles_m = m / arm.sm;
@@ -146,13 +154,11 @@ fn time_once(
     a: &Tensor,
     b: &Tensor,
     c: &Tensor,
-    m: usize,
-    n: usize,
-    k: usize,
+    shape: Shape,
 ) -> Result<f64, String> {
     rt.synchronize()?;
     let t0 = Instant::now();
-    run(rt, arm, a, b, c, m, n, k)?;
+    run(rt, arm, a, b, c, shape)?;
     rt.synchronize()?;
     Ok(t0.elapsed().as_secs_f64() * 1000.0)
 }
@@ -214,6 +220,7 @@ fn main() -> Result<(), String> {
 
         for (m, n, k, label) in &shapes {
             let (m, n, k) = (*m, *n, *k);
+            let shape = Shape { m, n, k };
             if m % lane.base.sm != 0 || n % lane.base.sn != 0 {
                 continue;
             }
@@ -228,7 +235,7 @@ fn main() -> Result<(), String> {
             };
 
             let c_base = rt.alloc_tensor_f32(&[m, n])?;
-            run(&rt, &lane.base, &a, &b, &c_base, m, n, k)?;
+            run(&rt, &lane.base, &a, &b, &c_base, shape)?;
             rt.synchronize()?;
             let refv = c_base.buffer.read_f32()[..m * n].to_vec();
             let refmax = refv.iter().fold(0f32, |acc, x| acc.max(x.abs())) as f64;
@@ -255,7 +262,7 @@ fn main() -> Result<(), String> {
                     println!("  {:<36}{:>10}", cand.kernel, "skip(div)");
                     continue;
                 }
-                if run(&rt, cand, &a, &b, &c_cand, m, n, k).is_err() {
+                if run(&rt, cand, &a, &b, &c_cand, shape).is_err() {
                     println!("  {:<36}{:>10}", cand.kernel, "skip(pipe)");
                     continue;
                 }
@@ -273,8 +280,8 @@ fn main() -> Result<(), String> {
                 let mut cand_ms_all = Vec::new();
                 for _ in 0..rounds {
                     for _ in 0..warmup {
-                        run(&rt, &lane.base, &a, &b, &c_base, m, n, k)?;
-                        run(&rt, cand, &a, &b, &c_cand, m, n, k)?;
+                        run(&rt, &lane.base, &a, &b, &c_base, shape)?;
+                        run(&rt, cand, &a, &b, &c_cand, shape)?;
                     }
                     rt.synchronize()?;
                     let mut bt = Vec::with_capacity(iters);
@@ -282,11 +289,11 @@ fn main() -> Result<(), String> {
                     // Interleave so clock drift lands on both arms equally.
                     for i in 0..iters {
                         if i % 2 == 0 {
-                            bt.push(time_once(&rt, &lane.base, &a, &b, &c_base, m, n, k)?);
-                            ct.push(time_once(&rt, cand, &a, &b, &c_cand, m, n, k)?);
+                            bt.push(time_once(&rt, &lane.base, &a, &b, &c_base, shape)?);
+                            ct.push(time_once(&rt, cand, &a, &b, &c_cand, shape)?);
                         } else {
-                            ct.push(time_once(&rt, cand, &a, &b, &c_cand, m, n, k)?);
-                            bt.push(time_once(&rt, &lane.base, &a, &b, &c_base, m, n, k)?);
+                            ct.push(time_once(&rt, cand, &a, &b, &c_cand, shape)?);
+                            bt.push(time_once(&rt, &lane.base, &a, &b, &c_base, shape)?);
                         }
                     }
                     let bm = median(&mut bt);

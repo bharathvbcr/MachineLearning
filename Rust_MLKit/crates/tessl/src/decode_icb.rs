@@ -367,6 +367,18 @@ pub struct DecodeIcb {
     barriers_elided: u64,
 }
 
+/// One argument table per encoded command, plus the number of distinct tables
+/// actually built (commands with identical binds share one).
+type PrebuiltTables = (Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>, usize);
+
+/// Per-command encode switches. Two adjacent `bool` parameters swap silently at
+/// a call site; named fields do not.
+#[derive(Clone, Copy)]
+struct EncodeCmdOpts {
+    use_icb_exec: bool,
+    freeze_binds: bool,
+}
+
 impl DecodeIcb {
     pub fn from_commands(
         rt: &GpuRuntime,
@@ -606,7 +618,7 @@ impl DecodeIcb {
     fn build_prebuilt_tables(
         rt: &GpuRuntime,
         commands: &[DecodeIcbCommand],
-    ) -> Result<(Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>, usize), String> {
+    ) -> Result<PrebuiltTables, String> {
         let mut unique: Vec<(u64, Retained<ProtocolObject<dyn MTL4ArgumentTable>>)> =
             Vec::new();
         let mut tables = Vec::with_capacity(commands.len());
@@ -990,7 +1002,9 @@ impl DecodeIcb {
                         None
                     };
                     let (icb_n, icb_cmds) = Self::encode_cmd(
-                        bnd, cmd, &icb, i, use_icb_exec, freeze, prebuilt, &mut s,
+                        bnd, cmd, &icb, i,
+                        EncodeCmdOpts { use_icb_exec, freeze_binds: freeze },
+                        prebuilt, &mut s,
                     );
                     execute_icb_calls = execute_icb_calls.saturating_add(icb_n);
                     execute_icb_cmds = execute_icb_cmds.saturating_add(icb_cmds);
@@ -1063,7 +1077,9 @@ impl DecodeIcb {
                         None
                     };
                     let (icb_n, icb_cmds) = Self::encode_cmd(
-                        bnd, cmd, &icb, i, use_icb_exec, freeze, prebuilt, &mut sticky,
+                        bnd, cmd, &icb, i,
+                        EncodeCmdOpts { use_icb_exec, freeze_binds: freeze },
+                        prebuilt, &mut sticky,
                     );
                     execute_icb_calls = execute_icb_calls.saturating_add(icb_n);
                     execute_icb_cmds = execute_icb_cmds.saturating_add(icb_cmds);
@@ -1108,11 +1124,11 @@ impl DecodeIcb {
         cmd: &DecodeIcbCommand,
         icb: &Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
         i: usize,
-        use_icb_exec: bool,
-        freeze_binds: bool,
+        opts: EncodeCmdOpts,
         prebuilt: Option<&ProtocolObject<dyn MTL4ArgumentTable>>,
         sticky: &mut StickyArgTable,
     ) -> (u64, u64) {
+        let EncodeCmdOpts { use_icb_exec, freeze_binds } = opts;
         let mut icb_calls = 0u64;
         let mut icb_cmds = 0u64;
         if freeze_binds {
@@ -1430,8 +1446,8 @@ mod tests {
         let out = unsafe {
             std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n)
         };
-        for i in 0..n {
-            assert_eq!(out[i], (i as f32) + 1.0, "mismatch at {i}");
+        for (i, v) in out.iter().take(n).enumerate() {
+            assert_eq!(*v, (i as f32) + 1.0, "mismatch at {i}");
         }
         // Second execute without re-encode.
         unsafe {
@@ -1443,8 +1459,8 @@ mod tests {
         let out2 = unsafe {
             std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n)
         };
-        for i in 0..n {
-            assert_eq!(out2[i], (i as f32) + 1.0);
+        for (i, v) in out2.iter().take(n).enumerate() {
+            assert_eq!(*v, (i as f32) + 1.0);
         }
         assert_eq!(dec.execute_count(), 2);
         let (set_calls, bind_total) = dec.last_set_address_stats();
@@ -1480,8 +1496,8 @@ mod tests {
         let out = unsafe {
             std::slice::from_raw_parts(c.metal().contents().as_ptr() as *const f32, n)
         };
-        for i in 0..n {
-            assert_eq!(out[i], (i as f32) + 1.0, "freeze mismatch at {i}");
+        for (i, v) in out.iter().take(n).enumerate() {
+            assert_eq!(*v, (i as f32) + 1.0, "freeze mismatch at {i}");
         }
         let (set_tables, elided) = dec.last_prebuilt_stats();
         let (set_calls, bind_total) = dec.last_set_address_stats();
@@ -1554,8 +1570,8 @@ mod tests {
             let out = unsafe {
                 std::slice::from_raw_parts(buf.metal().contents().as_ptr() as *const f32, n)
             };
-            for i in 0..n {
-                assert_eq!(out[i], (i as f32) + 1.0, "{label} mismatch at {i}");
+            for (i, v) in out.iter().take(n).enumerate() {
+                assert_eq!(*v, (i as f32) + 1.0, "{label} mismatch at {i}");
             }
         }
         set_icb_range_batch(false);

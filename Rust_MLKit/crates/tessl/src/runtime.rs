@@ -300,6 +300,9 @@ impl Drop for RuntimeAccess {
 /// fn require_send<T: Send>() {}
 /// require_send::<GpuRuntime>();
 /// ```
+/// A pooled buffer awaiting recycle, with the size it was allocated at.
+type PendingRecycle = (Retained<ProtocolObject<dyn MTLBuffer>>, usize);
+
 pub struct GpuRuntime {
     access_busy: Arc<AtomicBool>,
     encode_failed: AtomicBool,
@@ -331,7 +334,7 @@ pub struct GpuRuntime {
     /// Uncommitted residency adds/removes — flushed before encode / synchronize.
     residency_dirty: Mutex<bool>,
     /// Cold buffers whose last Arc dropped mid-step; recycled after CB wait.
-    pending_cold_recycle: Mutex<Vec<(Retained<ProtocolObject<dyn MTLBuffer>>, usize)>>,
+    pending_cold_recycle: Mutex<Vec<PendingRecycle>>,
     /// Self weak handle so Drop on pooled buffers can schedule recycle.
     self_weak: Mutex<Weak<GpuRuntime>>,
     /// Probed working-set / wired budget (P0b).
@@ -412,6 +415,14 @@ impl GpuRuntime {
             pool_cache_cap: DEFAULT_POOL_CACHE_BYTES,
         };
 
+        // clippy::arc_with_non_send_sync: `Retained<ProtocolObject<..>>` is not
+        // marked Send/Sync by objc2, so this Arc trips the lint. `Rc` is not the
+        // fix it suggests: `Arc<GpuRuntime>` is the type in every public
+        // signature in this crate, and `self_weak` needs `Weak<GpuRuntime>` to
+        // schedule buffer recycling from Drop. Marking the type Send/Sync would
+        // be an unsafe assertion about Metal's threading that this crate has not
+        // established, so the Arc stays and the lint is silenced here.
+        #[allow(clippy::arc_with_non_send_sync)]
         let rt = Arc::new(Self {
             access_busy: Arc::new(AtomicBool::new(false)),
             encode_failed: AtomicBool::new(false),
@@ -717,6 +728,10 @@ impl GpuRuntime {
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
+        // Same reason as the runtime Arc above: the pooled buffer holds a
+        // `Retained<ProtocolObject<dyn MTLBuffer>>`, and `GpuBuffer` is cloned
+        // into every `Tensor` view that borrows it.
+        #[allow(clippy::arc_with_non_send_sync)]
         Ok(crate::tensor::GpuBuffer {
             inner: Arc::new(crate::tensor::PooledBuffer {
                 buffer,
@@ -820,9 +835,9 @@ impl GpuRuntime {
         shape: &[usize],
     ) -> Result<crate::tensor::Tensor, String> {
         if self.bump_enabled() {
-            match self.bump_alloc_f32(shape) {
-                Ok(t) => return Ok(t),
-                Err(_) => {} // fall through on exhaustion
+            // Fall through to the general pool when the bump slab is exhausted.
+            if let Ok(t) = self.bump_alloc_f32(shape) {
+                return Ok(t);
             }
         }
         self.alloc_tensor_f32(shape)
@@ -1472,11 +1487,11 @@ mod tests {
         let dst_out = unsafe {
             std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n2).to_vec()
         };
-        for i in 0..n1 {
-            assert_eq!(mid_out[i], (i + 1) as f32, "first copy mismatch at {i}");
+        for (i, v) in mid_out.iter().take(n1).enumerate() {
+            assert_eq!(*v, (i + 1) as f32, "first copy mismatch at {i}");
         }
-        for i in 0..n2 {
-            assert_eq!(dst_out[i], 100.0 + i as f32, "second copy mismatch at {i}");
+        for (i, v) in dst_out.iter().take(n2).enumerate() {
+            assert_eq!(*v, 100.0 + i as f32, "second copy mismatch at {i}");
         }
         assert_eq!(*rt.metal4.const_cursor.lock().unwrap(), 0);
         assert!(rt.metal4.const_staging.length() >= METAL4_CONST_ARENA_BYTES);

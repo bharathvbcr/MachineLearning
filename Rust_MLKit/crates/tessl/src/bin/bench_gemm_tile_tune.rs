@@ -11,6 +11,15 @@ use tessl::tensor::Tensor;
 use objc2_metal::MTLComputePipelineState;
 use std::time::Instant;
 
+/// M, N, K travelling together. Three adjacent `usize` parameters transpose
+/// silently at a call site; a named-field struct does not.
+#[derive(Clone, Copy)]
+struct Shape {
+    m: usize,
+    n: usize,
+    k: usize,
+}
+
 struct Variant {
     kernel: &'static str,
     sm: usize,
@@ -149,10 +158,9 @@ fn run_variant(
     a: &Tensor,
     b: &Tensor,
     c: &Tensor,
-    m: usize,
-    n: usize,
-    k: usize,
+    shape: Shape,
 ) -> Result<(), String> {
+    let Shape { m, n, k } = shape;
     let p = rt.pipeline(v.kernel)?;
     let zero_p = rt.pipeline("zero_f32")?;
     let tiles_n = n / v.sn;
@@ -234,6 +242,7 @@ fn main() -> Result<(), String> {
     };
 
     for (m, n, k, label) in nn_shapes.iter().map(|(m, n, k, l)| (*m, *n, *k, l.as_str())) {
+        let shape = Shape { m, n, k };
         let a = rt.alloc_tensor_f32(&[m, k])?;
         let b = rt.alloc_tensor_f32(&[k, n])?;
         a.buffer.write_f32(&fill(m * k, 1));
@@ -270,7 +279,7 @@ fn main() -> Result<(), String> {
                 continue;
             }
             let c = rt.alloc_tensor_f32(&[m, n])?;
-            if run_variant(&rt, v, &a_bf, &b_bf, &c, m, n, k).is_err() {
+            if run_variant(&rt, v, &a_bf, &b_bf, &c, shape).is_err() {
                 println!("  {:<32}{:>10}", v.kernel, "skip(pipe)");
                 continue;
             }
@@ -280,11 +289,11 @@ fn main() -> Result<(), String> {
                 .map(|(x, y)| (*x as f64 - *y as f64).abs())
                 .fold(0.0, f64::max) / refmax;
 
-            for _ in 0..warmup { run_variant(&rt, v, &a_bf, &b_bf, &c, m, n, k)?; rt.synchronize()?; }
+            for _ in 0..warmup { run_variant(&rt, v, &a_bf, &b_bf, &c, shape)?; rt.synchronize()?; }
             let mut s = Vec::new();
             for _ in 0..iters {
                 let t0 = Instant::now();
-                run_variant(&rt, v, &a_bf, &b_bf, &c, m, n, k)?;
+                run_variant(&rt, v, &a_bf, &b_bf, &c, shape)?;
                 rt.synchronize()?;
                 s.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
@@ -312,6 +321,7 @@ fn main() -> Result<(), String> {
     rt.set_relaxed_precision(true);
     println!("\n================ f32 relaxed-precision ================");
     for &(m, n, k, label) in SHAPES {
+        let shape = Shape { m, n, k };
         let a = rt.alloc_tensor_f32(&[m, k])?;
         let b = rt.alloc_tensor_f32(&[k, n])?;
         a.buffer.write_f32(&fill(m * k, 1));
@@ -343,7 +353,7 @@ fn main() -> Result<(), String> {
                 continue;
             }
             let c = rt.alloc_tensor_f32(&[m, n])?;
-            if run_variant(&rt, v, &a, &b, &c, m, n, k).is_err() {
+            if run_variant(&rt, v, &a, &b, &c, shape).is_err() {
                 println!("  {:<32}{:>10}", v.kernel, "skip(pipe)");
                 continue;
             }
@@ -353,11 +363,11 @@ fn main() -> Result<(), String> {
                 .map(|(x, y)| (*x as f64 - *y as f64).abs())
                 .fold(0.0, f64::max) / refmax;
 
-            for _ in 0..warmup { run_variant(&rt, v, &a, &b, &c, m, n, k)?; rt.synchronize()?; }
+            for _ in 0..warmup { run_variant(&rt, v, &a, &b, &c, shape)?; rt.synchronize()?; }
             let mut s = Vec::new();
             for _ in 0..iters {
                 let t0 = Instant::now();
-                run_variant(&rt, v, &a, &b, &c, m, n, k)?;
+                run_variant(&rt, v, &a, &b, &c, shape)?;
                 rt.synchronize()?;
                 s.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
@@ -374,6 +384,7 @@ fn main() -> Result<(), String> {
     for (lane, shapes) in [("TN", TN_SHAPES), ("NT", NT_SHAPES)] {
         println!("\n================ {lane} bf16 (gradient shapes) ================");
         for &(m, n, k, label) in shapes {
+            let shape = Shape { m, n, k };
             // TN: A is [K,M], B is [K,N]. NT: A is [M,K], B is [N,K].
             let (ash, bsh) = if lane == "TN" {
                 (vec![k, m], vec![k, n])
@@ -420,7 +431,7 @@ fn main() -> Result<(), String> {
                     continue;
                 }
                 let c = rt.alloc_tensor_f32(&[m, n])?;
-                if run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k).is_err() {
+                if run_variant(&rt, &v, &a_bf, &b_bf, &c, shape).is_err() {
                     println!("  {suffix:<24}{:>10}", "skip(pipe)");
                     continue;
                 }
@@ -430,11 +441,11 @@ fn main() -> Result<(), String> {
                     .map(|(x, y)| (*x as f64 - *y as f64).abs())
                     .fold(0.0, f64::max) / refmax;
 
-                for _ in 0..warmup { run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k)?; rt.synchronize()?; }
+                for _ in 0..warmup { run_variant(&rt, &v, &a_bf, &b_bf, &c, shape)?; rt.synchronize()?; }
                 let mut sv = Vec::new();
                 for _ in 0..iters {
                     let t0 = Instant::now();
-                    run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k)?;
+                    run_variant(&rt, &v, &a_bf, &b_bf, &c, shape)?;
                     rt.synchronize()?;
                     sv.push(t0.elapsed().as_secs_f64() * 1000.0);
                 }
@@ -452,7 +463,7 @@ fn main() -> Result<(), String> {
                 }
                 let v = Variant { kernel, sm: tsm, sn: tsn, bk: tbk, nsg, needs_zero: false };
                 let c = rt.alloc_tensor_f32(&[m, n])?;
-                if run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k).is_err() {
+                if run_variant(&rt, &v, &a_bf, &b_bf, &c, shape).is_err() {
                     println!("  {label:<28}{:>10}", "skip(pipe)");
                     continue;
                 }
@@ -463,14 +474,14 @@ fn main() -> Result<(), String> {
                     .fold(0.0, f64::max) / refmax;
 
                 for _ in 0..warmup {
-                    run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k)?;
+                    run_variant(&rt, &v, &a_bf, &b_bf, &c, shape)?;
                     rt.synchronize()?;
                 }
                 let mut sv = Vec::new();
                 for _ in 0..iters {
                     rt.synchronize()?;
                     let t0 = Instant::now();
-                    run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k)?;
+                    run_variant(&rt, &v, &a_bf, &b_bf, &c, shape)?;
                     rt.synchronize()?;
                     sv.push(t0.elapsed().as_secs_f64() * 1000.0);
                 }
@@ -485,6 +496,7 @@ fn main() -> Result<(), String> {
         let tn = lane == "tnacc";
         println!("\n================ {lane} bf16 (accumulate) ================");
         for &(m, n, k, label) in shapes {
+            let shape = Shape { m, n, k };
             let (ash, bsh) = if tn { (vec![k, m], vec![k, n]) } else { (vec![m, k], vec![n, k]) };
             let a = rt.alloc_tensor_f32(&ash)?;
             let b = rt.alloc_tensor_f32(&bsh)?;
@@ -529,7 +541,7 @@ fn main() -> Result<(), String> {
                 }
                 let c = rt.alloc_tensor_f32(&[m, n])?;
                 c.buffer.write_f32(&vec![0f32; m * n]);
-                if run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k).is_err() {
+                if run_variant(&rt, &v, &a_bf, &b_bf, &c, shape).is_err() {
                     println!("  {suffix:<24}{:>10}", "skip(pipe)");
                     continue;
                 }
@@ -539,11 +551,11 @@ fn main() -> Result<(), String> {
                     .map(|(x, y)| (*x as f64 - *y as f64).abs())
                     .fold(0.0, f64::max) / refmax;
 
-                for _ in 0..warmup { run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k)?; rt.synchronize()?; }
+                for _ in 0..warmup { run_variant(&rt, &v, &a_bf, &b_bf, &c, shape)?; rt.synchronize()?; }
                 let mut sv = Vec::new();
                 for _ in 0..iters {
                     let t0 = Instant::now();
-                    run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k)?;
+                    run_variant(&rt, &v, &a_bf, &b_bf, &c, shape)?;
                     rt.synchronize()?;
                     sv.push(t0.elapsed().as_secs_f64() * 1000.0);
                 }
@@ -562,7 +574,7 @@ fn main() -> Result<(), String> {
                 let v = Variant { kernel, sm: tsm, sn: tsn, bk: tbk, nsg, needs_zero: false };
                 let c = rt.alloc_tensor_f32(&[m, n])?;
                 c.buffer.write_f32(&vec![0f32; m * n]);
-                if run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k).is_err() {
+                if run_variant(&rt, &v, &a_bf, &b_bf, &c, shape).is_err() {
                     println!("  {label:<28}{:>10}", "skip(pipe)");
                     continue;
                 }
@@ -574,7 +586,7 @@ fn main() -> Result<(), String> {
 
                 for _ in 0..warmup {
                 c.buffer.write_f32(&vec![0f32; m * n]);
-                    run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k)?;
+                    run_variant(&rt, &v, &a_bf, &b_bf, &c, shape)?;
                     rt.synchronize()?;
                 }
                 let mut sv = Vec::new();
@@ -582,7 +594,7 @@ fn main() -> Result<(), String> {
                 c.buffer.write_f32(&vec![0f32; m * n]);
                     rt.synchronize()?;
                     let t0 = Instant::now();
-                    run_variant(&rt, &v, &a_bf, &b_bf, &c, m, n, k)?;
+                    run_variant(&rt, &v, &a_bf, &b_bf, &c, shape)?;
                     rt.synchronize()?;
                     sv.push(t0.elapsed().as_secs_f64() * 1000.0);
                 }

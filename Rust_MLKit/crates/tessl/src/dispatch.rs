@@ -511,8 +511,8 @@ mod tests {
         let out = unsafe {
             std::slice::from_raw_parts(dst.metal().contents().as_ptr() as *const f32, n)
         };
-        for i in 0..n {
-            assert_eq!(out[i], (i as f32) * 2.0);
+        for (i, v) in out.iter().take(n).enumerate() {
+            assert_eq!(*v, (i as f32) * 2.0);
         }
     }
 }
