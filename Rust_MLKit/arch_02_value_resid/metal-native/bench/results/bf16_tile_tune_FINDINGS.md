@@ -2,10 +2,11 @@
 
 > **Landed 2026-08-30.** `get_destination_cooperative_tensor` (the "Not yet
 > done" item below) beat every BK/tile variant and shipped as the production
-> NN kernel for bf16 and relaxed f32, with a three-entry shape selection
-> (128×64 sg4 default; 64×64 sg4 for N ≤ 512; 256×64 sg8 for ≥4096² squares
-> with K ≥ 2048) — see `bf16_tile_tune_m5pro_coop.txt` and the "Landed
-> result" section at the end.
+> kernel for every bf16 and relaxed-f32 lane except split-K (NN, then TN/NT
+> and the accumulate kernels in round 2), with a two-entry NN selection
+> (128×64 sg4 default, 64×64 sg4 for N ≤ 512) plus an in-kernel grid swizzle
+> for large grids — see the "Landed result" and "Round 2" sections at the
+> end, and `bf16_tile_tune_m5pro_coop.txt` / `bf16_tnnt_coop_m5pro.txt`.
 
 M5 Pro / macOS 27.0. Measured from a **pristine HEAD worktree** — a concurrent
 session was editing `src/gemm.rs` mid-run and its added per-call validation
@@ -100,6 +101,38 @@ of 40, sync/iter, vs the same-session live torch-MPS lane:
 Geomean 1.06× of torch (from ~0.5×), still writing f32 C where torch writes
 bf16 C. The relaxed-f32 (tf32) NN kernel took the same rework and moved from
 ~2.0× to 2.0–2.9× of torch f32 (12.8–18.0 TFLOP/s on the large shapes).
-The TN/NT/split-K bf16 kernels are untouched: they were never on the BK
-accumulate path (single dynamic-K `multiply` run) and were not implicated in
-the measured gap; a coop round for them is possible follow-up, unmeasured.
+
+## Round 2 (2026-08-30): TN / NT / accumulate coop + NN grid swizzle
+
+The follow-ups measured and landed (`bench_gemm_tnnt_tune`, results in
+`bf16_tnnt_coop_m5pro.txt`):
+
+- **TN descriptor** (bf16): coop 128×64 sg4 wins 1.52–1.98× over the single
+  dynamic-K multiply kernel (tn_square_2048 12,047 → 21,957; tn_1024_k4096
+  8,627 → 17,078 GFLOP/s). Landed as `matmul2d_tensorops_tn_bf16_f32`.
+- **NT descriptor** (bf16, the dx lane every backward layer runs): coop
+  128×64 sg4 wins everywhere — 2.00–2.03× at scale (nt_wide 13,596 → 27,136),
+  +11–22% on the latency-bound dx shapes. Landed.
+- **Accumulate kernels** (opt-in `GEMM_ACCUM`/`ACCUM_DX` paths): coop
+  zero→run→load-add-store (the header's cooperative bias pattern, one C read
+  + one C write) beats `multiply_accumulate` 1.38–1.49× at bandwidth-bound
+  shapes, ties at the dispatch floor. Landed at 64×64 sg4.
+- **Split-K dW shapes** (M,N ≤ 384, K = 4096): coop no-split exactly ties the
+  split-K path — both sit at the ~0.25 ms dispatch-latency floor under
+  sync-per-iter, which cannot resolve the packed-encoder difference. The
+  split-K gate stays.
+- **NN grid swizzle** (the square_4096 operand-reread question): a column-panel
+  swizzle (8 tile-rows per band) bounds B-tile rereads to tiles_m/8 full
+  passes. +11% at 4096³ (24,976 → 27,779 raw), +1% tall_k1024/mlp_up, −3% at
+  square_2048 — landed inside the NN coop kernels gated on
+  `tiles_n*tiles_m ≥ 2048`. With the swizzle, plain 128×64 sg4 outruns the
+  256×64 sg8 wide variant at 4096³, so the wide selection entry and both
+  256×64 kernels were retired; the NN table is two entries (narrow-N 64×64,
+  default 128×64). Confirmed on a cooled machine through the full gemm()
+  API: square_4096 bf16 **29,022 GFLOP/s** (was 25,071 with the wide kernel;
+  1.22× of the live torch lane), square_2048 21,805, mlp_up 26,335, mlp_down
+  26,632, tall_k1024 25,904 — every campaign shape ≥ 1.01× of torch,
+  geomean 1.11×.
+
+Split-K kernels keep the 64×32 sg4 geometry (`TILE_V2`); everything else
+bf16/relaxed now runs cooperative-destination.

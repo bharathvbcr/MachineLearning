@@ -32,6 +32,10 @@ path = "src/bin/probe_gemm_parity.rs"
 name = "bench_gemm_tile_tune"
 path = "src/bin/bench_gemm_tile_tune.rs"
 
+[[bin]]
+name = "bench_gemm_tnnt_tune"
+path = "src/bin/bench_gemm_tnnt_tune.rs"
+
 [dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSError", "NSData", "NSValue", "NSRange"] }

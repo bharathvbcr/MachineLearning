@@ -74,11 +74,19 @@ const TILE_F32: TileGeom = TileGeom {
     sn: 32,
     simdgroups: 1,
 };
+/// Split-K bf16 kernels only; the plain bf16/relaxed NN/TN/NT lanes use the
+/// cooperative-destination geometries below.
 const TILE_V2: TileGeom = TileGeom {
     sm: 64,
     sn: 32,
     simdgroups: 4,
 };
+/// Coop TN/NT descriptor kernels (128×64 sg4; bench/results/
+/// bf16_tnnt_coop_m5pro.txt: 1.5–2.0× over the multiply single-run kernels).
+const TILE_COOP_TN_NT: TileGeom = TileGeom { sm: 128, sn: 64, simdgroups: 4 };
+/// Coop accumulate kernels (64×64 sg4; load-add-store, 1.4–1.5× over
+/// multiply_accumulate at bandwidth-bound shapes).
+const TILE_COOP_ACCUM: TileGeom = TileGeom { sm: 64, sn: 64, simdgroups: 4 };
 
 /// Exact 1D TG count for a `tiles_n × tiles_m` rectangle (no power-of-two pad —
 /// padding blew up tall NN shapes like BT×C and erased the binder win).
@@ -106,20 +114,6 @@ impl GemmBackend {
         }
     }
 
-    pub fn kernel_name_f32_relaxed(self) -> &'static str {
-        match self {
-            GemmBackend::TensorOps => "matmul2d_tensorops_f32_relaxed",
-            GemmBackend::Simdgroup => "matmul_simdgroup_f32",
-        }
-    }
-
-    pub fn kernel_name_bf16(self) -> &'static str {
-        match self {
-            GemmBackend::TensorOps => "matmul2d_tensorops_bf16_f32",
-            // No simdgroup bf16 kernel — callers cast to f32 first.
-            GemmBackend::Simdgroup => "matmul_simdgroup_f32",
-        }
-    }
 }
 
 /// Pick TensorOps when the metallib contains it; else simdgroup.
@@ -277,13 +271,13 @@ pub fn gemm(
 /// instantiations in matmul_tensorops.metal).
 const TILE_COOP_DEFAULT: TileGeom = TileGeom { sm: 128, sn: 64, simdgroups: 4 };
 const TILE_COOP_NARROW: TileGeom = TileGeom { sm: 64, sn: 64, simdgroups: 4 };
-const TILE_COOP_WIDE: TileGeom = TileGeom { sm: 256, sn: 64, simdgroups: 8 };
 
-/// Shape → coop NN kernel, from the 2026-08-30 M5 Pro tile tune
-/// (bench/results/bf16_tile_tune_m5pro_coop.txt): 64×64 sg4 wins narrow-N
-/// shapes by ~6%, 256×64 sg8 wins ≥4096² squares at K ≥ 2048 by ~5%,
-/// 128×64 sg4 everything else (0.96–1.19× of torch-MPS bf16 on the sweep).
-fn nn_coop_kernel(m: usize, n: usize, k: usize, bf16: bool) -> (&'static str, TileGeom) {
+/// Shape → coop NN kernel, from the 2026-08-30 M5 Pro tile tunes
+/// (bench/results/bf16_tile_tune_m5pro_coop.txt, bf16_tnnt_coop_m5pro.txt):
+/// 64×64 sg4 wins narrow-N shapes by ~6%; 128×64 sg4 everything else. The
+/// in-kernel column-panel swizzle covers the huge-square case (+11% at
+/// 4096³), which retired the earlier 256×64 sg8 wide entry it outran.
+fn nn_coop_kernel(_m: usize, n: usize, _k: usize, bf16: bool) -> (&'static str, TileGeom) {
     if n <= 512 {
         (
             if bf16 {
@@ -292,15 +286,6 @@ fn nn_coop_kernel(m: usize, n: usize, k: usize, bf16: bool) -> (&'static str, Ti
                 "matmul2d_tensorops_f32_relaxed_64x64_sg4"
             },
             TILE_COOP_NARROW,
-        )
-    } else if m >= 4096 && n >= 4096 && k >= 2048 {
-        (
-            if bf16 {
-                "matmul2d_tensorops_bf16_f32_256x64_sg8"
-            } else {
-                "matmul2d_tensorops_f32_relaxed_256x64_sg8"
-            },
-            TILE_COOP_WIDE,
         )
     } else {
         (
@@ -549,8 +534,9 @@ pub fn gemm_tn_train(
         if prefer_tn_splitk(m, n, k) {
             return gemm_tn_splitk_bf16(&a_bf, &b_bf, c, k);
         }
+        // Coop kernel: register accumulator, C written once, no zero pre-pass.
         let pipeline = rt.pipeline("matmul2d_tensorops_tn_bf16_f32")?;
-        return dispatch_tensorops_tn_nt(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_V2);
+        return dispatch_tensorops_nn_coop(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_COOP_TN_NT);
     }
     gemm_tn_f32(a_km, b_kn, c, backend)
 }
@@ -740,8 +726,9 @@ pub fn gemm_nt_train(
         let k = a_bf.shape[1];
         let n = b_bf.shape[0];
         assert_eq!(c.shape, &[m, n]);
+        // Coop kernel: register accumulator, C written once, no zero pre-pass.
         let pipeline = rt.pipeline("matmul2d_tensorops_nt_bf16_f32")?;
-        return dispatch_tensorops_tn_nt(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_V2);
+        return dispatch_tensorops_nn_coop(rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_COOP_TN_NT);
     }
     gemm_nt_f32(a_mk, b_nk, c, backend)
 }
@@ -766,7 +753,7 @@ pub fn gemm_tn_accum_train(
         }
         let pipeline = rt.pipeline("matmul2d_tensorops_tn_accum_bf16_f32")?;
         return dispatch_tensorops_accum(
-            rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_V2, /*bind_interior=*/ false,
+            rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_COOP_ACCUM, /*bind_interior=*/ false,
         );
     }
 
@@ -809,7 +796,7 @@ pub fn gemm_nt_accum_train(
         let b_bf = ensure_bf16(b_nk)?;
         let pipeline = rt.pipeline("matmul2d_tensorops_nt_accum_bf16_f32")?;
         return dispatch_tensorops_accum(
-            rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_V2, /*bind_interior=*/ false,
+            rt, &pipeline, &a_bf, &b_bf, c, m, n, k, TILE_COOP_ACCUM, /*bind_interior=*/ false,
         );
     }
 
@@ -1945,6 +1932,49 @@ mod stress_tests {
             eprintln!(
                 "large sampled parity {m}x{n}x{k} bf16={bf16}: {samples} samples max_err={max_err:.3e} (sampled coverage, not exhaustive)"
             );
+        }
+        rt.set_precision(PrecisionMode::F32);
+    }
+
+
+    /// The NN kernels switch to the column-panel swizzle only when
+    /// tiles_n*tiles_m >= 2048, a scale no other test reaches — cover the
+    /// swizzle mapping (bijective tile coverage) and its edge interaction
+    /// with sampled f64 parity at small K so the shapes stay cheap.
+    #[test]
+    fn gemm_swizzle_grid_sampled_parity() {
+        let rt = GpuRuntime::new().expect("GpuRuntime::new");
+        assert!(rt.has_tensorops(), "requires TensorOps metallib");
+        rt.set_precision(PrecisionMode::Bf16);
+        let mut rng = Rng::new(0x5117_2026u64);
+        // 4096x4096 with 128x64 tiles = 64*32 = 2048 tiles: swizzle ON.
+        // The ragged twin keeps the same grid with edge tiles in play.
+        for (m, n, k) in [(4096usize, 4096usize, 64usize), (4095, 4033, 65)] {
+            let a_host: Vec<f32> = (0..m * k).map(|_| rng.unit()).collect();
+            let b_host: Vec<f32> = (0..k * n).map(|_| rng.unit()).collect();
+            let a_ref = round_bf16(&a_host);
+            let b_ref = round_bf16(&b_host);
+            let a = upload(&rt, &mut rng, &[m, k], &a_host, true);
+            let b = upload(&rt, &mut rng, &[k, n], &b_host, true);
+            let c = rt.alloc_tensor_f32(&[m, n]).unwrap();
+            c.buffer.write_f32(&vec![f32::NAN; m * n]);
+            gemm(&a, &b, &c, GemmBackend::TensorOps).unwrap();
+            rt.synchronize().unwrap();
+            let got = c.buffer.read_f32();
+            // Every element overwritten: a tile skipped by a broken swizzle
+            // mapping would leave NaN poison behind.
+            let n_bad = got.iter().filter(|x| !x.is_finite()).count();
+            assert_eq!(n_bad, 0, "unwritten/nonfinite C at {m}x{n}x{k}");
+            for _ in 0..1500 {
+                let i = rng.below(m);
+                let j = rng.below(n);
+                let mut acc = 0.0f64;
+                for p in 0..k {
+                    acc += a_ref[i * k + p] as f64 * b_ref[p * n + j] as f64;
+                }
+                let err = (got[i * n + j] as f64 - acc).abs();
+                assert!(err < 1e-2, "{m}x{n}x{k} C[{i},{j}] = {} vs f64 {acc}", got[i * n + j]);
+            }
         }
         rt.set_precision(PrecisionMode::F32);
     }

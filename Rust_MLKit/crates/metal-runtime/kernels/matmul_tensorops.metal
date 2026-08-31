@@ -315,180 +315,6 @@ kernel void matmul2d_tensorops_tn_splitk_f32(
 // section at the end of this file.)
 // =============================================================================
 
-kernel void matmul2d_tensorops_tn_bf16_f32(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    constant uint &tiles_m [[buffer(7)]],
-    uint tgpig [[threadgroup_position_in_grid]])
-{
-    constexpr int SM = 64;
-    constexpr int SN = 32;
-    constexpr auto desc =
-        matmul2d_descriptor(SM, SN, dynamic_length_v<int>, true, false, false,
-                            matmul2d_descriptor::mode::multiply);
-    matmul2d<desc, execution_simdgroups<4>> op;
-
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
-    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-
-    bool interior = (tx + SN <= (int)N) && (ty + SM <= (int)M);
-    if (interior) {
-        auto tA = tensor(A + ty, dextents<int, 2>{SM, (int)K},
-                         array<int, 2>{1, (int)M});
-        auto tB = tensor(B + tx, dextents<int, 2>{SN, (int)K},
-                         array<int, 2>{1, (int)N});
-        auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                         array<int, 2>{1, (int)N});
-        op.run(tA, tB, tC);
-    } else {
-        auto mA = tensor(A, dextents<int, 2>{(int)M, (int)K}, array<int, 2>{1, (int)M});
-        auto mB = tensor(B, dextents<int, 2>{(int)N, (int)K}, array<int, 2>{1, (int)N});
-        auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
-        auto tA = mA.slice(ty, 0);
-        auto tB = mB.slice(tx, 0);
-        auto tC = mC.slice(tx, ty);
-        op.run(tA, tB, tC);
-    }
-}
-
-kernel void matmul2d_tensorops_nt_bf16_f32(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    constant uint &tiles_m [[buffer(7)]],
-    uint tgpig [[threadgroup_position_in_grid]])
-{
-    constexpr int SM = 64;
-    constexpr int SN = 32;
-    constexpr auto desc =
-        matmul2d_descriptor(SM, SN, dynamic_length_v<int>, false, true, false,
-                            matmul2d_descriptor::mode::multiply);
-    matmul2d<desc, execution_simdgroups<4>> op;
-
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
-    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-
-    bool interior = (tx + SN <= (int)N) && (ty + SM <= (int)M);
-    if (interior) {
-        auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM},
-                         array<int, 2>{1, (int)K});
-        auto tB = tensor(B + tx * (int)K, dextents<int, 2>{(int)K, SN},
-                         array<int, 2>{1, (int)K});
-        auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                         array<int, 2>{1, (int)N});
-        op.run(tA, tB, tC);
-    } else {
-        auto mA = tensor(A, dextents<int, 2>{(int)K, (int)M}, array<int, 2>{1, (int)K});
-        auto mB = tensor(B, dextents<int, 2>{(int)K, (int)N}, array<int, 2>{1, (int)K});
-        auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
-        auto tA = mA.slice(0, ty);
-        auto tB = mB.slice(0, tx);
-        auto tC = mC.slice(tx, ty);
-        op.run(tA, tB, tC);
-    }
-}
-
-/// C[M,N] += A_stored[K,M]^T @ B[K,N] (TN accumulate bf16→f32).
-kernel void matmul2d_tensorops_tn_accum_bf16_f32(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    constant uint &tiles_m [[buffer(7)]],
-    uint tgpig [[threadgroup_position_in_grid]])
-{
-    constexpr int SM = 64;
-    constexpr int SN = 32;
-    constexpr auto desc =
-        matmul2d_descriptor(SM, SN, dynamic_length_v<int>, true, false, false,
-                            matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<desc, execution_simdgroups<4>> op;
-
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
-    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-
-    bool interior = (tx + SN <= (int)N) && (ty + SM <= (int)M);
-    if (interior) {
-        auto tA = tensor(A + ty, dextents<int, 2>{SM, (int)K},
-                         array<int, 2>{1, (int)M});
-        auto tB = tensor(B + tx, dextents<int, 2>{SN, (int)K},
-                         array<int, 2>{1, (int)N});
-        auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                         array<int, 2>{1, (int)N});
-        op.run(tA, tB, tC);
-    } else {
-        auto mA = tensor(A, dextents<int, 2>{(int)M, (int)K}, array<int, 2>{1, (int)M});
-        auto mB = tensor(B, dextents<int, 2>{(int)N, (int)K}, array<int, 2>{1, (int)N});
-        auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
-        auto tA = mA.slice(ty, 0);
-        auto tB = mB.slice(tx, 0);
-        auto tC = mC.slice(tx, ty);
-        op.run(tA, tB, tC);
-    }
-}
-
-/// C[M,N] += A[M,K] @ B_stored[N,K]^T (NT accumulate bf16→f32).
-kernel void matmul2d_tensorops_nt_accum_bf16_f32(
-    device bfloat *A [[buffer(0)]],
-    device bfloat *B [[buffer(1)]],
-    device float *C [[buffer(2)]],
-    constant uint &M [[buffer(3)]],
-    constant uint &N [[buffer(4)]],
-    constant uint &K [[buffer(5)]],
-    constant uint &tiles_n [[buffer(6)]],
-    constant uint &tiles_m [[buffer(7)]],
-    uint tgpig [[threadgroup_position_in_grid]])
-{
-    constexpr int SM = 64;
-    constexpr int SN = 32;
-    constexpr auto desc =
-        matmul2d_descriptor(SM, SN, dynamic_length_v<int>, false, true, false,
-                            matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<desc, execution_simdgroups<4>> op;
-
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
-    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
-    int tx = (int)tile.x * SN;
-    int ty = (int)tile.y * SM;
-
-    bool interior = (tx + SN <= (int)N) && (ty + SM <= (int)M);
-    if (interior) {
-        auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM},
-                         array<int, 2>{1, (int)K});
-        auto tB = tensor(B + tx * (int)K, dextents<int, 2>{(int)K, SN},
-                         array<int, 2>{1, (int)K});
-        auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
-                         array<int, 2>{1, (int)N});
-        op.run(tA, tB, tC);
-    } else {
-        auto mA = tensor(A, dextents<int, 2>{(int)K, (int)M}, array<int, 2>{1, (int)K});
-        auto mB = tensor(B, dextents<int, 2>{(int)K, (int)N}, array<int, 2>{1, (int)K});
-        auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
-        auto tA = mA.slice(0, ty);
-        auto tB = mB.slice(0, tx);
-        auto tC = mC.slice(tx, ty);
-        op.run(tA, tB, tC);
-    }
-}
-
 kernel void matmul2d_tensorops_tn_splitk_bf16_f32(
     device bfloat *A [[buffer(0)]],
     device bfloat *B [[buffer(1)]],
@@ -548,7 +374,19 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
         matmul2d_descriptor::mode::multiply);
     matmul2d<d, execution_simdgroups<NSG>> op;
 
-    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    // Large grids take a column-panel swizzle (8 tile-rows per band): bounds
+    // B-tile rereads to tiles_m/8 full passes — +11% at 4096^3, neutral on
+    // tall_k1024/mlp_up, gated off where it measured -3% (square_2048).
+    uint2 tile;
+    if (tiles_n * tiles_m >= 2048u) {
+        constexpr uint PH = 8;
+        uint band = tgpig / (PH * tiles_n);
+        uint rem = tgpig - band * PH * tiles_n;
+        uint local_h = min(PH, tiles_m - band * PH);
+        tile = uint2(rem / local_h, band * PH + rem % local_h);
+    } else {
+        tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    }
     if (tile.x >= tiles_n || tile.y >= tiles_m) return;
     int tx = (int)tile.x * SN;
     int ty = (int)tile.y * SM;
@@ -604,7 +442,170 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
 
 NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32,            bfloat, 128, 64, 4, false)
 NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32_64x64_sg4,  bfloat,  64, 64, 4, false)
-NN_COOP_KERNEL(matmul2d_tensorops_bf16_f32_256x64_sg8, bfloat, 256, 64, 8, false)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed,            float, 128, 64, 4, true)
 NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_64x64_sg4,  float,  64, 64, 4, true)
-NN_COOP_KERNEL(matmul2d_tensorops_f32_relaxed_256x64_sg8, float, 256, 64, 8, true)
+
+/// TN / NT bf16 GEMMs — cooperative destination tensor (2026-08-30 round 2,
+/// bench/results/bf16_tnnt_coop_m5pro.txt): register accumulator, C touched
+/// once (plus one load for ACCUM), descriptor transposes per lane. Interior
+/// tiles use offset pointer tensors; edges the bounds-checked slice path.
+/// ACCUM adds the prior C via the header's cooperative bias pattern
+/// (load-add-store): one C read + one C write total, measured 1.4-1.5x over
+/// multiply_accumulate. Geometry: 128x64 sg4 (plain), 64x64 sg4 (accum).
+template <int SM, int SN, int NSG, bool ACCUM>
+inline void mm_tn_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
+                            uint M, uint N, uint K, uint tiles_n, uint tiles_m,
+                            uint tgpig) {
+    constexpr auto d = matmul2d_descriptor(
+        SM, SN, dynamic_length_v<int>, true, false, false,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<d, execution_simdgroups<NSG>> op;
+
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+
+    bool interior = (tx + SN <= (int)N) && (ty + SM <= (int)M);
+    if (interior) {
+        auto tA = tensor(A + ty, dextents<int, 2>{SM, (int)K},
+                         array<int, 2>{1, (int)M});
+        auto tB = tensor(B + tx, dextents<int, 2>{SN, (int)K},
+                         array<int, 2>{1, (int)N});
+        auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
+                         array<int, 2>{1, (int)N});
+        auto cT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA)>,
+            metal::remove_addrspace_t<decltype(tB)>, float>();
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+            cT.set(i, 0.0f);
+        op.run(tA, tB, cT);
+        if (ACCUM) {
+            auto prevT = op.template get_destination_cooperative_tensor<
+                metal::remove_addrspace_t<decltype(tA)>,
+                metal::remove_addrspace_t<decltype(tB)>, float>();
+            prevT.load(tC);
+#pragma clang loop unroll(full)
+            for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+                if (cT.is_valid_element(i))
+                    cT[i] += prevT[i];
+            }
+        }
+        cT.store(tC);
+    } else {
+        auto mA = tensor(A, dextents<int, 2>{(int)M, (int)K}, array<int, 2>{1, (int)M});
+        auto mB = tensor(B, dextents<int, 2>{(int)N, (int)K}, array<int, 2>{1, (int)N});
+        auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
+        auto tA = mA.slice(ty, 0);
+        auto tB = mB.slice(tx, 0);
+        auto tC = mC.slice(tx, ty);
+        auto cT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA)>,
+            metal::remove_addrspace_t<decltype(tB)>, float>();
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+            cT.set(i, 0.0f);
+        op.run(tA, tB, cT);
+        if (ACCUM) {
+            auto prevT = op.template get_destination_cooperative_tensor<
+                metal::remove_addrspace_t<decltype(tA)>,
+                metal::remove_addrspace_t<decltype(tB)>, float>();
+            prevT.load(tC);
+#pragma clang loop unroll(full)
+            for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+                if (cT.is_valid_element(i))
+                    cT[i] += prevT[i];
+            }
+        }
+        cT.store(tC);
+    }
+}
+
+template <int SM, int SN, int NSG, bool ACCUM>
+inline void mm_nt_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
+                            uint M, uint N, uint K, uint tiles_n, uint tiles_m,
+                            uint tgpig) {
+    constexpr auto d = matmul2d_descriptor(
+        SM, SN, dynamic_length_v<int>, false, true, false,
+        matmul2d_descriptor::mode::multiply);
+    matmul2d<d, execution_simdgroups<NSG>> op;
+
+    uint2 tile = tile_from_linear(tgpig, tiles_n, tiles_m);
+    if (tile.x >= tiles_n || tile.y >= tiles_m) return;
+    int tx = (int)tile.x * SN;
+    int ty = (int)tile.y * SM;
+
+    bool interior = (tx + SN <= (int)N) && (ty + SM <= (int)M);
+    if (interior) {
+        auto tA = tensor(A + ty * (int)K, dextents<int, 2>{(int)K, SM},
+                         array<int, 2>{1, (int)K});
+        auto tB = tensor(B + tx * (int)K, dextents<int, 2>{(int)K, SN},
+                         array<int, 2>{1, (int)K});
+        auto tC = tensor(C + ty * (int)N + tx, dextents<int, 2>{SN, SM},
+                         array<int, 2>{1, (int)N});
+        auto cT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA)>,
+            metal::remove_addrspace_t<decltype(tB)>, float>();
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+            cT.set(i, 0.0f);
+        op.run(tA, tB, cT);
+        if (ACCUM) {
+            auto prevT = op.template get_destination_cooperative_tensor<
+                metal::remove_addrspace_t<decltype(tA)>,
+                metal::remove_addrspace_t<decltype(tB)>, float>();
+            prevT.load(tC);
+#pragma clang loop unroll(full)
+            for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+                if (cT.is_valid_element(i))
+                    cT[i] += prevT[i];
+            }
+        }
+        cT.store(tC);
+    } else {
+        auto mA = tensor(A, dextents<int, 2>{(int)K, (int)M}, array<int, 2>{1, (int)K});
+        auto mB = tensor(B, dextents<int, 2>{(int)K, (int)N}, array<int, 2>{1, (int)K});
+        auto mC = tensor(C, dextents<int, 2>{(int)N, (int)M}, array<int, 2>{1, (int)N});
+        auto tA = mA.slice(0, ty);
+        auto tB = mB.slice(0, tx);
+        auto tC = mC.slice(tx, ty);
+        auto cT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(tA)>,
+            metal::remove_addrspace_t<decltype(tB)>, float>();
+#pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
+            cT.set(i, 0.0f);
+        op.run(tA, tB, cT);
+        if (ACCUM) {
+            auto prevT = op.template get_destination_cooperative_tensor<
+                metal::remove_addrspace_t<decltype(tA)>,
+                metal::remove_addrspace_t<decltype(tB)>, float>();
+            prevT.load(tC);
+#pragma clang loop unroll(full)
+            for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+                if (cT.is_valid_element(i))
+                    cT[i] += prevT[i];
+            }
+        }
+        cT.store(tC);
+    }
+}
+
+#define TN_NT_COOP_KERNEL(NAME, IMPL, SM, SN, NSG, ACCUM)                      \
+    kernel void NAME(device bfloat *A [[buffer(0)]],                           \
+                     device bfloat *B [[buffer(1)]],                           \
+                     device float *C [[buffer(2)]],                            \
+                     constant uint &M [[buffer(3)]],                           \
+                     constant uint &N [[buffer(4)]],                           \
+                     constant uint &K [[buffer(5)]],                           \
+                     constant uint &tiles_n [[buffer(6)]],                     \
+                     constant uint &tiles_m [[buffer(7)]],                     \
+                     uint tgpig [[threadgroup_position_in_grid]]) {            \
+        IMPL<SM, SN, NSG, ACCUM>(A, B, C, M, N, K, tiles_n, tiles_m, tgpig);   \
+    }
+
+TN_NT_COOP_KERNEL(matmul2d_tensorops_tn_bf16_f32,       mm_tn_coop_bf16, 128, 64, 4, false)
+TN_NT_COOP_KERNEL(matmul2d_tensorops_nt_bf16_f32,       mm_nt_coop_bf16, 128, 64, 4, false)
+TN_NT_COOP_KERNEL(matmul2d_tensorops_tn_accum_bf16_f32, mm_tn_coop_bf16,  64, 64, 4, true)
+TN_NT_COOP_KERNEL(matmul2d_tensorops_nt_accum_bf16_f32, mm_nt_coop_bf16,  64, 64, 4, true)
