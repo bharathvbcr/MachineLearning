@@ -134,3 +134,7 @@ sync_to_obsidian/
 # Generated Rust coverage reports (absolute paths, rebuilt by cargo-llvm-cov)
 lcov.info
 **/lcov.info
+
+# Standalone crates with their own git repositories.
+# sparsl: https://github.com/bharathvbcr/sparsl
+Rust_MLKit/crates/sparsl/
