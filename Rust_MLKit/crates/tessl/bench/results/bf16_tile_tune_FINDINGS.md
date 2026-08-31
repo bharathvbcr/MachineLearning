@@ -480,3 +480,112 @@ Three more, in addition to the two recorded above.
   2 GFLOP of work the sweep measures dispatch latency, not the kernel, and
   ratios there (including bf16 `square_512` at 0.84x) should not be read as
   throughput.
+
+---
+
+# Round 3: one owner for the GEMM
+
+The two crates carried byte-identical forks of the GEMM kernels and of
+`gemm.rs` / `runtime.rs` / `tensor.rs` / `dispatch.rs`, kept in step by a static
+audit. An audit that detects drift is a smoke alarm, not a fix. This round
+removes the second copy.
+
+## What the forks actually were
+
+Measured before touching anything, because "duplicate" and "forked" call for
+different work:
+
+| module | tessl | arch02 | relationship |
+|---|---|---|---|
+| `runtime.rs` | 1578 | 1298 | tessl a **strict API superset** — 0 arch02-only items |
+| `tensor.rs` | 510 | 466 | tessl a **strict API superset** |
+| `dispatch.rs` | 497 | 357 | arch02 added exactly 2 generic helpers |
+| `gemm.rs` | 2274 | 1719 | identical 37-fn API; **2 substantive body lines** differed |
+| `ab_flags.rs` | 113 | 264 | genuinely different — 14 arch02 training flags |
+
+So four of the five were not forks worth merging, they were copies. Deleting
+them and re-exporting tessl's cost nothing: `pub use tessl::{dispatch, gemm,
+npy, runtime, tensor}` keeps all 203 internal `crate::X::` paths resolving.
+
+`ab_flags` stayed split. Flags like `fa_blocksoft` and `muon_simdgroup` have no
+business in a released GEMM library; only the three GEMM flags moved.
+
+## What the boundary forced into the open
+
+Three things were only possible because the fork hid them:
+
+- **`Tensor` was constructed by struct literal in 11 places** with no bounds
+  check at all — any of them could describe a region larger than its buffer.
+  The field is private across a crate boundary, so those became
+  `Tensor::from_buffer(..)`, which runs the same `validate()` every dispatch
+  relies on. This is a real hardening win that the dedup paid for, not a cost.
+- **`GpuRuntime::new()` loads tessl's metallib**, which holds only GEMM and util
+  kernels. arch02's 42 call sites now go through `tessl_arch02::gpu_runtime()`,
+  which loads *its* metallib — build.rs compiles tessl's canonical GEMM sources
+  together with arch_02's ~28 training kernels. Getting this wrong failed late
+  and clearly ("kernel 'muon_bank_ns5_f32' not found in metallib"), which is
+  how it should fail.
+- **8 util kernels were defined twice**, byte-identically, in tessl's
+  `utils.metal` and in arch02's `block_glue*.metal` / `phase4_bf16.metal` /
+  `head_loss_fwd.metal`. Two definitions of one kernel is a metallib link error
+  waiting for someone to compile both — and this round compiled both. arch02's
+  copies are gone.
+
+## The mechanism
+
+tessl declares `links = "tessl"` and its build script publishes its kernel
+directory; arch02's build script reads `DEP_TESSL_KERNELS` and compiles those
+sources into its own metallib. This is Cargo's supported channel — a relative
+path guess from `CARGO_MANIFEST_DIR` would break the moment either crate moves.
+`DEP_TESSL_KERNELS` being absent is a hard `expect`, because the alternative is
+a metallib quietly built with no GEMM kernels in it.
+
+The audit's job changed accordingly. It no longer compares two copies; it checks
+the one copy against its Rust constants, and **fails if arch02 grows a local
+`matmul_tensorops.metal` again** — the reappearance of the copy is now itself
+the regression.
+
+## A stale-artifact hazard found while verifying
+
+Six fault injections were re-run after the move. One — a coop kernel's `SM`
+changed from 64 to 128 — came back clean, when it had failed before.
+
+The cause was not the dedup. `cargo:rerun-if-changed=kernels/` tracks a
+*directory*, whose mtime only moves when a file is created, deleted or renamed.
+Editing a kernel in place does not touch it, so `cargo test` happily reused a
+stale metallib and reported a pass. That is the third time a stale build
+artifact has produced a false result in this project.
+
+Both build scripts now emit `rerun-if-changed` for every `.metal` file
+individually, recursing into subdirectories. Verified: editing only a kernel,
+touching no `.rs`, now triggers a rebuild and the fault fails.
+
+Final fault-injection matrix, each caught by at least one gate:
+
+| fault | static audit | runtime tests |
+|---|---|---|
+| f32r coop BKC drift | FAIL | FAIL |
+| bf16 coop tile drift | **FAIL** | pass |
+| bf16 coop store removed | pass | FAIL |
+| f32r accumulator seeded non-zero | pass | FAIL |
+| bf16 coop skips every other K block | pass | FAIL |
+| f32r column offset by one | pass | FAIL |
+
+Tile drift is caught by the audit alone, which is the gate built for exactly
+that class. Worth stating plainly rather than claiming "6 of 6 at runtime":
+the two gates cover different failures and neither is redundant.
+
+## Result
+
+- Zero duplicated `.rs` modules, zero duplicated kernel files, **zero duplicate
+  kernel symbols**. `ab_flags.rs` and `lib.rs` differ on purpose.
+- ~4,800 lines deleted from arch02; 49 of the 50 tests it lost were duplicates
+  already covered in tessl. The one that was not
+  (`oversized_extent_rejected_before_callback`, guarding the two dispatch
+  helpers that moved) was recovered into tessl rather than dropped.
+- Suites: tessl 68, tessl-arch02 49, gemma-metal 134. Audit PASS. Fuzz soak
+  6 seeds x 1200 cases x 3 paths clean.
+- tessl now holds the GEMM benchmarks, the A/B rig and the audit, so the package
+  is verifiable and benchmarkable on its own. `cargo package` produces 32 files
+  / 115 KB with the kernels included, and the audit runs inside the extracted
+  crate.

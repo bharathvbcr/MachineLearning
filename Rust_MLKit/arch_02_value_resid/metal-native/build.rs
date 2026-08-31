@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=kernels/");
     println!("cargo:rerun-if-env-changed=DEVELOPER_DIR");
     println!("cargo:rerun-if-env-changed=METAL_NATIVE_SKIP_AOT");
 
@@ -52,6 +51,7 @@ fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let kernels_dir = manifest_dir.join("kernels");
+    track_kernel_sources(&kernels_dir);
 
     let sdk = xcrun_stdout(&["--sdk", "macosx", "--show-sdk-path"]);
     let metal = resolve_metal();
@@ -70,7 +70,7 @@ fn main() {
          declare `links = \"tessl\"`; without it this crate would silently \
          build a metallib with no GEMM kernels in it",
     ));
-    println!("cargo:rerun-if-changed={}", tessl_kernels.display());
+    track_kernel_sources(&tessl_kernels);
     let mut tensorops_sources: Vec<PathBuf> = vec![
         tessl_kernels.join("matmul_tensorops.metal"),
         kernels_dir.join("flash_attn_tensorops.metal"),
@@ -283,5 +283,28 @@ fn run(cmd: &mut Command, label: &str) {
         .unwrap_or_else(|e| panic!("{label}: failed to spawn: {e}"));
     if !status.success() {
         panic!("{label}: exited with {status}");
+    }
+}
+
+/// Emit `rerun-if-changed` for every `.metal` file, not just the directory.
+///
+/// A bare `cargo:rerun-if-changed=kernels/` tracks the *directory*, whose mtime
+/// only moves when a file is created, deleted or renamed — editing a kernel in
+/// place does not touch it. The result is a metallib that silently stays stale
+/// while `cargo test` reports a pass, which is how a broken kernel can look
+/// green. Listing the files individually is the only reliable form.
+fn track_kernel_sources(dir: &Path) {
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => panic!("read {} for change tracking: {e}", dir.display()),
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let p = entry.path();
+        if p.is_dir() {
+            track_kernel_sources(&p);
+        } else if p.extension().and_then(|s| s.to_str()) == Some("metal") {
+            println!("cargo:rerun-if-changed={}", p.display());
+        }
     }
 }
