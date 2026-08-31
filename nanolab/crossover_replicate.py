@@ -299,10 +299,18 @@ ARMS: tuple[Arm, ...] = (
         "E12: the board's co-leader with its attention windowed",
         overrides=(("swa_window", 128), ("swa_sinks", 4))),
 )
-SWA_ARMS = ("swa_w64", "swa_w128", "swa_w256", "swa_w64_nosink",
+# `attention` and `gdn` are carried IN these suites rather than read across from
+# suite 26 / E9. Those rows were measured on a GH200; these will not be. Joining
+# them would compare architectures across hardware, which is the confound this
+# paper is about -- and `current_recipe` records the device precisely so that
+# such a join cannot happen quietly. Ten extra runs buys a self-contained board.
+SWA_ARMS = ("attention", "gdn",
+            "swa_w64", "swa_w128", "swa_w256", "swa_w64_nosink",
             "hybrid_mingru10_swa2")
-# Same four questions at ctx 2048: three locality ratios plus the sink ablation.
-SWA2K_ARMS = ("swa_w64", "swa_w256", "swa_w512", "swa_w64_nosink")
+# Same questions at ctx 2048: three locality ratios, the sink ablation, and the
+# same two references for the same reason.
+SWA2K_ARMS = ("attention", "gdn",
+              "swa_w64", "swa_w256", "swa_w512", "swa_w64_nosink")
 # The four E10 arms, as one name so a launcher cannot list three of them.
 RATIO_ARMS = ("hybrid_mingru11_attn1", "hybrid_mingru_periodic",
               "hybrid_mingru_bookend", "hybrid_mingru8_attn4")
@@ -357,6 +365,26 @@ def cluster_swa_chunk() -> int:
     return int(os.environ.get("SWA_CHUNK", "-1"))
 
 
+def cluster_gpus() -> int:
+    """How many GPUs this launch spreads over. 1 unless set.
+
+    Kept SEPARATE from `workers`, which stays what it has always been: jobs per
+    GPU, i.e. tenancy. Total processes are `gpus * workers`. Conflating the two
+    would silently redefine `workers` in every recipe.json already on disk, and
+    every throughput number those recipes make interpretable.
+    """
+    return max(1, int(os.environ.get("CROSSOVER_GPUS", "1")))
+
+
+def visible_gpu_count() -> int:
+    """GPUs this process can actually see, honouring CUDA_VISIBLE_DEVICES."""
+    try:
+        import torch as _t
+        return _t.cuda.device_count() if _t.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+
 def cluster_workers() -> int:
     """How many jobs share the GPU. Set by ``cmd_launch``; 1 when unset.
 
@@ -391,7 +419,18 @@ def _suite_tenancy(suite_dir: Path) -> int | None:
         if isinstance(recorded, int) and recorded > 0:
             return recorded
     n = len(list(Path(suite_dir).glob("worker_*.log")))
-    return n or None
+    if not n:
+        return None
+    # Log files count TOTAL processes. On a multi-GPU launch that is gpus x
+    # tenancy, so dividing is the difference between "three to a GPU" and
+    # "twenty-four processes", which are wildly different throughput regimes.
+    gpus = 1
+    if rec.exists():
+        try:
+            gpus = int(json.loads(rec.read_text(encoding="utf-8")).get("gpus") or 1)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            gpus = 1
+    return max(1, -(-n // max(1, gpus)))
 
 
 RATE_SUITES = (
@@ -620,6 +659,11 @@ def current_recipe() -> dict:
         # at one jobs-per-GPU does not transfer to another, and a suite that
         # silently mixed the two would produce rates nothing could interpret.
         "workers": cluster_workers(),
+        # Total processes are gpus * workers; `workers` remains jobs-per-GPU.
+        # Recorded because a 2-per-GPU suite on 8 GPUs and one on 1 GPU are the
+        # same tenancy but not the same run, and the second cannot be resumed
+        # into the first without changing what "elapsed" means.
+        "gpus": cluster_gpus(),
         # Recorded so `lock_recipe` refuses to mix two wall-clock budgets, or a
         # wall-clock-matched run and a token-matched one, in one directory.
         "budget_by_arm": budget_by_arm() or None,
@@ -1267,6 +1311,14 @@ def cmd_launch(args) -> None:
     # recipe field set by assumption rather than by what happened is the defect
     # this suite's own analysis exists to catch.
     os.environ["CROSSOVER_WORKERS"] = str(args.workers)
+    gpus = max(1, int(getattr(args, "gpus", 0) or 0) or cluster_gpus())
+    seen = visible_gpu_count()
+    if seen and gpus > seen:
+        raise SystemExit(
+            f"--gpus {gpus} but only {seen} visible. Refusing rather than "
+            f"oversubscribing: workers past the last GPU would pile onto one "
+            f"device and the tenancy this suite records would be a fiction.")
+    os.environ["CROSSOVER_GPUS"] = str(gpus)
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
     lock_recipe(out_root)
@@ -1290,7 +1342,9 @@ def cmd_launch(args) -> None:
         1 for j in json.loads(queue.read_text(encoding="utf-8"))["jobs"]
         if j["status"] == "pending"
     )
-    print(f"queue {queue}  pending≈{n_pending}  workers={args.workers}")
+    total = gpus * args.workers
+    print(f"queue {queue}  pending≈{n_pending}  gpus={gpus} "
+          f"workers/gpu={args.workers}  processes={total}")
     workers = []
     env = os.environ.copy()
     env.setdefault("PEAK_FLOPS", str(resolve_peak_flops()))
@@ -1302,6 +1356,7 @@ def cmd_launch(args) -> None:
     # Workers is exported, not defaulted: the recipe every job records must say
     # how many jobs actually shared the GPU with it.
     env["CROSSOVER_WORKERS"] = str(args.workers)
+    env["CROSSOVER_GPUS"] = str(gpus)
     if os.environ.get("CROSSOVER_ARMS"):
         env["CROSSOVER_ARMS"] = os.environ["CROSSOVER_ARMS"]
     if os.environ.get("CROSSOVER_LR_HORIZON"):
@@ -1311,19 +1366,27 @@ def cmd_launch(args) -> None:
             n = int(stale.stem.split("_", 1)[1])
         except (IndexError, ValueError):
             continue
-        if n >= args.workers:
+        if n >= total:
             stale.unlink(missing_ok=True)
-    for wid in range(args.workers):
+    for wid in range(total):
         cmd = [
             sys.executable, "-m", "nanolab.crossover_replicate", "worker",
             "--out", str(out_root), "--worker-id", str(wid),
         ]
+        wenv = dict(env)
+        if gpus > 1:
+            # Round-robin, so gpus*workers processes land exactly `workers` to a
+            # device. Pinning by CUDA_VISIBLE_DEVICES rather than torch.set_device
+            # keeps every job seeing "cuda:0" and leaves the training code, the
+            # allocator and the peak-memory numbers untouched.
+            wenv["CUDA_VISIBLE_DEVICES"] = str(wid % gpus)
         log = (out_root / f"worker_{wid}.log").open("w", encoding="utf-8")
         workers.append(subprocess.Popen(
-            cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
+            cmd, env=wenv, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,
         ))
-        print(f"  started worker {wid} pid={workers[-1].pid}")
+        print(f"  started worker {wid} pid={workers[-1].pid}"
+              + (f" gpu={wid % gpus}" if gpus > 1 else ""))
     if args.detach:
         print("detached; monitor with: python -m nanolab.crossover_replicate status")
         return
@@ -1698,6 +1761,7 @@ def _launch_blocking(args, stage: dict) -> None:
     apply_isolate(stage)
     args.out = str(stage["out"])
     args.workers = stage["workers"]
+    args.gpus = max(1, int(getattr(args, "gpus", 1) or 1))
     args.arm = None
     args.seed = None
     args.unhold = False
@@ -1849,7 +1913,9 @@ def cmd_swaboard(args) -> None:
                     mixers="attention,swa_w64,swa_w512"))
             os.environ.pop("CROSSOVER_BLOCK", None)
         elif phase in ("swa32", "swa2k"):
-            _launch_blocking(argparse.Namespace(**vars(args)), stage_by_name(phase))
+            ns = argparse.Namespace(**vars(args))
+            ns.gpus = args.gpus or 1
+            _launch_blocking(ns, stage_by_name(phase))
         elif phase == "mqar-calibrate":
             _mqar(["--out", str(MQAR_OUT), "--device", args.device,
                    "--cells", ",".join(str(p) for p in _mqar_cells()),
@@ -1870,6 +1936,7 @@ def cmd_swaboard(args) -> None:
                    "--arms", ",".join(_mqar_arms()),
                    "--seeds", str(args.mqar_seeds),
                    "--workers", str(args.mqar_workers),
+                   "--gpus", str(args.gpus or 1),
                    "--steps", str(args.mqar_steps)])
     print("\n=== swaboard complete ===")
     print("  CE boards : nanolab/out/crossover50m_swa32, .../crossover50m_swa2k")
@@ -2297,7 +2364,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--force", action="store_true")
     run.add_argument("--smoke", action="store_true")
     launch = sub.add_parser("launch", parents=[common])
-    launch.add_argument("--workers", type=int, default=1)
+    launch.add_argument("--workers", type=int, default=1,
+                        help="jobs per GPU (tenancy), NOT total processes")
+    launch.add_argument("--gpus", type=int, default=0,
+                        help="spread over this many GPUs; total processes are "
+                             "gpus*workers. 0 = CROSSOVER_GPUS or 1.")
     launch.add_argument("--arm", default=None, choices=[a.name for a in ARMS])
     launch.add_argument("--seed", type=int, default=None)
     launch.add_argument("--detach", action="store_true")
@@ -2359,6 +2430,10 @@ def build_parser() -> argparse.ArgumentParser:
     board.add_argument("--workers", type=int, default=None)
     board.add_argument("--detach", action="store_true")
     board.add_argument("--device", default="cuda")
+    board.add_argument("--gpus", type=int, default=0,
+                       help="spread every phase over this many GPUs (0 = 1). "
+                            "The board is 315 independent runs, so this scales "
+                            "very nearly linearly where tenancy does not.")
     board.add_argument("--probe-steps", type=int, default=30)
     board.add_argument("--mqar-seeds", type=int, default=15)
     board.add_argument("--mqar-workers", type=int, default=4,

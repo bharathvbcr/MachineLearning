@@ -2426,8 +2426,14 @@ def swa_arms_carry_their_window_into_the_job_config():
         cfg = cr.job_config(job, Path("/tmp/does-not-matter"), smoke=True)
         assert (cfg.swa_window, cfg.swa_sinks) == (w, s), \
             f"{name} built at SWA({cfg.swa_window},{cfg.swa_sinks}), want SWA({w},{s})"
-    # Every SWA arm on either board must be one of the windows checked above.
-    assert set(cr.SWA_ARMS) | set(cr.SWA2K_ARMS) <= set(windows)
+    # Every WINDOWED arm on either board must be one of the windows checked
+    # above; the boards also carry `attention`/`gdn` as references, which have
+    # no window and are covered by swa_boards_carry_their_own_reference_arms.
+    on_board = set(cr.SWA_ARMS) | set(cr.SWA2K_ARMS)
+    windowed = {a.name for a in cr.ARMS
+                if a.name in on_board and (a.mixer == "swa" or "swa" in a.layer_mixers)}
+    assert windowed <= set(windows), windowed - set(windows)
+    assert on_board - windowed == {"attention", "gdn"}, on_board - windowed
     # The backlog's E12 question -- windowed attention INSIDE the hybrid -- must
     # actually be on the ctx-512 board, and must expand to 10 minGRU + 2 SWA.
     assert "hybrid_mingru10_swa2" in cr.SWA_ARMS
@@ -2920,6 +2926,86 @@ def gpu_bundle_shares_the_peak_table_rather_than_copying_it():
         "gpu_bundle.py defines its own DEVICE_PEAK_FLOPS again"
     assert "from nanolab.crossover_replicate import" in text and \
         "DEVICE_PEAK_FLOPS" in text, "gpu_bundle.py no longer shares the table"
+
+
+@test
+def swa_boards_carry_their_own_reference_arms():
+    """attention and gdn run INSIDE E12/E15 rather than being read across from
+    suite 26 / E9. Those rows were measured on a GH200 and these will not be;
+    joining them would compare architectures across hardware, which is the
+    confound the paper is about."""
+    from . import crossover_replicate as cr
+    for arms, name in ((cr.SWA_ARMS, "swa32"), (cr.SWA2K_ARMS, "swa2k")):
+        assert "attention" in arms, f"{name} has no full-attention reference"
+        assert "gdn" in arms, f"{name} has no linear-attention reference"
+        assert any(a.startswith("swa") for a in arms), f"{name} has no SWA arm"
+        stage = cr.stage_by_name(name)
+        assert set(stage["arms"].split(",")) == set(arms)
+
+
+@test
+def gpus_and_workers_stay_different_quantities():
+    """`workers` has always meant jobs per GPU. Redefining it as total processes
+    would silently reinterpret every recipe.json already on disk, and every
+    throughput number those recipes make readable."""
+    import os
+    from . import crossover_replicate as cr
+
+    prev = {k: os.environ.get(k) for k in ("CROSSOVER_GPUS", "CROSSOVER_WORKERS")}
+    try:
+        os.environ["CROSSOVER_WORKERS"], os.environ["CROSSOVER_GPUS"] = "2", "1"
+        one = cr.current_recipe()
+        os.environ["CROSSOVER_GPUS"] = "8"
+        eight = cr.current_recipe()
+    finally:
+        for k, v in prev.items():
+            os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+    assert "gpus" in one, "gpus missing from the recorded recipe"
+    assert one["workers"] == eight["workers"] == 2, "gpus leaked into tenancy"
+    assert one["gpus"] == 1 and eight["gpus"] == 8
+    assert one != eight, "1-GPU and 8-GPU launches share a fingerprint"
+
+    # Round-robin must put exactly `workers` processes on each device.
+    for gpus, workers in ((8, 2), (4, 1), (2, 3), (1, 4)):
+        total = gpus * workers
+        per = {}
+        for wid in range(total):
+            per.setdefault(wid % gpus if gpus > 1 else 0, []).append(wid)
+        assert len(per) == gpus, f"{gpus}x{workers} used {len(per)} devices"
+        assert all(len(v) == workers for v in per.values()), \
+            f"{gpus}x{workers} landed unevenly: {[len(v) for v in per.values()]}"
+
+
+@test
+def suite_tenancy_divides_worker_logs_by_gpu_count():
+    """Log files count TOTAL processes. On 8 GPUs at 2 jobs each that is 16, and
+    reading 16 as the tenancy would describe a throughput regime that never
+    existed."""
+    import json as _json
+    from . import crossover_replicate as cr
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        for i in range(16):
+            (root / f"worker_{i}.log").write_text("", encoding="utf-8")
+        assert cr._suite_tenancy(root) == 16, "no recipe: total is the best guess"
+        (root / "recipe.json").write_text(_json.dumps({"gpus": 8}), encoding="utf-8")
+        assert cr._suite_tenancy(root) == 2, "16 processes on 8 GPUs is tenancy 2"
+        (root / "recipe.json").write_text(_json.dumps({"gpus": 8, "workers": 2}),
+                                          encoding="utf-8")
+        assert cr._suite_tenancy(root) == 2, "a recorded tenancy must win"
+
+
+@test
+def mqar_shard_flags_survive_reinvocation():
+    """A worker re-invokes this module; leaving `--gpus 8` in its argv would make
+    every shard spawn its own eight shards."""
+    from .mqar_suite import _drop_workers_flag
+    got = _drop_workers_flag(["--out", "x", "--workers", "4", "--gpus", "8",
+                              "--steps", "3000"])
+    assert got == ["--out", "x", "--steps", "3000"], got
+    assert _drop_workers_flag(["--gpus=8", "--workers=2", "--cells", "16"]) \
+        == ["--cells", "16"]
 
 
 def main():

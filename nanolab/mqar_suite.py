@@ -150,7 +150,7 @@ def run_one(cfg: Config, device: str, arm: str | None = None) -> dict:
 
 
 def _drop_workers_flag(argv: list[str]) -> list[str]:
-    """Strip `--workers N` / `--workers=N` before re-invoking a worker.
+    """Strip `--workers N` / `--gpus N` (and `=` forms) before re-invoking.
 
     Both forms, and the VALUE of the space-separated form: leaving a bare `3`
     behind made argparse reject it in every worker at once. The suite refused
@@ -166,6 +166,11 @@ def _drop_workers_flag(argv: list[str]) -> list[str]:
             skip = True
             continue
         if a.startswith("--workers="):
+            continue
+        if a == "--gpus":
+            skip = True
+            continue
+        if a.startswith("--gpus="):
             continue
         out.append(a)
     return out
@@ -183,7 +188,7 @@ def shard(jobs: list, workers: int, index: int) -> list:
     return jobs[index::workers]
 
 
-def spawn_workers(argv: list[str], workers: int) -> int:
+def spawn_workers(argv: list[str], workers: int, gpus: int = 1) -> int:
     """Re-invoke this module once per worker, each on its own shard.
 
     The 225-run grid used to execute in one Python loop on a box that fits far
@@ -193,11 +198,20 @@ def spawn_workers(argv: list[str], workers: int) -> int:
     one JSON line per run, which POSIX keeps atomic below PIPE_BUF, so no lock
     is needed for records this size.
 
+    With `gpus > 1` the shard count is gpus*workers, so `workers` is jobs per
+    GPU here too -- the same meaning it carries in crossover_replicate.
+
     Returns the first non-zero exit code, or 0.
     """
+    total = max(1, gpus) * workers
     procs = []
-    for i in range(workers):
-        env = dict(os.environ, MQAR_SHARD=f"{i}/{workers}")
+    for i in range(total):
+        env = dict(os.environ, MQAR_SHARD=f"{i}/{total}")
+        if gpus > 1:
+            # Round-robin pin, so `workers` land on each device and every job
+            # still addresses "cuda:0". Without this the 8-GPU box bills eight
+            # and uses one.
+            env["CUDA_VISIBLE_DEVICES"] = str(i % gpus)
         procs.append(subprocess.Popen(
             [sys.executable, "-u", "-m", "nanolab.mqar_suite", *argv], env=env))
     rc = 0
@@ -338,6 +352,9 @@ def main() -> None:
                     help="E16: comma-separated batch sizes to test per cell. "
                          "Finds the smallest batch at which the reference arm "
                          "saturates, writes calibration.json, and STOPS.")
+    ap.add_argument("--gpus", type=int, default=1,
+                    help="spread shards over this many GPUs; total processes "
+                         "are gpus*workers")
     ap.add_argument("--workers", type=int, default=1,
                     help="run this many worker processes over the grid. The "
                          "models are ~9.5M params and a single run leaves the "
@@ -386,9 +403,9 @@ def main() -> None:
             "a time with an explicit --batch.")
 
     shard_env = os.environ.get("MQAR_SHARD", "")
-    if a.workers > 1 and not shard_env and not a.report_only:
+    if (a.workers > 1 or a.gpus > 1) and not shard_env and not a.report_only:
         argv = _drop_workers_flag(sys.argv[1:])
-        rc = spawn_workers(argv, a.workers)
+        rc = spawn_workers(argv, a.workers, a.gpus)
         if rc:
             raise SystemExit(f"a worker failed (exit {rc}); grid incomplete")
         done = {}                      # re-read: the workers wrote it, not us
