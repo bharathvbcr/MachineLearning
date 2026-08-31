@@ -2417,7 +2417,7 @@ mod ns5_tests {
             let cfg = ModelConfig::sota_toy();
             let mut w = init_weights_seeded(&rt, cfg, 77).expect("weights");
             let grads = Grads::zeros_like(&rt, &w).expect("grads");
-            for value in grads.qo_bank.buffer.contents_f32() {
+            for value in grads.qo_bank.buffer.contents_f32().iter_mut() {
                 *value = 0.2;
             }
             let before = w.qo_bank.buffer.contents_f32()[0];
@@ -2582,7 +2582,7 @@ mod ns5_tests {
             .iter()
             .zip(exp.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         eprintln!("4x4 ns5 max_abs={max_abs}");
         assert!(max_abs < 1e-4, "ns5 mismatch {max_abs}");
     }
@@ -2696,7 +2696,7 @@ mod ns5_tests {
             .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         assert!(max_abs < 2e-3, "Polar Express mismatch {max_abs}");
     }
 
@@ -2776,7 +2776,7 @@ mod ns5_tests {
             .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         assert!(max_abs < 2e-3, "NorMuon mismatch {max_abs}");
         assert!(row_state.buffer.contents_f32()[0] > 0.0);
     }
@@ -2834,7 +2834,7 @@ mod ns5_tests {
             .iter()
             .zip(expected_param.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         assert!(max_abs < 3e-3, "MONA mismatch {max_abs}");
         assert!((acc.buffer.contents_f32()[0] - host_acc[0]).abs() < 1e-6);
     }
@@ -2912,7 +2912,7 @@ mod ns5_tests {
             .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         assert!(max_abs < 3e-3, "Muown mismatch {max_abs}");
         assert!(mag_v.buffer.contents_f32()[0] > 0.0);
     }
@@ -2931,7 +2931,7 @@ mod ns5_tests {
             .iter()
             .zip(exp.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         eprintln!("128x64 ns5 max_abs={max_abs}");
         assert!(max_abs < 1e-3, "tall ns5 mismatch {max_abs}");
     }
@@ -2953,7 +2953,7 @@ mod ns5_tests {
             .iter()
             .zip(exp.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         assert!(max_abs < 1e-3, "ns3 mismatch {max_abs}");
     }
 
@@ -2978,7 +2978,7 @@ mod ns5_tests {
                 .iter()
                 .zip(expected.iter())
                 .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
+                .fold(0.0f32, crate::parity::max_finite_error);
             assert!(max_abs < 1e-3, "TensorOps {rows}x{cols} mismatch {max_abs}");
         }
     }
@@ -3025,7 +3025,7 @@ mod ns5_tests {
             .iter()
             .zip(ph.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         let mom_err = slot
             .exp_avg
             .buffer
@@ -3033,7 +3033,7 @@ mod ns5_tests {
             .iter()
             .zip(m.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         eprintln!("adamw param max_abs={max_abs} mom max_abs={mom_err}");
         assert!(max_abs < 1e-6 && mom_err < 1e-6);
     }

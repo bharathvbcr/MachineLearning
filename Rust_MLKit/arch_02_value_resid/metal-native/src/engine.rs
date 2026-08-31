@@ -356,7 +356,7 @@ mod tests {
             .iter()
             .zip(expected_qo.iter())
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, crate::parity::max_finite_error);
         eprintln!(
             "resume replay deltas: loss={loss_delta:e} grad_norm={norm_delta:e} qo={weight_delta:e}"
         );

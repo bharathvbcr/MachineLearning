@@ -86,7 +86,7 @@ fn load_bf16_bits(path: &Path, t: &Tensor) -> Result<(), String> {
         .chunks_exact(2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
         .collect();
-    let backing = t.buffer.contents_u16();
+    let mut backing = t.buffer.contents_u16();
     if backing.len() < bits.len() {
         return Err(format!(
             "bf16 destination {} has {} backing elements, needs {}",

@@ -203,18 +203,21 @@ pub fn collect_research_telemetry(
         })?;
     }
     rt.synchronize()?;
+    // Copy each scalar before opening the next exclusive mapping. Temporary
+    // guards in a struct literal otherwise live until the whole statement ends.
+    let scalar = |buffer: &GpuBuffer| buffer.contents_f32()[0];
     let role_norms = |values: &[GpuBuffer; 3]| RoleNorms {
-        matrix: (values[0].contents_f32()[0] as f64).sqrt(),
-        embedding: (values[1].contents_f32()[0] as f64).sqrt(),
-        auxiliary: (values[2].contents_f32()[0] as f64).sqrt(),
+        matrix: (scalar(&values[0]) as f64).sqrt(),
+        embedding: (scalar(&values[1]) as f64).sqrt(),
+        auxiliary: (scalar(&values[2]) as f64).sqrt(),
     };
     Ok(ResearchTelemetry {
         gradient_norm_by_role: role_norms(&grad_sq),
         update_norm_by_role: role_norms(&update_sq),
-        orthogonality_error_sampled: orth.contents_f32()[0] as f64 / pair_count.max(1) as f64,
-        row_log_drift: row_drift.contents_f32()[0] as f64 / row_count.max(1) as f64,
-        spectral_proxy_log_drift: spectral.contents_f32()[0] as f64 / matrix_count.max(1) as f64,
-        nonfinite_values: nonfinite.contents_f32()[0].max(0.0) as u64,
+        orthogonality_error_sampled: scalar(&orth) as f64 / pair_count.max(1) as f64,
+        row_log_drift: scalar(&row_drift) as f64 / row_count.max(1) as f64,
+        spectral_proxy_log_drift: scalar(&spectral) as f64 / matrix_count.max(1) as f64,
+        nonfinite_values: scalar(&nonfinite).max(0.0) as u64,
     })
 }
 
@@ -230,7 +233,7 @@ mod tests {
         let rt = GpuRuntime::new().expect("gpu");
         let w = init_weights_seeded(&rt, ModelConfig::sota_toy(), 19).expect("weights");
         let grads = Grads::zeros_like(&rt, &w).expect("grads");
-        for value in grads.qo_bank.buffer.contents_f32() {
+        for value in grads.qo_bank.buffer.contents_f32().iter_mut() {
             *value = 1.0;
         }
         let snapshot = capture_weight_snapshot(&w).expect("snapshot");

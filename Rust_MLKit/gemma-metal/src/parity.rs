@@ -28,16 +28,17 @@ pub struct ActivationDump {
 
 impl ActivationDump {
     pub fn numel(&self) -> usize {
-        self.shape.iter().product()
+        self.shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+            .expect("activation shape overflow")
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.data.len() != self.numel() {
+        let count = self.shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+            .ok_or_else(|| Error::Config(format!("activation '{}': shape overflow", self.name)))?;
+        if count == 0 || self.data.len() != count || self.data.iter().any(|x| !x.is_finite()) {
             return Err(Error::Config(format!(
-                "activation '{}': data len {} != shape product {}",
-                self.name,
-                self.data.len(),
-                self.numel()
+                "activation '{}': expected {count} finite values, got {}; empty evidence is invalid",
+                self.name, self.data.len()
             )));
         }
         Ok(())
@@ -55,7 +56,10 @@ pub struct CompareReport {
 
 impl CompareReport {
     pub fn pass(&self, max_abs_tol: f32, cosine_tol: f32) -> bool {
-        self.max_abs <= max_abs_tol && self.cosine >= cosine_tol
+        max_abs_tol.is_finite() && max_abs_tol >= 0.0
+            && cosine_tol.is_finite() && (-1.0..=1.0).contains(&cosine_tol)
+            && self.max_abs.is_finite() && self.mean_abs.is_finite() && self.cosine.is_finite()
+            && self.max_abs <= max_abs_tol && self.cosine >= cosine_tol
     }
 }
 
@@ -70,20 +74,13 @@ pub fn compare_activations(cand: &ActivationDump, reference: &ActivationDump) ->
         )));
     }
     let n = cand.data.len();
-    if n == 0 {
-        return Ok(CompareReport {
-            name: cand.name.clone(),
-            max_abs: 0.0,
-            mean_abs: 0.0,
-            cosine: 1.0,
-        });
-    }
-    let mut max_abs = 0f32;
-    let mut sum_abs = 0f32;
-    let mut dot = 0f32;
-    let mut na = 0f32;
-    let mut nb = 0f32;
+    let mut max_abs = 0f64;
+    let mut sum_abs = 0f64;
+    let mut dot = 0f64;
+    let mut na = 0f64;
+    let mut nb = 0f64;
     for (&a, &b) in cand.data.iter().zip(reference.data.iter()) {
+        let (a, b) = (f64::from(a), f64::from(b));
         let d = (a - b).abs();
         max_abs = max_abs.max(d);
         sum_abs += d;
@@ -101,9 +98,9 @@ pub fn compare_activations(cand: &ActivationDump, reference: &ActivationDump) ->
     };
     Ok(CompareReport {
         name: cand.name.clone(),
-        max_abs,
-        mean_abs: sum_abs / n as f32,
-        cosine,
+        max_abs: max_abs as f32,
+        mean_abs: (sum_abs / n as f64) as f32,
+        cosine: cosine.clamp(-1.0, 1.0) as f32,
     })
 }
 
@@ -307,5 +304,31 @@ mod tests {
         let dumps = load_dump_dir(dir.path()).unwrap();
         assert_eq!(dumps.len(), 1);
         assert_eq!(dumps[0].name, "logits");
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_evidence_cannot_pass() {
+        for data in [vec![f32::NAN], vec![f32::INFINITY], vec![]] {
+            let dump = ActivationDump { name: "invalid".into(), shape: vec![data.len()], data };
+            let result = compare_activations(&dump, &dump);
+            assert!(result.is_err(), "non-finite or empty evidence accepted");
+        }
+        let dump = ActivationDump { name: "overflow".into(),
+            shape: vec![usize::MAX, 2], data: vec![] };
+        assert!(dump.validate().is_err());
+        let report = CompareReport { name: "bad".into(), max_abs: 0.0, mean_abs: 0.0, cosine: 1.0 };
+        assert!(!report.pass(f32::INFINITY, 0.9));
+    }
+
+    #[test]
+    fn large_finite_identical_evidence_passes() {
+        let dump = ActivationDump { name: "finite".into(),
+            shape: vec![2], data: vec![f32::MAX, -f32::MAX] };
+        assert!(compare_activations(&dump,&dump).unwrap().pass(0.0,0.999));
     }
 }
