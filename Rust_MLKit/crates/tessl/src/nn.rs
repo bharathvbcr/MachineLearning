@@ -96,8 +96,16 @@ pub fn rms_norm_f32_with_scalars(
     require::<f32>(x, n, "rms_norm_f32 x")?;
     require::<f32>(weight, dim as usize, "rms_norm_f32 weight")?;
     require::<f32>(out, n, "rms_norm_f32 out")?;
+    if rows == 0 {
+        return Ok(());
+    }
     let p = rt.pipeline("rms_norm_f32")?;
-    dispatch_1d(rt, &p, rows as usize, |bnd| {
+    // One threadgroup per row with a tree reduction, matching `row_reduce`.
+    // Was `dispatch_1d(rt, &p, rows)` — one thread per row — which capped
+    // parallelism at `rows` and ran the whole kernel on a single GPU thread at
+    // the decode shape.
+    let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
+    dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
         set_gpu_buf(bnd, x, 0);
         set_gpu_buf(bnd, weight, 1);
         set_gpu_buf(bnd, out, 2);
@@ -139,8 +147,12 @@ pub fn rms_norm_bf16_with_scalars(
     require::<f32>(weight, dim as usize, "rms_norm_bf16 weight")?;
     // bf16 output: two bytes per element, not four.
     require::<u16>(out, n, "rms_norm_bf16 out")?;
+    if rows == 0 {
+        return Ok(());
+    }
     let p = rt.pipeline("rms_norm_bf16")?;
-    dispatch_1d(rt, &p, rows as usize, |bnd| {
+    let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
+    dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
         set_gpu_buf(bnd, x, 0);
         set_gpu_buf(bnd, weight, 1);
         set_gpu_buf(bnd, out, 2);
@@ -188,8 +200,12 @@ pub fn rms_norm_residual_add_f32_with_scalars(
     require::<f32>(x, n, "rms_norm_residual_add_f32 x")?;
     require::<f32>(weight, dim as usize, "rms_norm_residual_add_f32 weight")?;
     require::<f32>(resid, n, "rms_norm_residual_add_f32 resid")?;
+    if rows == 0 {
+        return Ok(());
+    }
     let p = rt.pipeline("rms_norm_residual_add_f32")?;
-    dispatch_1d(rt, &p, rows as usize, |bnd| {
+    let tptg = reduce_tptg(p.maxTotalThreadsPerThreadgroup(), dim as usize);
+    dispatch_tg_1d(rt, &p, rows as usize, tptg, None, |bnd| {
         set_gpu_buf(bnd, x, 0);
         set_gpu_buf(bnd, weight, 1);
         set_gpu_buf(bnd, resid, 2);
@@ -414,15 +430,29 @@ pub fn gemv_q8_with_scalars(
     require::<f32>(zeros, groups, "gemv_q8 zeros")?;
     require::<f32>(x, cols as usize, "gemv_q8 x")?;
     require::<f32>(y, rows as usize, "gemv_q8 y")?;
+    if rows == 0 {
+        return Ok(());
+    }
     let p = rt.pipeline("gemv_q8")?;
-    dispatch_1d(rt, &p, rows as usize, |bnd| {
-        set_gpu_buf(bnd, packed, 0);
-        set_gpu_buf(bnd, scales, 1);
-        set_gpu_buf(bnd, zeros, 2);
-        set_gpu_buf(bnd, x, 3);
-        set_gpu_buf(bnd, y, 4);
-        scalars(bnd);
-    })
+    // One simdgroup per `SIMD_ROWS` output rows with lanes striding K, the same
+    // geometry the MLX Q4 simd GEMVs use. Was `dispatch_1d(rt, &p, rows)` — one
+    // thread per row — which left adjacent threads reading `cols` bytes apart,
+    // so nothing in a simdgroup's loads coalesced.
+    dispatch_tg_1d(
+        rt,
+        &p,
+        simd_gemv_threadgroups(rows),
+        SIMD_TPTG,
+        None,
+        |bnd| {
+            set_gpu_buf(bnd, packed, 0);
+            set_gpu_buf(bnd, scales, 1);
+            set_gpu_buf(bnd, zeros, 2);
+            set_gpu_buf(bnd, x, 3);
+            set_gpu_buf(bnd, y, 4);
+            scalars(bnd);
+        },
+    )
 }
 
 // -------------------------------------------------------------- KV cache ---
@@ -716,7 +746,8 @@ pub fn flash_attn_swa_with_scalars(
     scalars: impl FnOnce(&mut Binder<'_>),
 ) -> Result<(), String> {
     let d = head_dim.dim();
-    validate_attn_dims(&dims, d, q, o, "flash_attn_swa")?;
+    // The sliding-window kernels always write f32.
+    validate_attn_dims(&dims, d, q, o, "flash_attn_swa", false)?;
     require::<u32>(tkv, 1, "flash_attn_swa tkv")?;
     require::<u32>(q_pos_offset, 1, "flash_attn_swa q_pos_offset")?;
     require::<u32>(kv_pos_offset, 1, "flash_attn_swa kv_pos_offset")?;
@@ -808,15 +839,7 @@ pub fn flash_attn_global_h512_with_scalars(
     const D: u32 = 512;
     // `BR = 4` for this kernel, not 8 — see its `constant uint BR`.
     const BR: usize = 4;
-    let out_elems = elems(
-        dims.batch * dims.tq * dims.heads,
-        D,
-        "flash_attn_global_h512",
-    )?;
-    validate_attn_dims(&dims, D, q, o, "flash_attn_global_h512")?;
-    if out_bf16 {
-        require::<u16>(o, out_elems, "flash_attn_global_h512 o (bf16)")?;
-    }
+    validate_attn_dims(&dims, D, q, o, "flash_attn_global_h512", out_bf16)?;
     require::<u32>(tkv, 1, "flash_attn_global_h512 tkv")?;
     require::<u32>(q_pos_offset, 1, "flash_attn_global_h512 q_pos_offset")?;
     require::<u32>(kv_pos_offset, 1, "flash_attn_global_h512 kv_pos_offset")?;
@@ -856,6 +879,7 @@ fn validate_attn_dims(
     q: &GpuBuffer,
     o: &GpuBuffer,
     what: &str,
+    out_bf16: bool,
 ) -> Result<(), String> {
     if dims.heads_kv == 0 {
         return Err(format!("{what}: heads_kv must be non-zero"));
@@ -872,7 +896,16 @@ fn validate_attn_dims(
     }
     let n = elems(dims.batch * dims.tq * dims.heads, d, what)?;
     require::<f32>(q, n, &format!("{what} q"))?;
-    require::<f32>(o, n, &format!("{what} o"))?;
+    if out_bf16 {
+        // `out_bf16` exists to halve this buffer — the kernel writes `bfloat`
+        // into it. Validating `o` as f32 regardless demanded twice the memory
+        // the kernel touches, so a caller who sized it correctly for bf16 got
+        // "buffer holds 2560 elements, kernel reads/writes 5120" and the
+        // documented half-width scratch was unreachable.
+        require::<u16>(o, n, &format!("{what} o (bf16)"))?;
+    } else {
+        require::<f32>(o, n, &format!("{what} o"))?;
+    }
     Ok(())
 }
 
@@ -1489,24 +1522,44 @@ pub fn gemv_q4_with_scalars(
     }
 
     let p = rt.pipeline(entry)?;
-    let tg_mem = (shape.cols as usize).saturating_mul(4);
-    let limit = rt.max_threadgroup_memory();
-    if tg_mem > limit {
-        return Err(format!(
-            "{entry}: caching x needs {tg_mem} bytes of threadgroup memory but \
-             this device allows {limit}; cols {} is too large for this kernel",
-            shape.cols
-        ));
-    }
-    let tptg = reduction_tptg(
-        p.maxTotalThreadsPerThreadgroup(),
-        GEMV_ROW_TPTG,
-        GEMV_ROW_TPTG,
-    )
-    .min(shape.rows as usize)
-    .max(1);
-    let groups = (shape.rows as usize).div_ceil(tptg);
-    dispatch_tg_1d(rt, &p, groups, tptg, Some((0, tg_mem)), |bnd| {
+    // The two kernels take *different* grids, and until 2026-08-31 both were
+    // dispatched with the one-thread-per-row geometry in the `else` arm.
+    //
+    // `gemv_q4_tiled` indexes its output row by `threadgroup_position_in_grid`
+    // and returns when that exceeds `rows`, so it needs one threadgroup per row.
+    // Handing it `rows.div_ceil(128)` groups meant it wrote the first
+    // `rows / 128` rows and left every other row of `y` untouched — no error, no
+    // partial-write signal, just whatever was in the buffer before. Measured at
+    // 512 rows it wrote 4 and left 508 holding a sentinel. The benchmark is what
+    // caught it: 3,077 GB/s is not a number this machine can produce, and it was
+    // doing 0.8% of the work.
+    //
+    // It also declares its scratch statically (`threadgroup float
+    // partial[GEMV_TG]`) and never caches `x`, so the dynamic threadgroup
+    // allocation, and the `cols` ceiling that exists to bound it, belong to the
+    // one-thread-per-row kernel alone.
+    let (groups, tptg, tg_mem) = if tiled {
+        (shape.rows as usize, GEMV_TILED_TPTG, None)
+    } else {
+        let bytes = (shape.cols as usize).saturating_mul(4);
+        let limit = rt.max_threadgroup_memory();
+        if bytes > limit {
+            return Err(format!(
+                "{entry}: caching x needs {bytes} bytes of threadgroup memory but this \
+                 device allows {limit}; cols {} is too large for this kernel",
+                shape.cols
+            ));
+        }
+        let t = reduction_tptg(
+            p.maxTotalThreadsPerThreadgroup(),
+            GEMV_ROW_TPTG,
+            GEMV_ROW_TPTG,
+        )
+        .min(shape.rows as usize)
+        .max(1);
+        ((shape.rows as usize).div_ceil(t), t, Some((0, bytes)))
+    };
+    dispatch_tg_1d(rt, &p, groups, tptg, tg_mem, |bnd| {
         set_gpu_buf(bnd, bank.packed, 0);
         set_gpu_buf(bnd, bank.scales, 1);
         set_gpu_buf(bnd, bank.zeros, 2);
@@ -1521,6 +1574,14 @@ pub fn gemv_q4_with_scalars(
 /// 128 amortizes the shared `x` cache across enough rows to pay for staging it,
 /// without making the tail group wasteful on short matrices.
 const GEMV_ROW_TPTG: usize = 128;
+
+/// Threads per threadgroup for `gemv_q4_tiled`.
+///
+/// Must equal `GEMV_TG` in `kernels/gemv_q4.metal`: the kernel sizes its
+/// `partial[]` scratch and its tree reduction by that constant, so a smaller
+/// launch leaves the upper half of the array uninitialised and a larger one
+/// overruns it.
+const GEMV_TILED_TPTG: usize = 128;
 
 // ---------------------------------------------------- Embedding lookup ---
 
@@ -1761,24 +1822,42 @@ pub fn gemv_q4_mlx_with_scalars(
     }
 
     let p = rt.pipeline(entry)?;
-    let tg_mem = (shape.cols as usize).saturating_mul(4);
-    let limit = rt.max_threadgroup_memory();
-    if tg_mem > limit {
-        return Err(format!(
-            "{entry}: caching x needs {tg_mem} bytes of threadgroup memory but \
-             this device allows {limit}; cols {} is too large for this kernel",
-            shape.cols
-        ));
-    }
-    let tptg = reduction_tptg(
-        p.maxTotalThreadsPerThreadgroup(),
-        GEMV_ROW_TPTG,
-        GEMV_ROW_TPTG,
-    )
-    .min(shape.rows as usize)
-    .max(1);
-    let groups = (shape.rows as usize).div_ceil(tptg);
-    dispatch_tg_1d(rt, &p, groups, tptg, Some((0, tg_mem)), |bnd| {
+    // `Tiled` takes a different grid from `Standard` and `Wide`, and until
+    // 2026-08-31 all three got the one-thread-per-row geometry below.
+    //
+    // `gemv_q4_mlx_tiled` indexes its output row by
+    // `threadgroup_position_in_grid`, so it needs one threadgroup per row.
+    // With `rows.div_ceil(128)` groups it wrote the first `rows / 128` rows and
+    // left the rest of `y` untouched, returning no error. This is the same
+    // defect `gemv_q4_tiled` had, in the sibling family — found by giving the
+    // three variants one shared numeric test rather than testing `Standard`
+    // alone.
+    //
+    // The tiled kernel also declares its scratch statically and does not cache
+    // `x`, so the dynamic threadgroup allocation and its `cols` ceiling belong
+    // to the other two.
+    let (groups, tptg, tg_mem) = if variant == Q4MlxRowVariant::Tiled {
+        (shape.rows as usize, GEMV_TILED_TPTG, None)
+    } else {
+        let bytes = (shape.cols as usize).saturating_mul(4);
+        let limit = rt.max_threadgroup_memory();
+        if bytes > limit {
+            return Err(format!(
+                "{entry}: caching x needs {bytes} bytes of threadgroup memory but this \
+                 device allows {limit}; cols {} is too large for this kernel",
+                shape.cols
+            ));
+        }
+        let t = reduction_tptg(
+            p.maxTotalThreadsPerThreadgroup(),
+            GEMV_ROW_TPTG,
+            GEMV_ROW_TPTG,
+        )
+        .min(shape.rows as usize)
+        .max(1);
+        ((shape.rows as usize).div_ceil(t), t, Some((0, bytes)))
+    };
+    dispatch_tg_1d(rt, &p, groups, tptg, tg_mem, |bnd| {
         bind_mlx_bank(bnd, &bank, 0);
         set_gpu_buf(bnd, x, 3);
         set_gpu_buf(bnd, y, 4);
@@ -1806,6 +1885,25 @@ const GEMV_X_TILE: usize = 4096;
 /// Each row gets 16 K-lanes that `simd_sum` their partial products, and `x` is
 /// staged a tile at a time rather than whole — so unlike [`gemv_q4_mlx`] this
 /// has no `cols` ceiling from threadgroup memory.
+///
+/// # The bank must be block-interleaved, not row-major
+///
+/// This is the one entry point whose [`Q4MlxBank`] is **not** laid out the way
+/// every other one here expects, and the type cannot express the difference —
+/// `Q4MlxBank` carries no layout tag, so passing a row-major bank compiles,
+/// dispatches, and returns wrong numbers with no error.
+///
+/// The kernel indexes within a 16-row block: for block `b`, group `g` and row
+/// `r` inside the block, it reads scale/bias at
+/// `b * groups_per_row * 16 + g * 16 + r` and the matching nibbles at the same
+/// index, rather than the row-major `row * groups_per_row + g`. Repack with
+/// that mapping before calling.
+///
+/// The two layouts coincide only when `groups_per_row == 1`, which is why a
+/// single-group matrix appears to work and anything wider silently does not.
+/// Measured on a 64x256 matrix with `group_size` 64: 63 of 64 rows wrong with a
+/// row-major bank, 0 of 64 once repacked.
+/// `promoted_numeric.rs` carries a reference repacking.
 ///
 /// Scalar indices for `_with_scalars`: 5 = `rows`, 6 = `cols`, 7 = `group_size`.
 pub fn gemv_q4_mlx_blocked(

@@ -157,6 +157,120 @@ fn rms_norm_residual_add_folds_the_layer_scale() {
     });
 }
 
+/// `dim` beyond one threadgroup's width, which is where the strided loop is the
+/// only thing summing the tail.
+///
+/// The three tests above all use `dim` of 16 to 64. `reduce_tptg` hands the
+/// kernel 1024 threads for a row that wide, so every lane's `for (d = lid; d <
+/// dim; d += tptg)` executes exactly once and a kernel that dropped the loop
+/// entirely would still pass them. Verified: replacing the loop with a single
+/// `xin[lid]` left all three green. These shapes take 4 strided iterations at
+/// 4096 and a ragged 3 at 3000, so the tail cannot go unsummed unnoticed.
+#[test]
+fn rms_norm_sums_rows_wider_than_one_threadgroup() {
+    with_gpu(|rt| {
+        for &(rows, dim) in &[(2usize, 4096usize), (3, 3000), (1, 8192)] {
+            let eps = 1e-6f32;
+            let mut x = random_f32(rows * dim, 0x9001 + dim as u64);
+            // A zero row here too: eps has to survive the reduction rewrite.
+            x[..dim].fill(0.0);
+            let w = random_f32(dim, 0x9002);
+            let xb = buf(rt, &x);
+            let wb = buf(rt, &w);
+            let ob = empty(rt, rows * dim);
+
+            nn::rms_norm_f32(rt, &xb, &wb, &ob, rows as u32, dim as u32, eps).unwrap();
+            rt.synchronize().unwrap();
+
+            let got = ob.read_f32();
+            assert!(
+                got[..rows * dim].iter().all(|v| v.is_finite()),
+                "{rows}x{dim}: non-finite output"
+            );
+            // The kernel now reduces as a tree, so it does NOT match a
+            // sequential f32 sum bit for bit. The reference is f64 and the
+            // tolerance is relative, which measures the error rather than
+            // agreeing with the kernel's own ordering.
+            let want = rms_norm_ref_f64(&x, &w, rows, dim, eps);
+            for (i, (g, wv)) in got[..rows * dim].iter().zip(&want).enumerate() {
+                let tol = 1e-5 * wv.abs().max(1e-3);
+                assert!(
+                    (g - wv).abs() <= tol,
+                    "rms_norm {rows}x{dim} [{i}]: got {g} want {wv}"
+                );
+            }
+        }
+    });
+}
+
+/// Same width sweep for the two sibling kernels, because the strided loop and
+/// the tree reduction are shared code and a fix applied to one of three is not
+/// a fix.
+#[test]
+fn rms_norm_siblings_handle_rows_wider_than_one_threadgroup() {
+    with_gpu(|rt| {
+        let (rows, dim, eps) = (2usize, 4096usize, 1e-6f32);
+        let x = random_f32(rows * dim, 0x9101);
+        let w = random_f32(dim, 0x9102);
+        let want = rms_norm_ref_f64(&x, &w, rows, dim, eps);
+        let xb = buf(rt, &x);
+        let wb = buf(rt, &w);
+
+        // bf16: same reduction, narrower store.
+        let ob = rt.alloc_buffer(rows * dim * 2).unwrap();
+        ob.zero();
+        nn::rms_norm_bf16(rt, &xb, &wb, &ob, rows as u32, dim as u32, eps).unwrap();
+        rt.synchronize().unwrap();
+        let got: Vec<f32> = ob.read_u32()[..rows * dim / 2]
+            .iter()
+            .flat_map(|p| {
+                [
+                    bf16_bits_to_f32((*p & 0xffff) as u16),
+                    bf16_bits_to_f32((*p >> 16) as u16),
+                ]
+            })
+            .collect();
+        for (i, (g, wv)) in got.iter().zip(&want).enumerate() {
+            let tol = 1e-2 * wv.abs().max(1e-3);
+            assert!(
+                (g - wv).abs() <= tol,
+                "rms_norm_bf16 wide [{i}]: {g} vs {wv}"
+            );
+        }
+
+        // residual_add with layer_scale = 1: resid += norm.
+        let resid = vec![0.0f32; rows * dim];
+        let rb = buf(rt, &resid);
+        nn::rms_norm_residual_add_f32(rt, &xb, &wb, &rb, rows as u32, dim as u32, eps, 1.0)
+            .unwrap();
+        rt.synchronize().unwrap();
+        let got = rb.read_f32();
+        for (i, (g, wv)) in got[..rows * dim].iter().zip(&want).enumerate() {
+            let tol = 1e-5 * wv.abs().max(1e-3);
+            assert!(
+                (g - wv).abs() <= tol,
+                "rms_norm_residual_add wide [{i}]: {g} vs {wv}"
+            );
+        }
+    });
+}
+
+/// f64 reference. Distinct from `rms_norm_ref` above, which accumulates in f32
+/// in the same order the old serial kernel did — a comparison that agreed with
+/// the kernel's rounding instead of measuring it.
+fn rms_norm_ref_f64(x: &[f32], weight: &[f32], rows: usize, dim: usize, eps: f32) -> Vec<f32> {
+    let mut out = vec![0.0f32; rows * dim];
+    for r in 0..rows {
+        let row = &x[r * dim..(r + 1) * dim];
+        let ss: f64 = row.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        let inv = 1.0 / (ss / dim as f64 + eps as f64).sqrt();
+        for d in 0..dim {
+            out[r * dim + d] = (row[d] as f64 * inv * weight[d] as f64) as f32;
+        }
+    }
+    out
+}
+
 // ------------------------------------------------------------ MLP gating ---
 
 #[test]
@@ -294,6 +408,180 @@ fn gemv_q8_matches_cpu_dequant_reference() {
             want[r] = acc;
         }
         close("gemv_q8", &yb.read_f32()[..rows], &want, 1e-3);
+    });
+}
+
+/// CPU reference for Q8 GEMV, in f64 so it measures the kernel's error rather
+/// than sharing its rounding.
+fn gemv_q8_ref(
+    packed: &[i8],
+    scales: &[f32],
+    zeros: &[f32],
+    x: &[f32],
+    rows: usize,
+    cols: usize,
+    group: usize,
+) -> Vec<f32> {
+    let gpr = cols / group;
+    (0..rows)
+        .map(|r| {
+            let mut acc = 0.0f64;
+            for g in 0..gpr {
+                let gi = r * gpr + g;
+                for i in 0..group {
+                    let w = scales[gi] as f64
+                        * (packed[r * cols + g * group + i] as f64 - zeros[gi] as f64);
+                    acc += w * x[g * group + i] as f64;
+                }
+            }
+            acc as f32
+        })
+        .collect()
+}
+
+/// Shapes that reach the two paths the original test could not.
+///
+/// `gemv_q8` is one simdgroup per four rows, and it takes a `char4` fast path
+/// when `group_size % 4 == 0`. The only pre-existing test used rows = 24 and
+/// group = 16 — a multiple of the 8 rows a threadgroup covers, and a group
+/// width divisible by 4 — so neither the row tail nor the scalar fallback ran.
+/// Verified: forcing `xv = 0` in the fallback, and removing the `row < rows`
+/// writeback guard, both left that test green.
+#[test]
+fn gemv_q8_covers_the_row_tail_and_the_scalar_fallback() {
+    with_gpu(|rt| {
+        // group 15 is not divisible by 4 -> scalar path; rows 13 and 37 are not
+        // multiples of 8 -> partially filled final threadgroup.
+        for &(rows, cols, group) in &[
+            (13usize, 60usize, 15usize),
+            (37, 128, 32),
+            (13, 120, 15),
+            (100, 4096, 64),
+        ] {
+            let packed: Vec<i8> = (0..rows * cols)
+                .map(|i| (i as i32 % 251 - 125) as i8)
+                .collect();
+            let groups = rows * (cols / group);
+            let scales: Vec<f32> = (0..groups).map(|i| 0.01 + (i % 7) as f32 * 0.003).collect();
+            let zeros: Vec<f32> = (0..groups).map(|i| (i % 5) as f32 - 2.0).collect();
+            let x = random_f32(cols, 0xB100 + cols as u64);
+
+            let pb = rt.alloc_buffer(packed.len()).unwrap();
+            pb.write_bytes(&packed.iter().map(|v| *v as u8).collect::<Vec<u8>>());
+            let sb = buf(rt, &scales);
+            let zb = buf(rt, &zeros);
+            let xb = buf(rt, &x);
+
+            // y is allocated past `rows` and seeded with a sentinel: a kernel
+            // whose tail threadgroup writes rows it does not own would land
+            // here, and a bounds bug that only ever wrote plausible numbers
+            // inside the live range would otherwise be invisible.
+            const SENTINEL: f32 = -12345.0;
+            let yb = buf(rt, &vec![SENTINEL; rows + 16]);
+
+            nn::gemv_q8(
+                rt,
+                &pb,
+                &sb,
+                &zb,
+                &xb,
+                &yb,
+                rows as u32,
+                cols as u32,
+                group as u32,
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+
+            let got = yb.read_f32();
+            let want = gemv_q8_ref(&packed, &scales, &zeros, &x, rows, cols, group);
+            for (i, w) in want.iter().enumerate() {
+                let tol = 1e-3 * w.abs().max(1.0);
+                assert!(
+                    (got[i] - w).abs() <= tol,
+                    "gemv_q8 {rows}x{cols} g{group} [{i}]: got {} want {w}",
+                    got[i]
+                );
+            }
+            for (i, v) in got[rows..rows + 16].iter().enumerate() {
+                assert_eq!(
+                    *v, SENTINEL,
+                    "gemv_q8 {rows}x{cols} g{group} wrote past row {rows} at +{i}"
+                );
+            }
+        }
+    });
+}
+
+/// `gemv_q4`'s two variants take different grids, and the tiled one was getting
+/// the other's.
+///
+/// `gemv_q4_tiled` indexes its output row by `threadgroup_position_in_grid`, so
+/// it needs one threadgroup per row. It was dispatched with
+/// `rows.div_ceil(128)` groups — the geometry the one-thread-per-row kernel
+/// needs — and so wrote the first `rows / 128` rows and left the rest of `y`
+/// untouched. No error, no partial-write signal. At 512 rows it wrote 4.
+///
+/// Nothing caught it: `promoted_kernels.rs` checks the pipeline name exists and
+/// `nn_adversarial.rs` checks the error paths, and neither runs the kernel for a
+/// number. This asserts the two variants agree and that every row is written.
+#[test]
+fn gemv_q4_tiled_writes_every_row_and_agrees_with_the_row_kernel() {
+    with_gpu(|rt| {
+        // rows must exceed the 128 threads the row kernel groups by, or the two
+        // grids coincide and the bug is invisible. 512 and a ragged 300 both do.
+        for &(rows, cols, group) in &[(512usize, 256usize, 64usize), (300, 128, 32)] {
+            let packed: Vec<u8> = (0..rows * cols / 2)
+                .map(|i| ((i * 7) % 251) as u8)
+                .collect();
+            let groups = rows * (cols / group);
+            let scales: Vec<f32> = (0..groups).map(|i| 0.02 + (i % 5) as f32 * 0.001).collect();
+            let zeros: Vec<f32> = (0..groups).map(|i| 7.0 + (i % 3) as f32).collect();
+            let x = random_f32(cols, 0xC400 + cols as u64);
+
+            let pb = rt.alloc_buffer(packed.len()).unwrap();
+            pb.write_bytes(&packed);
+            let sb = buf(rt, &scales);
+            let zb = buf(rt, &zeros);
+            let xb = buf(rt, &x);
+            let shape = nn::QuantShape {
+                rows: rows as u32,
+                cols: cols as u32,
+                group_size: group as u32,
+            };
+            let bank = nn::Q4Bank {
+                packed: &pb,
+                scales: &sb,
+                zeros: &zb,
+            };
+
+            const SENTINEL: f32 = -98765.0;
+            let mut out = Vec::new();
+            for tiled in [false, true] {
+                // Re-seeded per variant: filled once, the first variant's write
+                // would mask whatever the second failed to write.
+                let yb = buf(rt, &vec![SENTINEL; rows]);
+                nn::gemv_q4(rt, bank, &xb, &yb, shape, tiled).unwrap();
+                rt.synchronize().unwrap();
+                out.push(yb.read_f32());
+            }
+
+            for (which, y) in out.iter().enumerate() {
+                let name = if which == 0 { "row" } else { "tiled" };
+                let unwritten = y[..rows].iter().filter(|v| **v == SENTINEL).count();
+                assert_eq!(
+                    unwritten, 0,
+                    "gemv_q4 [{name}] {rows}x{cols}: {unwritten} of {rows} rows never written"
+                );
+            }
+            for (i, (row_y, tiled_y)) in out[0][..rows].iter().zip(&out[1][..rows]).enumerate() {
+                let tol = 1e-3 * row_y.abs().max(1.0);
+                assert!(
+                    (row_y - tiled_y).abs() <= tol,
+                    "gemv_q4 {rows}x{cols} row {i}: row kernel {row_y} vs tiled {tiled_y}"
+                );
+            }
+        }
     });
 }
 
