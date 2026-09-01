@@ -23,11 +23,16 @@ verified to 1e-5 by verify_scan.py / verify_gdn.py.
 
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from . import flash_cuda
+
+log = logging.getLogger("nanolab.mixers")
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +258,9 @@ class Attention(nn.Module):
         # Numerically identical either way, so it never affects a quality row --
         # but it does affect tok/s, so it is a recipe field, not a free knob.
         self.swa_chunk = int(getattr(cfg, "swa_chunk", -1))
+        # Opt-in custom CUDA kernel for the plain-causal path (see config).
+        self.flash_cuda = bool(getattr(cfg, "flash_cuda", False))
+        self._flash_declined = False
         if self.swa_window:
             sliding_window_mask(1 + self.swa_window, self.swa_window,
                                 self.swa_sinks, "cpu", {})   # validate now, not on GPU
@@ -279,40 +287,46 @@ class Attention(nn.Module):
             lam = torch.sigmoid(self.vr_lambda)
             v = (1 - lam) * v + lam * v0
 
-        # (B, H, T, D)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        # GQA: repeat KV heads to match Q heads
-        if self.n_kv_head != self.n_head:
-            rep = self.n_head // self.n_kv_head
-            k = k.repeat_interleave(rep, dim=1)
-            v = v.repeat_interleave(rep, dim=1)
-
         scale = self.attn_scale
         if self.block_attn > 0 and self.swa_window:
             # Two mask generators, one attn_mask slot. Silently letting either win
             # would evaluate an architecture nobody asked for.
             raise ValueError("block-causal (diffusion) attention and SWA are "
                              "mutually exclusive masks")
-        if self.block_attn > 0:                  # semi-AR: causal across blocks, dense within
-            mask = block_causal_mask(T, self.block_attn, x.device, self._mask_cache)
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
-        elif self.swa_window:
-            if not self.causal:
-                raise ValueError("SWA is causal-only; set_causal(False) would "
-                                 "make the window mask meaningless")
-            chunk = (swa_auto_chunk(T, self.swa_window) if self.swa_chunk < 0
-                     else self.swa_chunk)
-            if chunk:
-                y = swa_chunked(q, k, v, self.swa_window, self.swa_sinks,
-                                scale, chunk)
+
+        # The custom CUDA kernel eats (B, T, H, D) with the KV heads still narrow,
+        # so when it takes the step it skips both the transpose and the GQA
+        # widening below. Returns None whenever it cannot (see _flash_cuda_attn).
+        y = self._flash_cuda_attn(q, k, v, scale)
+        if y is None:
+            # (B, H, T, D)
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            # GQA: repeat KV heads to match Q heads
+            if self.n_kv_head != self.n_head:
+                rep = self.n_head // self.n_kv_head
+                k = k.repeat_interleave(rep, dim=1)
+                v = v.repeat_interleave(rep, dim=1)
+
+            if self.block_attn > 0:              # semi-AR: causal across blocks, dense within
+                mask = block_causal_mask(T, self.block_attn, x.device, self._mask_cache)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scale)
+            elif self.swa_window:
+                if not self.causal:
+                    raise ValueError("SWA is causal-only; set_causal(False) would "
+                                     "make the window mask meaningless")
+                chunk = (swa_auto_chunk(T, self.swa_window) if self.swa_chunk < 0
+                         else self.swa_chunk)
+                if chunk:
+                    y = swa_chunked(q, k, v, self.swa_window, self.swa_sinks,
+                                    scale, chunk)
+                else:
+                    mask = sliding_window_mask(T, self.swa_window, self.swa_sinks,
+                                               x.device, self._mask_cache)
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask,
+                                                       scale=scale)
             else:
-                mask = sliding_window_mask(T, self.swa_window, self.swa_sinks,
-                                           x.device, self._mask_cache)
-                y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask,
-                                                   scale=scale)
-        else:
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal, scale=scale)
-        y = y.transpose(1, 2).contiguous()       # (B, T, H, D)
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal, scale=scale)
+            y = y.transpose(1, 2).contiguous()   # (B, T, H, D)
 
         if self.gated:
             g = torch.sigmoid(self.gate(x)).unsqueeze(-1)   # (B,T,H,1)
@@ -320,6 +334,31 @@ class Attention(nn.Module):
 
         y = y.view(B, T, self.n_head * self.head_dim)
         return self.o_proj(y), raw_v
+
+    def _flash_cuda_attn(self, q, k, v, scale):
+        """(B,T,H,D) attention through nanolab/csrc/flash_attn_cuda.cu, or None.
+
+        Plain causal only — the kernel takes no mask, so block-causal (diffusion)
+        and SWA stay on SDPA. When the flag is on but the step cannot use it, the
+        reason is logged once per module: a silent fallback would let
+        ``flash_cuda=True`` sit in a recipe meaning nothing.
+        """
+        if not self.flash_cuda:
+            return None
+        if not self.causal or self.block_attn > 0 or self.swa_window:
+            return None
+        # supports() first, deliberately: it is pure shape/dtype checking, while
+        # is_available() compiles the extension on first call. A CPU tensor must
+        # not trigger a two-minute nvcc build to find that out.
+        ok = flash_cuda.supports(q, k, v)
+        if ok and flash_cuda.is_available():
+            return flash_cuda.flash_attn(q, k, v, scale)
+        if not self._flash_declined:
+            self._flash_declined = True
+            why = (flash_cuda.unavailable_reason() if ok else
+                   f"unsupported inputs: {tuple(q.shape)} {q.dtype} on {q.device}")
+            log.warning("flash_cuda=True but the kernel cannot run (%s) -> SDPA", why)
+        return None
 
     def forward_cached(self, x, cos, sin, v0, cache, commit, causal=False):
         """Incremental forward over ONE block window for semi-AR / self-spec

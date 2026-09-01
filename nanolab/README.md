@@ -53,6 +53,9 @@ each trick a flag on a `Config`, so an A/B is literally one changed field.
 | `reason.py` | §12 | Phase-1/2 inference harness: free-form reasoning + schema-guided JSON decoding |
 | `diffusion.py` | §9 | Phase 3: AR → masked-diffusion conversion (annealing, 1/t objective, complementary masking, parallel decoding); **block diffusion / tri-mode** (block-causal attn → `--mode` full/block/selfspec) |
 | `star.py` | §8, §24 | Phase-3 Self-Taught Reasoner (STaR) bootstrap loop (sample traces, filter correct, rationalize, SFT) |
+| `flash_cuda.py` | §7 | Build-on-demand wrapper + autograd for the custom CUDA flash-attention kernel (`--flash_cuda`); falls back to SDPA whenever it cannot run |
+| `csrc/flash_attn_cuda.cu` | §7 | The kernel itself: FA-2 causal GQA fwd/bwd, a port of the repo's Metal kernels |
+| `csrc/flash_attn_sim.py` | §7 | CPU mirror of that kernel's index arithmetic, so it can be verified without a GPU |
 | `bench_gpu.py` | §7 | GPU-utilization micro-bench (MFU / mem / fwd-bwd-opt breakdown) |
 | `bench_modes.py` | §9 | wall-clock tok/s per decoding mode (ar / diffusion / block / selfspec, cached vs not) |
 | `sweep_gpu.py` | §7 | runs the **whole registry** (every mixer / optimizer / FFN) on the GPU, ranked by throughput; VRAM cap so over-budget configs OOM cleanly |
@@ -71,6 +74,11 @@ python -m nanolab.tests        # 14 checks, <30s
 ```
 
 Run it after any change before a GPU run.
+
+Checks that *cannot* run on the current machine (the CUDA flash-attention kernel
+with no GPU, say) print **SKIP** with the reason and are counted separately —
+never PASS. A check that could not run must not report the same word as one that
+ran and passed.
 
 ## The experiment bake-offs (guide §6.3)
 
@@ -214,6 +222,125 @@ python -m nanolab.train --preset gpu_max     # all of the above, on the 3070 Ti
 > `d=768` matmuls are small and memory-bound, and Ampere has no FP8. GPU
 > *utilization* is already ~100%; higher MFU needs a bigger `d_model` or
 > Blackwell/FP8 (guide §7.3). The point of §7 — no idle tensor cores — is met.
+
+### The custom CUDA flash-attention kernel (`--flash_cuda`)
+
+`nanolab/csrc/flash_attn_cuda.cu` is a hand-written FA-2 causal GQA kernel —
+forward, backward, taped LSE — ported from this repo's Metal kernels
+(`Rust_MLKit/arch_02_value_resid/metal-native/kernels/flash_attn_*.metal`) with
+the same layout, the same tape and the same backward algebra, so the two
+backends can be compared line by line. `nanolab/flash_cuda.py` compiles it on
+first use (`torch.utils.cpp_extension`) and wraps it in an autograd Function.
+
+Two implementations of each direction live in that file:
+
+| path | dtypes | head dims | how the products run |
+|---|---|---|---|
+| FMA fwd + bwd | fp32 / fp16 / bf16 | 32 / 64 / 128 | scalar loops, one thread per row |
+| **tensor core** fwd | fp16 / bf16, sm_80+ | 32 / 64 / 128 | `mma.sync.aligned.m16n8k16`, one warp per 16 rows |
+| **tensor core** bwd | fp16 / bf16, sm_80+ | 32 / 64 | same, five products per tile |
+
+The tensor-core backward stops at head_dim 64 because a dK/dV warp there already
+holds 64 registers of K/V fragments, 48 of scores and 128 of accumulators — past
+the register file before temporaries. head_dim 128 keeps the FMA backward.
+
+The tensor-core forward keeps the online softmax in registers between the two
+products: two adjacent 16×8 score tiles concatenate straight into one 16×16 `A`
+fragment, so turning `S` into `P`'s operand is a pack rather than a round trip
+through shared memory, and a row max/sum is a local reduce plus two
+`__shfl_xor`s (a lane owns rows `gid` and `gid+8` and nothing else). `K` stays in
+its natural `[key][d]` layout and `V` is staged transposed to `[d][key]`, which
+is what makes the `S`/`dP` `B` operands a single contiguous 32-bit pair per lane.
+
+**Tiles are staged with `cp.async`, double buffered.** The copy for tile *n+1* is
+issued before the wait for tile *n*, so the next tile crosses global memory while
+the current one is being multiplied — `cp.async` → `commit` → `wait_prior(1)` →
+`__syncthreads()`, then compute. That last barrier is not optional: cp.async
+completion is per-thread, and the tile has to be visible to the whole block.
+
+This is also why **nothing is staged in two orientations any more.** `cp.async`
+copies bytes and cannot transpose, so a transposed staging copy would have been a
+hole in the pipeline — half the bytes unable to overlap. Instead every matrix is
+staged once in its natural `[row][d]` layout, and the products that want the
+other orientation read that same buffer *down a column* (`load_b_strided`: two
+16-bit loads a row apart instead of one 32-bit pair). That trade is heavily in
+its favour — an extra load per operand register against an entire extra tile of
+scattered shared-memory writes per stage — and it paid for the double buffering
+almost exactly in shared memory.
+
+Rows past the end of a tile clamp to the last live row rather than zero-filling,
+for the same reason: `cp.async` cannot synthesise zeros. Every consumer already
+drops those columns (`col < T`), so all the buffer owes them is a *finite* value.
+That the mirror still matches the reference at `T = 33` and `T = 37` is the check
+that the masks really do the work, rather than the zeros having been load-bearing.
+
+**The backward's transposes are a choice of axis, not a data movement.** `dK +=
+dSᵀ·Q` and `dV += Pᵀ·dO` look like they need the transpose of a register-resident
+matrix, which is the awkward part of any FA backward. They don't here: the dK/dV
+pass makes *keys* the m dimension and computes `Sᵀ = K·Qᵀ` rather than `S`, so
+`dSᵀ` lands in the accumulator already oriented for the next product. What's left
+is staging Q and dO in both orientations in shared memory — which that pass was
+doing anyway. The mirror image of the choice is that the dQ pass reads the
+LSE/Delta tape by *row* while the dK/dV pass reads it by *column*; that is the
+easiest thing in the kernel to get backwards, so it is checked against a
+brute-force gradient rather than read twice.
+
+Every combination of forward and backward produces the same tape and the same
+gradients up to accumulation order, so the choice is a speed/precision question,
+not a semantic one.
+
+**The fragment layout is checked, not trusted.** The PTX register-to-matrix
+mapping is the one thing in the file that a CPU mirror cannot verify — the
+mirror and the kernel would read the same table and agree even if it were wrong.
+So `mma_probe` multiplies known matrices through the kernel's own fragment
+helpers on the device and compares against a plain matmul; `flash_cuda` runs it
+once at load and **leaves the tensor-core path off if it disagrees**. A wrong
+layout is wrong by order 1, not by an ulp, so this is not a close call — and
+getting it wrong silently would corrupt training.
+
+fp32 has no tensor-core path here: `m16n8k16` has no f32 form, and the tf32
+instruction is a different shape (`m16n8k8`) with a different fragment layout.
+`use_mma=True` on fp32 raises rather than quietly downgrading. And the
+tensor-core backward rounds `dS` and `P` to 16 bits for the `A` operand where the
+FMA backward keeps them fp32 — accumulation is fp32 in both, but that is a real
+precision difference, and the reason the gradient tolerances differ.
+
+**Off by default, and honest about why.** Even with tensor cores, CUDA already
+has a fast path: `F.scaled_dot_product_attention` dispatches to a tensor-core
+FlashAttention-2 built on CUTLASS, with `cp.async` pipelining and swizzled
+shared memory this kernel does not have. What this one buys:
+
+- **Native GQA.** `Attention.forward` currently calls `repeat_interleave` to
+  widen K/V from `n_kv_head` to `n_head` before SDPA; the kernel indexes the KV
+  head directly, so that materialisation and both transposes disappear.
+- **Deterministic gradients.** Two passes (dQ over key tiles, dK/dV over query
+  tiles), no `atomicAdd`, so the backward is bit-reproducible run to run.
+- **A base for the masked variants.** SWA + attention sinks currently costs a
+  dense `[T,T]` mask (or the chunked path); a windowed key loop is a small edit
+  to this kernel and no mask at all.
+
+Whether that adds up to a win *at your shape is an open measurement*, not a
+claim — `python -m nanolab.flash_cuda` checks correctness against SDPA first,
+then times both, fwd and fwd+bwd:
+
+```bash
+python -m nanolab.flash_cuda --batch 8 --seq 1024 --heads 12 --kv_heads 4 --dtype bf16
+```
+
+The bench prints all three arms (SDPA / FMA / mma) with their correctness
+deltas above the timings, so a fast wrong answer cannot be mistaken for a win.
+
+Supported: head_dim 32 / 64 / 128, fp32 / fp16 / bf16, plain causal only; the
+tensor-core forward additionally needs a 16-bit dtype and sm_80+. Anything
+else — block-causal (diffusion), SWA, an unsupported head_dim, no nvcc — falls
+back to SDPA and says so once in the log. `NANOLAB_FLASH_CUDA=0` refuses to
+build it at all.
+
+The kernel's own optimisations, and what was measured about them, are documented
+in the header of the `.cu`. The three that came straight from the Metal audits:
+compile-time head dim (audit 8: ~11× on the Metal backward), `__restrict__` in
+place of the hoists the Metal compiler could not prove (audit 7), and a
+shared-memory budget chosen for occupancy rather than tile size.
 
 ### Sweeping the whole registry on the GPU
 

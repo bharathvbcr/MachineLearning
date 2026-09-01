@@ -45,6 +45,15 @@ from .native_funnel import (
 _RESULTS = []
 
 
+class Skip(Exception):
+    """Raised by a test that cannot run on this machine (no CUDA, no nvcc, ...).
+
+    It prints SKIP, not PASS: a check that could not run must never report the
+    same word as one that ran and passed, or "green" quietly comes to mean
+    "unexamined".
+    """
+
+
 def test(fn):
     _RESULTS.append(fn)
     return fn
@@ -167,6 +176,268 @@ def mingru_value_residual_threads_v0():
 
     m_off, _ = _toy_model(mixer="mingru", value_residual=False)
     assert not getattr(m_off.blocks[0].mixer, "value_residual", False)
+
+
+@test
+def flash_cuda_sim_matches_reference():
+    # The CUDA kernel cannot run without an NVIDIA GPU, but its *index
+    # arithmetic* can: csrc/flash_attn_sim.py walks the same query blocks, key
+    # tiles and softmax sub-tiles with the same bounds. float64 throughout, so
+    # anything left over is algorithm error rather than rounding -- the whole
+    # point of suite 19's "verify against a brute-force reference" lesson.
+    from .csrc.flash_attn_sim import (reference_attention, simulate_bwd,
+                                      simulate_delta, simulate_fwd)
+
+    torch.manual_seed(0)
+    # T deliberately not a multiple of the tiles; GQA groups 2, 1 and 4;
+    # itemsize 8 selects the fp32 tile geometry (BC=32), 2 the bf16 one (BC=64).
+    for B, T, H, Hkv, D, itemsize in ((2, 100, 4, 2, 32, 8),
+                                      (1, 37, 2, 2, 32, 2),
+                                      (1, 64, 4, 1, 32, 8)):
+        q = torch.randn(B, T, H, D, dtype=torch.float64)
+        k = torch.randn(B, T, Hkv, D, dtype=torch.float64)
+        v = torch.randn(B, T, Hkv, D, dtype=torch.float64)
+        scale = 1.0 / math.sqrt(D)
+        tag = f"B{B} T{T} H{H}/{Hkv} D{D} itemsize{itemsize}"
+
+        qa, ka, va = (t.clone().requires_grad_() for t in (q, k, v))
+        o_ref, lse_ref = reference_attention(qa, ka, va, scale)
+        do = torch.randn_like(o_ref)
+        o_ref.backward(do)
+
+        o_sim, lse_sim = simulate_fwd(q, k, v, scale, itemsize=itemsize)
+        assert (o_sim - o_ref).abs().max() < 1e-12, f"{tag}: output"
+        assert (lse_sim - lse_ref).abs().max() < 1e-12, f"{tag}: taped LSE"
+
+        # Delta is the backward's only extra tape; check it on its own so a
+        # failure below cannot be blamed on it.
+        delta = simulate_delta(o_sim, do)
+        assert (delta - (do * o_ref).sum(-1).permute(0, 2, 1)).abs().max() < 1e-12, \
+            f"{tag}: Delta"
+
+        dq, dk, dv = simulate_bwd(q, k, v, o_sim, do, lse_sim, scale,
+                                  itemsize=itemsize)
+        assert (dq - qa.grad).abs().max() < 1e-12, f"{tag}: dQ"
+        assert (dk - ka.grad).abs().max() < 1e-12, f"{tag}: dK"
+        assert (dv - va.grad).abs().max() < 1e-12, f"{tag}: dV"
+
+
+@test
+def flash_cuda_mma_sim_matches_reference():
+    # Same treatment for the tensor-core forward, one level lower: the mirror
+    # models all 32 lanes of a warp and holds exactly the fragment elements the
+    # PTX layout gives each one, so an mma is "reconstruct A and B from the
+    # registers, multiply, scatter D back". That checks every use of the layout
+    # -- K/V^T addressing, the S -> P repack, which lanes own which rows, the
+    # cross-lane row reductions, the causal mask, the rescale, the epilogue.
+    #
+    # It cannot check the layout table itself: the mirror and the kernel read it
+    # from the same place, so they would agree even if both were wrong. That one
+    # fact is checked on the device by flash_cuda's mma_probe, which is exactly
+    # why that probe exists.
+    from .csrc.flash_attn_sim import (reference_attention, simulate_bwd_mma,
+                                      simulate_fwd_mma)
+
+    torch.manual_seed(0)
+    # head_dim 32 / 64 / 128 to exercise 2, 4 and 8 mma k-chunks; T not a
+    # multiple of the 64-row block or the 32-key tile; GQA groups 2, 1 and 4.
+    #
+    # The short-T cases carry a second job now that tiles are staged with
+    # cp.async: rows past the end of a tile CLAMP to the last live row instead
+    # of being zero-filled, because cp.async copies bytes and cannot synthesise
+    # zeros. If the masks were ever relying on those zeros rather than doing the
+    # work themselves, T=33 and T=37 are where it shows.
+    for B, T, H, Hkv, D in ((2, 100, 4, 2, 32), (1, 37, 2, 2, 32),
+                            (1, 33, 2, 1, 32), (1, 64, 4, 1, 64),
+                            (1, 80, 2, 1, 128)):
+        q = torch.randn(B, T, H, D, dtype=torch.float64)
+        k = torch.randn(B, T, Hkv, D, dtype=torch.float64)
+        v = torch.randn(B, T, Hkv, D, dtype=torch.float64)
+        scale = 1.0 / math.sqrt(D)
+        tag = f"B{B} T{T} H{H}/{Hkv} D{D}"
+
+        qa, ka, va = (t.clone().requires_grad_() for t in (q, k, v))
+        o_ref, lse_ref = reference_attention(qa, ka, va, scale)
+        do = torch.randn_like(o_ref)
+        o_ref.backward(do)
+
+        o_sim, lse_sim = simulate_fwd_mma(q, k, v, scale)
+        assert (o_sim - o_ref).abs().max() < 1e-12, f"{tag}: mma output"
+        assert (lse_sim - lse_ref).abs().max() < 1e-12, f"{tag}: mma taped LSE"
+
+        # The backward's two passes are mirror images: dQ makes queries the m
+        # dimension and reads the tape by row, dK/dV makes KEYS the m dimension
+        # -- computing S^T, not S -- and reads it by column. That column-indexed
+        # tape is what removes the register transpose, and it is the easiest
+        # thing in the kernel to get backwards, so it gets checked rather than
+        # read twice.
+        if D in (32, 64):        # the tensor-core backward's head dims
+            dq, dk, dv = simulate_bwd_mma(q, k, v, o_sim, do, lse_sim, scale)
+            assert (dq - qa.grad).abs().max() < 1e-12, f"{tag}: mma dQ"
+            assert (dk - ka.grad).abs().max() < 1e-12, f"{tag}: mma dK"
+            assert (dv - va.grad).abs().max() < 1e-12, f"{tag}: mma dV"
+
+
+@test
+def flash_cuda_mma_kernel_matches_reference():
+    # The tensor-core forward on real hardware, including the layout probe that
+    # gates it.
+    from . import flash_cuda as fc
+    from .csrc.flash_attn_sim import reference_attention
+
+    if not torch.cuda.is_available():
+        raise Skip("no CUDA device")
+    if not fc.is_available():
+        raise Skip(f"extension unavailable: {fc.unavailable_reason()}")
+    if not fc.mma_available():
+        raise Skip(f"tensor-core path unavailable: {fc.mma_unavailable_reason()}")
+
+    torch.manual_seed(0)
+    scale_of = lambda d: 1.0 / math.sqrt(d)
+    for D, dtype, tol in ((32, torch.float16, 3e-2), (32, torch.bfloat16, 8e-2),
+                          (64, torch.bfloat16, 8e-2), (128, torch.bfloat16, 1e-1)):
+        B, T, H, Hkv = 2, 100, 4, 2
+        scale = scale_of(D)
+        q = torch.randn(B, T, H, D, device="cuda", dtype=dtype, requires_grad=True)
+        k = torch.randn(B, T, Hkv, D, device="cuda", dtype=dtype, requires_grad=True)
+        v = torch.randn(B, T, Hkv, D, device="cuda", dtype=dtype, requires_grad=True)
+        tag = f"D{D} {dtype}"
+
+        y_mma = fc.flash_attn(q, k, v, scale, use_mma=True)
+        y_fma = fc.flash_attn(q, k, v, scale, use_mma=False)
+        do = torch.randn_like(y_mma)
+        # retain_graph: y_mma is differentiated twice, once for the value and
+        # once for the reproducibility check.
+        g_mma = torch.autograd.grad(y_mma, (q, k, v), do, retain_graph=True)
+        g_fma = torch.autograd.grad(y_fma, (q, k, v), do)
+
+        # float64 reference, forward and backward, on the same inputs.
+        ref_in = [t.detach().double().cpu().requires_grad_() for t in (q, k, v)]
+        o_ref, _ = reference_attention(*ref_in, scale)
+        o_ref.backward(do.double().cpu())
+
+        assert (y_mma.double().cpu() - o_ref.detach()).abs().max() < tol, \
+            f"{tag}: forward vs reference"
+        # The two forwards differ only in accumulation order, so they must agree
+        # far more tightly than either agrees with the float64 reference.
+        assert (y_mma.float() - y_fma.float()).abs().max() < tol / 2, \
+            f"{tag}: the two forwards disagree"
+
+        # Gradients against the reference. head_dim 32/64 exercises the
+        # tensor-core backward; 128 stays on the FMA one by design, so this
+        # covers both and says which it was.
+        which = ("tensor-core" if D in fc.MMA_BWD_HEAD_DIMS else "FMA") + " backward"
+        for name, got, want in zip("qkv", g_mma, (t.grad for t in ref_in)):
+            assert (got.double().cpu() - want).abs().max() < 4 * tol, \
+                f"{tag}: d{name} vs reference ({which})"
+        # ...and against the other backward, which shares no code with it.
+        for name, a, b in zip("qkv", g_mma, g_fma):
+            assert (a.float() - b.float()).abs().max() < 4 * tol, \
+                f"{tag}: d{name} disagrees between the two backwards"
+
+        # Still no atomics on either path, so still bit-reproducible. This is
+        # also the closest thing there is to a check on the cp.async pipeline:
+        # a missing wait or barrier would show up as a tile of K/V that is
+        # sometimes stale, which is exactly what run-to-run inequality means
+        # here. (T=100 is 3 full key tiles plus a short one, so the pipeline
+        # actually cycles rather than running a single stage.)
+        again = torch.autograd.grad(y_mma, (q, k, v), do)
+        for name, a, b in zip("qkv", g_mma, again):
+            assert torch.equal(a, b), f"{tag}: d{name} is not reproducible"
+        y_again = fc.flash_attn(q, k, v, scale, use_mma=True)
+        assert torch.equal(y_mma, y_again), \
+            f"{tag}: the forward is not reproducible (stale staged tile?)"
+
+    # float32 has no m16n8k16 form; asking for one must be an error, not a
+    # silent downgrade to the FMA kernel.
+    q32 = torch.randn(1, 32, 2, 32, device="cuda")
+    try:
+        fc.flash_attn(q32, q32, q32, scale_of(32), use_mma=True)
+        raise AssertionError("use_mma=True on float32 should have raised")
+    except ValueError:
+        pass
+
+
+@test
+def flash_cuda_kernel_matches_reference():
+    # The real kernel, when there is a GPU and an nvcc to build it with.
+    from . import flash_cuda as fc
+    from .csrc.flash_attn_sim import reference_attention
+
+    if not torch.cuda.is_available():
+        raise Skip("no CUDA device")
+    if not fc.is_available():
+        raise Skip(f"extension unavailable: {fc.unavailable_reason()}")
+
+    torch.manual_seed(0)
+    B, T, H, Hkv, D = 2, 100, 4, 2, 32
+    scale = 1.0 / math.sqrt(D)
+    for dtype, tol in ((torch.float32, 1e-4), (torch.bfloat16, 5e-2)):
+        q = torch.randn(B, T, H, D, device="cuda", dtype=dtype, requires_grad=True)
+        k = torch.randn(B, T, Hkv, D, device="cuda", dtype=dtype, requires_grad=True)
+        v = torch.randn(B, T, Hkv, D, device="cuda", dtype=dtype, requires_grad=True)
+        tag = f"{dtype}"
+
+        y = fc.flash_attn(q, k, v, scale, use_mma=False)   # FMA forward
+        do = torch.randn_like(y)
+        grads = torch.autograd.grad(y, (q, k, v), do, retain_graph=True)
+
+        ref_in = [t.detach().double().cpu().requires_grad_() for t in (q, k, v)]
+        o_ref, _ = reference_attention(*ref_in, scale)
+        o_ref.backward(do.double().cpu())
+
+        assert (y.double().cpu() - o_ref).abs().max() < tol, f"{tag}: output"
+        for name, got, want in zip("qkv", grads, (t.grad for t in ref_in)):
+            assert (got.double().cpu() - want).abs().max() < tol, f"{tag}: d{name}"
+
+        # No atomics in the backward, so it is bit-reproducible. This is the
+        # invariant that buys determinism over a faster fused dQ pass.
+        again = torch.autograd.grad(y, (q, k, v), do, retain_graph=False)
+        for name, a, b in zip("qkv", grads, again):
+            assert torch.equal(a, b), f"{tag}: d{name} is not reproducible"
+
+    # The dtypes the model actually presents: RoPE promotes q/k to fp32 while v
+    # stays bf16, and autocast is what reconciles them for SDPA. The kernel has
+    # to mirror that or it would decline every step of the default recipe.
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        q = torch.randn(B, T, H, D, device="cuda", requires_grad=True)
+        k = torch.randn(B, T, Hkv, D, device="cuda", requires_grad=True)
+        v = torch.randn(B, T, Hkv, D, device="cuda", dtype=torch.bfloat16,
+                        requires_grad=True)
+        assert fc.supports(q, k, v), "autocast bridge refused the model's dtypes"
+        y = fc.flash_attn(q, k, v, scale)
+        y_sdpa = fc.sdpa_reference(q, k, v, scale)
+    assert y.dtype is torch.bfloat16, f"autocast path returned {y.dtype}"
+    assert (y.float() - y_sdpa.float()).abs().max() < 5e-2, "autocast path vs SDPA"
+
+
+@test
+def flash_cuda_effective_dtype_mirrors_autocast():
+    # The CPU-runnable half of the autocast bridge: with no autocast there must
+    # be one dtype for all three, and mixed inputs must produce None (decline)
+    # rather than a silently chosen one.
+    from . import flash_cuda as fc
+
+    q = torch.randn(1, 8, 2, 32)
+    assert fc.effective_dtype(q, q, q) is torch.float32
+    assert fc.effective_dtype(q, q, q.to(torch.bfloat16)) is None
+    assert not fc.supports(q, q, q), "CPU tensors are not for this kernel"
+
+
+@test
+def flash_cuda_flag_is_inert_without_the_kernel():
+    # cfg.flash_cuda is opt-in and must never change the answer when the kernel
+    # cannot run -- otherwise a recipe carrying the flag would not be portable.
+    # The toy model is on CPU, so this holds on a CUDA box too: the gate declines
+    # on the tensors, without ever asking whether the extension would build.
+    m_off, cfg = _toy_model(mixer="attention", flash_cuda=False)
+    m_on, _ = _toy_model(mixer="attention", flash_cuda=True)
+    x, y = _batch(cfg)
+    _, loss_off = m_off(x, y)
+    _, loss_on = m_on(x, y)
+    assert torch.equal(loss_off, loss_on), "flash_cuda=True changed the CPU result"
+    loss_on.backward()
+    assert torch.isfinite(loss_on), "flash_cuda=True broke the fallback path"
 
 
 @test
@@ -3055,12 +3326,15 @@ def worker_pinning_never_escapes_an_inherited_device_allowlist():
 
 def main():
     torch.set_num_threads(2)
-    passed = failed = 0
+    passed = failed = skipped = 0
     for fn in _RESULTS:
         try:
             fn()
             print(f"  PASS  {fn.__name__}")
             passed += 1
+        except Skip as e:
+            print(f"  SKIP  {fn.__name__}: {e}")
+            skipped += 1
         except (Exception, SystemExit) as e:
             # SystemExit is BaseException, so an uncaught one used to kill the
             # runner mid-list: no FAIL line, no summary, exit 1 -- indistinguish-
@@ -3068,7 +3342,8 @@ def main():
             # test raises SystemExit deliberately, so it is a failure, not an exit.
             print(f"  FAIL  {fn.__name__}: {type(e).__name__}: {e}")
             failed += 1
-    print(f"\n{passed}/{passed + failed} passed")
+    tail = f", {skipped} skipped" if skipped else ""
+    print(f"\n{passed}/{passed + failed} passed{tail}")
     sys.exit(1 if failed else 0)
 
 

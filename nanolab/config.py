@@ -198,6 +198,13 @@ class Config:
     # vs 8 (4.2 vs 5.6 GB), which is what lets bs32 fit. See probe_perf / sweep_gpu.
     fused_ce_chunks: int = 16
     tf32: bool = True              # TF32 matmul/cudnn on Ampere+ (free throughput)
+    # Custom CUDA flash-attention kernel (nanolab/csrc/flash_attn_cuda.cu) on the
+    # plain-causal attention path. Off by default and deliberately so: it needs
+    # nvcc, and torch's SDPA already reaches a tensor-core FlashAttention-2 here.
+    # What it buys is native GQA -- no repeat_interleave widening of K/V and no
+    # [B,T,H,D] <-> [B,H,T,D] transposes. Masked paths (block-causal, SWA) stay
+    # on SDPA regardless, since the kernel takes no mask.
+    flash_cuda: bool = False
     # VRAM cap (guide §7): on an 8 GB Windows/WDDM card, an over-budget step
     # silently spills to host RAM over PCIe (~25x slower) instead of OOMing —
     # 100% util, ~60 W, multi-second steps that look like a hang. Capping the
