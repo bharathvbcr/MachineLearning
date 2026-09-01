@@ -3199,6 +3199,26 @@ impl GpuDecodeSession {
         &self.pos_buf
     }
 
+    /// Hard ceiling on `pos` before a KV slot refuses the next append, or `None`
+    /// when every slot is a sliding ring and therefore wraps instead of filling.
+    ///
+    /// Sliding rings recycle (`head = (head + 1) % capacity`), so they impose no
+    /// bound. Full-slot (global) KV does: [`GpuKvSlot::peek_write_offset`]
+    /// returns `Error::Kv("GPU KV full")` once `seq_len == capacity`. Long-running
+    /// callers — the sustained-load gate, a server session — need that number to
+    /// recycle *before* the error rather than treating a legitimate capacity stop
+    /// as a runtime fault.
+    pub fn kv_capacity(&self) -> Option<usize> {
+        self.global_slots
+            .iter()
+            .chain(std::iter::once(&self.shared_global))
+            .chain(self.sliding_rings.iter())
+            .chain(std::iter::once(&self.shared_sliding))
+            .filter(|s| !s.is_ring && s.capacity > 0)
+            .map(|s| s.capacity)
+            .min()
+    }
+
     /// Ping-pong CB replay scaffold (record/commit/reuse bookkeeping; replay not wired).
     pub fn encode_once_scaffold(&self) -> &tessl::PingPongCbReplay {
         &self.encode_once
@@ -4589,12 +4609,18 @@ impl GpuDecodeSession {
     /// Decode-only timing: measures `n_steps` incremental steps after prefill of `prompt`.
     /// Uses GPU-resident tokens (no mid-loop host readback).
     pub fn bench_decode_tok_s(&mut self, prompt: &[u32], n_steps: usize) -> Result<f64> {
+        let last = *prompt
+            .last()
+            .ok_or_else(|| Error::Config("bench_decode_tok_s: empty prompt".into()))?;
+        if n_steps == 0 {
+            return Err(Error::Config("bench_decode_tok_s: n_steps must be > 0".into()));
+        }
         self.reset();
-        for &t in &prompt[..prompt.len().saturating_sub(1)] {
+        for &t in &prompt[..prompt.len() - 1] {
             self.step_prefill(t)?;
         }
         // First generated token (encode only).
-        let _ = self.step_inner(StepSeed::Host(*prompt.last().unwrap()), false, true)?;
+        let _ = self.step_inner(StepSeed::Host(last), false, true)?;
         self.model.gpu.synchronize()?;
         let t0 = std::time::Instant::now();
         for _ in 0..n_steps {
@@ -4602,17 +4628,109 @@ impl GpuDecodeSession {
         }
         self.model.gpu.synchronize()?;
         let secs = t0.elapsed().as_secs_f64();
+        if !secs.is_finite() || secs <= 0.0 {
+            return Err(Error::Metal(format!(
+                "bench_decode_tok_s: {n_steps} steps measured {secs}s — clock unusable"
+            )));
+        }
         Ok(n_steps as f64 / secs)
+    }
+
+    /// Continuous decode for sustained-load measurement: run `n_steps` further
+    /// GPU-resident decode steps from wherever this session already is, priming
+    /// or recycling only when the KV cannot take another append.
+    ///
+    /// This is the work unit the sustained-load gate wants and
+    /// [`Self::bench_decode_tok_s`] is not: that one resets and re-prefills on
+    /// every call, so a short call is mostly prefill and the measured rate
+    /// swings with how many calls happen to land inside a window. Here the
+    /// prefill cost is paid once per `kv_capacity` tokens instead of once per
+    /// call, so consecutive calls do near-identical work and a change in rate
+    /// means the machine changed.
+    ///
+    /// A full global KV slot is a capacity limit, not a fault: rather than
+    /// surfacing `Error::Kv("GPU KV full")` mid-run, the session recycles
+    /// (reset + re-prefill `prompt`) and keeps going, exactly as a server would
+    /// start a new conversation. Returns the number of decode steps completed,
+    /// which is always `n_steps` on success — prefill tokens are deliberately
+    /// not counted, so the rate stays comparable to `bench_decode_tok_s`.
+    ///
+    /// Drains the queue before returning so the caller's wall clock covers the
+    /// GPU work rather than just the encode.
+    pub fn bench_decode_sustained(&mut self, prompt: &[u32], n_steps: usize) -> Result<usize> {
+        if prompt.is_empty() {
+            return Err(Error::Config("bench_decode_sustained: empty prompt".into()));
+        }
+        if n_steps == 0 {
+            // Well-defined, unlike `bench_decode_tok_s(_, 0)` which would divide
+            // by a zero-step interval: zero steps completed, no work done.
+            return Ok(0);
+        }
+        let ceiling = self.kv_capacity();
+        // One free slot must remain after the prompt, or priming itself would
+        // fill the cache and every step would recycle.
+        if let Some(cap) = ceiling {
+            if prompt.len() + 2 > cap {
+                return Err(Error::Kv(format!(
+                    "bench_decode_sustained: prompt len {} leaves no room in KV capacity {cap}",
+                    prompt.len()
+                )));
+            }
+        }
+        // `pos == 0` means nothing is primed yet (fresh session, or we just reset).
+        let mut primed = self.pos > 0;
+        let mut done = 0usize;
+        // Liveness backstop. The capacity check above already guarantees that a
+        // freshly primed session has room for at least one decode step, so a
+        // recycle is always followed by progress. This counter makes that
+        // structural rather than a property of one guard: if a future change to
+        // `pos` accounting ever left the loop recycling without decoding, the
+        // call returns a named error instead of hanging the caller forever.
+        let mut recycles = 0usize;
+        // Worst legal case is a cache that holds the prompt plus exactly one
+        // decode slot, i.e. one recycle per step; anything above that is the
+        // pathology this backstop exists to catch, not a tight cache.
+        let recycle_budget = n_steps + 8;
+        while done < n_steps {
+            let would_fill = ceiling.is_some_and(|cap| self.pos + 1 >= cap);
+            if !primed || would_fill {
+                if recycles > recycle_budget {
+                    return Err(Error::Kv(format!(
+                        "bench_decode_sustained: {recycles} recycles for {done}/{n_steps} steps \
+                         (pos={}, kv_capacity={ceiling:?}) — recycling without making progress",
+                        self.pos
+                    )));
+                }
+                recycles += 1;
+                self.reset();
+                for &t in &prompt[..prompt.len() - 1] {
+                    self.step_prefill(t)?;
+                }
+                let _ = self.step_inner(StepSeed::Host(prompt[prompt.len() - 1]), false, true)?;
+                primed = true;
+                // The seed step produced a token but is priming, not measured
+                // work: counting it would make short calls look faster than
+                // long ones purely from how often they recycle.
+                continue;
+            }
+            let _ = self.step_inner(StepSeed::FromArgmax, false, true)?;
+            done += 1;
+        }
+        self.model.gpu.synchronize()?;
+        Ok(done)
     }
 
     /// Prefill TTFT (ms) through first generated token.
     pub fn bench_ttft_ms(&mut self, prompt: &[u32]) -> Result<f64> {
+        if prompt.is_empty() {
+            return Err(Error::Config("bench_ttft_ms: empty prompt".into()));
+        }
         self.reset();
         let t0 = std::time::Instant::now();
-        for &t in &prompt[..prompt.len().saturating_sub(1)] {
+        for &t in &prompt[..prompt.len() - 1] {
             self.step_prefill(t)?;
         }
-        let _ = self.step(*prompt.last().unwrap())?;
+        let _ = self.step(prompt[prompt.len() - 1])?;
         Ok(t0.elapsed().as_secs_f64() * 1e3)
     }
 }
@@ -4677,6 +4795,128 @@ mod tests {
             return;
         };
         assert!(next2 < sess.model.vocab as u32);
+    }
+
+    #[test]
+    fn kv_capacity_reports_the_binding_global_slot() {
+        let Ok(host) = SyntheticE4bGraph::mini_parity() else {
+            return;
+        };
+        let Ok(model) = GpuSynthModel::from_synthetic(host, QuantScheme::q4_default()) else {
+            eprintln!("skip: no GPU/metallib");
+            return;
+        };
+        let sess = GpuDecodeSession::new(model).unwrap();
+        // The mini graph carries one global slot; a ring would not bound `pos`.
+        let cap = sess.kv_capacity().expect("mini graph has a full-slot global KV");
+        assert!(cap > 0, "capacity must be positive, got {cap}");
+        assert!(
+            cap <= 4096,
+            "an implausible capacity means the wrong slot was picked: {cap}"
+        );
+    }
+
+    #[test]
+    fn sustained_decode_outruns_kv_capacity_without_erroring() {
+        // The whole point of `bench_decode_sustained`: a sustained-load run
+        // generates far more tokens than the KV holds. Before it existed, a
+        // continuous loop hit `Error::Kv("GPU KV full")` at `capacity` steps.
+        let Ok(host) = SyntheticE4bGraph::mini_parity() else {
+            return;
+        };
+        let Ok(model) = GpuSynthModel::from_synthetic(host, QuantScheme::q4_default()) else {
+            eprintln!("skip: no GPU/metallib");
+            return;
+        };
+        if !metal_ready(&model) {
+            eprintln!("skip: Metal pipeline unavailable");
+            return;
+        }
+        let mut sess = GpuDecodeSession::new(model).unwrap();
+        let cap = sess.kv_capacity().expect("mini graph has a full-slot global KV");
+        let prompt = [1u32, 2, 3, 4];
+        let steps = cap * 3 + 7; // several recycles, ending mid-cycle
+        match sess.bench_decode_sustained(&prompt, steps) {
+            Ok(done) => assert_eq!(done, steps, "must complete every requested step"),
+            Err(e) => {
+                // A GPU that cannot run at all is a skip; a KV-full error is the
+                // regression this test exists to catch.
+                assert!(
+                    !e.to_string().contains("KV full"),
+                    "sustained decode must recycle instead of filling the KV: {e}"
+                );
+                eprintln!("skip: sustained decode unavailable: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn sustained_decode_is_resumable_across_calls() {
+        let Ok(host) = SyntheticE4bGraph::mini_parity() else {
+            return;
+        };
+        let Ok(model) = GpuSynthModel::from_synthetic(host, QuantScheme::q4_default()) else {
+            eprintln!("skip: no GPU/metallib");
+            return;
+        };
+        if !metal_ready(&model) {
+            eprintln!("skip: Metal pipeline unavailable");
+            return;
+        }
+        let mut sess = GpuDecodeSession::new(model).unwrap();
+        let cap = sess.kv_capacity().unwrap_or(64);
+        let prompt = [1u32, 2, 3, 4];
+        // Many short calls must behave like one long run — no reset per call,
+        // so `pos` keeps climbing until a recycle.
+        let mut total = 0usize;
+        for _ in 0..(cap / 4 + 3) {
+            match sess.bench_decode_sustained(&prompt, 4) {
+                Ok(n) => total += n,
+                Err(e) => {
+                    eprintln!("skip: sustained decode unavailable: {e}");
+                    return;
+                }
+            }
+        }
+        assert_eq!(total, (cap / 4 + 3) * 4);
+        assert!(
+            sess.pos() <= cap,
+            "pos {} exceeded KV capacity {cap} — recycle did not fire",
+            sess.pos()
+        );
+    }
+
+    #[test]
+    fn sustained_decode_rejects_degenerate_input() {
+        let Ok(host) = SyntheticE4bGraph::mini_parity() else {
+            return;
+        };
+        let Ok(model) = GpuSynthModel::from_synthetic(host, QuantScheme::q4_default()) else {
+            eprintln!("skip: no GPU/metallib");
+            return;
+        };
+        let mut sess = GpuDecodeSession::new(model).unwrap();
+        assert!(
+            sess.bench_decode_sustained(&[], 4).is_err(),
+            "an empty prompt has no seed token"
+        );
+        assert_eq!(
+            sess.bench_decode_sustained(&[1, 2], 0).ok(),
+            Some(0),
+            "zero steps is a no-op, not an error"
+        );
+        if let Some(cap) = sess.kv_capacity() {
+            let too_long: Vec<u32> = (0..(cap as u32 + 1)).collect();
+            let err = sess
+                .bench_decode_sustained(&too_long, 1)
+                .expect_err("a prompt larger than the KV must be refused, not looped on");
+            assert!(err.to_string().contains("KV capacity"), "{err}");
+        }
+        // Degenerate inputs to the burst bench too — these used to panic on
+        // `prompt.last().unwrap()`.
+        assert!(sess.bench_decode_tok_s(&[], 4).is_err());
+        assert!(sess.bench_decode_tok_s(&[1, 2], 0).is_err());
+        assert!(sess.bench_ttft_ms(&[]).is_err());
     }
 
     #[test]

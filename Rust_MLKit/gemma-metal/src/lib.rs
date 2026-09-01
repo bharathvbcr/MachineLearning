@@ -25,6 +25,7 @@ pub mod ple;
 pub mod quant;
 pub mod scratch;
 pub mod step_verify;
+pub mod thermal;
 pub mod tokenizer;
 pub mod trace;
 pub mod weights;
@@ -56,6 +57,10 @@ pub use scratch::{ActStorage, ScratchArena, ScratchPlan};
 pub use step_verify::{
     accept_block, commit_accepted, compare_token_stream, generate_with_host_stub, host_stub_draft,
     BlockAccept,
+};
+pub use thermal::{
+    evaluate as evaluate_thermal, run_sustained, ThermalGateConfig, ThermalReport, ThermalWindow,
+    Verdict as ThermalVerdict,
 };
 pub use tokenizer::{GemmaTokenizer, TokenizerPaths};
 pub use weights::{

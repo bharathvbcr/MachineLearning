@@ -34,6 +34,17 @@ use gemma_metal::weights::{
 };
 
 fn main() {
+    std::process::exit(run());
+}
+
+/// Exit code contract (only meaningful when `--thermal` is passed; without it
+/// the harness always returns 0 as before):
+///   0 — every requested gate passed, or no gate was requested
+///   1 — a gate ran and FAILED
+///   2 — a gate was requested but could not run (no GPU, no model, too few
+///       windows). Never conflated with 0: a check that could not run must not
+///       report the same result as a check that ran and passed.
+fn run() -> i32 {
     diag::init();
     let argv: Vec<String> = env::args().collect();
     diag::log(
@@ -57,6 +68,8 @@ fn main() {
     let mut run_dflash = false;
     let mut run_dflash_31b = false;
     let mut model_dir: Option<PathBuf> = None;
+    let mut thermal = false;
+    let mut thermal_cfg = gemma_metal::thermal::ThermalGateConfig::default();
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -82,6 +95,44 @@ fn main() {
                     }
                 }
             }
+            "--thermal" => thermal = true,
+            "--thermal-quick" => {
+                thermal = true;
+                thermal_cfg = gemma_metal::thermal::ThermalGateConfig::quick();
+            }
+            "--thermal-secs" => {
+                thermal = true;
+                thermal_cfg.duration_secs = num_arg(&mut args, "--thermal-secs");
+            }
+            "--thermal-window" => {
+                thermal = true;
+                thermal_cfg.window_secs = num_arg(&mut args, "--thermal-window");
+            }
+            "--thermal-warmup" => {
+                thermal = true;
+                thermal_cfg.warmup_secs = num_arg(&mut args, "--thermal-warmup");
+            }
+            "--thermal-ratio" => {
+                thermal = true;
+                thermal_cfg.min_sustained_ratio = num_arg(&mut args, "--thermal-ratio");
+            }
+            "--thermal-rolling" => {
+                thermal = true;
+                thermal_cfg.min_rolling_ratio = num_arg(&mut args, "--thermal-rolling");
+            }
+            "--thermal-cv" => {
+                thermal = true;
+                let v = num_arg(&mut args, "--thermal-cv");
+                thermal_cfg.max_cv = if v <= 0.0 { None } else { Some(v) };
+            }
+            "--thermal-floor" => {
+                thermal = true;
+                thermal_cfg.floor_tok_s = Some(num_arg(&mut args, "--thermal-floor"));
+            }
+            "--thermal-windows" => {
+                thermal = true;
+                thermal_cfg.min_windows = count_arg(&mut args, "--thermal-windows");
+            }
             "--trace" => gemma_metal::trace::set_cli_mode(gemma_metal::trace::TraceMode::Host),
             "--trace-json" => {
                 gemma_metal::trace::set_cli_mode(gemma_metal::trace::TraceMode::Json)
@@ -93,10 +144,34 @@ fn main() {
                 eprintln!(
                     "bench [--e4b] [--dflash] [--dflash-31b] [--model DIR|e4b|31b] [--trace|--trace-json|--trace-sync]"
                 );
+                eprintln!(
+                    "Thermal (sustained-load) gate: --thermal | --thermal-quick"
+                );
+                eprintln!(
+                    "  --thermal-secs S --thermal-window S --thermal-warmup S --thermal-windows N"
+                );
+                eprintln!(
+                    "  --thermal-ratio R (tail/head, default 0.90) --thermal-rolling R (default 0.85)"
+                );
+                eprintln!(
+                    "  --thermal-cv X (dispersion ceiling, default 0.09; <=0 disables)"
+                );
+                eprintln!(
+                    "  --thermal-floor TOK_S (every window must clear it)"
+                );
+                eprintln!(
+                    "  exit 0 pass/not-requested · 1 gate FAILED · 2 gate requested but could not run"
+                );
                 eprintln!("Logs: GEMMA_METAL_LOG=1 (default ON) | GEMMA_METAL_LOG=0 silence");
                 eprintln!("Infer line-log: GEMMA_METAL_INFER_LOG=1 (default ON) | =0 silence");
                 eprintln!("Per-op decode rollup: GEMMA_METAL_TRACE=1|json|sync");
-                return;
+                eprintln!(
+                    "Burst decode steps: GEMMA_METAL_BENCH_STEPS=N (default 16) — raise to compare"
+                );
+                eprintln!(
+                    "  the burst bench against the sustained gate at the same KV depth"
+                );
+                return 0;
             }
             _ => {
                 diag::log("bench", format_args!("ignoring unknown arg {a}"));
@@ -117,6 +192,9 @@ fn main() {
         ),
     );
 
+    // Sustained-load gate reports, aggregated into the process exit code.
+    let mut thermal_reports: Vec<gemma_metal::thermal::ThermalReport> = Vec::new();
+
     // --- Synthetic mini (always) ---
     let model = SyntheticE4bGraph::mini_parity().expect("mini graph");
     let tokens = [1u32, 2, 3, 4, 5, 6, 7, 8];
@@ -132,7 +210,11 @@ fn main() {
     if let Err(e) = GemmaGpu::new() {
         println!("GPU unavailable — skipping Metal benches: {e}");
         println!("metallib={}", gemma_metal::gemma_metallib_path());
-        return;
+        if thermal {
+            println!("thermal gate REQUESTED but could not run (no GPU) — exit 2, not a pass");
+            return 2;
+        }
+        return 0;
     }
 
     match GpuSynthModel::from_synthetic(
@@ -159,6 +241,22 @@ fn main() {
                         println!("  decode: {tok_s:.1} tok/s  ({steps} steps after prefill)");
                         if let Ok(ttft_ms) = sess.bench_ttft_ms(&tokens) {
                             println!("  TTFT proxy (prefill T=8): {ttft_ms:.2} ms");
+                        }
+                        // Gate the mini graph only when no real model was asked
+                        // for. Mini's per-step work is dominated by host
+                        // dispatch, so on a busy machine it reports SKIPPED
+                        // ("too noisy to certify") — true, but not worth
+                        // spending the exit code on when a real model is the
+                        // subject under test.
+                        if thermal && !run_e4b {
+                            let meta = serde_json::json!({
+                                "model": "mini_synth",
+                                "graph": "vocab=512 hidden=256 layers=3",
+                                "burst_tok_s_reference": tok_s,
+                            });
+                            thermal_reports.push(run_thermal_gate(
+                                "mini", &mut sess, &prompt, &thermal_cfg, meta,
+                            ));
                         }
                     }
                     Err(e) => println!("GPU Hot synthetic decode bench failed: {e}"),
@@ -276,7 +374,17 @@ fn main() {
             }
         }
 
-        let steps = 16usize;
+        // Decode-step count for the burst bench. Overridable so the burst and
+        // sustained numbers can be compared at the same KV depth: a 16-step
+        // burst measures decode at pos≈4..20, while a sustained run spends most
+        // of its time near `kv_capacity`, and attention cost is not flat in KV
+        // length. Comparing the two without this knob compares two different
+        // workloads and calls the difference a regression.
+        let steps = std::env::var("GEMMA_METAL_BENCH_STEPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(16);
         let ttft_ms = match sess.bench_ttft_ms(&prompt) {
             Ok(ms) => {
                 diag::log("bench", format_args!("TTFT={ms:.1} ms prompt_len={}", prompt.len()));
@@ -318,6 +426,21 @@ fn main() {
             diag::log("bench", format_args!("RSS_end={rss:.1} MiB"));
         }
         write_real_model_result(ttft_ms, tok_s, steps, &dir, layers, hidden, vocab);
+
+        if thermal {
+            let label = if is_31b_shape(layers, hidden) { "31b" } else { "e4b" };
+            let meta = serde_json::json!({
+                "model": model_id_from_dir(&dir, is_31b_shape(layers, hidden)),
+                "weights_dir": dir.display().to_string(),
+                "layers": layers,
+                "hidden": hidden,
+                "vocab": vocab,
+                "burst_tok_s_reference": tok_s,
+            });
+            thermal_reports.push(run_thermal_gate(
+                label, &mut sess, &prompt, &thermal_cfg, meta,
+            ));
+        }
 
         // --- Real-model verify(M) sweep (opt-in: GEMMA_METAL_VERIFY_SWEEP=1) ---
         // The mini sweep measured the M×GEMV FALLBACK (mini cols=256 fails the
@@ -395,7 +518,7 @@ fn main() {
 
     // --- Microbenches ---
     let Ok(gpu) = GemmaGpu::new() else {
-        return;
+        return thermal_exit_code(thermal, &thermal_reports);
     };
     println!();
     println!("=== Kernel microbenches ===");
@@ -429,7 +552,10 @@ fn main() {
     logits[12345] = 3.0;
     let lb = gpu.rt.alloc_buffer(n * 4).unwrap();
     lb.write_f32(&logits);
-    if let Err(e) = softcap_argmax(&gpu, &lb, 30.0, n as u32) { println!("GPU softcap microbench skipped: {e}"); return; }
+    if let Err(e) = softcap_argmax(&gpu, &lb, 30.0, n as u32) {
+        println!("GPU softcap microbench skipped: {e}");
+        return thermal_exit_code(thermal, &thermal_reports);
+    }
     let t2 = std::time::Instant::now();
     let s_iters = 20usize;
     for _ in 0..s_iters {
@@ -500,6 +626,245 @@ fn main() {
     gpu.synchronize().unwrap();
     let fa_us = t3.elapsed().as_secs_f64() * 1e6 / fa_iters as f64;
     println!("GPU FA SWA h256 prefill B=1 T={t} H={h}: {fa_us:.1} µs/call");
+
+    thermal_exit_code(thermal, &thermal_reports)
+}
+
+/// Collapse the sustained-load reports into the process exit code.
+///
+/// The whole point of the four-valued [`gemma_metal::thermal::Verdict`] is that
+/// it survives to the shell: FAIL is 1, and "requested but produced no verdict"
+/// is 2. Neither collapses into 0.
+fn thermal_exit_code(
+    requested: bool,
+    reports: &[gemma_metal::thermal::ThermalReport],
+) -> i32 {
+    if !requested {
+        return 0;
+    }
+    println!();
+    println!("=== Sustained-load gate summary ===");
+    if reports.is_empty() {
+        println!("  thermal gate REQUESTED but no session ran it — exit 2, not a pass");
+        return 2;
+    }
+    for r in reports {
+        println!("  {}", r.summary_line());
+    }
+    if reports.iter().any(|r| !r.passed()) {
+        let failed = reports
+            .iter()
+            .filter(|r| matches!(r.verdict, gemma_metal::thermal::Verdict::Fail(_)))
+            .count();
+        if failed > 0 {
+            println!("  verdict: {failed} gate(s) FAILED — exit 1");
+            return 1;
+        }
+        println!("  verdict: no gate failed, but at least one produced no verdict — exit 2");
+        return 2;
+    }
+    println!("  verdict: all {} gate(s) PASSED — exit 0", reports.len());
+    0
+}
+
+/// Parse a required numeric flag value. A missing or malformed value exits
+/// non-zero rather than silently falling back to a default — a gate configured
+/// by a typo is a gate that measures something nobody asked for.
+fn num_arg<I: Iterator<Item = String>>(args: &mut I, flag: &str) -> f64 {
+    let Some(raw) = args.next() else {
+        eprintln!("{flag} requires a value");
+        std::process::exit(2);
+    };
+    match raw.trim().parse::<f64>() {
+        Ok(v) if v.is_finite() => v,
+        Ok(v) => {
+            eprintln!("{flag} value {v} is not finite");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("{flag} value {raw:?} is not a number: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Parse a required positive-integer flag value. Kept separate from
+/// [`num_arg`] so `--thermal-windows 3.7` and `--thermal-windows -1` are named
+/// errors rather than a silent truncation to 3 and a saturating cast to 0.
+fn count_arg<I: Iterator<Item = String>>(args: &mut I, flag: &str) -> usize {
+    let Some(raw) = args.next() else {
+        eprintln!("{flag} requires a value");
+        std::process::exit(2);
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(0) => {
+            eprintln!("{flag} must be >= 1");
+            std::process::exit(2);
+        }
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{flag} value {raw:?} is not a positive whole number: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Run the sustained-load gate against a live decode session.
+///
+/// The unit of work is `n` further decode steps on a session that keeps running
+/// — see [`GpuDecodeSession::bench_decode_sustained`]. The session recycles
+/// (reset + re-prefill) only when the global KV slot would otherwise fill, so
+/// the prefill cost is paid once per `kv_capacity` tokens rather than once per
+/// call. That keeps consecutive calls doing near-identical work, which is what
+/// makes a change in window rate attributable to the machine.
+fn run_thermal_gate(
+    label: &str,
+    sess: &mut GpuDecodeSession,
+    prompt: &[u32],
+    cfg: &gemma_metal::thermal::ThermalGateConfig,
+    meta: serde_json::Value,
+) -> gemma_metal::thermal::ThermalReport {
+    use gemma_metal::thermal::run_sustained;
+
+    // Leave room for the prefilled prompt plus the seed step, then a slot of
+    // margin so a burst never *reaches* the capacity error.
+    let headroom = match sess.kv_capacity() {
+        Some(cap) => cap.saturating_sub(prompt.len() + 2).max(1),
+        None => 512,
+    };
+    let mut cfg = cfg.clone();
+    cfg.max_batch = Some(match cfg.max_batch {
+        Some(existing) => existing.min(headroom),
+        None => headroom,
+    });
+
+    println!();
+    println!("=== Sustained-load (thermal) gate — {label} ===");
+    println!(
+        "  {:.0}s measured in {:.0}s windows after {:.0}s warmup; gates: tail/head ≥ {:.2}, rolling ≥ {:.2}{}",
+        cfg.duration_secs,
+        cfg.window_secs,
+        cfg.warmup_secs,
+        cfg.min_sustained_ratio,
+        cfg.min_rolling_ratio,
+        cfg.floor_tok_s
+            .map(|f| format!(", floor ≥ {f:.1} tok/s"))
+            .unwrap_or_default()
+    );
+    println!(
+        "  burst = reset + prefill(T={}) + N steps; KV capacity {:?} ⇒ max N {}",
+        prompt.len(),
+        sess.kv_capacity(),
+        headroom
+    );
+
+    let report = run_sustained(&cfg, label, |batch| {
+        let want = batch.max(1);
+        let done = sess
+            .bench_decode_sustained(prompt, want)
+            .map_err(|e| e.to_string())?;
+        if done != want {
+            return Err(format!(
+                "sustained decode completed {done} of {want} requested steps"
+            ));
+        }
+        Ok(done)
+    });
+
+    println!("  {}", report.summary_line());
+    println!("  attribution: {}", report.attribution);
+    for w in &report.windows {
+        println!(
+            "    window {:>2}: {:>6.2}s  {:>6} tok  {:>7.2} tok/s  rss={}  load={}  os={}{}",
+            w.index,
+            w.secs,
+            w.tokens,
+            w.tok_s,
+            w.rss_mib
+                .map(|r| format!("{r:.0} MiB"))
+                .unwrap_or_else(|| "n/a".into()),
+            w.load_avg
+                .map(|l| format!("{l:.2}"))
+                .unwrap_or_else(|| "n/a".into()),
+            w.thermal_state.map(|s| s.as_str()).unwrap_or("n/a"),
+            if w.low_power == Some(true) { " LOW-POWER" } else { "" }
+        );
+    }
+    if report.dropped_partial_windows > 0 {
+        println!(
+            "    ({} partial trailing window(s) discarded — too short to compare)",
+            report.dropped_partial_windows
+        );
+    }
+    write_thermal_result(label, &report, &cfg, meta);
+    report
+}
+
+/// Persist the gate artifact next to the other `bench/results/*.json`.
+fn write_thermal_result(
+    label: &str,
+    report: &gemma_metal::thermal::ThermalReport,
+    cfg: &gemma_metal::thermal::ThermalGateConfig,
+    meta: serde_json::Value,
+) {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let out_dir = manifest.join("bench/results");
+    if let Err(e) = fs::create_dir_all(&out_dir) {
+        eprintln!("thermal: cannot create {}: {e}", out_dir.display());
+        return;
+    }
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut body = report.to_json(cfg);
+    if let (Some(obj), Some(extra)) = (body.as_object_mut(), meta.as_object()) {
+        for (k, v) in extra {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("unix_ts".into(), serde_json::json!(ts));
+        obj.insert("host".into(), serde_json::json!(host_tag()));
+    }
+    let text = match serde_json::to_string_pretty(&body) {
+        Ok(t) => t + "\n",
+        Err(e) => {
+            eprintln!("thermal: serialize failed: {e}");
+            return;
+        }
+    };
+    let path = out_dir.join(format!("thermal_gate_{label}_{ts}.json"));
+    if let Err(e) = fs::write(&path, &text) {
+        eprintln!("thermal: failed to write {}: {e}", path.display());
+        return;
+    }
+    println!("  wrote {}", path.display());
+    let latest = out_dir.join(format!("thermal_gate_{label}_latest.json"));
+    if let Err(e) = fs::write(&latest, &text) {
+        eprintln!("thermal: failed to write {}: {e}", latest.display());
+    }
+}
+
+/// Best-effort host identifier so a gate artifact records what it ran on.
+fn host_tag() -> String {
+    let cpu = std::process::Command::new("sysctl")
+        .args(["-n", "machdep.cpu.brand_string"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-cpu".into());
+    let os = std::process::Command::new("sw_vers")
+        .args(["-productVersion"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-os".into());
+    format!("{cpu} / macOS {os}")
 }
 
 fn is_31b_shape(layers: usize, hidden: usize) -> bool {

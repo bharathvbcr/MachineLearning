@@ -217,6 +217,108 @@ cargo run --release --bin bench -- --model "$HOME/.cache/huggingface/hub/models-
 
 ---
 
+## Sustained-load (thermal) gate
+
+Every other number in this file is a **burst**: warm up, run 16–32 steps, divide.
+That is the cold-clock rate. It says nothing about a session that runs for
+minutes while the die heats and the OS walks the clocks down — which is the
+shape a user actually sees, and the one a fanless or thermally-limited part
+fails first. This gate closes that hole.
+
+```bash
+cd Rust_MLKit/gemma-metal
+cargo run --release --bin bench -- --e4b --thermal          # 60 s on real E4B
+cargo run --release --bin bench -- --thermal-quick          # 24 s on the mini graph
+```
+
+**What it measures.** Continuous decode, chopped into fixed wall-clock windows.
+The work unit is `GpuDecodeSession::bench_decode_sustained` — further steps on a
+session that keeps running, recycling (reset + re-prefill) only when the global
+KV slot would otherwise fill, so prefill is paid once per `kv_capacity` tokens
+instead of once per call. Consecutive calls therefore do near-identical work, and
+a change in window rate is attributable to the machine.
+
+**Three statistics, deliberately separated.**
+
+| Statistic | What it answers | Default |
+|-----------|-----------------|---------|
+| `sustained_ratio` = median(last third) / median(first third) | *Did it slow down?* Directional — scheduling noise perturbs both thirds equally | ≥ **0.90** |
+| `rolling_ratio` = min(2-window mean) / **median**(2-window mean) | *Did it sag?* Two adjacent windows must dip together, so one stall cannot fail a run. Dividing by the median, not the best pair, keeps the statistic from drifting with run length | ≥ **0.85** |
+| `cv` = sd / mean over windows | *Was the run clean enough to certify?* | ≤ **0.09** |
+| `peak_thermal_state` — `NSProcessInfo.thermalState` | *Was it actually hot?* The one input not derived from throughput | reported |
+| RSS growth, first → last window | Leak detector, free with the window series | ≤ **512 MiB** |
+
+The `cv` ceiling is calibrated, not guessed: measured on this host, quiet runs
+land at **0.017–0.075** and runs with visible host contention at **0.100–0.163**.
+The default sits in that gap.
+
+**The OS reading decides attribution, never the verdict.** Throughput decides
+*whether* the part slowed; `NSProcessInfo.thermalState` (plus
+`isLowPowerModeEnabled`, since Low Power Mode caps clocks and looks identical to
+heat) decides *what to blame*. `NSProcessInfo` is coarse and lags, so letting it
+veto a measured decline would trade a false alarm for a missed regression. Every
+report carries an `attribution` line, e.g.:
+
+> `OS reported no thermal pressure (peak fair) — this decline is NOT thermal;
+> look at host contention or a code regression`
+
+**Verdict is four-valued, and `SKIPPED` is not `PASS`.** Order matters and is
+asymmetric on purpose: a depressed tail is a **FAIL** even on a noisy run (noise
+is not an alibi for a real decline), but a *stable* tail on a noisy run is
+**SKIPPED** — the run did not earn a clean bill of health. Exit codes:
+`0` pass / not requested · `1` a gate ran and FAILED · `2` a gate was requested
+but produced no verdict (no GPU, no model, too few windows, too noisy).
+
+**Flags:** `GEMMA_METAL_BENCH_STEPS=N` sets the burst-bench step count (default
+16) so the burst and sustained numbers can be compared at the same KV depth.
+Gate flags: `--thermal-secs S`, `--thermal-window S`, `--thermal-warmup S`,
+`--thermal-windows N`, `--thermal-ratio R`, `--thermal-rolling R`,
+`--thermal-cv X` (≤0 disables), `--thermal-floor TOK_S`.
+Artifacts: `bench/results/thermal_gate_{label}_{ts}.json` + `_latest.json`.
+
+### Measured (2026-08-31, M5 Pro 20-core / 64 GB, macOS 27.0)
+
+| Subject | Verdict | sustained | rolling | cv | OS peak | Note |
+|---------|---------|-----------|---------|-----|---------|------|
+| mini synth, 24 s, quiet | **PASS** | 1.022 | 0.974 | 0.017 | fair | `thermal_gate_mini_1788234882.json` |
+| E4B Q4 Hot, 60 s | FAIL | 0.863 | 0.867 | 0.071 | fair | 3.7 → 3.2 tok/s; attributed **not thermal**; `thermal_gate_e4b_1788234851.json` |
+| mini synth, 300 s endurance | FAIL | 0.888 | 0.570 | 0.163 | fair | 27 windows · 13 224 tokens · ~220 KV recycles · **RSS growth 0.06 MiB**; attributed **not thermal**; `thermal_gate_mini_1788235220.json` |
+
+**This host cannot certify a sustained run, and the gate says so rather than
+pretending otherwise.** A persistent ~100 %-CPU background process keeps the
+1-minute load average near 15 and drifts on a multi-minute cycle. Across six 60 s
+E4B runs in one session the sustained ratio ranged **0.86 – 1.08** at a
+within-run `cv` of only 0.066–0.075: the *windows* are consistent, but the
+run-level mean wanders with the background load, which a 60 s head-vs-tail pair
+straddles. Every non-PASS above carries the same attribution line — the OS
+reports no thermal pressure, so the cause is contention, not heat.
+
+**What is established regardless of host noise:**
+
+- **No leak.** 13 224 tokens and ~220 KV recycles over 292 s moved RSS by
+  **0.06 MiB**. A second 300 s run moved it 0.016 MiB.
+- **No stalls, no errors.** No window failed to produce work across any run.
+- **Correct discrimination.** Injected GPU contention that outlives the run
+  produces FAIL or SKIPPED with a non-thermal attribution; a quiet mini run
+  passes reproducibly at cv 0.017–0.020.
+
+**Not established:** whether the M5 Pro throttles under sustained decode. That
+needs a quiet host. Re-run `--e4b --thermal` with the background load stopped
+before reading the E4B row as a property of the silicon.
+
+**Caveat on the absolute rate.** The ~3.5 tok/s above is *not* comparable to the
+~23.9 tok/s quiet figure elsewhere in this file. Per
+[`bottleneck.md`](bottleneck.md) roughly 77 % of a decode token is host-side
+per-token overhead, so a contended CPU depresses decode directly. A matched burst
+bench (`GEMMA_METAL_BENCH_STEPS=200`) measured 3.29 tok/s on the same host —
+i.e. the gate agrees with the burst bench at the same KV depth, and the gap is
+the host, not the gate.
+
+**31B is wired but unrun:** `mlx-community/gemma-4-31b-it-4bit` is not in the HF
+cache on this machine, so the `31b` gate label has never executed.
+
+---
+
 ## Distance to gates (summary)
 
 | Gate | Target | Now | Gap |
@@ -241,6 +343,7 @@ python3 bench.py mlx --model mlx-community/gemma-4-e4b-it-4bit \
 # Custom stack Phase 4 harness
 cd Rust_MLKit/gemma-metal && cargo run --release --bin bench
 cargo run --release --bin bench -- --e4b   # real MLX E4B from HF cache
+cargo run --release --bin bench -- --e4b --thermal   # + 60 s sustained-load gate
 cargo run --release --bin serve -- --preset 31b --port 8787
 ```
 

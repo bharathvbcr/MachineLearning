@@ -30,7 +30,7 @@ Reuse the runtime substrate (~encode/GEMM). Do **not** drag bwd/Muon/XSA/VE or f
 Rust_MLKit/
   crates/tessl/   # Phase 0b extract
   gemma-metal/            # this product crate
-    src/                  # config … gpu_model, mtp, kernels, …
+    src/                  # config … gpu_model, mtp, kernels, thermal, …
     src/bin/bench.rs      # Phase 4 speed harness
     src/bin/serve.rs      # Phase 6 OpenAI-compatible stub
     kernels/              # Gemma-only overlay: PLE + persistent-interp (general kernels live in tessl)

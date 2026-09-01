@@ -604,3 +604,64 @@ Inference-stack decisions for agents. Training decisions stay in
 - **Next:** leave flag OFF; lane can park gate→down or explore non-PI dispatch
   cuts. Optional: drop per-layer `synchronize()` if a future path needs fail
   checks without tok/s collapse.
+
+---
+
+## D19. Sustained-load gate: throughput decides the verdict, the OS decides the blame
+
+- **Decision:** `src/thermal.rs` gates a continuous-decode run on **three**
+  statistics and reports a **four-valued** verdict (`Pass`/`Fail`/`Skipped`/
+  `Error`) whose `Skipped` and `Error` arms are never readable as a pass
+  (`ThermalReport::passed()` is true for `Pass` only; `bench --thermal` exits `1`
+  on FAIL and `2` on no-verdict).
+  - `sustained_ratio` = median(last third)/median(first third) — **directional**.
+  - `rolling_ratio` = min(2-window mean)/**median**(2-window mean) — **sag**.
+  - `cv` = sd/mean over windows — **dispersion**.
+  - Order is asymmetric on purpose: a depressed tail FAILs even on a noisy run
+    (noise is not an alibi for a real decline); a *stable* tail on a noisy run is
+    SKIPPED, never PASS.
+- **Decision:** `NSProcessInfo.thermalState` / `isLowPowerModeEnabled`
+  (`objc2-foundation`, now a direct dependency) supply **attribution only** —
+  they never move the verdict. Throughput decides *whether* it slowed; the OS
+  reading decides *what to blame*. `NSProcessInfo` is coarse and lags, so letting
+  it veto a measured decline would trade a false alarm for a missed regression.
+  `HostThermalState::Unknown` counts as pressure: a level Apple adds later is far
+  more likely above `Critical` than below `Nominal`.
+- **Why:** the first version gated on `tail/head` plus raw `worst/best` and
+  failed the mini graph at 0.89. It was not throttling — a build and two editors
+  were saturating the CPU, and the mini graph is dispatch-bound, so window rates
+  wandered 24–50 tok/s with no trend. A gate that calls host contention a thermal
+  failure gets ignored; one that passes a real throttle is worse.
+- **Three defects the measurements exposed, in order:**
+  1. Raw `worst/best` fails on a single stall → replaced by a **two-window
+     rolling** mean.
+  2. `min/max` of those means compounds two order statistics, so it drifts down
+     as the window count rises: the 300 s run scored 0.691 against 0.905–0.927
+     for 11-window runs of the same material. → divide by the **median**.
+  3. Attribution derived from the gate predicates contradicted verdicts that
+     short-circuited before those arms ran ("this decline is NOT thermal" printed
+     under a SKIPPED). → attribution is derived from the **decided verdict** via
+     a three-valued `DeclineFinding` (`Declined`/`Held`/`Inconclusive`).
+- **Calibration, not guesswork:** `max_cv = 0.09` sits in the measured gap
+  between quiet runs (cv 0.017–0.075) and contended runs (0.100–0.163);
+  `min_rolling_ratio = 0.85` between clean runs (0.867–0.974) and genuine sags
+  (≤ 0.730).
+- **Why the work unit is `bench_decode_sustained`, not `bench_decode_tok_s`:**
+  the burst bench resets and re-prefills on **every** call, so a short call is
+  mostly prefill and the window rate swings with how many calls land inside a
+  window (measured: 3× spread, windows of 72/48/48/32/40 tokens). Continuing an
+  already-running session pays prefill once per `kv_capacity` tokens instead,
+  which cut the spread to ~1.18×. A full global KV slot is a **capacity limit,
+  not a fault** — the session recycles rather than surfacing
+  `Error::Kv("GPU KV full")` mid-run.
+- **Evidence:** `docs/gates.md` § Sustained-load gate; artifacts
+  `bench/results/thermal_gate_{e4b,mini}_*.json`. **No leak** (13 224 tokens /
+  ~220 recycles / 292 s moved RSS 0.06 MiB). **This host cannot certify a
+  sustained run** — a persistent ~100 %-CPU process drifts on a multi-minute
+  cycle, and six 60 s E4B runs ranged 0.86–1.08 sustained at within-run cv
+  0.066–0.075. Every non-PASS is attributed non-thermal by the OS reading.
+  Whether the M5 Pro throttles under sustained decode is **unestablished** and
+  needs a quiet host.
+- **Overturn if:** a per-process GPU-time signal lands that can attribute noise
+  to a specific competitor, at which point the dispersion arm can become a
+  precondition check instead of a verdict.
