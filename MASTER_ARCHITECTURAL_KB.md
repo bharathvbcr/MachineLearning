@@ -676,7 +676,10 @@ a wrong budget at another. Both were caught by controls, not by review.
     for it appears anywhere in this repository**. The incumbent is not a straw man —
     SDPA on CUDA already reaches a CUTLASS FlashAttention-2 — so the open question is
     whether it beats what is already there at any shape this lab runs, and "it does
-    not" is a legitimate answer. Minutes on a CUDA box. Spec: backlog E17.
+    not" is a legitimate answer. The asymmetry with the Metal side states the gap
+    most sharply: the same algorithm on Apple silicon has a published measurement
+    set (`Rust_MLKit/crates/tessl/bench/results/attn_*_m5pro.json`), and the CUDA
+    port has none. Minutes on a CUDA box. Spec: backlog E17.
 
 ---
 
