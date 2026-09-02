@@ -1,6 +1,16 @@
 # Small-Model Training and Apple-Silicon ML Systems Research
 
+<p align="left">
+  <a href="https://attention.vbcr.dev/"><img src="https://img.shields.io/badge/research-attention.vbcr.dev-8B5CF6?style=flat&logo=safari&logoColor=white" alt="Attention Research"></a>
+  <a href="https://kernel.vbcr.dev/"><img src="https://img.shields.io/badge/kernels-kernel.vbcr.dev-EAB308?style=flat&logo=apple&logoColor=white" alt="Custom Kernels"></a>
+  <img src="https://img.shields.io/badge/stack-PyTorch_%7C_Rust_%7C_Metal-orange" alt="Stack">
+</p>
+
 This is a language-model research workspace spanning efficient training, architecture and optimizer experiments, educational implementations, and native Apple-silicon inference and training.
+
+<p>
+  <strong>Explore the Live Research Showcases:</strong> <a href="https://attention.vbcr.dev/"><strong>attention.vbcr.dev</strong></a> (Attention &amp; Sequence Mixers) · <a href="https://kernel.vbcr.dev/"><strong>kernel.vbcr.dev</strong></a> (Custom GPU Kernels)
+</p>
 
 **Primary result: [`PAPER_2026-08_Recipe_Dependent_Rankings.md`](PAPER_2026-08_Recipe_Dependent_Rankings.md)** —
 *Method Orderings in Language-Model Screens Are Properties of the Measurement, Not the Methods.*
