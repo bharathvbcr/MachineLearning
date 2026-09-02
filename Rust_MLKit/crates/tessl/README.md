@@ -847,8 +847,14 @@ clock. Nothing failed when this rule changed, which is exactly why it is asserte
 rather than inferred.
 
 The tiled kernels remain as [`flash_attn_swa_tiled`](src/nn.rs) /
-`flash_attn_global_h512_tiled` — they are the A/B baseline the benchmark
-measures against and the second opinion the tests score against, not dead code.
+`flash_attn_global_h512_tiled`. They are the A/B baseline the benchmark measures
+against and the second opinion the tests score against — and they are also, for
+now, what the one in-tree consumer actually runs: `gemma-metal` dispatches
+`flash_attn_swa_h256` / `_h128` / `flash_attn_global_h512` by name through its
+own `KernelId`, with the original `BR = 8`, 32-thread geometry, because the fast
+paths have no scalar-binder entry an indirect command buffer can encode. So they
+are not dead code in two distinct senses, and the second one is a
+[gap](#-known-gaps), not a design.
 `TESSL_ATTN_TILED=1` forces them.
 
 ### Correctness
@@ -1212,12 +1218,13 @@ It requires the cooperative-destination path — bf16 operands, or f32 with rela
 
 Recorded rather than implied. All kernels are wired to a typed Rust API, the suite is warning-free, and there are no stubs; these are capabilities the crate does not have.
 
-Four of the six original entries here have since shipped: the [fused epilogue](#-fused-gemm-epilogue), row-wise reductions (`nn::softmax_rows_f32`, `row_sum_f32`, `row_max_f32`), IEEE binary16 (`DType::F16` with casts and GEMM), and strided batched GEMM (`gemm_batched`). What remains is one upstream block and one deliberate choice.
+Four of the six original entries here have since shipped: the [fused epilogue](#-fused-gemm-epilogue), row-wise reductions (`nn::softmax_rows_f32`, `row_sum_f32`, `row_max_f32`), IEEE binary16 (`DType::F16` with casts and GEMM), and strided batched GEMM (`gemm_batched`). What remains is one upstream block, one deliberate choice, and two gaps this crate's own attention work opened or exposed.
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
 | **Int4 TensorOps GEMM** | Half the weight bandwidth of int8. | TensorOps accepts `int4b_format` — the gap is the shader-side tensor constructor for a sub-byte element type, not the objc2 binding this table used to blame. `nn::gemm_i8_dequant` ships the int8 case. |
 | **No CPU fallback** | No Metal 4 device means nothing runs. | Deliberate: the crate is an Apple-silicon runtime, and a silent CPU path would make "GPU" benchmarks meaningless. |
+| **The fast attention paths have no ICB entry point** | `gemma-metal` — the one in-tree consumer — reaches only the *tiled* kernels, so it gets none of the row-parallel or KV-split work. | `flash_attn_swa_with_scalars` is the scalar-binder form an indirect command buffer needs, and it dispatches the tiled kernel; `flash_attn_rows` and `flash_attn_decode` have no `_with_scalars` variant. The KV-split path also allocates a partials scratch and issues two dispatches, neither of which fits a frozen-bind ICB without design. Not measured end-to-end for `gemma-metal`, so no speedup is claimed here — only that the faster kernels are unreachable from that call path. |
 | **D=512 decode is ~1.2x off MLX** | The one attention shape not at parity; everything else is level or ahead. | Characterised, not guessed: it is not GQA re-read (the `Hkv = H` control shows the same deficit) and not the cache layout (built, measured bit-identical, 5x under the noise floor — [see above](#the-kv-layout-changed-and-measured-and-put-back)). What is left is D=512 streaming efficiency; the `Hkv = H` control shows the same 1.14x on a pure DRAM stream. |
 
 The typed `nn` API covers 11 kernels in depth (RMSNorm, MLP gating, Q8 GEMV, KV stores) and the remaining promoted ones through shape-checked entry points; the MLX Q4 family is reached via `Q4MlxBank` rather than 15 separate signatures.

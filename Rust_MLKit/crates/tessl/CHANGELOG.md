@@ -162,6 +162,15 @@ All notable changes to `tessl` are recorded here. The format follows
   pulling it `H/Hkv` separate times — no threadgroup memory and no barrier.
   Against MLX the shipping path is now 0.90-0.97x on prefill and 0.91-0.97x on
   decode kernel-only, from 11.1x and 37.9x.
+- **Recorded that `gemma-metal` reaches none of this.** It dispatches
+  `flash_attn_swa_h256` / `_h128` / `flash_attn_global_h512` by name through its
+  own `KernelId`, with the original `BR = 8`, 32-thread geometry, because the
+  scalar-binder form an indirect command buffer needs
+  (`flash_attn_swa_with_scalars`) dispatches the *tiled* kernel and the fast
+  paths have no `_with_scalars` variant. The KV-split path additionally
+  allocates a partials scratch and issues two dispatches. Documented as a gap
+  rather than fixed; no end-to-end figure is claimed for `gemma-metal` because
+  none was measured.
 - Retuned `DECODE_CHUNK_*`, `DECODE_LANES_D128`, `ROWS_GROUPS_*` and
   `DECODE_HEAD_BLOCK_*` against the changed kernels. Every published tuning
   table is generated from its artifact JSON now rather than transcribed.
