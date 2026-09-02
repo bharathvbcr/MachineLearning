@@ -45,6 +45,27 @@ SUITES = [
                                                   "global512_decode_4k,swa128_prefill_512,"
                                                   "swa256_prefill_2048,"
                                                   "global512_prefill_1024")),
+    # Every decode (lanes-per-key x chunk) pair, and every rows lanes-per-row.
+    # Both are compile-time constants, so each combination is its own kernel and
+    # sweeping one axis at the other's default would leave the cross product
+    # undispatched -- which is exactly what the gate caught.
+    *[
+        ("bench_flash_attn", [], dict(
+            BENCH_ITERS="1", BENCH_WARMUP="0",
+            BENCH_ATTN_DECODE_R=r, BENCH_ATTN_DECODE_CHUNK=ch,
+            BENCH_ATTN_CFGS="swa128_decode_1k,swa256_decode_4k,global512_decode_4k"))
+        for r in ("8", "16", "32")
+        for ch in ("64", "128", "256")
+    ],
+    *[
+        ("bench_flash_attn", [], dict(
+            BENCH_ITERS="1", BENCH_WARMUP="0", BENCH_ATTN_ROWS_R=r,
+            BENCH_ATTN_ROWS_SGT=g,
+            BENCH_ATTN_CFGS="swa128_prefill_512,swa256_prefill_2048,"
+                            "global512_prefill_1024"))
+        for r in ("8", "16", "32")
+        for g in ("8", "16", "32")
+    ],
     # The tiled kernels remain the A/B baseline and are still dispatched.
     ("bench_flash_attn", [], dict(BENCH_ITERS="1", BENCH_WARMUP="0",
                                   TESSL_ATTN_TILED="1",
@@ -171,7 +192,9 @@ def run_suites(tmp):
             continue
         got = {x for x in line[-1][len("KERNEL_TRACE "):].split(",") if x}
         tag = " ".join(f"{k}={v}" for k, v in sorted(env.items())
-                       if k.startswith("TESSL_"))
+                       if k.startswith("TESSL_") or k in ("BENCH_ATTN_ROWS_R",
+                                 "BENCH_ATTN_ROWS_SGT", "BENCH_ATTN_DECODE_CHUNK",
+                                 "BENCH_ATTN_DECODE_R"))
         key = f"{name}{' ' + argv[0] if argv else ''}{' ' + tag if tag else ''}"
         per_suite[key] = got
         traced |= got

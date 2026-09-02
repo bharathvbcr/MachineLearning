@@ -672,26 +672,216 @@ impl AttnHeadDim {
     }
 }
 
-/// Keys per chunk in the decode kernels. Must match `KV_CHUNK` in
-/// `kernels/flash_attn_decode.metal`; `tests/attention.rs` pins the pair.
+/// The shader's declared default chunk size. Kept mirrored so
+/// `tests/attention.rs` can catch a drift between the two files; the value the
+/// router actually uses comes from [`decode_chunk_for`].
 pub const DECODE_KV_CHUNK: usize = 256;
 
-/// Head dimensions the FlashDecoding path is compiled for.
-fn decode_entries(d: u32) -> Option<(&'static str, &'static str)> {
+/// Keys per chunk for a decode dispatch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DecodeChunk {
+    C64,
+    C128,
+    C256,
+}
+
+impl DecodeChunk {
+    pub fn keys(self) -> usize {
+        match self {
+            DecodeChunk::C64 => 64,
+            DecodeChunk::C128 => 128,
+            DecodeChunk::C256 => 256,
+        }
+    }
+
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v {
+            "64" => Ok(DecodeChunk::C64),
+            "128" => Ok(DecodeChunk::C128),
+            "256" => Ok(DecodeChunk::C256),
+            other => Err(format!(
+                "decode chunk must be 64, 128 or 256; got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Which query heads share a threadgroup in the decode partial pass.
+///
+/// They walk the same K/V, so co-residency decides how many times a line is
+/// pulled through the load path. A *policy* rather than a count, because the
+/// useful widths are shape-derived: `Group` is `H/Hkv` simdgroups, `AllHeads`
+/// is `H`.
+///
+/// Measured, `bench/attn_tune.py --knob decode-sgs --batched 32`, median ms:
+///
+/// | config | one | group | all |
+/// |---|---|---|---|
+/// | `swa128_decode_1k` | 0.037 | **0.035** | 0.058 |
+/// | `swa128_decode_4k` | 0.046 | **0.041** | 0.062 |
+/// | `swa128_decode_b8_4k` | 0.439 | **0.339** | 0.340 |
+/// | `swa256_decode_4k` | 0.057 | **0.054** | 0.080 |
+/// | `global512_decode_4k` | 0.193 | 0.170 | **0.168** |
+/// | `global512_decode_4k_mha` | 0.610 | 0.585 | **0.578** |
+///
+/// `Group` beats one-head-per-threadgroup by **1.3–1.7x everywhere**, which is
+/// far outside the ~3% run-to-run noise floor and is the finding here.
+///
+/// `AllHeads` is the marginal one. It makes a threadgroup's per-key read the
+/// whole contiguous `[Hkv][D]` row instead of a strided slice, and at D=512
+/// (where `H` is 8) it wins — but by 4% in one sweep and 1.2% in another, so
+/// the honest reading is a tie that two independent sweeps broke the same way,
+/// not a measured gain. At D=128 `H` is 32, so it asks for 1024-thread
+/// threadgroups and loses **1.7x** to the occupancy that costs; that half is
+/// unambiguous. Chosen per head dim for that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeHeadBlock {
+    /// One query head per threadgroup: the original dispatch.
+    One,
+    /// The `H/Hkv` heads that share a KV head.
+    Group,
+    /// Every head of a batch item.
+    AllHeads,
+}
+
+impl DecodeHeadBlock {
+    /// Simdgroups per threadgroup for this shape, or `None` if the width does
+    /// not divide `H` or does not fit a threadgroup — the caller steps down.
+    ///
+    /// Public because it is the rule that keeps a threadgroup's head-block
+    /// arithmetic exact: `grid.y` is decoded as `(batch, block)` with
+    /// `H / sgs` blocks, so an `sgs` that does not divide `H` would address the
+    /// wrong head rather than fail. Nothing but a reference check would see
+    /// that, so the rule is pinned by a test.
+    pub fn simdgroups(self, heads: usize, group: usize) -> Option<usize> {
+        let n = match self {
+            DecodeHeadBlock::One => 1,
+            DecodeHeadBlock::Group => group,
+            DecodeHeadBlock::AllHeads => heads,
+        };
+        ((1..=32).contains(&n) && heads % n == 0).then_some(n)
+    }
+
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v {
+            "one" => Ok(DecodeHeadBlock::One),
+            "group" => Ok(DecodeHeadBlock::Group),
+            "all" => Ok(DecodeHeadBlock::AllHeads),
+            other => Err(format!(
+                "decode head block must be one, group or all; got {other:?}"
+            )),
+        }
+    }
+}
+
+pub const DECODE_HEAD_BLOCK_D128: DecodeHeadBlock = DecodeHeadBlock::Group;
+pub const DECODE_HEAD_BLOCK_D256: DecodeHeadBlock = DecodeHeadBlock::Group;
+pub const DECODE_HEAD_BLOCK_D512: DecodeHeadBlock = DecodeHeadBlock::AllHeads;
+
+pub fn decode_head_block_for(d: u32) -> DecodeHeadBlock {
     match d {
-        128 => Some((
-            "flash_attn_decode_partial_h128",
-            "flash_attn_decode_reduce_h128",
-        )),
-        256 => Some((
-            "flash_attn_decode_partial_h256",
-            "flash_attn_decode_reduce_h256",
-        )),
-        512 => Some((
-            "flash_attn_decode_partial_h512",
-            "flash_attn_decode_reduce_h512",
-        )),
-        _ => None,
+        512 => DECODE_HEAD_BLOCK_D512,
+        256 => DECODE_HEAD_BLOCK_D256,
+        _ => DECODE_HEAD_BLOCK_D128,
+    }
+}
+
+/// Threads per threadgroup in the decode reduce pass.
+///
+/// Swept with `bench/attn_tune.py --knob reduce-w --batched 32`; it is a
+/// dispatch parameter, not a compiled constant, so the values are not kernels.
+pub const DECODE_REDUCE_THREADS: usize = 256;
+
+/// Chunk size chosen per head dimension.
+///
+/// Measured with `bench/attn_tune.py --knob decode --batched 32`, five
+/// interleaved rounds (median ms). The `--batched 32` matters: swept at one
+/// launch per submit, ~88% of every number is the host round trip, which
+/// compresses the margins towards 1.0x and decides near-ties on noise.
+///
+/// | config | 64 | 128 | 256 |
+/// |---/// |---/// |---/// |---|
+/// | `swa128_decode_1k` | 0.035 | **0.031** | 0.033 |
+/// | `swa128_decode_4k` | 0.054 | 0.040 | **0.037** |
+/// | `swa128_decode_b8_4k` | 0.360 | 0.316 | **0.304** |
+/// | `swa256_decode_4k` | 0.053 | **0.044** | 0.056 |
+/// | `global512_decode_4k` | 0.183 | **0.154** | 0.160 |
+///
+/// Two of the three are clear and one is not. **D=256 is 128**, ahead of 64 by
+/// 21% — a real margin. **D=512 is 128**, ahead of 256 by 4%, which is at the
+/// edge of what this measurement resolves. **D=128 is 256 by 1.4% on the
+/// geometric mean over its three configs (0.0719 against 0.0729)**, which is
+/// inside the ~3% run-to-run noise floor and is therefore recorded as a tie
+/// broken by measurement, not as a rule. Per config it splits: `decode_1k`
+/// prefers 128, `decode_4k` and `decode_b8_4k` prefer 256.
+///
+/// Unlike the rows knob there is no clean rule here: the trade is grid
+/// parallelism against the number of partials the reduce pass combines, and
+/// where that balances depends on how many threadgroups `B*H` already supplies
+/// and how much K/V reuse a threadgroup already has.
+pub const DECODE_CHUNK_D128: DecodeChunk = DecodeChunk::C256;
+pub const DECODE_CHUNK_D256: DecodeChunk = DecodeChunk::C128;
+pub const DECODE_CHUNK_D512: DecodeChunk = DecodeChunk::C128;
+
+pub fn decode_chunk_for(d: u32) -> DecodeChunk {
+    match d {
+        512 => DECODE_CHUNK_D512,
+        256 => DECODE_CHUNK_D256,
+        _ => DECODE_CHUNK_D128,
+    }
+}
+
+/// Head dimensions the FlashDecoding path is compiled for.
+fn decode_entries(d: u32, c: DecodeChunk, r: RowsLanes) -> Option<(String, String)> {
+    if !matches!(d, 128 | 256 | 512) {
+        return None;
+    }
+    Some((
+        format!(
+            "flash_attn_decode_partial_h{d}_c{}_r{}",
+            c.keys(),
+            r.width()
+        ),
+        format!("flash_attn_decode_reduce_h{d}_c{}", c.keys()),
+    ))
+}
+
+/// Lanes per key in the decode partial pass, per head dimension.
+///
+/// Measured with `bench/attn_tune.py --knob decode-r --batched 32`, five
+/// interleaved rounds (median ms):
+///
+/// | config | R=8 | R=16 | R=32 |
+/// |---/// |---/// |---/// |---|
+/// | `swa128_decode_1k` | **0.032** | 0.047 | 0.076 |
+/// | `swa128_decode_4k` | **0.037** | 0.051 | 0.080 |
+/// | `swa128_decode_b8_4k` | **0.304** | 0.312 | 0.342 |
+/// | `swa256_decode_4k` | 0.102 | **0.044** | 0.058 |
+/// | `global512_decode_4k` | 0.345 | 0.268 | **0.154** |
+///
+/// Kept separate from [`rows_lanes_for`] because the two kernels are bound by
+/// different things. Prefill is ALU bound and lands cleanly on `D/R = 16`.
+/// Decode *was* latency bound — 0.6% of ALU peak and 5% of bandwidth when these
+/// values were first chosen — and is now bandwidth bound at 48-65% of the
+/// memory roof and under 10% of the ALU roof, which is why the later rounds of
+/// tuning stopped paying. D=256 and D=512 land on `D/R = 16`; D=128 does not,
+/// and takes R=8.
+///
+/// D=128 was R=16 until this sweep was re-run kernel-only. At one launch per
+/// submit the two were a 3% tie that R=16 won; with the ~88% dispatch share
+/// removed, R=8 is ahead or level at every D=128 config.
+///
+/// Choosing wrong is expensive even where choosing right gains little: R=16 at
+/// D=512 is **9.3x** slower than R=32.
+pub const DECODE_LANES_D128: RowsLanes = RowsLanes::R8;
+pub const DECODE_LANES_D256: RowsLanes = RowsLanes::R16;
+pub const DECODE_LANES_D512: RowsLanes = RowsLanes::R32;
+
+pub fn decode_lanes_for(d: u32) -> RowsLanes {
+    match d {
+        512 => DECODE_LANES_D512,
+        256 => DECODE_LANES_D256,
+        _ => DECODE_LANES_D128,
     }
 }
 
@@ -725,9 +915,56 @@ pub fn flash_attn_decode(
     kv_capacity: usize,
     out_bf16: bool,
 ) -> Result<(), String> {
-    let (partial_entry, reduce_entry) = decode_entries(head_dim).ok_or_else(|| {
-        format!("flash_attn_decode: head dim {head_dim} has no decode kernel (128, 256 or 512)")
-    })?;
+    flash_attn_decode_with_chunk(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        dims,
+        head_dim,
+        kv_capacity,
+        decode_chunk_for(head_dim),
+        decode_lanes_for(head_dim),
+        None,
+        None,
+        out_bf16,
+    )
+}
+
+/// [`flash_attn_decode`] with an explicit chunk size, for the tuning sweep.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_decode_with_chunk(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    head_dim: u32,
+    kv_capacity: usize,
+    chunk: DecodeChunk,
+    lanes: RowsLanes,
+    // Threads per threadgroup for the reduce pass; `None` takes
+    // [`DECODE_REDUCE_THREADS`]. A dispatch parameter, so a sweep of it costs
+    // no extra kernels.
+    reduce_threads: Option<usize>,
+    // Which query heads share a threadgroup in the partial pass; `None` takes
+    // [`decode_head_block_for`]. A width that does not divide `H` or does not
+    // fit a threadgroup steps down rather than mis-indexing.
+    head_block: Option<DecodeHeadBlock>,
+    out_bf16: bool,
+) -> Result<(), String> {
+    let (partial_entry, reduce_entry) =
+        decode_entries(head_dim, chunk, lanes).ok_or_else(|| {
+            format!("flash_attn_decode: head dim {head_dim} has no decode kernel (128, 256 or 512)")
+        })?;
     if dims.tq != 1 {
         return Err(format!(
             "flash_attn_decode is the Tq == 1 path; got Tq = {}. Use flash_attn_swa \
@@ -761,17 +998,40 @@ pub fn flash_attn_decode(
     if bh == 0 {
         return Ok(());
     }
-    let chunks = kv_capacity.div_ceil(DECODE_KV_CHUNK).max(1);
+    let chunks = kv_capacity.div_ceil(chunk.keys()).max(1);
     let stride = head_dim as usize + 2;
     let scratch_elems = bh
         .checked_mul(chunks)
         .and_then(|x| x.checked_mul(stride))
         .ok_or("flash_attn_decode: partial scratch size overflows")?;
     let scratch = rt.alloc_buffer(scratch_elems * 4)?;
-    scratch.write_f32(&vec![0f32; scratch_elems]);
+    // Deliberately not zeroed. The reduce pass reads chunks
+    // `0 .. ceil(Tkv/KV_CHUNK)`, and the partial pass returns early only for
+    // `chunk * KV_CHUNK >= Tkv` -- which by construction is exactly the chunks
+    // outside that range. So every slot the reduce reads was written by this
+    // dispatch, and zero-filling was a 66 KB host allocation and memcpy on
+    // every decode step. `decode_is_immune_to_a_recycled_scratch` is what
+    // holds that invariant: it alternates long and short histories through the
+    // pooled buffer, so a stale partial would be exactly what it reads.
 
-    let p = rt.pipeline(partial_entry)?;
-    dispatch_2d_tg(rt, &p, chunks, bh, 32, |bnd| {
+    // Query heads that walk the same K/V go in one threadgroup, so grid.y
+    // enumerates (batch, head-block) and the threadgroup is `sgs` simdgroups
+    // wide. [`DecodeHeadBlock`] carries the measurements behind the choice.
+    // Metal caps a threadgroup at 1024 threads, and past that the kernel's
+    // `sgs == 1` path is the original one-head-per-threadgroup dispatch.
+    let heads = dims.heads.max(1) as usize;
+    let group = (dims.heads / dims.heads_kv.max(1)).max(1) as usize;
+    let want = head_block.unwrap_or_else(|| decode_head_block_for(head_dim));
+    // Step down through the policies rather than rounding a count, so a shape
+    // the requested width cannot serve lands on one that can — ultimately the
+    // original one-head-per-threadgroup dispatch, which always divides.
+    let partial_sgs = [want, DecodeHeadBlock::Group, DecodeHeadBlock::One]
+        .into_iter()
+        .find_map(|p| p.simdgroups(heads, group))
+        .unwrap_or(1);
+    let partial_y = (dims.batch as usize).saturating_mul(heads / partial_sgs);
+    let p = rt.pipeline(&partial_entry)?;
+    dispatch_2d_tg(rt, &p, chunks, partial_y, partial_sgs * 32, |bnd| {
         set_gpu_buf(bnd, q, 0);
         set_gpu_buf(bnd, k, 1);
         set_gpu_buf(bnd, v, 2);
@@ -786,8 +1046,18 @@ pub fn flash_attn_decode(
         set_gpu_buf(bnd, kv_pos_offset, 12);
     })?;
 
-    let r = rt.pipeline(reduce_entry)?;
-    dispatch_2d_tg(rt, &r, 1, bh, 32, |bnd| {
+    let r = rt.pipeline(&reduce_entry)?;
+    // The reduce pass is a serial tail: one threadgroup per (batch, head), so
+    // at B*H = 8 the whole GPU folds partials on 8 threadgroups. Its width is a
+    // dispatch parameter rather than a compiled-in one -- the kernel strides
+    // its output loop by `threads_per_threadgroup` -- so widening it costs no
+    // extra kernel. Capped at D because a lane past the head dim does nothing,
+    // and at the Metal maximum of 1024.
+    let reduce_width = reduce_threads
+        .unwrap_or(DECODE_REDUCE_THREADS)
+        .min(head_dim as usize)
+        .max(32);
+    dispatch_2d_tg(rt, &r, 1, bh, reduce_width, |bnd| {
         set_gpu_buf(bnd, &scratch, 0);
         set_gpu_buf(bnd, o, 1);
         set_u32(bnd, dims.batch, 2);
@@ -797,17 +1067,151 @@ pub fn flash_attn_decode(
     })
 }
 
-/// Query rows per threadgroup in the row-parallel kernels. Must match
-/// `SG_PER_TG` in `kernels/flash_attn_rows.metal`; `tests/attention.rs` pins it.
-pub const ROWS_PER_TG: usize = 8;
+/// Simdgroups per threadgroup in the row-parallel kernels.
+///
+/// Every simdgroup in a threadgroup walks the same key range, so this is how
+/// much K/V reuse one global read buys: a threadgroup's lines are read once
+/// from L2 and served `SGT` times from L1. Rows per threadgroup are
+/// `SGT * 32/R`, which is why it interacts with [`RowsLanes`] and is swept
+/// against it rather than chosen alone. 32 simdgroups is 1024 threads, the
+/// Metal maximum. Compiled into the kernel name; `tests/attention.rs` pins the
+/// host and shader agreeing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsGroups {
+    G8,
+    G16,
+    G32,
+}
 
-fn rows_entry(d: u32) -> Option<&'static str> {
-    match d {
-        128 => Some("flash_attn_rows_h128"),
-        256 => Some("flash_attn_rows_h256"),
-        512 => Some("flash_attn_rows_h512"),
-        _ => None,
+impl RowsGroups {
+    pub fn count(self) -> usize {
+        match self {
+            RowsGroups::G8 => 8,
+            RowsGroups::G16 => 16,
+            RowsGroups::G32 => 32,
+        }
     }
+
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v {
+            "8" => Ok(RowsGroups::G8),
+            "16" => Ok(RowsGroups::G16),
+            "32" => Ok(RowsGroups::G32),
+            other => Err(format!(
+                "rows simdgroups-per-threadgroup must be 8, 16 or 32; got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Lanes per query row in the row-parallel kernels.
+///
+/// The reduction that turns per-lane partial dots into a score costs log2(R)
+/// shuffle-and-add steps against 2*D/R fused multiply-adds, so narrowing R
+/// trades reduction overhead for per-lane work and puts 32/R query rows in one
+/// simdgroup. Which value wins is measured per head dimension, not assumed --
+/// `bench_flash_attn` sweeps it with `BENCH_ATTN_ROWS_R`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowsLanes {
+    R8,
+    R16,
+    R32,
+}
+
+impl RowsLanes {
+    pub fn width(self) -> usize {
+        match self {
+            RowsLanes::R8 => 8,
+            RowsLanes::R16 => 16,
+            RowsLanes::R32 => 32,
+        }
+    }
+
+    pub fn parse(v: &str) -> Result<Self, String> {
+        match v {
+            "8" => Ok(RowsLanes::R8),
+            "16" => Ok(RowsLanes::R16),
+            "32" => Ok(RowsLanes::R32),
+            other => Err(format!(
+                "rows lanes-per-row must be 8, 16 or 32; got {other:?}"
+            )),
+        }
+    }
+}
+
+/// Lanes per row chosen for each head dimension.
+///
+/// Measured on an M5 Pro; see the tessl README. Kept as a table rather than a
+/// formula because the winner is a cache and register-pressure outcome, not a
+/// derivable one.
+pub fn rows_lanes_for(d: u32) -> RowsLanes {
+    match d {
+        512 => ROWS_LANES_D512,
+        256 => ROWS_LANES_D256,
+        _ => ROWS_LANES_D128,
+    }
+}
+
+/// Measured with `bench/attn_tune.py --knob rows`, five interleaved rounds
+/// (median ms) -- generated from
+/// `bench/results/attn_tune_rows_m5pro.json`, not transcribed:
+///
+/// | config | R=8 | R=16 | R=32 | winner |
+/// |---|---|---|---|---|
+/// | `swa128_prefill_512` | **1.096** | 1.283 | 1.672 | 8 |
+/// | `swa128_prefill_2048` | **11.493** | 17.062 | 21.064 | 8 |
+/// | `swa128_prefill_4096` | **27.291** | 44.191 | 52.045 | 8 |
+/// | `swa256_prefill_2048` | 22.973 | **14.891** | 16.667 | 16 |
+/// | `global512_prefill_1024` | 21.898 | 8.208 | **5.195** | 32 |
+///
+/// The winners are not arbitrary: all three land at **D/R = 16 dims per lane**.
+/// Below that the log2(R) reduction steps dominate the 2*D/R multiply-adds;
+/// above it `q_reg[D/R] + acc[D/R]` exceeds 32 floats per lane and the register
+/// file spills — which is the cliff visible at D=256/R=8 and D=512/R=16, both
+/// of which want 32 dims per lane.
+pub const ROWS_LANES_D128: RowsLanes = RowsLanes::R8;
+pub const ROWS_LANES_D256: RowsLanes = RowsLanes::R16;
+pub const ROWS_LANES_D512: RowsLanes = RowsLanes::R32;
+
+/// Simdgroups per threadgroup, per head dimension.
+///
+/// Swept with `bench/attn_tune.py --knob rows-g`. It was a single constant 8
+/// for every head dim, and that is what left D=512 behind: rows per threadgroup
+/// are `SGT * 32/R`, so at R=32 eight simdgroups gave 8 rows of reuse per K/V
+/// line against 32 at D=128/R=8 — the same arithmetic per byte over four times
+/// the L1 traffic. Median ms, 5 interleaved rounds:
+///
+/// | config | 8 | 16 | 32 |
+/// |---|---|---|---|
+/// | `swa128_prefill_512` | **1.125** | 1.197 | 1.282 |
+/// | `swa128_prefill_2048` | **12.278** | 13.743 | 12.943 |
+/// | `swa128_prefill_4096` | **29.006** | 35.975 | 31.021 |
+/// | `swa256_prefill_2048` | 15.110 | 16.624 | **14.243** |
+/// | `global512_prefill_1024` | 7.298 | 7.234 | **5.986** |
+///
+/// Prefill is ~100% kernel, so this is swept at one launch per submit: the
+/// batched arm buys nothing here and costs 32x the wall clock.
+pub const ROWS_GROUPS_D128: RowsGroups = RowsGroups::G8;
+pub const ROWS_GROUPS_D256: RowsGroups = RowsGroups::G32;
+pub const ROWS_GROUPS_D512: RowsGroups = RowsGroups::G32;
+
+pub fn rows_groups_for(d: u32) -> RowsGroups {
+    match d {
+        512 => ROWS_GROUPS_D512,
+        256 => ROWS_GROUPS_D256,
+        _ => ROWS_GROUPS_D128,
+    }
+}
+
+fn rows_entry(d: u32, r: RowsLanes, g: RowsGroups) -> Option<String> {
+    if !matches!(d, 128 | 256 | 512) {
+        return None;
+    }
+    Some(format!(
+        "flash_attn_rows_h{d}_r{}_g{}",
+        r.width(),
+        g.count()
+    ))
 }
 
 /// Row-parallel flash attention: one simdgroup per query row.
@@ -835,7 +1239,41 @@ pub fn flash_attn_rows(
     head_dim: u32,
     out_bf16: bool,
 ) -> Result<(), String> {
-    let entry = rows_entry(head_dim).ok_or_else(|| {
+    flash_attn_rows_with_lanes(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        dims,
+        head_dim,
+        rows_lanes_for(head_dim),
+        rows_groups_for(head_dim),
+        out_bf16,
+    )
+}
+
+/// [`flash_attn_rows`] with an explicit lanes-per-row, for the tuning sweep.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_rows_with_lanes(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    head_dim: u32,
+    lanes: RowsLanes,
+    groups: RowsGroups,
+    out_bf16: bool,
+) -> Result<(), String> {
+    let entry = rows_entry(head_dim, lanes, groups).ok_or_else(|| {
         format!("flash_attn_rows: head dim {head_dim} has no kernel (128, 256 or 512)")
     })?;
     validate_attn_dims(&dims, head_dim, q, o, "flash_attn_rows", out_bf16)?;
@@ -854,10 +1292,13 @@ pub fn flash_attn_rows(
         "flash_attn_rows v",
     )?;
 
-    let groups_x = (dims.tq as usize).div_ceil(ROWS_PER_TG);
+    // Rows per threadgroup is `SGT` simdgroups times 32/R rows each, so the
+    // grid depends on both values the kernel was compiled for.
+    let rows_per_tg = groups.count() * (32 / lanes.width());
+    let groups_x = (dims.tq as usize).div_ceil(rows_per_tg);
     let groups_y = (dims.batch as usize).saturating_mul(dims.heads as usize);
-    let p = rt.pipeline(entry)?;
-    dispatch_2d_tg(rt, &p, groups_x, groups_y, ROWS_PER_TG * 32, |bnd| {
+    let p = rt.pipeline(&entry)?;
+    dispatch_2d_tg(rt, &p, groups_x, groups_y, groups.count() * 32, |bnd| {
         set_gpu_buf(bnd, q, 0);
         set_gpu_buf(bnd, k, 1);
         set_gpu_buf(bnd, v, 2);
@@ -884,16 +1325,34 @@ fn tiled_attn_forced() -> bool {
     *FORCED.get_or_init(|| std::env::var_os("TESSL_ATTN_TILED").is_some())
 }
 
-/// Threadgroups below which the KV split is worth its second pass.
+/// Which kernel an attention dispatch routes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttnKernel {
+    /// FlashDecoding: `n_chunks x B*H` threadgroups plus a reduce pass.
+    SplitKv,
+    /// One simdgroup per query row: `Tq x B*H` threadgroups, single pass.
+    Rows,
+}
+
+/// The routing rule, as a pure function of what it actually depends on.
 ///
-/// At `Tq == 1` the row-parallel kernel launches `B*H` threadgroups, and
-/// FlashDecoding multiplies that by the chunk count at the cost of a scratch
-/// buffer and a reduce pass. Measured on an M5 Pro: at `B*H = 8` the split wins
-/// 0.59 ms against 2.29 ms, at 16 it wins 0.61 against 0.68, at 32 the two are
-/// within noise (0.57 against 0.52), and at 256 the split *loses* 0.96 against
-/// 0.65 because the grid is already full and the second pass is pure overhead.
-/// 128 sits inside the flat region between those.
-const ATTN_SPLIT_KV_BELOW_TG: usize = 128;
+/// Extracted so the rule can be pinned by a test rather than inferred from a
+/// timing run. The rule it replaced -- `Tq == 1 && B*H < 128` -- was wrong for
+/// two years' worth of batch sizes and nothing failed when it changed, because
+/// both kernels compute the same thing and only the clock could tell them
+/// apart.
+///
+/// `kv_capacity` is how many KV positions the K buffer can hold. The split
+/// kernel sizes its grid from it, because the live `Tkv` is a device value, so
+/// a buffer too small to hold one position has no grid to launch and falls
+/// back rather than dispatching an empty one.
+pub fn attn_kernel_for(tq: u32, kv_capacity: usize) -> AttnKernel {
+    if tq == 1 && kv_capacity > 0 {
+        AttnKernel::SplitKv
+    } else {
+        AttnKernel::Rows
+    }
+}
 
 /// Pick the attention kernel for a dispatch and run it.
 #[allow(clippy::too_many_arguments)]
@@ -910,41 +1369,57 @@ fn route_attn(
     head_dim: u32,
     out_bf16: bool,
 ) -> Result<(), String> {
-    let bh = (dims.batch as usize).saturating_mul(dims.heads as usize);
-    if dims.tq == 1 && bh < ATTN_SPLIT_KV_BELOW_TG {
-        // `Tkv` is a device value, so the grid is sized from what K can hold.
-        let per_pos = elems(dims.batch * dims.heads_kv, head_dim, "flash_attn k")?;
-        let capacity = capacity_of::<f32>(k).checked_div(per_pos).unwrap_or(0);
-        if capacity > 0 {
-            return flash_attn_decode(
-                rt,
-                q,
-                k,
-                v,
-                o,
-                tkv,
-                q_pos_offset,
-                kv_pos_offset,
-                dims,
-                head_dim,
-                capacity,
-                out_bf16,
-            );
-        }
+    // Every `Tq == 1` dispatch takes the KV split. There used to be a
+    // `B*H < 128` threshold here, on the evidence that at `B*H = 256` the split
+    // lost 0.96 ms to the row kernel's 0.65 -- but that was measured at one
+    // launch per submit, where ~85% of a decode call is the host round trip and
+    // the split pays two submits to the row kernel's one. Measured kernel-only,
+    // 32 launches per submit, the split wins at every batch the config set
+    // reaches, and by more as the batch grows:
+    //
+    // | `B*H` | split | rows | |
+    // |---|---|---|---|
+    // | 32 | 0.033 | 0.327 | 9.9x |
+    // | 256 | 0.344 | 0.494 | 1.4x |
+    // | 1024 | 1.229 | 2.775 | 2.3x |
+    // | 2048 | 2.476 | 5.127 | 2.1x |
+    //
+    // It also wins at one launch per submit once the decode kernel's own
+    // constants were retuned on a kernel-only signal (1.18x at 32, 1.31x at
+    // 256, 1.86x at 2048), so the threshold was not trading one protocol
+    // against the other -- it was reading dispatch cost as kernel cost.
+    // `Tkv` is a device value, so the grid is sized from what K can hold.
+    let per_pos = elems(dims.batch * dims.heads_kv, head_dim, "flash_attn k")?;
+    let capacity = capacity_of::<f32>(k).checked_div(per_pos).unwrap_or(0);
+    match attn_kernel_for(dims.tq, capacity) {
+        AttnKernel::SplitKv => flash_attn_decode(
+            rt,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            dims,
+            head_dim,
+            capacity,
+            out_bf16,
+        ),
+        AttnKernel::Rows => flash_attn_rows(
+            rt,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            dims,
+            head_dim,
+            out_bf16,
+        ),
     }
-    flash_attn_rows(
-        rt,
-        q,
-        k,
-        v,
-        o,
-        tkv,
-        q_pos_offset,
-        kv_pos_offset,
-        dims,
-        head_dim,
-        out_bf16,
-    )
 }
 
 /// Sliding-window flash attention.

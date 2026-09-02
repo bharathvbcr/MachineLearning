@@ -15,7 +15,8 @@ a dump it had not actually verified.
 import json, os, shutil, sys, tempfile
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE_BENCH = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE_BENCH)
 from gemm_sweep_mlx import parity  # noqa: E402
 
 M, N, K = 32, 24, 16
@@ -262,6 +263,95 @@ def speed_coverage():
         print(f"  ok    a fully absent comparison lane names all {len(gaps)} shapes")
 
 
+def attn_paired_contract():
+    """`attn_paired` -- the same coverage rule, plus the batching guard.
+
+    The batching guard exists because this driver once set BENCH_ATTN_BATCHED
+    for the Python lane and not the Rust one, compared tessl at batch=1 against
+    MLX at batch=32, and printed a perfectly plausible 11.6x. Both lanes now
+    echo the batch they ran and the driver refuses the ratio; that refusal is
+    what is tested here.
+    """
+    import types
+    import attn_paired
+    print("\n-- attn_paired: coverage rule and batching guard --")
+
+    cfgs = ["swa128_decode_1k", "swa128_decode_4k"]
+    a = {(c, "tessl-decode"): 1.0 for c in cfgs}
+    b = {(c, "mlx"): 1.0 for c in cfgs}
+    rounds = [(dict(a), dict(b)) for _ in range(3)]
+    gaps = attn_paired.missing_coverage(rounds, cfgs, ["mlx"], "tessl-decode")
+    if gaps:
+        FAILURES.append(f"attn complete rounds reported gaps: {gaps}")
+        print(f"  FAIL  complete rounds reported gaps: {gaps}")
+    else:
+        print("  ok    complete coverage reports no gaps")
+
+    holed = [(dict(a), dict(b)) for _ in range(3)]
+    del holed[2][1][("swa128_decode_4k", "mlx")]
+    gaps = attn_paired.missing_coverage(holed, cfgs, ["mlx"], "tessl-decode")
+    if gaps != ["swa128_decode_4k/mlx"]:
+        FAILURES.append(f"attn hole in one round not caught: {gaps}")
+        print(f"  FAIL  hole in one round not caught: {gaps}")
+    else:
+        print(f"  ok    a config missing from one round is caught: {gaps}")
+
+    def with_rows(rows):
+        def fake_run(cmd, env=None, **kw):
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+        return fake_run
+
+    real_run = attn_paired.subprocess.run
+    try:
+        # A lane that ran at a different batch than the driver asked for.
+        attn_paired.subprocess.run = with_rows(
+            [dict(cfg="swa128_decode_1k", runtime="mlx", median_ms=1.0, batched=1)])
+        try:
+            attn_paired._run(["x"], {}, "fake lane", lambda x: x["runtime"], 32)
+        except SystemExit as exc:
+            if "different batching" in str(exc):
+                print("  ok    a lane at the wrong batch refuses to form a ratio")
+            else:
+                FAILURES.append(f"batch mismatch raised the wrong error: {exc}")
+                print(f"  FAIL  wrong error: {exc}")
+        else:
+            FAILURES.append("a batch mismatch was accepted")
+            print("  FAIL  batch mismatch accepted")
+
+        # A lane that reports no batch at all cannot be confirmed, and an
+        # unconfirmable check must not pass like a confirmed one.
+        attn_paired.subprocess.run = with_rows(
+            [dict(cfg="swa128_decode_1k", runtime="mlx", median_ms=1.0)])
+        try:
+            attn_paired._run(["x"], {}, "fake lane", lambda x: x["runtime"], 32)
+        except SystemExit as exc:
+            if "no 'batched' field" in str(exc):
+                print("  ok    a lane that reports no batch is refused, not trusted")
+            else:
+                FAILURES.append(f"missing batch field raised the wrong error: {exc}")
+                print(f"  FAIL  wrong error: {exc}")
+        else:
+            FAILURES.append("a lane reporting no batch was accepted")
+            print("  FAIL  missing batch field accepted")
+
+        # A non-finite or zero median is a failed measurement, not a fast one.
+        for bad in (0.0, float("nan"), -1.0):
+            attn_paired.subprocess.run = with_rows(
+                [dict(cfg="swa128_decode_1k", runtime="mlx", median_ms=bad, batched=1)])
+            try:
+                attn_paired._run(["x"], {}, "fake lane", lambda x: x["runtime"], 1)
+            except SystemExit:
+                pass
+            else:
+                FAILURES.append(f"median_ms={bad} was accepted as a timing")
+                print(f"  FAIL  median_ms={bad} accepted")
+                break
+        else:
+            print("  ok    zero, NaN and negative medians are all refused")
+    finally:
+        attn_paired.subprocess.run = real_run
+
+
 ATTN_CLI_CASES = [
     ("--dump-parity with no directory", ["--dump-parity"], {}, "requires a directory"),
     ("BENCH_ITERS=0", [], {"BENCH_ITERS": "0"}, "below the minimum"),
@@ -270,6 +360,18 @@ ATTN_CLI_CASES = [
     ("BENCH_ATTN_CFGS=nope", [], {"BENCH_ATTN_CFGS": "nope"}, "not a configuration"),
     ("BENCH_ATTN_CFGS=swa128_prefill_5120", [],
      {"BENCH_ATTN_CFGS": "swa128_prefill_5120"}, "not a configuration"),
+    # A parity artifact must describe the shipping configuration. Under a
+    # tuning override it would describe a kernel no caller reaches, which is
+    # exactly how the forced-decode lane came to be dumped at chunk 256 while
+    # the library shipped 128.
+    ("--dump-parity with BENCH_ATTN_DECODE_CHUNK", ["--dump-parity", "/tmp/attn-refused"],
+     {"BENCH_ATTN_DECODE_CHUNK": "64"}, "shipping configuration"),
+    ("--dump-parity with BENCH_ATTN_DECODE_R", ["--dump-parity", "/tmp/attn-refused"],
+     {"BENCH_ATTN_DECODE_R": "32"}, "shipping configuration"),
+    ("--dump-parity with BENCH_ATTN_ROWS_R", ["--dump-parity", "/tmp/attn-refused"],
+     {"BENCH_ATTN_ROWS_R": "32"}, "shipping configuration"),
+    ("--dump-parity with TESSL_ATTN_TILED", ["--dump-parity", "/tmp/attn-refused"],
+     {"TESSL_ATTN_TILED": "1"}, "shipping configuration"),
 ]
 
 
@@ -343,6 +445,103 @@ def attention_semantics():
         print(f"  ok    live-pair counts match the Rust FLOP accounting ({len(want)} checked)")
 
 
+def tune_knob_contract():
+    """The knob table and the environment it actually hands the binary.
+
+    `attn_tune.run` clears every knob it is not sweeping, because a knob left
+    over from the caller's shell would silently be measured as part of the
+    value under test. That clearing list used to be a second hardcoded copy of
+    the knob names, so adding a knob to KNOBS and forgetting the copy leaked
+    it. Both the table's shape and the env the subprocess receives are checked
+    here.
+    """
+    import types
+    import attn_tune
+    from flash_attn_torch_mlx import BY_LABEL
+    print("\n-- attn_tune knob table and subprocess environment --")
+
+    declared = {env for env, *_ in attn_tune.KNOBS.values()}
+    if declared == set(attn_tune.KNOB_ENV):
+        print(f"  ok    KNOB_ENV covers all {len(declared)} knob variables")
+    else:
+        FAILURES.append(f"KNOB_ENV {attn_tune.KNOB_ENV} != declared {sorted(declared)}")
+        print("  FAIL  KNOB_ENV does not cover every knob")
+
+    lanes = {"tessl", "tessl-tiled", "tessl-decode", "tessl-rows"}
+    for knob, (env, values, lane, cfgs) in sorted(attn_tune.KNOBS.items()):
+        bad = [c for c in cfgs if c not in BY_LABEL]
+        if bad:
+            FAILURES.append(f"knob {knob}: unknown configs {bad}")
+            print(f"  FAIL  {knob}: unknown configs {bad}")
+        elif lane not in lanes:
+            FAILURES.append(f"knob {knob}: lane {lane!r} is not one the binary emits")
+            print(f"  FAIL  {knob}: unknown lane {lane!r}")
+        elif len(set(values)) != len(values):
+            FAILURES.append(f"knob {knob}: duplicate values {values}")
+            print(f"  FAIL  {knob}: duplicate values {values}")
+        else:
+            print(f"  ok    {knob}: {env}={values} on {lane}, {len(cfgs)} configs")
+
+    # The decomposition report divides batched by solo, so the values are part
+    # of the contract, not a default someone may reorder.
+    if attn_tune.KNOBS["batched"][1] == ["1", "32"]:
+        print("  ok    batched knob is ('1', '32'), the order the share assumes")
+    else:
+        FAILURES.append(f"batched values reordered: {attn_tune.KNOBS['batched'][1]}")
+        print("  FAIL  batched knob values are not ('1', '32')")
+
+    # A knob left in the caller's environment must not survive into a sweep of
+    # a different knob.
+    seen = {}
+
+    def fake_run(cmd, env=None, **kw):
+        seen.clear()
+        seen.update(env or {})
+        rows = [dict(cfg=c, runtime="tessl-rows", median_ms=1.0)
+                for c in attn_tune.KNOBS["rows"][3]]
+        return types.SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr="")
+
+    real_run, real_env = attn_tune.subprocess.run, dict(os.environ)
+    try:
+        attn_tune.subprocess.run = fake_run
+        os.environ["BENCH_ATTN_DECODE_CHUNK"] = "256"
+        os.environ["BENCH_ATTN_BATCHED"] = "32"
+        env_name, _, lane, cfgs = attn_tune.KNOBS["rows"]
+        attn_tune.run(env_name, "8", lane, cfgs, 3, 1)
+    finally:
+        attn_tune.subprocess.run = real_run
+        os.environ.clear()
+        os.environ.update(real_env)
+
+    # BENCH_ATTN_BATCHED is not cleared but *set*, so a stray value in the
+    # caller's shell is overridden rather than inherited: a sweep silently run
+    # at someone else's batching is a sweep of the wrong thing.
+    leaked = [k for k in attn_tune.KNOB_ENV
+              if k not in ("BENCH_ATTN_ROWS_R", "BENCH_ATTN_BATCHED") and k in seen]
+    if leaked:
+        FAILURES.append(f"knobs leaked into a rows sweep: {leaked}")
+        print(f"  FAIL  knobs leaked into the child env: {leaked}")
+    elif seen.get("BENCH_ATTN_ROWS_R") != "8":
+        FAILURES.append(f"swept knob not set: BENCH_ATTN_ROWS_R={seen.get('BENCH_ATTN_ROWS_R')}")
+        print("  FAIL  the swept knob did not reach the child env")
+    elif seen.get("BENCH_ATTN_BATCHED") != "1":
+        FAILURES.append(f"stray BENCH_ATTN_BATCHED inherited: {seen.get('BENCH_ATTN_BATCHED')}")
+        print(f"  FAIL  inherited BENCH_ATTN_BATCHED={seen.get('BENCH_ATTN_BATCHED')}")
+    else:
+        print("  ok    sweeping one knob clears the others and pins the batching")
+
+    # A sweep of launches-per-submit cannot also be handed a fixed batching.
+    import subprocess as _sp
+    r = _sp.run([sys.executable, os.path.join(HERE_BENCH, "attn_tune.py"),
+                 "--knob", "batched", "--batched", "32"],
+                capture_output=True, text=True)
+    if r.returncode != 0 and "Drop one of them" in (r.stderr + r.stdout):
+        print("  ok    --knob batched with --batched is refused")
+    else:
+        FAILURES.append("--knob batched --batched 32 was accepted")
+        print("  FAIL  --knob batched --batched 32 accepted")
+
+
 def attn_cli_contract():
     import subprocess
     print("\n-- bench_flash_attn argument / environment contract --")
@@ -357,7 +556,9 @@ def attn_cli_contract():
         return
     for label, argv, env, needle in ATTN_CLI_CASES:
         e = dict(os.environ, **env)
-        for var in ("BENCH_ITERS", "BENCH_WARMUP", "BENCH_ATTN_DIST", "BENCH_ATTN_CFGS"):
+        for var in ("BENCH_ITERS", "BENCH_WARMUP", "BENCH_ATTN_DIST", "BENCH_ATTN_CFGS",
+                    "BENCH_ATTN_DECODE_CHUNK", "BENCH_ATTN_DECODE_R",
+                    "BENCH_ATTN_ROWS_R", "TESSL_ATTN_TILED"):
             if var not in env:
                 e.pop(var, None)
         r = subprocess.run([binary] + argv, env=e, capture_output=True, text=True)
@@ -641,6 +842,8 @@ def main():
     speed_coverage()
     attention_semantics()
     attn_cli_contract()
+    attn_paired_contract()
+    tune_knob_contract()
     coverage_inventory()
 
     print()

@@ -218,6 +218,62 @@ fn run_decode(
         scale,
     };
 
+    // Every lanes-per-key: R selects the partial kernel and changes both the
+    // per-key butterfly and the cross-group combine, so each width has its own
+    // arithmetic to get wrong. All must agree with the f64 reference.
+    // The reduce width is a dispatch parameter rather than a compiled one, so
+    // it is not a distinct kernel -- but it changes which lane writes which
+    // output dim and how many chunks each folds, and 32 (one simdgroup, the
+    // old fixed width) has to keep working alongside the wide default.
+    for lanes in [nn::RowsLanes::R8, nn::RowsLanes::R16, nn::RowsLanes::R32] {
+        for chunk in [
+            nn::DecodeChunk::C64,
+            nn::DecodeChunk::C128,
+            nn::DecodeChunk::C256,
+        ] {
+            for reduce_w in [None, Some(32), Some(64), Some(1024)] {
+                // Head-block width is a dispatch parameter too, and it decides
+                // which query head each simdgroup owns and how grid.y decodes
+                // into (batch, block). Getting it wrong swaps heads' outputs --
+                // every head still reads valid data, just the wrong one's, so
+                // nothing but a reference check would see it.
+                for sgs in [
+                    None,
+                    Some(nn::DecodeHeadBlock::One),
+                    Some(nn::DecodeHeadBlock::Group),
+                    Some(nn::DecodeHeadBlock::AllHeads),
+                ] {
+                    let probe = seeded(rt, s.b * s.tq * s.h * s.d, UNWRITTEN);
+                    nn::flash_attn_decode_with_chunk(
+                        rt, &qb, &kb, &vb, &probe, &tkv, &qo, &ko, dims, s.d as u32, s.tkv, chunk,
+                        lanes, reduce_w, sgs, false,
+                    )
+                    .unwrap();
+                    rt.synchronize().unwrap();
+                    let want = reference(
+                        &q,
+                        &k,
+                        &v,
+                        s,
+                        window,
+                        q_off as usize,
+                        kv_off as usize,
+                        scale,
+                    );
+                    let got = probe.read_f32()[..want.len()].to_vec();
+                    check(
+                        &format!(
+                            "decode r={} c={} w={reduce_w:?} sgs={sgs:?}",
+                            lanes.width(),
+                            chunk.keys()
+                        ),
+                        &got,
+                        &want,
+                    );
+                }
+            }
+        }
+    }
     nn::flash_attn_decode(
         rt, &qb, &kb, &vb, &o_dec, &tkv, &qo, &ko, dims, s.d as u32, s.tkv, false,
     )
@@ -268,6 +324,8 @@ fn run_rows(
     kv_off: u32,
     scale: f32,
     seed: u64,
+    lanes: nn::RowsLanes,
+    groups: nn::RowsGroups,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let q = random_f32(s.b * s.tq * s.h * s.d, seed);
     let k = random_f32(s.b * s.tkv * s.hkv * s.d, seed + 1);
@@ -287,8 +345,8 @@ fn run_rows(
         scale,
     };
 
-    nn::flash_attn_rows(
-        rt, &qb, &kb, &vb, &o_rows, &tkv, &qo, &ko, dims, s.d as u32, false,
+    nn::flash_attn_rows_with_lanes(
+        rt, &qb, &kb, &vb, &o_rows, &tkv, &qo, &ko, dims, s.d as u32, lanes, groups, false,
     )
     .unwrap();
     match window {
@@ -327,32 +385,46 @@ fn run_rows(
     )
 }
 
-/// The row-parallel kernels' rows-per-threadgroup must match the shader's
-/// `SG_PER_TG`: the host derives the grid from its copy, so a drift would
-/// leave the tail of every dispatch uncomputed.
+/// Every (D, R, SGT) the host can ask for must be instantiated in the shader.
+///
+/// Simdgroups per threadgroup used to be one `constant uint SG_PER_TG` that the
+/// host mirrored, and the risk then was drift between the two copies. It is now
+/// compiled into the kernel name, so the risk is a *missing* instantiation
+/// instead: the host would ask for a pipeline that does not exist and fail at
+/// dispatch, deep inside a benchmark, rather than here.
 #[test]
-fn rows_per_tg_matches_the_shader() {
+fn every_rows_kernel_the_host_can_ask_for_exists() {
     let src = include_str!("../kernels/flash_attn_rows.metal");
-    let line = src
-        .lines()
-        .find(|l| l.contains("constant uint SG_PER_TG"))
-        .expect("SG_PER_TG not declared in flash_attn_rows.metal");
-    let want: usize = line
-        .split('=')
-        .nth(1)
-        .and_then(|x| x.trim().trim_end_matches(';').parse().ok())
-        .expect("could not parse SG_PER_TG");
-    assert_eq!(
-        want,
-        nn::ROWS_PER_TG,
-        "shader SG_PER_TG and nn::ROWS_PER_TG disagree"
-    );
+    let mut n = 0;
+    for d in [128u32, 256, 512] {
+        for lanes in [nn::RowsLanes::R8, nn::RowsLanes::R16, nn::RowsLanes::R32] {
+            for groups in [nn::RowsGroups::G8, nn::RowsGroups::G16, nn::RowsGroups::G32] {
+                let want = format!(
+                    "ROWS_KERNEL(flash_attn_rows_h{d}_r{}_g{}, {d}, {}, {})",
+                    lanes.width(),
+                    groups.count(),
+                    lanes.width(),
+                    groups.count()
+                );
+                assert!(
+                    src.contains(&want),
+                    "flash_attn_rows.metal is missing {want}"
+                );
+                n += 1;
+            }
+        }
+    }
+    assert_eq!(n, 27, "the (D, R, SGT) grid changed shape");
+    // A threadgroup is SGT simdgroups of 32 threads and Metal caps that at
+    // 1024, so the largest value in the enum is also the largest that can be
+    // dispatched.
+    assert_eq!(nn::RowsGroups::G32.count() * 32, 1024);
 }
 
 #[test]
 fn rows_matches_the_reference_and_the_tiled_kernel() {
     with_gpu(|rt| {
-        // Tq values chosen around ROWS_PER_TG = 8: exactly one threadgroup, a
+        // Tq values chosen around the rows a threadgroup covers: exactly one, a
         // partial tail, and several full ones. The tail is where a grid derived
         // from the wrong constant would silently drop rows.
         let cases: &[(Shape, Option<usize>)] = &[
@@ -472,18 +544,34 @@ fn rows_matches_the_reference_and_the_tiled_kernel() {
                 Some(1024),
             ),
         ];
-        for (i, &(s, window)) in cases.iter().enumerate() {
-            let (rows, gen, want) = run_rows(rt, s, window, 0, 0, 0.125, 0x4000 + i as u64);
-            check(
-                &format!("rows[{i}] Tq={} d={} w={window:?}", s.tq, s.d),
-                &rows,
-                &want,
-            );
-            check(
-                &format!("tiled[{i}] Tq={} d={} w={window:?}", s.tq, s.d),
-                &gen,
-                &want,
-            );
+        // Every (R, SGT) pair, not just the routed one: both are compile-time
+        // constants, so each pair is a distinct kernel with its own
+        // union-range-and-mask arithmetic and its own grid to get wrong. The
+        // rows a threadgroup covers are `SGT * 32/R`, so the Tq boundary cases
+        // below land differently for each.
+        for lanes in [nn::RowsLanes::R8, nn::RowsLanes::R16, nn::RowsLanes::R32] {
+            for groups in [nn::RowsGroups::G8, nn::RowsGroups::G16, nn::RowsGroups::G32] {
+                for (i, &(s, window)) in cases.iter().enumerate() {
+                    let (rows, gen, want) =
+                        run_rows(rt, s, window, 0, 0, 0.125, 0x4000 + i as u64, lanes, groups);
+                    check(
+                        &format!(
+                            "rows[{i}] r={} g={} Tq={} d={} w={window:?}",
+                            lanes.width(),
+                            groups.count(),
+                            s.tq,
+                            s.d
+                        ),
+                        &rows,
+                        &want,
+                    );
+                    check(
+                        &format!("tiled[{i}] Tq={} d={} w={window:?}", s.tq, s.d),
+                        &gen,
+                        &want,
+                    );
+                }
+            }
         }
     });
 }
@@ -501,15 +589,233 @@ fn rows_honours_position_offsets_and_masks_to_zero() {
             hkv: 2,
             d: 128,
         };
-        let (rows, gen, want) = run_rows(rt, s, Some(8), 36, 0, 0.125, 0x5001);
-        check("rows offset", &rows, &want);
-        check("tiled offset", &gen, &want);
+        for lanes in [nn::RowsLanes::R8, nn::RowsLanes::R16, nn::RowsLanes::R32] {
+            for groups in [nn::RowsGroups::G8, nn::RowsGroups::G16, nn::RowsGroups::G32] {
+                let (rows, gen, want) =
+                    run_rows(rt, s, Some(8), 36, 0, 0.125, 0x5001, lanes, groups);
+                check(
+                    &format!("rows offset r={} g={}", lanes.width(), groups.count()),
+                    &rows,
+                    &want,
+                );
+                check("tiled offset", &gen, &want);
 
-        // Every key past the query position: the whole output is zeros.
-        let (rows, _, _) = run_rows(rt, s, Some(1024), 0, 5000, 0.125, 0x5002);
-        for (i, v) in rows.iter().enumerate() {
-            assert!(v.is_finite(), "rows[{i}] is {v}, want a finite zero");
-            assert_eq!(*v, 0.0, "rows[{i}] = {v}, want 0");
+                // Every key past the query position: the whole output is zeros.
+                let (rows, _, _) =
+                    run_rows(rt, s, Some(1024), 0, 5000, 0.125, 0x5002, lanes, groups);
+                for (i, v) in rows.iter().enumerate() {
+                    assert!(v.is_finite(), "rows[{i}] r={} is {v}", lanes.width());
+                    assert_eq!(*v, 0.0, "rows[{i}] r={} = {v}, want 0", lanes.width());
+                }
+            }
+        }
+    });
+}
+
+/// Adversarial inputs for both fast paths.
+///
+/// The shipped configs all use `scale = 1/sqrt(D)` on unit-ish operands, which
+/// keeps every score within a few units of zero. That is the easy case for an
+/// online softmax; these are not.
+#[test]
+fn fast_paths_survive_extreme_score_magnitudes() {
+    with_gpu(|rt| {
+        // (label, |q| scale, |k| scale, softmax scale). The products drive
+        // scores far from zero in both directions, which is where a rescale
+        // that mishandles -inf, or a max polluted by an unwritten slot,
+        // underflows every term to zero and silently returns zeros.
+        let cases: &[(&str, f32, f32, f32)] = &[
+            ("large positive", 30.0, 30.0, 1.0),
+            ("large negative", 30.0, -30.0, 1.0),
+            ("tiny", 1e-6, 1e-6, 1.0),
+            ("huge scale", 1.0, 1.0, 5000.0),
+            ("denormal-ish", 1e-20, 1e-20, 1.0),
+        ];
+        for &(label, qs, ks, scale) in cases {
+            for (d, tkv) in [(128usize, 900usize), (256, 600), (512, 700)] {
+                let s = Shape {
+                    b: 1,
+                    tq: 1,
+                    tkv,
+                    h: 4,
+                    hkv: 2,
+                    d,
+                };
+                let q: Vec<f32> = random_f32(s.b * s.h * d, 0x9001)
+                    .iter()
+                    .map(|x| x * qs)
+                    .collect();
+                let k: Vec<f32> = random_f32(s.b * tkv * s.hkv * d, 0x9002)
+                    .iter()
+                    .map(|x| x.abs() * ks)
+                    .collect();
+                let v = random_f32(s.b * tkv * s.hkv * d, 0x9003);
+                let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+                let o_dec = seeded(rt, s.b * s.h * d, UNWRITTEN);
+                let o_rows = seeded(rt, s.b * s.h * d, UNWRITTEN);
+                let tkvb = u32_buf(rt, tkv as u32);
+                let qo = u32_buf(rt, (tkv - 1) as u32);
+                let ko = u32_buf(rt, 0);
+                let dims = nn::AttnDims {
+                    batch: 1,
+                    tq: 1,
+                    heads: s.h as u32,
+                    heads_kv: s.hkv as u32,
+                    window: 0,
+                    scale,
+                };
+                nn::flash_attn_decode(
+                    rt, &qb, &kb, &vb, &o_dec, &tkvb, &qo, &ko, dims, d as u32, tkv, false,
+                )
+                .unwrap();
+                nn::flash_attn_rows(
+                    rt, &qb, &kb, &vb, &o_rows, &tkvb, &qo, &ko, dims, d as u32, false,
+                )
+                .unwrap();
+                rt.synchronize().unwrap();
+                let want = reference(&q, &k, &v, s, None, tkv - 1, 0, scale);
+                let got_d = o_dec.read_f32()[..want.len()].to_vec();
+                let got_r = o_rows.read_f32()[..want.len()].to_vec();
+                for (i, w) in want.iter().enumerate() {
+                    let tol = 2e-3 * w.abs().max(1e-3);
+                    assert!(
+                        got_d[i].is_finite() && (got_d[i] - w).abs() <= tol,
+                        "decode {label} d={d}: [{i}] got {} want {w}",
+                        got_d[i]
+                    );
+                    assert!(
+                        got_r[i].is_finite() && (got_r[i] - w).abs() <= tol,
+                        "rows {label} d={d}: [{i}] got {} want {w}",
+                        got_r[i]
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// The decode scratch is pool-recycled, so a second call can be handed the
+/// first call's bytes. Every chunk the reduce pass reads must have been written
+/// by the partial pass in *this* dispatch.
+#[test]
+fn decode_is_immune_to_a_recycled_scratch() {
+    with_gpu(|rt| {
+        let d = 128usize;
+        // A long history first, then a short one. If the reduce ever read a
+        // chunk the partial pass did not write this time, the long run's
+        // partials are exactly what would be sitting there.
+        let mut prev: Option<Vec<f32>> = None;
+        for pass in 0..2 {
+            for &tkv in &[2000usize, 300, 2000, 257] {
+                let s = Shape {
+                    b: 1,
+                    tq: 1,
+                    tkv,
+                    h: 4,
+                    hkv: 2,
+                    d,
+                };
+                let q = random_f32(s.b * s.h * d, 0xA001);
+                let k = random_f32(s.b * tkv * s.hkv * d, 0xA002 + tkv as u64);
+                let v = random_f32(s.b * tkv * s.hkv * d, 0xA003 + tkv as u64);
+                let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+                let ob = seeded(rt, s.b * s.h * d, UNWRITTEN);
+                let tkvb = u32_buf(rt, tkv as u32);
+                let qo = u32_buf(rt, (tkv - 1) as u32);
+                let ko = u32_buf(rt, 0);
+                let dims = nn::AttnDims {
+                    batch: 1,
+                    tq: 1,
+                    heads: s.h as u32,
+                    heads_kv: s.hkv as u32,
+                    window: 0,
+                    scale: 0.125,
+                };
+                nn::flash_attn_decode(
+                    rt, &qb, &kb, &vb, &ob, &tkvb, &qo, &ko, dims, d as u32, tkv, false,
+                )
+                .unwrap();
+                rt.synchronize().unwrap();
+                let want = reference(&q, &k, &v, s, None, tkv - 1, 0, 0.125);
+                let got = ob.read_f32()[..want.len()].to_vec();
+                check(
+                    &format!("recycled scratch pass={pass} tkv={tkv}"),
+                    &got,
+                    &want,
+                );
+                if tkv == 257 {
+                    if let Some(p) = &prev {
+                        assert_eq!(p, &got, "same inputs gave different results across passes");
+                    }
+                    prev = Some(got);
+                }
+            }
+        }
+    });
+}
+
+/// bf16 output, which only the global entry point exercises in the other tests.
+#[test]
+fn fast_paths_write_bf16_output_within_bf16_resolution() {
+    with_gpu(|rt| {
+        for (d, tq, tkv) in [(128usize, 1usize, 700usize), (512, 12, 300)] {
+            let s = Shape {
+                b: 1,
+                tq,
+                tkv,
+                h: 4,
+                hkv: 2,
+                d,
+            };
+            let q = random_f32(s.b * tq * s.h * d, 0xB001);
+            let k = random_f32(s.b * tkv * s.hkv * d, 0xB002);
+            let v = random_f32(s.b * tkv * s.hkv * d, 0xB003);
+            let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+            let n = s.b * tq * s.h * d;
+            let o_bf = rt.alloc_buffer(n * 4).unwrap();
+            let tkvb = u32_buf(rt, tkv as u32);
+            let qo = u32_buf(rt, 0);
+            let ko = u32_buf(rt, 0);
+            let dims = nn::AttnDims {
+                batch: 1,
+                tq: tq as u32,
+                heads: s.h as u32,
+                heads_kv: s.hkv as u32,
+                window: 0,
+                scale: 0.125,
+            };
+            if tq == 1 {
+                nn::flash_attn_decode(
+                    rt, &qb, &kb, &vb, &o_bf, &tkvb, &qo, &ko, dims, d as u32, tkv, true,
+                )
+                .unwrap();
+            } else {
+                nn::flash_attn_rows(
+                    rt, &qb, &kb, &vb, &o_bf, &tkvb, &qo, &ko, dims, d as u32, true,
+                )
+                .unwrap();
+            }
+            rt.synchronize().unwrap();
+            let want = reference(&q, &k, &v, s, None, 0, 0, 0.125);
+            let got_all: Vec<f32> = o_bf.read_u32()[..n / 2]
+                .iter()
+                .flat_map(|p| {
+                    [
+                        tessl::tensor::bf16_bits_to_f32((*p & 0xffff) as u16),
+                        tessl::tensor::bf16_bits_to_f32((*p >> 16) as u16),
+                    ]
+                })
+                .collect();
+            for (i, w) in want.iter().enumerate() {
+                let got = got_all[i];
+                assert!(got.is_finite(), "bf16 d={d}[{i}] non-finite");
+                // bf16 carries 8 significand bits.
+                let tol = 8e-3 * w.abs().max(1e-2);
+                assert!(
+                    (got - w).abs() <= tol,
+                    "bf16 d={d}[{i}]: got {got} want {w}"
+                );
+            }
         }
     });
 }
@@ -894,4 +1200,183 @@ fn global_h512_bf16_output_matches_the_f32_one_within_bf16_resolution() {
             assert!((g - w).abs() <= tol, "global bf16 [{i}]: {g} vs {w}");
         }
     });
+}
+
+/// The routing rule, pinned.
+///
+/// Both kernels compute the same thing, so a routing regression is invisible
+/// to every other test in this file -- it shows up only as a slower clock.
+/// The rule that stood here before sent `B*H >= 128` decode dispatches to the
+/// row kernel on the strength of a measurement that was ~85% command-buffer
+/// submit; kernel-only, the split kernel wins at 32, 256, 1024 and 2048
+/// threadgroups (9.9x, 1.4x, 2.3x, 2.1x). Nothing failed when that changed,
+/// which is exactly why the rule is asserted rather than inferred.
+#[test]
+fn every_single_query_dispatch_takes_the_kv_split() {
+    use tessl::nn::{attn_kernel_for, AttnKernel};
+
+    // Batch size is not part of the rule any more. These stand in for
+    // B*H = 32, 256, 1024, 2048 and beyond.
+    for capacity in [1, 128, 1024, 4096, 32_768, usize::MAX] {
+        assert_eq!(
+            attn_kernel_for(1, capacity),
+            AttnKernel::SplitKv,
+            "Tq=1 with capacity {capacity} must take the KV split"
+        );
+    }
+
+    // Prefill is the row kernel's regime at every length.
+    for tq in [2, 8, 512, 2048, 4096, u32::MAX] {
+        assert_eq!(
+            attn_kernel_for(tq, 4096),
+            AttnKernel::Rows,
+            "Tq={tq} is not single-query and must take the row kernel"
+        );
+    }
+
+    // A K buffer too small to hold one KV position gives the split kernel no
+    // grid to launch. Falling back is the only safe answer; dispatching an
+    // empty grid would silently produce zeros.
+    assert_eq!(attn_kernel_for(1, 0), AttnKernel::Rows);
+    assert_eq!(attn_kernel_for(0, 0), AttnKernel::Rows);
+}
+
+/// The routed path and a direct KV-split dispatch must agree bit for bit.
+///
+/// `route_attn` sizes the split grid from the K buffer's *capacity*, because
+/// the live `Tkv` is a device value it cannot read. A pooled allocator that
+/// hands back more bytes than were asked for therefore dispatches chunks past
+/// the live range, and the reduce pass folds their zeroed partials in. That is
+/// meant to be a no-op; this asserts it, because the parity dump showed the
+/// two paths' outputs differing by 2.2e-08 and only a bit-level comparison
+/// says whether that is a different reduction order or a real contribution.
+#[test]
+fn the_routed_path_matches_a_direct_kv_split_dispatch() {
+    with_gpu(|rt| {
+        for (b, tkv, h, hkv, d, window, q_off) in [
+            (2usize, 512usize, 8usize, 2usize, 128usize, 256u32, 0u32),
+            // The benchmark's `swa128_decode_b32_1k`, scaled down in batch: the
+            // parity dump showed these two paths differing there.
+            (4, 1024, 32, 8, 128, 1024, 1023),
+            // The benchmark's `swa128_decode_b32_1k` exactly. The parity dump
+            // showed the two paths differing here and not at b=4, so batch is
+            // part of whatever separates them.
+            (32, 1024, 32, 8, 128, 1024, 1023),
+        ] {
+            let q = random_f32(b * h * d, 11);
+            let k = random_f32(b * tkv * hkv * d, 12);
+            let v = random_f32(b * tkv * hkv * d, 13);
+            let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+            let tkvb = u32_buf(rt, tkv as u32);
+            let zero = u32_buf(rt, 0);
+            let dims = AttnDims {
+                batch: b as u32,
+                tq: 1,
+                heads: h as u32,
+                heads_kv: hkv as u32,
+                window,
+                scale: 0.125,
+            };
+            let qoff = u32_buf(rt, q_off);
+
+            let routed = empty(rt, b * h * d);
+            nn::flash_attn_swa(
+                rt,
+                AttnHeadDim::D128,
+                &qb,
+                &kb,
+                &vb,
+                &routed,
+                &tkvb,
+                &qoff,
+                &zero,
+                dims,
+            )
+            .unwrap();
+
+            let direct = empty(rt, b * h * d);
+            nn::flash_attn_decode_with_chunk(
+                rt,
+                &qb,
+                &kb,
+                &vb,
+                &direct,
+                &tkvb,
+                &qoff,
+                &zero,
+                dims,
+                d as u32,
+                tkv,
+                nn::decode_chunk_for(d as u32),
+                nn::decode_lanes_for(d as u32),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+
+            let (a, c) = (routed.read_f32(), direct.read_f32());
+            let mut worst = (0usize, 0.0f32);
+            for (i, (x, y)) in a[..b * h * d].iter().zip(&c[..b * h * d]).enumerate() {
+                let e = (x - y).abs();
+                if e > worst.1 {
+                    worst = (i, e);
+                }
+            }
+            assert_eq!(
+                worst.1, 0.0,
+                "b={b} tkv={tkv} h={h} d={d} window={window}: routed and direct \
+             KV-split disagree at element {} by {}",
+                worst.0, worst.1
+            );
+        }
+    });
+}
+
+/// The head-block step-down rule, pinned.
+///
+/// `grid.y` is decoded as `(batch, block)` with `H / sgs` blocks, so an `sgs`
+/// that does not divide `H` addresses the wrong query head rather than failing.
+/// Every head still reads valid data — just the wrong one's — which no timing
+/// and no finite-difference check would catch.
+#[test]
+fn the_head_block_width_always_divides_the_head_count() {
+    use tessl::nn::DecodeHeadBlock::{AllHeads, Group, One};
+
+    // One head per threadgroup always divides, whatever the shape.
+    for h in [1usize, 3, 7, 8, 32, 33, 64] {
+        assert_eq!(One.simdgroups(h, 4), Some(1), "H={h}");
+    }
+    // The GQA group divides by construction when H is a multiple of Hkv.
+    assert_eq!(Group.simdgroups(32, 4), Some(4));
+    assert_eq!(Group.simdgroups(8, 4), Some(4));
+    // ... and is refused when it is not, rather than mis-indexing.
+    assert_eq!(Group.simdgroups(7, 4), None);
+    assert_eq!(Group.simdgroups(32, 5), None);
+
+    // Every head of a batch item, up to the 1024-thread threadgroup cap.
+    assert_eq!(AllHeads.simdgroups(8, 4), Some(8));
+    assert_eq!(AllHeads.simdgroups(32, 4), Some(32));
+    assert_eq!(
+        AllHeads.simdgroups(64, 4),
+        None,
+        "64 simdgroups is 2048 threads"
+    );
+
+    // The dispatcher's fallback chain must always terminate: whatever the
+    // shape, some policy in [want, Group, One] yields a width.
+    for h in [1usize, 2, 3, 5, 7, 8, 12, 16, 31, 32, 33, 48, 64, 96] {
+        for hkv in [1usize, 2, 3, 4, 8] {
+            let group = (h / hkv).max(1);
+            let n = [AllHeads, Group, One]
+                .into_iter()
+                .find_map(|p| p.simdgroups(h, group))
+                .expect("the One policy must always divide");
+            assert!(
+                (1..=32).contains(&n) && h % n == 0,
+                "H={h} Hkv={hkv} gave sgs={n}"
+            );
+        }
+    }
 }

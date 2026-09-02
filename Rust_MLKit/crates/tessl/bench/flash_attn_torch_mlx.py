@@ -32,10 +32,14 @@ CFGS = [
     dict(label="swa128_decode_1k",      b=1, tq=1,    tkv=1024, h=32, hkv=8, d=128, window=1024, q_off=1023, kv_off=0),
     dict(label="swa128_decode_4k",      b=1, tq=1,    tkv=4096, h=32, hkv=8, d=128, window=1024, q_off=4095, kv_off=0),
     dict(label="swa128_decode_b8_4k",   b=8, tq=1,    tkv=4096, h=32, hkv=8, d=128, window=1024, q_off=4095, kv_off=0),
+    dict(label="swa128_decode_b32_1k",  b=32, tq=1,   tkv=1024, h=32, hkv=8, d=128, window=1024, q_off=1023, kv_off=0),
+    dict(label="swa128_decode_b64_1k",  b=64, tq=1,   tkv=1024, h=32, hkv=8, d=128, window=1024, q_off=1023, kv_off=0),
     dict(label="swa256_prefill_2048",   b=1, tq=2048, tkv=2048, h=16, hkv=4, d=256, window=1024, q_off=0,    kv_off=0),
     dict(label="swa256_decode_4k",      b=1, tq=1,    tkv=4096, h=16, hkv=4, d=256, window=1024, q_off=4095, kv_off=0),
     dict(label="global512_prefill_1024", b=1, tq=1024, tkv=1024, h=8, hkv=2, d=512, window=-1,   q_off=0,    kv_off=0),
     dict(label="global512_decode_4k",   b=1, tq=1,    tkv=4096, h=8,  hkv=2, d=512, window=-1,   q_off=4095, kv_off=0),
+    dict(label="global512_decode_4k_mha", b=1, tq=1,  tkv=4096, h=8,  hkv=8, d=512, window=-1,   q_off=4095, kv_off=0),
+    dict(label="global512_decode_4k_mqa", b=1, tq=1,  tkv=4096, h=8,  hkv=1, d=512, window=-1,   q_off=4095, kv_off=0),
 ]
 BY_LABEL = {c["label"]: c for c in CFGS}
 
@@ -107,15 +111,18 @@ def torch_attn(q, k, v, c, time_it=False, warmup=0, iters=1):
         o = run()
         torch.mps.synchronize()
         return np.transpose(o.float().cpu().numpy(), (0, 2, 1, 3))
+    batch = int(os.environ.get("BENCH_ATTN_BATCHED", "1"))
     for _ in range(warmup):
-        run()
+        for _ in range(batch):
+            run()
         torch.mps.synchronize()
     s = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        run()
+        for _ in range(batch):
+            run()
         torch.mps.synchronize()
-        s.append((time.perf_counter() - t0) * 1000.0)
+        s.append((time.perf_counter() - t0) * 1000.0 / batch)
     return s
 
 
@@ -137,13 +144,17 @@ def mlx_attn(q, k, v, c, time_it=False, warmup=0, iters=1):
         o = run()
         mx.eval(o)
         return np.transpose(np.array(o, copy=False), (0, 2, 1, 3))
+    # `batch > 1` queues that many attentions before a single eval, which is
+    # what separates MLX's kernel from its submit cost the same way
+    # BENCH_ATTN_BATCHED does for tessl.
+    batch = int(os.environ.get("BENCH_ATTN_BATCHED", "1"))
     for _ in range(warmup):
-        mx.eval(run())
+        mx.eval([run() for _ in range(batch)])
     s = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        mx.eval(run())
-        s.append((time.perf_counter() - t0) * 1000.0)
+        mx.eval([run() for _ in range(batch)])
+        s.append((time.perf_counter() - t0) * 1000.0 / batch)
     return s
 
 
@@ -193,16 +204,55 @@ def parity(parity_dir):
         if not np.isfinite(scale) or scale == 0.0:
             raise SystemExit(f"{label}: reference peak is {scale}")
 
-        lanes = {"tessl": np.load(os.path.join(d, "o_tessl.npy"))}
-        # The FlashDecoding path, when this config has one. Scored against the
-        # same f64 reference rather than only against the kernel it replaces.
-        dec = os.path.join(d, "o_decode.npy")
-        if os.path.exists(dec):
-            lanes["tessl-decode"] = np.load(dec)
-        elif c["tq"] == 1:
+        # Every implementation the dump ran, scored against the same f64
+        # reference under the name of the dispatch that produced it. The
+        # manifest lists them, so a lane the binary wrote and this scorer
+        # skipped -- or one the manifest names and the dump does not hold --
+        # is an error rather than a quietly shorter report.
+        declared = mc.get("lanes")
+        if not declared:
             raise SystemExit(
-                f"{label}: Tq == 1 but no o_decode.npy in the dump. The decode "
-                "path is expected here; a missing lane must not read as a pass.")
+                f"{label}: manifest names no lanes. A dump whose lanes cannot "
+                "be identified must not be scored as if they had been.")
+        lanes = {}
+        for entry in declared:
+            name = entry["lane"]
+            fn = os.path.join(d, f"o_{name}.npy")
+            if not os.path.exists(fn):
+                raise SystemExit(
+                    f"{label}: manifest names lane {name!r} ({entry['kernel']}) "
+                    f"but {os.path.basename(fn)} is absent. A missing lane must "
+                    "not read as a pass.")
+            lanes[name] = np.load(fn)
+        stray = sorted(x[2:-4] for x in os.listdir(d)
+                       if x.startswith("o_") and x.endswith(".npy")
+                       and x[2:-4] not in lanes)
+        if stray:
+            raise SystemExit(
+                f"{label}: dump holds unscored lane(s) {stray} that the manifest "
+                "does not name. Scoring a subset silently is the defect this "
+                "harness exists to prevent.")
+        if c["tq"] == 1 and "tessl-decode" not in lanes:
+            raise SystemExit(
+                f"{label}: Tq == 1 but the dump has no tessl-decode lane. The "
+                "KV-split path is expected here.")
+        # At Tq == 1 the routed path *is* the KV split, so the two lanes are the
+        # same kernel on the same data and must agree bit for bit. They did not:
+        # the benchmark's forced-decode lane defaulted to chunk 256 for every
+        # head dim while the library ships 128, so a lane labelled "the decode
+        # kernel" was a kernel the library never dispatches. Nothing else in
+        # this harness could see that -- both outputs were correct, just not the
+        # same one.
+        if c["tq"] == 1 and not np.array_equal(lanes["tessl"], lanes["tessl-decode"]):
+            n = int((lanes["tessl"] != lanes["tessl-decode"]).sum())
+            worst = float(np.abs(lanes["tessl"].astype(np.float64)
+                                 - lanes["tessl-decode"].astype(np.float64)).max())
+            raise SystemExit(
+                f"{label}: the routed lane and the forced KV-split lane differ "
+                f"in {n} of {lanes['tessl'].size} elements (max {worst:.3e}). At "
+                "Tq == 1 routing takes the split path, so these are the same "
+                "kernel on the same data -- a difference means the benchmark's "
+                "lane is configured differently from the shipping one.")
         for name, fn in (("torch-mps", torch_attn), ("mlx", mlx_attn)):
             try:
                 lanes[name] = fn(q, k, v, c)
@@ -278,6 +328,7 @@ def main():
                 continue
             med = statistics.median(s)
             rows.append(dict(cfg=label, kernel=f"sdpa-{name}", runtime=name,
+                             batched=int(os.environ.get("BENCH_ATTN_BATCHED", "1")),
                              **{x: c[x] for x in ("b", "tq", "tkv", "h", "hkv", "d",
                                                   "window", "q_off", "kv_off")},
                              median_ms=med, best_ms=min(s),
