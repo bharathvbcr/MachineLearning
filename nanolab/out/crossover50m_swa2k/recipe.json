@@ -1,0 +1,40 @@
+{
+  "batch_size": 8,
+  "block_size": 2048,
+  "workers": 2,
+  "gpus": 1,
+  "budget_by_arm": null,
+  "arm_overrides": {
+    "swa_w64": {
+      "swa_window": 64,
+      "swa_sinks": 4
+    },
+    "swa_w256": {
+      "swa_window": 256,
+      "swa_sinks": 4
+    },
+    "swa_w512": {
+      "swa_window": 512,
+      "swa_sinks": 4
+    },
+    "swa_w64_nosink": {
+      "swa_window": 64,
+      "swa_sinks": 0
+    }
+  },
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "token_budget": 50000000,
+  "lr_horizon": null,
+  "arms": [
+    "attention",
+    "gdn",
+    "swa_w64",
+    "swa_w256",
+    "swa_w512",
+    "swa_w64_nosink"
+  ],
+  "prefix": "cx2kswa",
+  "device": "NVIDIA GH200 480GB",
+  "compile": false
+}

@@ -87,9 +87,42 @@ E16_PAIRS = (16, 64, 128)
 E16_ARMS = ("attention", "gdn", "mingru", "swa_w64", "swa_w64_nosink")
 
 
+# E8's 406 completed runs were all measured at batch 256, so that is the batch
+# the base LR belongs to. Every scaling rule below is a NO-OP there, which is
+# what keeps those runs reproducible while the calibration is free to move.
+MQAR_LR_BASE_BATCH = 256
+MQAR_LR_RULES = ("sqrt", "linear", "none")
+
+
+def mqar_lr_for_batch(lr: float, batch: int, rule: str = "sqrt") -> float:
+    """Scale a batch-256 learning rate to another batch.
+
+    E16's calibration swept batch 64 -> 512 at a FIXED 1e-3 and concluded no
+    batch saturated the reference arm. The seq-511 evidence says that conclusion
+    was about the LR, not the task: recall went 0.052 / 1.000 / 1.000 at bs 64
+    and 0.049 / 0.049 / 0.049 at bs 512. Larger batches got monotonically WORSE,
+    which is not what a capacity or context limit looks like -- a bigger batch is
+    strictly more information per step. It is what a step size too small for the
+    batch looks like.
+
+    `sqrt` is the default because the optimizer is AdamW: the linear rule is the
+    SGD result, and applying it to Adam at 8x batch overshoots badly. Both are
+    offered because neither is a law, and `none` reproduces the old behaviour
+    exactly for anyone re-running the original sweep.
+    """
+    if rule not in MQAR_LR_RULES:
+        raise ValueError(f"unknown lr rule {rule!r}; known: {MQAR_LR_RULES}")
+    if batch <= 0:
+        raise ValueError(f"batch must be >0, got {batch}")
+    ratio = batch / MQAR_LR_BASE_BATCH
+    if rule == "none":
+        return lr
+    return lr * (math.sqrt(ratio) if rule == "sqrt" else ratio)
+
+
 def e8_config(arm: str, seed: int, *, n_pairs=4, n_queries=4, n_keys=16,
               n_values=16, steps=3000, d_model=256, n_layer=12,
-              batch_size=256) -> Config:
+              batch_size=256, lr_rule: str = "sqrt") -> Config:
     spec = {a.name: a for a in ARMS}[arm]
     # An arm's own knobs -- e.g. the SWA window -- are what make it that arm.
     # Without this, every `swa_*` arm here would silently train at the Config
@@ -98,7 +131,9 @@ def e8_config(arm: str, seed: int, *, n_pairs=4, n_queries=4, n_keys=16,
     # keeps `swa_w64` and `swa_w64_nosink` apart.
     knobs = dict(spec.overrides)
     return Config(
-        run_name=f"mqar_p{n_pairs}_b{batch_size}_t{steps}_{arm}_s{seed}",
+        run_name=(f"mqar_p{n_pairs}_b{batch_size}_t{steps}_{arm}_s{seed}"
+                  + ("" if lr_rule == "none" and batch_size == MQAR_LR_BASE_BATCH
+                     else f"_lr{lr_rule}")),
         mixer=spec.mixer, layer_mixers=spec.layer_mixers or "", **knobs,
         seed=seed, batch_size=batch_size,
         mqar_n_pairs=n_pairs, mqar_n_queries=n_queries,
@@ -108,7 +143,9 @@ def e8_config(arm: str, seed: int, *, n_pairs=4, n_queries=4, n_keys=16,
         d_model=d_model, n_layer=n_layer, n_head=4, head_dim=d_model // 4,
         tie_embeddings=False,           # see module docstring: required, not tuned
         fused_ce=False,                 # recall_accuracy needs logits
-        optimizer="adamw", lr=1e-3, matrix_lr=1e-3,
+        optimizer="adamw",
+        lr=mqar_lr_for_batch(1e-3, batch_size, lr_rule),
+        matrix_lr=mqar_lr_for_batch(1e-3, batch_size, lr_rule),
         max_steps=steps,
     )
 
@@ -290,7 +327,8 @@ def report(rows: list[dict]) -> None:
               "can saturate before\n  reading this as a recall result.")
 
 
-def calibrate(cells, batches, device, seeds=3, steps=3000, ref="attention"):
+def calibrate(cells, batches, device, seeds=3, steps=3000, ref="attention",
+              lr_rule: str = "sqrt"):
     """Find, per cell, the smallest batch at which the REFERENCE arm saturates.
 
     The module docstring records why this is not optional: at batch 32 the
@@ -312,6 +350,7 @@ def calibrate(cells, batches, device, seeds=3, steps=3000, ref="attention"):
             recalls = []
             for seed in range(1, seeds + 1):
                 cfg = e8_config(ref, seed, steps=steps, batch_size=bs,
+                                lr_rule=lr_rule,
                                 n_pairs=pairs, n_queries=pairs,
                                 n_keys=max(16, 4 * pairs),
                                 n_values=max(16, 4 * pairs))
@@ -356,6 +395,10 @@ def main() -> None:
                     help="E16: comma-separated batch sizes to test per cell. "
                          "Finds the smallest batch at which the reference arm "
                          "saturates, writes calibration.json, and STOPS.")
+    ap.add_argument("--lr-rule", default="sqrt", choices=list(MQAR_LR_RULES),
+                    help="how the batch-256 base LR moves with batch. The "
+                         "original sweep was effectively 'none', which is why it "
+                         "found no saturating batch. No-op at batch 256.")
     ap.add_argument("--gpus", type=int, default=1,
                     help="spread shards over this many GPUs; total processes "
                          "are gpus*workers")
@@ -386,7 +429,8 @@ def main() -> None:
 
     if a.calibrate:
         batches = [int(x) for x in a.calibrate.split(",") if x.strip()]
-        picked = calibrate(cells, batches, a.device, steps=a.steps)
+        picked = calibrate(cells, batches, a.device, steps=a.steps,
+                           lr_rule=a.lr_rule)
         path = out / "calibration.json"
         path.write_text(json.dumps({str(k): v for k, v in picked.items()},
                                    indent=2) + "\n", encoding="utf-8")
@@ -437,6 +481,7 @@ def main() -> None:
                   f"({len(jobs)} runs, {a.steps} steps, device={a.device}) ===")
             for i, (arm, seed) in enumerate(jobs, 1):
                 cfg = e8_config(arm, seed, steps=a.steps, batch_size=bs,
+                                lr_rule=a.lr_rule,
                                 n_pairs=pairs,
                                 n_queries=pairs,
                                 n_keys=max(16, 4 * pairs),

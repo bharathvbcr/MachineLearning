@@ -1960,6 +1960,7 @@ def cmd_swaboard(args) -> None:
             _mqar(["--out", str(MQAR_OUT), "--device", args.device,
                    "--cells", ",".join(str(p) for p in _mqar_cells()),
                    "--calibrate", ",".join(str(b) for b in MQAR_CALIB_BATCHES),
+                   "--lr-rule", args.mqar_lr_rule,
                    "--steps", str(args.mqar_steps)])
         elif phase == "mqar-grid":
             calib = MQAR_OUT / "calibration.json"
@@ -1976,6 +1977,7 @@ def cmd_swaboard(args) -> None:
                    "--arms", ",".join(_mqar_arms()),
                    "--seeds", str(args.mqar_seeds),
                    "--workers", str(args.mqar_workers),
+                   "--lr-rule", args.mqar_lr_rule,
                    "--gpus", str(args.gpus or 1),
                    "--steps", str(args.mqar_steps)])
     print("\n=== swaboard complete ===")
@@ -2491,6 +2493,11 @@ def build_parser() -> argparse.ArgumentParser:
                             "very nearly linearly where tenancy does not.")
     board.add_argument("--probe-steps", type=int, default=30)
     board.add_argument("--mqar-seeds", type=int, default=15)
+    board.add_argument("--mqar-lr-rule", default="sqrt",
+                       choices=["sqrt", "linear", "none"],
+                       help="batch-scaling rule for MQAR's LR. The first E16 "
+                            "calibration ran at a fixed LR ('none') and found no "
+                            "saturating batch at any cell.")
     board.add_argument("--mqar-workers", type=int, default=4,
                        help="MQAR runs are ~9.5M-param models that leave the GPU "
                             "mostly idle one at a time; this is the grid's main "

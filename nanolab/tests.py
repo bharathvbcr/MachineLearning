@@ -3324,6 +3324,69 @@ def worker_pinning_never_escapes_an_inherited_device_allowlist():
         assert len(per) == gpus and all(len(v) == workers for v in per.values()), per
 
 
+@test
+def mqar_lr_scales_with_batch_and_is_inert_at_the_base():
+    """E16's calibration swept batch 64->512 at a FIXED 1e-3 and concluded no
+    batch saturated the reference arm. At seq 511 recall went 0.052/1.000/1.000
+    at bs64 and 0.049/0.049/0.049 at bs512 -- monotonically WORSE with more
+    information per step, which is a step size too small for the batch, not a
+    capacity limit."""
+    from .mqar_suite import (mqar_lr_for_batch as f, MQAR_LR_BASE_BATCH as B,
+                             MQAR_LR_RULES, e8_config)
+    # Must be a no-op at the base batch, or E8's 406 completed runs stop being
+    # reproducible the moment anyone re-runs one.
+    for rule in MQAR_LR_RULES:
+        assert f(1e-3, B, rule) == 1e-3, f"{rule} moved the LR at the base batch"
+    assert f(1e-3, 4 * B, "linear") == 4e-3
+    assert abs(f(1e-3, 4 * B, "sqrt") - 2e-3) < 1e-12
+    assert abs(f(1e-3, B // 4, "sqrt") - 5e-4) < 1e-12
+    assert f(1e-3, 8 * B, "none") == 1e-3
+    # Monotone in batch, and sqrt is gentler than linear above the base.
+    for rule in ("sqrt", "linear"):
+        vals = [f(1e-3, b, rule) for b in (64, 128, 256, 512, 1024)]
+        assert vals == sorted(vals), f"{rule} is not monotone in batch"
+    assert f(1e-3, 1024, "sqrt") < f(1e-3, 1024, "linear")
+    for bad in (("bogus", 256), ("sqrt", 0), ("sqrt", -8)):
+        try:
+            f(1e-3, bad[1], bad[0])
+            raise AssertionError(f"{bad} must be refused")
+        except ValueError:
+            pass
+    # The rule reaches the Config, and the run name keeps two rules apart so a
+    # ledger cannot average them into one row.
+    a = e8_config("attention", 1, batch_size=512, lr_rule="sqrt")
+    b = e8_config("attention", 1, batch_size=512, lr_rule="linear")
+    assert abs(a.lr - 1.4142135e-3) < 1e-9 and abs(b.lr - 2e-3) < 1e-9
+    assert a.lr == a.matrix_lr, "matrix LR must scale with the scalar LR"
+    assert a.run_name != b.run_name, "two LR rules collide in one ledger row"
+
+
+@test
+def mqar_calibrate_and_grid_accept_the_lr_rule_they_are_given():
+    """Both MQAR entry points build configs; a rule threaded into one and not the
+    other is a NameError on a rented GPU, which is how it was actually found --
+    the suite was green because nothing called `calibrate` at all."""
+    import inspect
+    from . import mqar_suite as ms
+
+    sig = inspect.signature(ms.calibrate)
+    assert "lr_rule" in sig.parameters, "calibrate cannot be told the LR rule"
+    assert sig.parameters["lr_rule"].default == "sqrt"
+    # `calibrate` must not reach for a name it does not own.
+    src = inspect.getsource(ms.calibrate)
+    assert "a.lr_rule" not in src, "calibrate references main()'s argparse namespace"
+    assert "lr_rule=lr_rule" in src, "calibrate does not forward the rule it took"
+    # main() must actually pass it, or the default silently wins.
+    msrc = inspect.getsource(ms.main)
+    assert "lr_rule=a.lr_rule" in msrc, "main() does not forward --lr-rule"
+    # And the orchestrator must forward it to both phases.
+    from . import crossover_replicate as cr
+    csrc = inspect.getsource(cr.cmd_swaboard) if hasattr(cr, "cmd_swaboard") else ""
+    if csrc:
+        assert csrc.count("--lr-rule") >= 2, \
+            "swaboard forwards --lr-rule to fewer than both mqar phases"
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = skipped = 0
