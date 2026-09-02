@@ -285,36 +285,262 @@ Reading the rest:
 
 The three attention kernels had thorough correctness coverage and **no timing
 lane at all**. [`bench_flash_attn`](src/bin/bench_flash_attn.rs) and
-[`bench/attn_paired.py`](bench/attn_paired.py) closed that over 10 prefill and
+[`bench/attn_paired.py`](bench/attn_paired.py) closed that over prefill and
 decode configurations at 4:1 GQA — and the measurement found the kernels were
 **11× slower than torch-MPS and 20.5× slower than MLX**, geomean, with a worst
-case of 271×. Both causes are now fixed.
+case of 271×. Two structural causes, one routing cause and four
+throughput causes are now fixed, in that order — each one findable only after
+the one before it had been.
 
-**Shipping path vs. the baselines, 5 alternating rounds × 20 iterations.
->1 means tessl is slower.**
+**Shipping path vs. the baselines, 5 alternating rounds x 20 iterations, over
+the same 10 configurations before and after. >1 means tessl is slower.**
 
-| Config | torch before | torch after | MLX before | MLX after |
+| | torch before | torch after | MLX before | MLX after |
 |---|---|---|---|---|
-| `swa128_prefill_512` | 7.1× | **0.78×** | 9.4× | 1.21× |
-| `swa128_prefill_2048` | 7.7× | **1.67×** | 8.1× | 1.67× |
-| `swa128_prefill_4096` | 4.4× | **0.89×** | 4.8× | 0.94× |
-| `swa256_prefill_2048` | 4.6× | **0.88×** | 8.6× | 1.66× |
-| `global512_prefill_1024` | 35.1× | **1.59×** | 54.8× | 2.54× |
-| `swa128_decode_1k` | 23.7× | **1.44×** | 27.0× | 2.40× |
-| `swa128_decode_4k` | 14.6× | **0.89×** | 22.8× | 1.94× |
-| `swa128_decode_b8_4k` | 2.7× | **0.30×** | 9.9× | 1.06× |
-| `swa256_decode_4k` | 24.7× | **0.83×** | 47.3× | 1.95× |
-| `global512_decode_4k` | 29.1× | **0.17×** | 271.1× | 1.69× |
-| **GEOMEAN** | **11.0×** | **0.79×** | **20.5×** | **1.63×** |
+| **Prefill** (5 configs) | 8.3x | **0.70–0.73x** | 11.1x | **0.90–0.97x** |
+| **Decode** (5 configs) | 14.7x | **0.63–0.65x** | 37.9x | **1.61–1.72x** |
+| **All 10** | **11.0x** | **0.67–0.69x** | **20.5x** | **1.20–1.29x** |
 
-Against torch-MPS the shipping path is now **faster than the baseline** on 8 of
-10 configs; against MLX it is 1.63× slower, down from 20.5×. Artifacts:
-[before](bench/results/attn_speed_m5pro.json),
-[after](bench/results/attn_speed_routed_m5pro.json).
+Ranges, not points: two reps of the same sweep minutes apart differ by 7% on the
+geomean, and the reason is the subject of [a section
+below](#the-decomposition-predicts-which-numbers-are-stable-and-it-is-right).
+
+Four configurations were added afterwards to probe things the original set could
+not see — two large-batch decodes (`B·H` = 1024 and 2048) for the routing rule,
+one with GQA switched off to separate issued K/V traffic from unique, and one at
+`Hkv = 1` to calibrate the measurement noise floor. Over all 14: **0.63–0.65x vs
+torch**, **1.18–1.26x vs MLX**. Both reps:
+[A](bench/results/attn_speed_routed_m5pro.json),
+[B](bench/results/attn_speed_routed_m5pro_b.json), against
+[before](bench/results/attn_speed_m5pro.json).
+
+> [!IMPORTANT]
+> **These are the numbers from a machine that had been benchmarking for hours,
+> and they are the worse of the states measured.** An earlier run of the same
+> sweep on a cool machine gave prefill **0.91x**, decode **1.49x**, all-10
+> **1.17x** against MLX — so the full observed range across four runs is
+> 1.16–1.29x. The whole difference sits in the decode configs, whose
+> wall clock is 8–29% kernel and the rest host dispatch — see
+> [below](#the-decomposition-predicts-which-numbers-are-stable-and-it-is-right),
+> where that turns out to be a prediction the decomposition makes and passes.
+> The loaded numbers are published because picking the cooler run would be
+> choosing the flattering half of a measurement whose spread is understood.
+
+**Prefill is ahead of MLX in both states**, and `swa128_prefill_4096` runs at
+half MLX's wall clock or better (37.3 ms against 82.9 loaded; 25.4 against 51.5
+cool). Decode's wall-clock gap is dispatch, decomposed next.
+
+#### Where the remaining gap sits — and how much of it is real
+
+The headline table times **one attention call per submit-and-wait**, because
+that is what `mx.eval` and `torch.mps.synchronize` do. At decode sizes that
+protocol measures the host round trip, not the kernel. On this machine a
+*trivial* elementwise kernel (`mlp_gelu_tanh`, n=4096) measures **4 us batched
+and 178 us solo**; the median solo dispatch is **257 us** on a cool machine and
+**432 us** after hours of load — a 68% swing in the floor itself, measured by
+`bench_nn_kernels` in the same states as the attention runs, and the direct
+cause of the wall-clock decode ratios moving while the kernel-only ones did not.
+
+Those two figures reconcile with the table below, and the arithmetic is the
+whole reason decode's wall clock behaves as it does. The KV-split path is two
+dispatches — partial then reduce — so at one launch per submit it pays **two**
+round trips where MLX's single-kernel decode pays one. The submit column below
+comes out at 339–470 us, i.e. ~170–235 us apiece, bracketing the one-submit cost
+the elementwise kernel shows in the same states. Decode is not slow here; it is charged twice
+for a protocol nobody uses in a real decode loop, and that charge is levered to
+whatever the host is doing.
+
+`bench/attn_tune.py --knob batched` sweeps launches-per-submit to separate the
+two — 3 interleaved rounds, shipping routed path
+([artifact](bench/results/attn_dispatch_split_m5pro.json)):
+
+| config | solo | batched (32/submit) | submit | kernel share |
+|---|---|---|---|---|
+| `swa128_decode_1k` | 515.6 us | **46.1 us** | 470 us | 8.9% |
+| `swa128_decode_4k` | 455.9 us | **47.8 us** | 408 us | 10.5% |
+| `swa256_decode_4k` | 436.3 us | **64.9 us** | 371 us | 14.9% |
+| `global512_decode_4k` | 570.3 us | **230.9 us** | 339 us | 40.5% |
+| `swa128_prefill_2048` | 14.21 ms | 16.93 ms | — | *119.1%* |
+| `swa256_prefill_2048` | 14.40 ms | 19.89 ms | — | *138.2%* |
+| `global512_prefill_1024` | 5.91 ms | 8.64 ms | — | *146.3%* |
+
+**The decodes are 85–91% command-buffer submit; `global512_decode_4k`, the
+largest, is still 60%.** A real decode loop issues a whole model step into one
+command buffer and syncs once per token — the batched column, not the solo one.
+
+> [!WARNING]
+> **The prefill rows are the control, and they are broken in this run — the
+> batched arm is what breaks them.** They read 119–146% "kernel share", i.e.
+> batching measured *slower* than not batching, which is not a physical
+> quantity. Thirty-two unsynchronised prefill launches is a ~400 ms burst with
+> no gap for the clocks to recover, where the solo arm syncs every 14 ms. The
+> batched arm is a decomposition tool for kernels small enough that 32 of them
+> fit inside a thermal envelope; at prefill sizes it measures the throttle.
+>
+> Run once on a genuinely cold machine it behaved: 96.5%, 99.7%, 95.8%. Three
+> subsequent runs did not reproduce that, including one after a deliberate
+> 10-minute idle — this hardware does not return to cold quickly. The decode
+> rows, which are what the tool exists to establish, reproduce across all four
+> runs (8.4–9.4%, 9.5–10.5%, 11.0–14.9%, 29.1–40.5%).
+>
+> The prefill claim does not rest on this tool anyway. It has independent
+> support from the stability analysis below: prefill *ratios* against MLX are
+> unchanged between thermal states (1.00x shift) while decode ratios move by up
+> to 1.44x, which is what "prefill is kernel-dominated and decode is not"
+> predicts, measured without the batched arm at all.
+
+Re-run with submits amortized, over the 9 decode configs, three repetitions
+([A](bench/results/attn_speed_decode_kernel_m5pro.json),
+[B](bench/results/attn_speed_decode_kernel_m5pro_b.json),
+[C](bench/results/attn_speed_decode_kernel_m5pro_c.json)) — geomeans 0.91, 0.97,
+0.97 against MLX and 0.22 in all three against torch:
+
+| | submit-and-wait | kernel only (32/submit) |
+|---|---|---|
+| **vs torch-MPS** | 0.59–0.60x | **0.22x** — 4.5x faster |
+| **vs MLX** | 1.37–1.45x | **0.91–0.97x** |
+
+So most of the answer to "why is it slower" is **it isn't** — the measurement was
+dominated by dispatch cost, and with that removed the decode kernels are *ahead*
+of MLX overall and at every config but the D=512 pair. Per-config medians of the
+three reps: `swa128_decode_4k` **0.78x**, `swa128_decode_b64_1k` 0.84x,
+`swa128_decode_b32_1k` 0.86x, `swa128_decode_b8_4k` 0.89x, `swa256_decode_4k`
+0.94x, `swa128_decode_1k` 0.99x, `global512_decode_4k_mqa` 1.02x.
+
+> [!NOTE]
+> The MLX geomean spread across those three reps is **6.5%** (0.91 to 0.97), and
+> an earlier set of three on a cooler machine agreed to 0.3% (0.952–0.955). Both
+> are real; the wider one is what this hardware does after hours of continuous
+> benchmarking. The range is published rather than the tightest run, because
+> picking the tightest run is how a 0.3% claim gets made about a 6.5%
+> measurement.
+
+**The one gap left is `global512_decode_4k`, 1.13x kernel-only** (1.05/1.13/1.20
+across the three reps). What it is *not* is a GQA problem, and the control
+config settles that: `global512_decode_4k_mha` is the same shape with `Hkv = H`,
+so it issues the same bytes through the load path while reading four times as
+many unique ones, which makes it DRAM-bound by construction. It sits at
+**1.14x** — the same deficit, with the GQA re-read removed. So what is left is
+D=512 streaming efficiency, not redundant traffic.
+
+The deficit is a *ratio*, and that is deliberate. Absolute throughput on this
+machine moves with thermal state by more than the gap being measured: the same
+kernel on the same config read **223 GB/s early in a session and 164 GB/s after
+hours of continuous benchmarking**, a 35% swing. MLX moves with it (273 → 183
+GB/s on the same pair of runs), which is why the paired, interleaved ratio is
+the quantity reported. Measured against a pure elementwise copy on the same
+machine in the same state — 245 GB/s — both sit at 67–75% of streaming, and the
+gap between them is 12%.
+
+At D=512 a simdgroup reads 2 KB per key from addresses `Hkv * D` floats apart.
+The obvious next move is to make that stream contiguous by changing the KV
+layout — which is what the next section did, and measured, and undid.
+
+#### The KV layout, changed and measured and put back
+
+The obvious explanation for that residual was the cache layout. tessl's K/V are
+`[B, Tkv, Hkv, D]` — sequence-major, which is what the cache *writer* wants,
+since appending a token is one contiguous `Hkv*D` store. torch and MLX both take
+`[B, H, S, D]`, head-major, where one simdgroup walking the key axis issues a
+sequential stream instead of 2 KB blocks strided by `Hkv*D`. On a pure DRAM
+stream — the `Hkv = H` control — MLX is 1.14x ahead, and a strided walk is
+exactly the kind of thing that produces that.
+
+So it was built. The KV-split kernel took explicit `(batch, head, position)`
+element strides — so it no longer knew which layout it was serving at all — and
+the benchmark uploaded K/V in whichever order was under test while keeping the
+canonical order for the f64 reference, so a layout experiment could not turn
+into a silent correctness change. **Both layouts scored bit-identical against
+the reference**, on every decode config.
+
+Then it was crossed against the head-block policy, three interleaved rounds,
+because the two mechanisms could be substitutes — `all` already gives a
+*threadgroup* a contiguous read of the whole `[Hkv][D]` row per key, and
+head-major would only change which simdgroup inside it issues which part:
+
+| config | seq-major | head-major |
+|---|---|---|
+| `swa128_decode_4k`, block=one | 0.0461 | 0.0458 |
+| `swa128_decode_4k`, block=group | **0.0389** | 0.0400 |
+| `swa256_decode_4k`, block=group | **0.0464** | 0.0474 |
+| `global512_decode_4k`, block=all | 0.1606 | 0.1596 |
+| `global512_decode_4k_mha`, block=all | 0.5873 | 0.5838 |
+
+**No cell shows a head-major advantage, including `block=one` where the layout
+has to do the work alone.** The scale to read those differences against comes
+from `global512_decode_4k_mqa`, added for the purpose: at `Hkv = 1` the two
+layouts are *byte-identical* arrangements, and it still measured 0.0948 against
+0.0918 — a **3.2%** spread between two runs of provably the same memory. The
+largest layout effect anywhere in the table is 0.6%, five times smaller than the
+noise floor on a case where the true effect is exactly zero.
+
+So the layout parameter was **removed** rather than shipped. It was correct and
+it was measured, but a decode-only layout switch that measures as noise is API
+surface plus a footgun — the row-parallel and tiled kernels still index
+sequence-major, so a head-major buffer reaching them would read as plausible
+garbage. What survives is this section and the `mqa` config, so nobody has to
+run the experiment twice.
+
+> [!NOTE]
+> This gap was smaller than it looked and shrank three times as the measurement
+> improved. It read as "1.5x, and the GQA re-read is the cause" until the no-GQA
+> control was added; the control then showed the same deficit without GQA, which
+> retired the traffic explanation. Two of the three fixes below came out of
+> chasing it and helped everywhere *except* there.
+
+#### The decomposition predicts which numbers are stable, and it is right
+
+The same wall-clock sweep was run four times: twice on a cool machine and twice
+after hours of continuous benchmarking. The geomean against MLX ranged
+**1.16x to 1.29x** over the ten shared configs — and *where* it moved is the
+point:
+
+| config | cool | loaded | shift | kernel share |
+|---|---|---|---|---|
+| `swa128_prefill_2048` | 0.9x | 0.9x | 1.00x | 96% |
+| `swa256_prefill_2048` | 0.9x | 0.9x | 1.00x | 100% |
+| `global512_prefill_1024` | 1.6x | 1.8x | 1.12x | 96% |
+| `global512_decode_4k` | 1.4x | 1.5x | 1.07x | 29–41% |
+| `swa128_decode_1k` | 1.7x | 2.0x | 1.18x | 8–9% |
+| `swa128_decode_4k` | 1.5x | 1.8x | 1.20x | 10% |
+| `swa256_decode_4k` | 1.6x | 2.3x | **1.44x** | 11–15% |
+
+The kernel-dominated configs moved a mean of **1.04x**; the dispatch-dominated
+ones moved **1.22x**. That is the decomposition making a falsifiable prediction —
+a ratio that is 96% kernel should not care about host state, one that is 8%
+kernel should track it — and the prediction holding. It is also the independent
+support for the prefill shares, which the batched arm can only measure on a cold
+machine: whatever their exact value, those three ratios do not move, and ratios
+that do not move with host state are not made of host time. Over six kernel-only
+repetitions spanning both states the decode geomean stayed inside **0.91–0.97x**
+— a 6.6% band against the wall clock's 16%.
+
+Which is why the kernel-only number is the one to design against, and the
+wall-clock number is quoted as a range. The submit floor is not tessl's to
+control, and the KV-split path pays two submits to MLX's one, so it is levered
+to whatever the host is doing.
+
+> [!WARNING]
+> **The batched arm found three defects in the measurement before it found
+> anything about the kernels**, and every one of them had produced a
+> plausible-looking number.
+>
+> 1. `attn_paired.py` plumbed `BENCH_ATTN_BATCHED` to the Python lane but not
+>    the Rust one, so it compared tessl at batch=1 against MLX at batch=32 and
+>    reported **11.6x**. Both lanes now echo the batch they ran and the driver
+>    refuses to form a ratio across different batching.
+> 2. A 10-config batched geomean was published at **1.1x vs MLX** and would not
+>    reproduce — repeat runs gave 1.1x, 1.4x and 1.7x. A geomean mixing prefill
+>    (where batching changes nothing) with decode (where it removes 88% of the
+>    clock) answers no single question; the decode-only figure above reproduces
+>    to 1.5% across three runs, and the mixed one is gone.
+> 3. `attn_paired.py` recorded only *ratios*, so when a geomean moved there was
+>    no way to say which lane had moved. Both lanes' absolute medians now travel
+>    with every ratio, in the printout and in the artifact.
 
 ### What was wrong, and what replaced it
 
-Both causes were visible at the dispatch in [`nn.rs`](src/nn.rs): a grid of
+Both *structural* causes were visible at the dispatch in [`nn.rs`](src/nn.rs): a grid of
 `ceil(Tq/BR) × B·H` threadgroups of **32 threads**, with the inner loops guarded
 by `row_valid = lid < BR`.
 
@@ -334,21 +560,22 @@ binding constraint there — **8 of 32 lanes doing scalar FMAs** was. It ran at
 **241 GFLOP/s, 3.7% of this machine's own f32 GEMM peak**, against MLX at 998.
 
 → [`flash_attn_rows.metal`](kernels/flash_attn_rows.metal): one simdgroup per
-query *row*, lane `L` owning head dims `L, L+32, L+64, …`. Prefill went to
-**984–1343 GFLOP/s**, 4.5–21× faster than the tiled kernel:
+query *row*, lane `L` owning four consecutive head dims per step. Prefill went to
+**1499–2261 GFLOP/s**, 9.4–29.7× faster than the tiled kernel — 23–35% of this
+machine's f32 GEMM peak, from 3.7%:
 
-| Config | tiled | row-parallel | speedup | GFLOP/s |
+| Config | tiled | row-parallel, tuned | speedup | GFLOP/s |
 |---|---|---|---|---|
-| `swa128_prefill_512` | 10.6 ms | 1.65 ms | 6.4× | 203 → 1306 |
-| `swa128_prefill_2048` | 123.5 ms | 23.3 ms | 5.3× | 209 → 1109 |
-| `swa128_prefill_4096` | 293.5 ms | 61.1 ms | 4.8× | 205 → 984 |
-| `swa256_prefill_2048` | 135.3 ms | 24.8 ms | 5.5× | 191 → 1039 |
-| `global512_prefill_1024` | 177.7 ms | 8.3 ms | **21.4×** | 48 → 1036 |
+| `swa128_prefill_2048` | 109.1 ms | 11.4 ms | 9.6× | 236 → 2261 |
+| `swa128_prefill_4096` | 257.3 ms | 27.4 ms | 9.4× | 234 → 2198 |
+| `swa256_prefill_2048` | 133.3 ms | 12.4 ms | **10.7×** | 193 → 2077 |
+| `global512_prefill_1024` | 170.3 ms | 5.7 ms | **29.7×** | 50 → 1499 |
 
 Both new kernels share one design, and three properties do the work:
 
-- **every lane is live**, and the K/V reads are one coalesced 128-byte line per
-  simdgroup step;
+- **every lane is live**, and the K/V reads are coalesced across the simdgroup —
+  `float4` per lane in the row-parallel kernel, so one step of the inner loop
+  moves 16R bytes;
 - **the P@V accumulate needs no cross-lane communication** — each lane owns its
   own slice of the output row in registers, so there is no `Oacc` threadgroup
   array and no barrier around it;
@@ -361,18 +588,263 @@ to take the union window over its rows and mask inside it, so it iterated key
 blocks that were fully masked for most of the tile. Here masked keys are never
 visited.
 
+#### Four more, once the measurement was trustworthy
+
+Every kernel time above is **1.2–1.7× better** than the first version of this
+section — prefill 1.5–1.7×, decode 1.2–1.3× — from four changes that only became
+findable once the dispatch cost was separated out and the tuning knobs were
+swept on a kernel-only signal rather than a submit-dominated one.
+
+**1. `float4` reads — 1.3–1.4× on prefill, 1.1× on decode.** A lane owned dims
+`L, L+32, …`, one scalar load each: at D=512 that is 16 K loads and 16 V loads
+against 32 multiply-adds, an ALU pipeline starved by address arithmetic. A lane
+now owns four *consecutive* dims per step, so one instruction moves 16R bytes
+across the R lanes of a row instead of 4R.
+
+> [!WARNING]
+> This one was measured **twice, with opposite results**, and the order matters.
+> On the KV-split kernel it first *lost* 8–14% at every head dim: decode is
+> latency bound, and 16 narrow loads leave more requests outstanding than 4 wide
+> ones. It was reverted with the losing numbers written into the kernel comment.
+> After change 4 below made the GQA group co-resident, the balance inverted —
+> the outstanding requests now come from the other simdgroups and what is scarce
+> is L1 bandwidth, which wide loads use better — and re-testing turned the same
+> change into a win. **A tuning result is only valid against the kernel it was
+> measured on**, and the only reason this was caught is that every knob was
+> re-swept after every structural change rather than trusted from before.
+
+**2. Simdgroups per threadgroup (`SGT`), per head dim — 1.2× at D=512.** Every
+simdgroup in a threadgroup walks the same key range, so `SGT` is how many query
+rows one global K/V read serves. It was a single constant 8 for every head dim,
+which meant D=512 at R=32 got 8 rows of reuse per K/V line where D=128 at R=8
+got 32 — the same arithmetic per byte over four times the L1 traffic. It is now
+compiled per instantiation and swept
+([artifact](bench/results/attn_tune_rows_g_m5pro.json)).
+
+**3. The KV-split reduce pass — 1.1–1.4× on decode.** It ran on one simdgroup
+per (batch, head): 8 threadgroups of 32 threads for `global512_decode_4k`, a
+serial tail on an otherwise parallel kernel. Its width is now a *dispatch*
+parameter — the kernel strides its output loop by `threads_per_threadgroup` and
+keeps no accumulator array, each lane recomputing the per-chunk weights instead
+of holding `acc[D/32]` in registers — so widening it costs no extra kernel and
+no registers.
+
+**4. Query heads that share a KV head now share a threadgroup — 1.4–1.7×.** They
+walk the same K/V, so being co-resident means they touch each line while it is
+still in L1 instead of pulling it `H/Hkv` separate times. `grid.y` enumerates
+(batch, head-block) and the threadgroup is `H/Hkv` simdgroups wide. No
+threadgroup memory and no barrier: co-residency is the whole mechanism, which is
+what makes it cheap.
+
+The wider block — *every* head of a batch item, which additionally makes a
+threadgroup's per-key read the whole contiguous `[Hkv][D]` row rather than a
+strided slice — was measured too. It wins 4–5% at D=512, where `H` is 8, and
+loses **1.7×** at D=128, where `H` is 32 and it asks for 1024-thread
+threadgroups. So it is chosen per head dim like everything else here:
+contiguity is worth having only where the occupancy is free.
+
+### Tuning: six knobs, all measured
+
+Each fast path has free parameters, and four of the six are *compile-time*
+constants in the shader — a value is a kernel, not a flag, which is why
+[`bench/attn_tune.py`](bench/attn_tune.py) sweeps them in interleaved rounds
+rather than guessing. Choosing wrong costs up to **9.3x**. The other two — the
+reduce pass's threadgroup width and which query heads share a threadgroup — are
+dispatch parameters and cost no kernels at all.
+
+**Lanes per query row (`R`) and simdgroups per threadgroup (`SGT`),
+row-parallel path.** `R` first. The reduction turning per-lane
+partial dots into a score costs `log2(R)` shuffle-and-add steps that produce no
+arithmetic, against `2*D/R` fused multiply-adds that do — **38% of the inner
+loop at R=32, D=128.** Median ms, 5 interleaved rounds
+([artifact](bench/results/attn_tune_rows_m5pro.json)):
+
+| config | R=8 | R=16 | R=32 | winner |
+|---|---|---|---|---|
+| `swa128_prefill_512` | **1.096** | 1.283 | 1.672 | 8 |
+| `swa128_prefill_2048` | **11.493** | 17.062 | 21.064 | 8 |
+| `swa128_prefill_4096` | **27.291** | 44.191 | 52.045 | 8 |
+| `swa256_prefill_2048` | 22.973 | **14.891** | 16.667 | 16 |
+| `global512_prefill_1024` | 21.898 | 8.208 | **5.195** | 32 |
+
+The winners are not arbitrary: **all three land at `D/R = 16` dims per lane.**
+Below that the reduction dominates; above it `q_reg[D/R] + acc[D/R]` exceeds 32
+floats per lane and the register file spills — the cliff at D=256/R=8 (1.5x
+worse) and D=512/R=16 (1.6x worse), both of which want 32 dims per lane.
+
+`SGT` decides how much reuse one global K/V read buys, since every simdgroup in
+a threadgroup walks the same key range: a threadgroup covers `SGT * 32/R` query
+rows. It was a fixed 8, which is what left D=512 behind — at R=32 that is 8 rows
+of reuse per line against 32 at D=128/R=8, the same arithmetic per byte over
+four times the L1 traffic. Median ms, 5 interleaved rounds
+([artifact](bench/results/attn_tune_rows_g_m5pro.json)):
+
+| config | SGT=8 | SGT=16 | SGT=32 | winner |
+|---|---|---|---|---|
+| `swa128_prefill_512` | **1.125** | 1.197 | 1.282 | 8 |
+| `swa128_prefill_2048` | **12.278** | 13.743 | 12.943 | 8 |
+| `swa128_prefill_4096` | **29.006** | 35.975 | 31.021 | 8 |
+| `swa256_prefill_2048` | 15.110 | 16.624 | **14.243** | 32 |
+| `global512_prefill_1024` | 7.298 | 7.234 | **5.986** | 32 |
+
+Prefill is kernel-dominated, so these are swept at one launch per submit: the
+batched arm buys nothing here, costs 32x the wall clock, and at prefill sizes
+measures the throttle rather than the kernel. The decode sweeps below are the
+opposite case and need it.
+
+**Lanes per key (`R`) and keys per chunk (`CH`), KV-split path.** When these
+were first swept, decode ran at **0.6% of ALU peak and 5% of bandwidth** — far
+off *both* roofs, latency bound, and the prefill `D/R = 16` rule only half
+applied. That is no longer where it sits. Measured on the current kernels:
+
+| config | GFLOP/s | % ALU peak | GB/s |
+|---|---|---|---|
+| `swa128_decode_1k` | 518 | 8.0% | 259 |
+| `swa128_decode_4k` | 450 | 6.9% | 225 |
+| `swa256_decode_4k` | 384 | 5.9% | 192 |
+| `global512_decode_4k` | 446 | 6.9% | 223 |
+
+Decode is now **bandwidth bound**, not latency bound, and under a tenth of the
+ALU roof. That is why the last few rounds of tuning stopped paying: the knobs
+move latency and occupancy, and the binding constraint had moved to memory.
+
+**What that bandwidth is a fraction of took measuring, not assuming.** This file
+used to divide by "~400 GB/s", a figure never checked on this machine. Run
+`bench_nn_kernels` in the same session and thermal state as the decode numbers
+and the *measured* streaming ceiling is lower: a pure f32 elementwise pass
+(`scale_f32_inplace`, 33.5 MB moved) reaches **245 GB/s**, `copy_f32` **210**,
+and the fastest kernel in the whole suite — a Q4 GEMV — **316**. In that same
+state `global512_decode_4k` moves K/V at **164 GB/s** against MLX's **183**, and
+the no-GQA control at **186** against **212**.
+
+So decode is running at **67–89% of what a pure elementwise copy achieves on the
+same machine in the same state**, not at half of a theoretical roof. The
+remaining gap to MLX is 12–14% of a ceiling both are near, which is a much
+smaller claim than the earlier framing implied and is the honest one.
+
+These were first swept at one launch per submit, where ~88% of every number was
+the host round trip. That is a constant added to each arm, so the *winner* was
+mostly still readable, but the margins were compressed towards 1.0x and the two
+near-ties were decided on a signal an order of magnitude smaller than the noise
+they sat in. Re-swept kernel-only, 5 interleaved rounds, 32 launches per submit
+([R](bench/results/attn_tune_decode_r_kernel_m5pro.json),
+[CH](bench/results/attn_tune_decode_kernel_m5pro.json)) — median ms:
+
+| config | R=8 | R=16 | R=32 | | CH=64 | CH=128 | CH=256 |
+|---|---|---|---|---|---|---|---|
+| `swa128_decode_1k` | **0.032** | 0.047 | 0.076 | | 0.035 | 0.031 | **0.033** |
+| `swa128_decode_4k` | **0.037** | 0.051 | 0.080 | | 0.054 | 0.040 | **0.037** |
+| `swa256_decode_4k` | 0.102 | **0.044** | 0.058 | | 0.053 | **0.044** | 0.056 |
+| `global512_decode_4k` | 0.345 | 0.268 | **0.154** | | 0.183 | **0.154** | 0.160 |
+
+Four choices changed across the re-sweeps, and each moved only because the
+kernel underneath it had. **D=128 moved from R=16 to R=8** — the solo sweep had
+it as a 3% tie decided the other way, and kernel-only R=8 is ahead at every
+D=128 config. **D=256 moved from CH=64 to CH=128**, worth 21%. **D=512 moved
+from CH=256 to CH=128** after the `float4` reads landed, worth 4%. **D=128 moved
+from CH=128 to CH=256** once the GQA group shared a threadgroup — but only by
+1.4% on the geometric mean over its three configs, which is inside the ~3% noise
+floor, so that one is recorded as a tie broken by measurement rather than as a
+finding. D=256 and D=512 still sit on `D/R = 16`; `CH` has no rule — the trade
+is grid parallelism against the number of partials to combine, and where it
+balances depends on how many threadgroups `B*H` supplies and how much K/V reuse
+a threadgroup already has.
+
+Note the asymmetry: tuning `R` for decode gains 1.2x, but picking it *wrong*
+costs 9.3x at D=512. Cheap to get right, expensive to guess.
+
+**Which query heads share a threadgroup.** A dispatch parameter, not a kernel —
+`group` is the `H/Hkv` heads that share a KV head, `all` is every head of a
+batch item ([artifact](bench/results/attn_tune_decode_sgs_m5pro.json)):
+
+| config | one | group | all |
+|---|---|---|---|
+| `swa128_decode_1k` | 0.037 | **0.035** | 0.058 |
+| `swa128_decode_4k` | 0.046 | **0.041** | 0.062 |
+| `swa128_decode_b8_4k` | 0.439 | **0.339** | 0.340 |
+| `swa256_decode_4k` | 0.057 | **0.054** | 0.080 |
+| `global512_decode_4k` | 0.193 | 0.170 | **0.168** |
+| `global512_decode_4k_mha` | 0.610 | 0.585 | **0.578** |
+
+`group` is **1.3–1.7x** over one head per threadgroup everywhere — far outside
+the noise floor, and the finding. `all` buys contiguity, the threadgroup's
+per-key read becoming the whole `[Hkv][D]` row, and wins at D=512 where `H` is
+8 — but by 4% in one sweep and 1.2% in a second, so that half is a tie two
+sweeps broke the same way rather than a measured gain. At D=128 `H` is 32 and
+1024-thread threadgroups cost **1.7x** in occupancy, which is unambiguous.
+Chosen per head dim for that reason.
+
+**Reduce-pass width.** The KV-split reduce folds every chunk's `(m, l, acc[D])`
+and ran on one simdgroup per (batch, head) — 8 threadgroups of 32 threads for
+`global512_decode_4k`, a serial tail on an otherwise parallel kernel. Widening
+it is worth up to **1.48x** ([artifact](bench/results/attn_tune_reduce_w_m5pro.json)):
+
+| config | 32 | 128 | 256 |
+|---|---|---|---|
+| `swa128_decode_1k` | 0.036 | 0.035 | **0.033** |
+| `swa128_decode_4k` | 0.042 | 0.039 | **0.038** |
+| `swa128_decode_b8_4k` | 0.324 | 0.324 | **0.322** |
+| `swa256_decode_4k` | 0.074 | 0.052 | **0.050** |
+| `global512_decode_4k` | 0.242 | 0.169 | **0.164** |
+
+It is the one knob that is not a kernel: the pass strides its output loop by
+`threads_per_threadgroup` and keeps no accumulator array — each lane recomputes
+the per-chunk weights instead of holding `acc[D/32]` in registers — so the width
+is a dispatch argument and the whole sweep adds nothing to the metallib.
+
+> [!WARNING]
+> The `tessl-decode` benchmark lane had defaulted to **CH=256 for every head
+> dim** while the library shipped 128 — so a lane labelled "the decode kernel"
+> was a kernel no caller reaches, and the first kernel-only re-sweep of `R` was
+> run against the wrong chunk. Nothing timing-side could see it: both kernels
+> are correct and the ratios looked ordinary. The **parity dump** caught it, by
+> showing the routed lane and the forced KV-split lane disagreeing by 2.2e-08
+> where at `Tq == 1` they are the same kernel on the same data and must be
+> bit-identical. The bench lane now defaults to what the library ships, the
+> scorer asserts those two lanes are bit-equal, and `--dump-parity` refuses to
+> run at all under a tuning override — a parity artifact describes the shipping
+> configuration or it is not written.
+
 ### Routing
 
-`flash_attn_swa` and `flash_attn_global_h512` now pick the kernel:
+`flash_attn_swa` and `flash_attn_global_h512` pick the kernel:
 
 ```rust
-if tq == 1 && B*H < ATTN_SPLIT_KV_BELOW_TG { decode } else { rows }
+if tq == 1 && kv_capacity > 0 { split_kv } else { rows }
 ```
 
-The threshold is 128 threadgroups, measured rather than guessed: at `B·H = 8`
-the KV split wins 0.59 ms against 2.29, at 16 it wins 0.61 against 0.68, at 32
-the two are within noise, and at 256 the split *loses* 0.96 against 0.65 because
-the grid is already full and its second pass is pure overhead.
+**There used to be a `B*H < 128` threshold in that condition, and it was wrong.**
+It was set on the evidence that at `B·H = 256` the split kernel lost 0.96 ms to
+the row kernel's 0.65 — measured at one launch per submit, where ~88% of a decode
+call is the host round trip and the split pays *two* submits to the row kernel's
+one. Measured kernel-only, the split wins at every batch the config set reaches:
+
+| `B·H` | split | rows | |
+|---|---|---|---|
+| 32 | 0.038 ms | 0.308 ms | **8.0x** |
+| 256 | 0.317 | 0.846 | **2.7x** |
+| 1024 | 1.089 | 2.201 | **2.0x** |
+| 2048 | 2.137 | 4.260 | **2.0x** |
+
+The last two configurations were added to look for the crossover the threshold
+implied. There isn't one out to `B·H = 2048`, and the split also wins at one
+launch per submit once its own constants were retuned on a kernel-only signal
+(1.18x at 32, 1.31x at 256, 1.86x at 2048, measured when the decision was taken)
+— so the threshold was not trading one protocol against the other, it was
+reading dispatch cost as kernel cost. On the
+shipping path the fix took `swa128_decode_b8_4k` from 0.94 ms to 0.35 ms
+kernel-only, and it now sits at **0.89x** against MLX.
+
+The margin at `B·H = 256` has since narrowed from 2.7x to 1.4x, because the row
+kernel picked up the `float4` reads and the per-head-dim `SGT` as well — the
+losing branch got faster along with the winning one. The rule is unchanged: the
+split wins at every batch measured, by 1.4–9.9x, with no crossover.
+
+The rule is now a pure function, [`attn_kernel_for`](src/nn.rs), pinned by a test
+— because both kernels compute the same thing, so a routing regression is
+invisible to every correctness test in the suite and shows up only as a slower
+clock. Nothing failed when this rule changed, which is exactly why it is asserted
+rather than inferred.
 
 The tiled kernels remain as [`flash_attn_swa_tiled`](src/nn.rs) /
 `flash_attn_global_h512_tiled` — they are the A/B baseline the benchmark
@@ -382,14 +854,27 @@ measures against and the second opinion the tests score against, not dead code.
 ### Correctness
 
 Both new paths are scored against the same f64 reference as everything else, and
-match the kernel they replace to the digit (5.117e-07 vs 5.117e-07 at
-`swa128_decode_4k`). [`tests/attention.rs`](tests/attention.rs) grew from 6 tests
-to 12: seventeen shape/window/GQA cases across the two paths, `Tq` values that
-straddle the rows-per-threadgroup boundary, windows narrower than one chunk,
-cross-attention shapes where `Tq != Tkv`, fully-masked queries that must yield
-zeros rather than `exp(-inf - -inf)` NaN, and two shader-constant cross-checks
-(`KV_CHUNK`, `SG_PER_TG`) where a drift between the host's copy and the
-shader's would silently drop rows or read partials at the wrong stride.
+the shipping path's worst relative error over the whole 14-config set (79 lane scores, none skipped)
+([artifact](bench/results/attn_parity_m5pro.json)) is **3.5e-07** — level with torch MPS's 3.4e-07, 2x better than MLX's 6.7e-07, and
+8x better than the tiled kernels it replaced (2.7e-06), because a chunked
+reduction is numerically kinder than one serial pass over 4,096 keys. Tuning for
+speed improved this too: the D=512 chunk moving from 256 keys to 128 halved the
+work each partial folds serially.
+
+[`tests/attention.rs`](tests/attention.rs) grew from 6 tests to 18. The cases
+that matter are the ones the tuning parameters created: every `(R, CH,
+reduce-width)` combination on the KV-split path and every `(R, SGT)` on the
+row-parallel one is a distinct kernel with its own masking arithmetic and its own
+grid, and all of them are checked against the f64 reference — alongside `Tq`
+values that straddle the rows-per-threadgroup boundary, windows narrower than one
+chunk, cross-attention shapes where `Tq != Tkv`, fully-masked queries that must
+yield zeros rather than `exp(-inf - -inf)` NaN, and the routing rule itself.
+
+That last one is worth naming: both kernels compute the same thing, so a routing
+regression is invisible to every other test here and shows up only as a slower
+clock. `attn_kernel_for` is a pure function and
+`every_single_query_dispatch_takes_the_kv_split` asserts it, because nothing
+failed when the rule was wrong.
 
 > [!NOTE]
 > The existing `global_h512_is_causal_and_ignores_the_window` test caught a real
@@ -495,9 +980,10 @@ Reading the three speed rows against these:
 > when a budget is breached it names whether tessl alone, the comparison runtime
 > alone, or every runtime exceeded it, because those call for opposite responses.
 >
-> [`bench/test_parity_harness.py`](bench/test_parity_harness.py) holds **56
+> [`bench/test_parity_harness.py`](bench/test_parity_harness.py) holds **94
 > assertions** against that whole class — adversarial dumps, grid-merge cases,
-> budget verdicts and CLI/env contracts. Only the CLI section needs a GPU:
+> budget verdicts, the attention drivers' coverage and batching guards, the
+> tuning knob table, and CLI/env contracts. Only the CLI sections need a GPU:
 >
 > ```bash
 > python3 bench/test_parity_harness.py
@@ -615,7 +1101,7 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 | `bench_gemm_tile_tune` | Exhaustive tile geometry ($SM \times SN$) and $BK$ ladder benchmark. |
 | `bench_gemm_tnnt_tune` | Paired A/B tuning evaluation for TN/NT descriptor and accumulate kernels. |
 | `bench_gemm_sweep` | Cross-runtime GEMM timing (`f32`, `tf32`, `bf16`), JSON out. `--dump-parity DIR` writes operands and every lane's result for the numeric scorer. |
-| `bench_flash_attn` | The attention kernels over 10 prefill/decode configs, timing the tiled baseline, the shipping routed path, and each fast kernel in one run. `--dump-parity DIR` writes Q/K/V/O for the f64 scorer. |
+| `bench_flash_attn` | The attention kernels over 14 prefill/decode configs, timing the tiled baseline, the shipping routed path, and each fast kernel in one run. `--dump-parity DIR` writes Q/K/V and *every* implementation's output for the f64 scorer; it refuses to run under a tuning override. |
 | `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against reference SIMD implementations. |
 | `bench_nn_kernels` | RMSNorm, MLP gating, Q4/Q8 GEMV, reductions. |
 | `bench/paired_cross_runtime.py` | Paired, round-interleaved `tessl` vs. PyTorch MPS / MLX GEMM evaluation. |
@@ -623,6 +1109,7 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 | `bench/flash_attn_torch_mlx.py` | torch-MPS and MLX SDPA lanes plus the f64 attention reference. |
 | `bench/attn_paired.py` | Paired, round-interleaved attention evaluation. |
 | `bench_gemm_variants` | TN / NT / accumulate / split-K / batched / epilogue / f16 GEMM lanes. |
+| `bench/attn_tune.py` | Sweeps the attention tuning knobs in interleaved rounds and reports the winner per config. |
 | `bench/kernel_coverage.py` | Measures which kernels the suite actually dispatches, via `TESSL_KERNEL_TRACE`. `--check` gates on 100%. |
 | `bench/test_parity_harness.py` | Adversarial tests for every harness. Only the CLI sections need a GPU. |
 
@@ -660,7 +1147,15 @@ back to the default silently.
 | `BENCH_ATTN_CFGS` | all | Comma-separated attention config labels. |
 | `BENCH_ATTN_DIST` | `uniform` | Operand distribution for the attention sweep. |
 | `TESSL_KERNEL_TRACE` | unset | Records every kernel a run dispatches, for `bench/kernel_coverage.py`. One relaxed load on the dispatch path when unset. |
-| `TESSL_ATTN_TILED` | unset | Forces the original BR-tiled attention kernels instead of the row-parallel / KV-split ones. A/B only; the tiled path is 4.8–21× slower. |
+| `TESSL_ATTN_TILED` | unset | Forces the original BR-tiled attention kernels instead of the row-parallel / KV-split ones. A/B only; the tiled path is 7–25× slower. Rejected alongside `--dump-parity`. |
+| `BENCH_ATTN_ROWS_R` | shipping default | Lanes per query row (8, 16 or 32) for the `tessl-rows` benchmark lane. Re-derives the `D/R = 16` tuning on other hardware. Rejected alongside `--dump-parity`. |
+| `BENCH_ATTN_ROWS_SGT` | shipping default | Simdgroups per threadgroup (8, 16 or 32) for the `tessl-rows` lane — how many query rows one global K/V read serves. Rejected alongside `--dump-parity`. |
+| `BENCH_ATTN_REDUCE_W` | 256 | Threads per threadgroup in the KV-split reduce pass, a multiple of 32 in [32, 1024]. A dispatch parameter, not a compiled constant. Rejected alongside `--dump-parity`. |
+| `BENCH_ATTN_DECODE_SGS` | shipping default | Which query heads share a threadgroup in the KV-split partial pass: `one`, `group` (the `H/Hkv` sharing a KV head) or `all`. A dispatch parameter. Rejected alongside `--dump-parity`. |
+| `BENCH_ATTN_DECODE_CHUNK` | shipping default | Keys per KV chunk (64, 128 or 256) for the `tessl-decode` lane. Rejected alongside `--dump-parity`. |
+| `BENCH_ATTN_DECODE_R` | shipping default | Lanes per key (8, 16 or 32) for the `tessl-decode` lane. Rejected alongside `--dump-parity`. |
+| `BENCH_ATTN_BATCHED` | `1` | Launches per submit. `1` matches `mx.eval` / `torch.mps.synchronize`; larger amortises the command-buffer submit and isolates the kernel. Enables `async_encode`, without which every dispatch commits its own command buffer and the arm silently measures the same thing as solo. |
+| `BENCH_ATTN_IMPLS` | fast paths | `all` puts the 7-25x slower tiled baseline back into a batched run. |
 
 ---
 
@@ -717,16 +1212,17 @@ It requires the cooperative-destination path — bf16 operands, or f32 with rela
 
 Recorded rather than implied. All kernels are wired to a typed Rust API, the suite is warning-free, and there are no stubs; these are capabilities the crate does not have.
 
-Four of the six entries here have since shipped: the [fused epilogue](#-fused-gemm-epilogue), row-wise reductions (`nn::softmax_rows_f32`, `row_sum_f32`, `row_max_f32`), IEEE binary16 (`DType::F16` with casts and GEMM), and strided batched GEMM (`gemm_batched`). What remains is one upstream block and one deliberate choice.
+Four of the six original entries here have since shipped: the [fused epilogue](#-fused-gemm-epilogue), row-wise reductions (`nn::softmax_rows_f32`, `row_sum_f32`, `row_max_f32`), IEEE binary16 (`DType::F16` with casts and GEMM), and strided batched GEMM (`gemm_batched`). What remains is one upstream block and one deliberate choice.
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
 | **Int4 TensorOps GEMM** | Half the weight bandwidth of int8. | TensorOps accepts `int4b_format` — the gap is the shader-side tensor constructor for a sub-byte element type, not the objc2 binding this table used to blame. `nn::gemm_i8_dequant` ships the int8 case. |
 | **No CPU fallback** | No Metal 4 device means nothing runs. | Deliberate: the crate is an Apple-silicon runtime, and a silent CPU path would make "GPU" benchmarks meaningless. |
+| **D=512 decode is ~1.2x off MLX** | The one attention shape not at parity; everything else is level or ahead. | Characterised, not guessed: it is not GQA re-read (the `Hkv = H` control shows the same deficit) and not the cache layout (built, measured bit-identical, 5x under the noise floor — [see above](#the-kv-layout-changed-and-measured-and-put-back)). What is left is D=512 streaming efficiency; the `Hkv = H` control shows the same 1.14x on a pure DRAM stream. |
 
 The typed `nn` API covers 11 kernels in depth (RMSNorm, MLP gating, Q8 GEMV, KV stores) and the remaining promoted ones through shape-checked entry points; the MLX Q4 family is reached via `Q4MlxBank` rather than 15 separate signatures.
 
-### Benchmark coverage: 84/84, measured
+### Benchmark coverage: 147/147, measured
 
 Every kernel entry point in the shipped metallib is dispatched by a benchmark.
 That is measured rather than claimed: `TESSL_KERNEL_TRACE=1` makes the runtime
@@ -740,11 +1236,18 @@ python3 bench/kernel_coverage.py --check   # non-zero if any kernel is unmeasure
 
 | Suite | Kernels dispatched |
 |---|---|
-| `bench_nn_kernels` | 44 |
+| `bench_nn_kernels` | 53 |
+| `bench_flash_attn` (all `CH`/`R`/`SGT`/tiled variants) | 63 |
 | `bench_gemm_variants` (+`TESSL_GEMM_ACCUM`) | 23 |
-| `bench_gemm_sweep` (timing + `--dump-parity`) | 12 |
-| `bench_flash_attn` | 3 |
-| **union** | **84 / 84** |
+| `bench_gemm_sweep` (timing + `--dump-parity`) | 15 |
+| **union** | **147 / 147** |
+
+The attention row is the reason the count grew from 84: the KV-split and
+row-parallel kernels are parameterized on `(D, CH, R)` and `(D, R, SGT)`, and a
+value is a *kernel*, not a flag — 27 + 9 + 27 entry points that all have to be
+dispatched by something. `kernel_coverage.py` runs the tuning envs for exactly
+that reason. The reduce pass's width is deliberately *not* among them: it is a
+dispatch parameter, so sweeping it costs no kernels at all.
 
 > [!WARNING]
 > **This section previously published wrong numbers** — "67 kernel entry
@@ -754,7 +1257,9 @@ python3 bench/kernel_coverage.py --check   # non-zero if any kernel is unmeasure
 > - **The census was wrong.** A scan for `^kernel void` misses every kernel
 >   declared through the `NN_COOP_KERNEL` / `TN_NT_COOP_KERNEL` macro families —
 >   16 entry points, including every `_64x64_sg4` cooperative variant. The true
->   count is **84**, confirmed against `xcrun metal-nm default.metallib`.
+>   count was **84** at the time, confirmed against `xcrun metal-nm
+>   default.metallib`; it is **147** now that the attention kernels are
+>   parameterized on their tuning constants.
 > - **Coverage was inferred, not measured.** Grepping a kernel's name out of the
 >   bench sources reported `matmul2d_tensorops_*` as untimed (it is reached
 >   through a dispatcher) and a name in a comment as timed.
