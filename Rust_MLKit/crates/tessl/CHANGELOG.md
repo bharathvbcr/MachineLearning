@@ -82,6 +82,24 @@ All notable changes to `tessl` are recorded here. The format follows
 - `examples/gemm.rs` and `examples/nn_layer.rs`, both run by CI. The README's
   snippets are these files.
 
+- **Attention tuning knobs, all measured rather than chosen.** `RowsGroups`
+  (simdgroups per threadgroup in the row-parallel kernel, compiled per
+  instantiation), `DecodeHeadBlock` (which query heads share a threadgroup in
+  the KV-split partial pass), and a dispatch-parameter width for the KV-split
+  reduce pass. [`bench/attn_tune.py`](bench/attn_tune.py) sweeps all six
+  attention knobs in interleaved rounds and refuses to name a winner from a
+  partial sweep; `--knob batched` decomposes wall clock into submit and kernel
+  instead of tuning anything.
+- **`nn::attn_kernel_for`** — the attention routing rule as a pure function, so
+  a test can pin it. Both kernels compute the same thing, so a routing
+  regression is invisible to every correctness test and shows up only as a
+  slower clock.
+- Four attention benchmark configs: two large-batch decodes that probe the
+  routing rule out to `B*H = 2048`, one with GQA switched off (`Hkv = H`) to
+  separate issued K/V traffic from unique, and one at `Hkv = 1` where two
+  candidate cache layouts are byte-identical — which is what calibrates the
+  run-to-run noise floor at ~3%.
+
 ### Fixed
 
 - Removed a duplicate `cast_f32_to_bf16` that arrived with the promoted kernels.
@@ -95,6 +113,28 @@ All notable changes to `tessl` are recorded here. The format follows
   was being parsed as intra-doc links, and one public doc linked a private item.
 - README: the `add_metallib` / `from_metallib_path` snippets passed `&str` to
   functions that take `&Path` and would not have compiled.
+
+- **The attention routing threshold was wrong.** `ATTN_SPLIT_KV_BELOW_TG` sent
+  `B*H >= 128` decode dispatches to the row-parallel kernel on the evidence that
+  the KV-split path lost 0.96 ms to 0.65 there — measured at one launch per
+  submit, where ~88% of a decode call is the host round trip and the split path
+  pays two submits to the row kernel's one. Measured kernel-only the split wins
+  at every batch reachable, 1.4x to 9.9x, with no crossover. The threshold is
+  gone.
+- **The `tessl-decode` benchmark lane defaulted to chunk 256 for every head
+  dim** while the library shipped 128, so a lane labelled "the decode kernel"
+  was a kernel no caller reaches. Nothing timing-side could see it — both
+  kernels are correct — and the parity dump caught it by showing the routed and
+  forced lanes disagreeing where at `Tq == 1` they must be bit-identical.
+- **`--dump-parity` wrote whichever implementation ran last** under
+  `o_tessl.npy` while the manifest named a different kernel, so the scorer
+  reported the row kernel's error under the routed path's name. Each
+  implementation is now dumped from its own dispatch, and the dump refuses to
+  run under a tuning override at all: a parity artifact describes the shipping
+  configuration or it is not written.
+- `attn_paired.py` recorded ratios only, so when a geomean moved there was no
+  way to say which lane had moved. Both lanes' absolute medians now travel with
+  every ratio.
 
 ### Changed
 
@@ -110,8 +150,27 @@ All notable changes to `tessl` are recorded here. The format follows
   of relying on both call sites happening to pass the length the buffer was
   allocated from.
 
+- **Attention throughput: 1.2x to 1.7x on every configuration.** K/V/Q reads in
+  the row-parallel and KV-split kernels are `float4`, so a lane owns four
+  consecutive head dims per step rather than issuing one scalar load each —
+  at D=512 that was 32 memory instructions against 32 multiply-adds.
+  Simdgroups per threadgroup is compiled per head dim instead of a fixed 8. The
+  KV-split reduce pass keeps no accumulator array and takes its width as a
+  dispatch parameter, rather than folding every chunk on one simdgroup per
+  (batch, head). And the query heads that share a KV head now share a
+  threadgroup, so they touch each K/V line while it is still in L1 instead of
+  pulling it `H/Hkv` separate times — no threadgroup memory and no barrier.
+  Against MLX the shipping path is now 0.90-0.97x on prefill and 0.91-0.97x on
+  decode kernel-only, from 11.1x and 37.9x.
+- Retuned `DECODE_CHUNK_*`, `DECODE_LANES_D128`, `ROWS_GROUPS_*` and
+  `DECODE_HEAD_BLOCK_*` against the changed kernels. Every published tuning
+  table is generated from its artifact JSON now rather than transcribed.
+
 ### Removed
 
+- `ATTN_SPLIT_KV_BELOW_TG`. See *Fixed*: it was reading dispatch cost as kernel
+  cost, and there is no batch at which the row kernel is the right choice for a
+  single-query dispatch.
 - `mtl_tensor::try_quant_tensorops_prefill_gemm`. Its entire body was
   `Err("not wired yet")` with every parameter underscored, no caller and no
   test. The fact it encoded — that quantized TensorOps prefill GEMM does not

@@ -236,7 +236,7 @@ rather than printing a page of `skip(pipe)` and exiting 0.
 | `bench/test_parity_harness.py` | Adversarial cases for every harness. Only the CLI sections need a GPU. |
 | `bench_gemm_variants` | TN / NT / accumulate / split-K / batched / epilogue / f16 lanes -- the 18 GEMM kernels the cross-runtime sweep cannot reach. |
 | `bench/kernel_coverage.py` | Measures which kernels the suite dispatches (`TESSL_KERNEL_TRACE`), cross-checked against `metal-nm default.metallib`. `--check` gates on 100%. |
-| `bench_flash_attn` + `bench/attn_paired.py` | The attention kernels, prefill and decode. The benchmark found them 11x (torch) / 20.5x (MLX) slower, geomean, worst case 271x; both causes were dispatch geometry rather than arithmetic, and the row-parallel + KV-split rewrites brought the shipping path to 0.79x / 1.63x. See the tessl README. |
+| `bench_flash_attn` + `bench/attn_paired.py` | The attention kernels, prefill and decode, over 14 configs. The benchmark found them 11x (torch) / 20.5x (MLX) slower, geomean, worst case 271x. The row-parallel and KV-split rewrites fixed the dispatch geometry; four throughput changes and a routing fix followed. Prefill is now 0.90-0.97x MLX and decode kernel-only 0.91-0.97x, both ahead. See the tessl README. |
 | `bench/paired_cross_runtime.py` | Alternates the tessl and torch/MLX lanes round by round. Aborts rather than reporting a geomean over part of the ladder; `--out` writes the artifact. |
 
 Measured speed, M5 Pro, 5 alternating rounds x 30 iters over the full ladder
