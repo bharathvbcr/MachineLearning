@@ -658,10 +658,293 @@ impl AttnHeadDim {
         }
     }
 
+    /// The Metal entry point this head dimension dispatches to.
+    ///
+    /// Exposed so a benchmark can report the kernel it actually ran rather
+    /// than a second mapping of its own that could drift from this one.
+    pub fn kernel(self) -> &'static str {
+        self.entry()
+    }
+
     /// Query-block rows per threadgroup, from the kernel's `constant uint BR`.
     fn br(self) -> usize {
         8
     }
+}
+
+/// Keys per chunk in the decode kernels. Must match `KV_CHUNK` in
+/// `kernels/flash_attn_decode.metal`; `tests/attention.rs` pins the pair.
+pub const DECODE_KV_CHUNK: usize = 256;
+
+/// Head dimensions the FlashDecoding path is compiled for.
+fn decode_entries(d: u32) -> Option<(&'static str, &'static str)> {
+    match d {
+        128 => Some((
+            "flash_attn_decode_partial_h128",
+            "flash_attn_decode_reduce_h128",
+        )),
+        256 => Some((
+            "flash_attn_decode_partial_h256",
+            "flash_attn_decode_reduce_h256",
+        )),
+        512 => Some((
+            "flash_attn_decode_partial_h512",
+            "flash_attn_decode_reduce_h512",
+        )),
+        _ => None,
+    }
+}
+
+/// Single-query attention, split over the KV sequence (FlashDecoding).
+///
+/// The general kernels tile over query rows, so at `Tq == 1` they run one live
+/// lane in 32 over a grid of `B*H` threadgroups. This splits over KV instead:
+/// `n_chunks x B*H` threadgroups, every lane live. `window == 0` selects the
+/// global (causal) rule; anything else is the sliding window.
+///
+/// `Tkv` is a device value, so the host cannot size the grid to the live chunk
+/// count and dispatches for `kv_capacity` chunks instead. Chunks past `Tkv`
+/// return without writing, which is why the scratch is zeroed first: the reduce
+/// pass reads `n_chunks` derived from the live `Tkv`, and a stale partial left
+/// by a previous dispatch inside that range would be combined as if it were
+/// this one's.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_decode(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    head_dim: u32,
+    // Maximum `Tkv` the K/V buffers can hold; sizes the grid, since the live
+    // `Tkv` is a device value the host cannot read without a stall.
+    kv_capacity: usize,
+    out_bf16: bool,
+) -> Result<(), String> {
+    let (partial_entry, reduce_entry) = decode_entries(head_dim).ok_or_else(|| {
+        format!("flash_attn_decode: head dim {head_dim} has no decode kernel (128, 256 or 512)")
+    })?;
+    if dims.tq != 1 {
+        return Err(format!(
+            "flash_attn_decode is the Tq == 1 path; got Tq = {}. Use flash_attn_swa \
+             or flash_attn_global_h512 for prefill.",
+            dims.tq
+        ));
+    }
+    validate_attn_dims(&dims, head_dim, q, o, "flash_attn_decode", out_bf16)?;
+    require::<u32>(tkv, 1, "flash_attn_decode tkv")?;
+    require::<u32>(q_pos_offset, 1, "flash_attn_decode q_pos_offset")?;
+    require::<u32>(kv_pos_offset, 1, "flash_attn_decode kv_pos_offset")?;
+    if kv_capacity == 0 {
+        return Err("flash_attn_decode: kv_capacity must be at least 1".into());
+    }
+    require::<f32>(
+        k,
+        elems(dims.batch * dims.heads_kv, head_dim, "flash_attn_decode k")?
+            .checked_mul(kv_capacity)
+            .ok_or("flash_attn_decode: k extent overflows")?,
+        "flash_attn_decode k",
+    )?;
+    require::<f32>(
+        v,
+        elems(dims.batch * dims.heads_kv, head_dim, "flash_attn_decode v")?
+            .checked_mul(kv_capacity)
+            .ok_or("flash_attn_decode: v extent overflows")?,
+        "flash_attn_decode v",
+    )?;
+
+    let bh = (dims.batch as usize).saturating_mul(dims.heads as usize);
+    if bh == 0 {
+        return Ok(());
+    }
+    let chunks = kv_capacity.div_ceil(DECODE_KV_CHUNK).max(1);
+    let stride = head_dim as usize + 2;
+    let scratch_elems = bh
+        .checked_mul(chunks)
+        .and_then(|x| x.checked_mul(stride))
+        .ok_or("flash_attn_decode: partial scratch size overflows")?;
+    let scratch = rt.alloc_buffer(scratch_elems * 4)?;
+    scratch.write_f32(&vec![0f32; scratch_elems]);
+
+    let p = rt.pipeline(partial_entry)?;
+    dispatch_2d_tg(rt, &p, chunks, bh, 32, |bnd| {
+        set_gpu_buf(bnd, q, 0);
+        set_gpu_buf(bnd, k, 1);
+        set_gpu_buf(bnd, v, 2);
+        set_gpu_buf(bnd, &scratch, 3);
+        set_u32(bnd, dims.batch, 4);
+        set_gpu_buf(bnd, tkv, 6);
+        set_u32(bnd, dims.heads, 7);
+        set_u32(bnd, dims.heads_kv, 8);
+        set_u32(bnd, dims.window, 9);
+        set_f32(bnd, dims.scale, 10);
+        set_gpu_buf(bnd, q_pos_offset, 11);
+        set_gpu_buf(bnd, kv_pos_offset, 12);
+    })?;
+
+    let r = rt.pipeline(reduce_entry)?;
+    dispatch_2d_tg(rt, &r, 1, bh, 32, |bnd| {
+        set_gpu_buf(bnd, &scratch, 0);
+        set_gpu_buf(bnd, o, 1);
+        set_u32(bnd, dims.batch, 2);
+        set_gpu_buf(bnd, tkv, 3);
+        set_u32(bnd, dims.heads, 4);
+        set_u32(bnd, u32::from(out_bf16), 5);
+    })
+}
+
+/// Query rows per threadgroup in the row-parallel kernels. Must match
+/// `SG_PER_TG` in `kernels/flash_attn_rows.metal`; `tests/attention.rs` pins it.
+pub const ROWS_PER_TG: usize = 8;
+
+fn rows_entry(d: u32) -> Option<&'static str> {
+    match d {
+        128 => Some("flash_attn_rows_h128"),
+        256 => Some("flash_attn_rows_h256"),
+        512 => Some("flash_attn_rows_h512"),
+        _ => None,
+    }
+}
+
+/// Row-parallel flash attention: one simdgroup per query row.
+///
+/// The tiled kernels put BR query rows in a 32-thread threadgroup and guard the
+/// inner loops with `lid < BR`, so 8 lanes in 32 do the arithmetic. This gives
+/// each simdgroup its own row and each lane its own slice of the head
+/// dimension, which makes every lane live, removes the `Oacc` threadgroup array
+/// and its barriers, and — because a simdgroup owns one row rather than a tile
+/// — lets each row walk its exact key range instead of the union window over
+/// the tile followed by masking inside it.
+///
+/// `window == 0` selects the global (causal) rule.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_rows(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    head_dim: u32,
+    out_bf16: bool,
+) -> Result<(), String> {
+    let entry = rows_entry(head_dim).ok_or_else(|| {
+        format!("flash_attn_rows: head dim {head_dim} has no kernel (128, 256 or 512)")
+    })?;
+    validate_attn_dims(&dims, head_dim, q, o, "flash_attn_rows", out_bf16)?;
+    require::<u32>(tkv, 1, "flash_attn_rows tkv")?;
+    require::<u32>(q_pos_offset, 1, "flash_attn_rows q_pos_offset")?;
+    require::<u32>(kv_pos_offset, 1, "flash_attn_rows kv_pos_offset")?;
+    // Tkv lives on the device, so K/V can only be checked for one position.
+    require::<f32>(
+        k,
+        elems(dims.batch * dims.heads_kv, head_dim, "flash_attn_rows k")?,
+        "flash_attn_rows k",
+    )?;
+    require::<f32>(
+        v,
+        elems(dims.batch * dims.heads_kv, head_dim, "flash_attn_rows v")?,
+        "flash_attn_rows v",
+    )?;
+
+    let groups_x = (dims.tq as usize).div_ceil(ROWS_PER_TG);
+    let groups_y = (dims.batch as usize).saturating_mul(dims.heads as usize);
+    let p = rt.pipeline(entry)?;
+    dispatch_2d_tg(rt, &p, groups_x, groups_y, ROWS_PER_TG * 32, |bnd| {
+        set_gpu_buf(bnd, q, 0);
+        set_gpu_buf(bnd, k, 1);
+        set_gpu_buf(bnd, v, 2);
+        set_gpu_buf(bnd, o, 3);
+        set_u32(bnd, dims.batch, 4);
+        set_u32(bnd, dims.tq, 5);
+        set_gpu_buf(bnd, tkv, 6);
+        set_u32(bnd, dims.heads, 7);
+        set_u32(bnd, dims.heads_kv, 8);
+        set_u32(bnd, dims.window, 9);
+        set_f32(bnd, dims.scale, 10);
+        set_gpu_buf(bnd, q_pos_offset, 11);
+        set_gpu_buf(bnd, kv_pos_offset, 12);
+        set_u32(bnd, u32::from(out_bf16), 13);
+    })
+}
+
+/// `TESSL_ATTN_TILED=1` forces the original tiled kernels.
+///
+/// Read once: this sits on the attention dispatch path, and the A/B harness
+/// sets it per process rather than per call.
+fn tiled_attn_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| std::env::var_os("TESSL_ATTN_TILED").is_some())
+}
+
+/// Threadgroups below which the KV split is worth its second pass.
+///
+/// At `Tq == 1` the row-parallel kernel launches `B*H` threadgroups, and
+/// FlashDecoding multiplies that by the chunk count at the cost of a scratch
+/// buffer and a reduce pass. Measured on an M5 Pro: at `B*H = 8` the split wins
+/// 0.59 ms against 2.29 ms, at 16 it wins 0.61 against 0.68, at 32 the two are
+/// within noise (0.57 against 0.52), and at 256 the split *loses* 0.96 against
+/// 0.65 because the grid is already full and the second pass is pure overhead.
+/// 128 sits inside the flat region between those.
+const ATTN_SPLIT_KV_BELOW_TG: usize = 128;
+
+/// Pick the attention kernel for a dispatch and run it.
+#[allow(clippy::too_many_arguments)]
+fn route_attn(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    head_dim: u32,
+    out_bf16: bool,
+) -> Result<(), String> {
+    let bh = (dims.batch as usize).saturating_mul(dims.heads as usize);
+    if dims.tq == 1 && bh < ATTN_SPLIT_KV_BELOW_TG {
+        // `Tkv` is a device value, so the grid is sized from what K can hold.
+        let per_pos = elems(dims.batch * dims.heads_kv, head_dim, "flash_attn k")?;
+        let capacity = capacity_of::<f32>(k).checked_div(per_pos).unwrap_or(0);
+        if capacity > 0 {
+            return flash_attn_decode(
+                rt,
+                q,
+                k,
+                v,
+                o,
+                tkv,
+                q_pos_offset,
+                kv_pos_offset,
+                dims,
+                head_dim,
+                capacity,
+                out_bf16,
+            );
+        }
+    }
+    flash_attn_rows(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        dims,
+        head_dim,
+        out_bf16,
+    )
 }
 
 /// Sliding-window flash attention.
@@ -680,6 +963,55 @@ impl AttnHeadDim {
 /// 9 = `window`, 10 = `scale` (f32). Buffers 6, 11, 12 are bound here.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_swa(
+    rt: &Arc<GpuRuntime>,
+    head_dim: AttnHeadDim,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+) -> Result<(), String> {
+    // The tiled kernel is 4.5-6.4x slower on prefill -- 8 of its 32 lanes do
+    // the arithmetic -- and 12-22x slower on decode. It stays reachable as
+    // [`flash_attn_swa_tiled`], which is what the A/B benchmark and
+    // `tests/attention.rs` compare the fast paths against.
+    if !tiled_attn_forced() {
+        return route_attn(
+            rt,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            dims,
+            head_dim.dim(),
+            false,
+        );
+    }
+    flash_attn_swa_tiled(
+        rt,
+        head_dim,
+        q,
+        k,
+        v,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        dims,
+    )
+}
+
+/// The original BR-tiled sliding-window kernel, unrouted.
+///
+/// Kept as the A/B baseline the fast paths are measured and tested against.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_swa_tiled(
     rt: &Arc<GpuRuntime>,
     head_dim: AttnHeadDim,
     q: &GpuBuffer,
@@ -788,6 +1120,55 @@ pub fn flash_attn_swa_with_scalars(
 /// 9 = `scale` (f32), 12 = `out_bf16`. Buffers 6, 10, 11 are bound here.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_global_h512(
+    rt: &Arc<GpuRuntime>,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    tkv: &GpuBuffer,
+    q_pos_offset: &GpuBuffer,
+    kv_pos_offset: &GpuBuffer,
+    dims: AttnDims,
+    out_bf16: bool,
+) -> Result<(), String> {
+    if !tiled_attn_forced() {
+        // This entry point's contract is that `window` is ignored: the tiled
+        // h512 kernel has no window parameter at all. The routed kernels take
+        // one and treat 0 as "global", so it is zeroed here rather than passed
+        // through -- otherwise a caller who left a window set in `dims` would
+        // silently get sliding-window attention from the global entry point.
+        let global = AttnDims { window: 0, ..dims };
+        return route_attn(
+            rt,
+            q,
+            k,
+            v,
+            o,
+            tkv,
+            q_pos_offset,
+            kv_pos_offset,
+            global,
+            512,
+            out_bf16,
+        );
+    }
+    flash_attn_global_h512_tiled(
+        rt,
+        q,
+        k,
+        v,
+        o,
+        tkv,
+        q_pos_offset,
+        kv_pos_offset,
+        dims,
+        out_bf16,
+    )
+}
+
+/// The original BR-tiled global kernel, unrouted. A/B baseline.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attn_global_h512_tiled(
     rt: &Arc<GpuRuntime>,
     q: &GpuBuffer,
     k: &GpuBuffer,

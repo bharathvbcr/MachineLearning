@@ -1917,6 +1917,14 @@ def cmd_swaboard(args) -> None:
 
     for phase in want:
         print(f"\n########## phase {phase} ##########", flush=True)
+        # The orchestrator runs the probe IN-PROCESS -- cmd_probe trains 124M
+        # models and the SWA preflight allocates q/k/v at every stage shape -- so
+        # it ends the probe holding GPU memory it will never touch again. Measured
+        # on the GH200: 18.5 GB still resident while the workers ran, i.e. a fifth
+        # of the card lost for the rest of a multi-day board. The caching
+        # allocator will not return it on its own, and every later phase spawns
+        # workers that need exactly that headroom.
+        _release_orchestrator_gpu_memory()
         if phase == "probe":
             # Preflight, and it is not a formality: on CUDA an explicit attn_mask
             # cannot use the flash kernel, and if SDPA falls back to the math path
@@ -2283,6 +2291,21 @@ def cmd_compute(args) -> None:
         for line in recent:
             print(f"  {line}")
     cmd_status(args)
+
+
+def _release_orchestrator_gpu_memory() -> None:
+    """Hand back anything this process cached on the GPU between phases.
+
+    A no-op when the phase used no GPU, and it never touches a worker: workers
+    are separate processes with their own allocators.
+    """
+    try:
+        if torch.cuda.is_available():
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+    except Exception:
+        pass                       # freeing memory must never fail a run
 
 
 def cmd_measure_peak(args) -> None:

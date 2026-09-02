@@ -358,6 +358,49 @@ pub struct GpuRuntime {
     memory_info: Mutex<DeviceMemoryInfo>,
 }
 
+/// Kernel-use trace, gated on `TESSL_KERNEL_TRACE=1`.
+///
+/// Benchmark coverage used to be an inference: grep a kernel's name out of the
+/// bench sources and hope the path that dispatches it is the one being timed.
+/// That mis-attributed both directions -- `matmul2d_tensorops_*` is reached
+/// through a dispatcher and looked untimed, while a name mentioned in a comment
+/// looked timed. This records what a run actually dispatched, so
+/// `bench/kernel_coverage.py` can gate on a measurement instead.
+///
+/// Off by default and read through a `OnceLock`, so the cost on the dispatch
+/// path when disabled is one relaxed load.
+static KERNEL_TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static KERNEL_TRACE: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn record_kernel_use(name: &str) {
+    if !*KERNEL_TRACE_ON.get_or_init(|| std::env::var_os("TESSL_KERNEL_TRACE").is_some()) {
+        return;
+    }
+    if let Ok(mut set) = KERNEL_TRACE.lock() {
+        if !set.contains(name) {
+            set.insert(name.to_string());
+        }
+    }
+}
+
+/// Every distinct kernel this process has requested a pipeline for, sorted.
+///
+/// Empty unless `TESSL_KERNEL_TRACE` is set — a caller that forgets to set it
+/// would otherwise read an empty trace as "nothing ran".
+pub fn traced_kernels() -> Vec<String> {
+    KERNEL_TRACE
+        .lock()
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Whether the trace is recording. Lets a caller distinguish "nothing
+/// dispatched" from "tracing was never switched on".
+pub fn kernel_trace_enabled() -> bool {
+    *KERNEL_TRACE_ON.get_or_init(|| std::env::var_os("TESSL_KERNEL_TRACE").is_some())
+}
+
 impl GpuRuntime {
     fn acquire_access(&self) -> Result<RuntimeAccess, String> {
         if self.encode_failed.load(Ordering::Acquire) {
@@ -677,6 +720,7 @@ impl GpuRuntime {
         &self,
         name: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, String> {
+        record_kernel_use(name);
         // Cache hit without holding overlay lock or allocating a key String.
         let icb = crate::decode_icb::icb_pipelines_enabled();
         {

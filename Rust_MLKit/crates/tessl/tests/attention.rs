@@ -184,6 +184,493 @@ fn run_swa(
     (ob.read_f32()[..want.len()].to_vec(), want)
 }
 
+/// Run the FlashDecoding path and the general kernel on identical inputs.
+///
+/// Returns (decode output, general-kernel output, f64 reference). The decode
+/// kernel is a second implementation of the same rule, so agreeing with the
+/// f64 reference *and* with the kernel it replaces is two independent checks.
+#[allow(clippy::too_many_arguments)]
+fn run_decode(
+    rt: &Arc<GpuRuntime>,
+    s: Shape,
+    window: Option<usize>,
+    q_off: u32,
+    kv_off: u32,
+    scale: f32,
+    seed: u64,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    assert_eq!(s.tq, 1, "decode path is Tq == 1");
+    let q = random_f32(s.b * s.tq * s.h * s.d, seed);
+    let k = random_f32(s.b * s.tkv * s.hkv * s.d, seed + 1);
+    let v = random_f32(s.b * s.tkv * s.hkv * s.d, seed + 2);
+    let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+    let o_dec = seeded(rt, s.b * s.tq * s.h * s.d, UNWRITTEN);
+    let o_gen = seeded(rt, s.b * s.tq * s.h * s.d, UNWRITTEN);
+    let tkv = u32_buf(rt, s.tkv as u32);
+    let qo = u32_buf(rt, q_off);
+    let ko = u32_buf(rt, kv_off);
+    let dims = nn::AttnDims {
+        batch: s.b as u32,
+        tq: s.tq as u32,
+        heads: s.h as u32,
+        heads_kv: s.hkv as u32,
+        window: window.unwrap_or(0) as u32,
+        scale,
+    };
+
+    nn::flash_attn_decode(
+        rt, &qb, &kb, &vb, &o_dec, &tkv, &qo, &ko, dims, s.d as u32, s.tkv, false,
+    )
+    .unwrap();
+    match window {
+        Some(_) => {
+            let hd = match s.d {
+                128 => AttnHeadDim::D128,
+                256 => AttnHeadDim::D256,
+                other => panic!("no sliding-window kernel at head dim {other}"),
+            };
+            nn::flash_attn_swa_tiled(rt, hd, &qb, &kb, &vb, &o_gen, &tkv, &qo, &ko, dims).unwrap();
+        }
+        None => {
+            nn::flash_attn_global_h512_tiled(
+                rt, &qb, &kb, &vb, &o_gen, &tkv, &qo, &ko, dims, false,
+            )
+            .unwrap();
+        }
+    }
+    rt.synchronize().unwrap();
+
+    let want = reference(
+        &q,
+        &k,
+        &v,
+        s,
+        window,
+        q_off as usize,
+        kv_off as usize,
+        scale,
+    );
+    let n = want.len();
+    (
+        o_dec.read_f32()[..n].to_vec(),
+        o_gen.read_f32()[..n].to_vec(),
+        want,
+    )
+}
+
+/// Run the row-parallel path and the tiled kernel on identical inputs.
+#[allow(clippy::too_many_arguments)]
+fn run_rows(
+    rt: &Arc<GpuRuntime>,
+    s: Shape,
+    window: Option<usize>,
+    q_off: u32,
+    kv_off: u32,
+    scale: f32,
+    seed: u64,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let q = random_f32(s.b * s.tq * s.h * s.d, seed);
+    let k = random_f32(s.b * s.tkv * s.hkv * s.d, seed + 1);
+    let v = random_f32(s.b * s.tkv * s.hkv * s.d, seed + 2);
+    let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+    let o_rows = seeded(rt, s.b * s.tq * s.h * s.d, UNWRITTEN);
+    let o_gen = seeded(rt, s.b * s.tq * s.h * s.d, UNWRITTEN);
+    let tkv = u32_buf(rt, s.tkv as u32);
+    let qo = u32_buf(rt, q_off);
+    let ko = u32_buf(rt, kv_off);
+    let dims = nn::AttnDims {
+        batch: s.b as u32,
+        tq: s.tq as u32,
+        heads: s.h as u32,
+        heads_kv: s.hkv as u32,
+        window: window.unwrap_or(0) as u32,
+        scale,
+    };
+
+    nn::flash_attn_rows(
+        rt, &qb, &kb, &vb, &o_rows, &tkv, &qo, &ko, dims, s.d as u32, false,
+    )
+    .unwrap();
+    match window {
+        Some(_) => {
+            let hd = match s.d {
+                128 => AttnHeadDim::D128,
+                256 => AttnHeadDim::D256,
+                other => panic!("no sliding-window kernel at head dim {other}"),
+            };
+            nn::flash_attn_swa_tiled(rt, hd, &qb, &kb, &vb, &o_gen, &tkv, &qo, &ko, dims).unwrap();
+        }
+        None => {
+            nn::flash_attn_global_h512_tiled(
+                rt, &qb, &kb, &vb, &o_gen, &tkv, &qo, &ko, dims, false,
+            )
+            .unwrap();
+        }
+    }
+    rt.synchronize().unwrap();
+
+    let want = reference(
+        &q,
+        &k,
+        &v,
+        s,
+        window,
+        q_off as usize,
+        kv_off as usize,
+        scale,
+    );
+    let n = want.len();
+    (
+        o_rows.read_f32()[..n].to_vec(),
+        o_gen.read_f32()[..n].to_vec(),
+        want,
+    )
+}
+
+/// The row-parallel kernels' rows-per-threadgroup must match the shader's
+/// `SG_PER_TG`: the host derives the grid from its copy, so a drift would
+/// leave the tail of every dispatch uncomputed.
+#[test]
+fn rows_per_tg_matches_the_shader() {
+    let src = include_str!("../kernels/flash_attn_rows.metal");
+    let line = src
+        .lines()
+        .find(|l| l.contains("constant uint SG_PER_TG"))
+        .expect("SG_PER_TG not declared in flash_attn_rows.metal");
+    let want: usize = line
+        .split('=')
+        .nth(1)
+        .and_then(|x| x.trim().trim_end_matches(';').parse().ok())
+        .expect("could not parse SG_PER_TG");
+    assert_eq!(
+        want,
+        nn::ROWS_PER_TG,
+        "shader SG_PER_TG and nn::ROWS_PER_TG disagree"
+    );
+}
+
+#[test]
+fn rows_matches_the_reference_and_the_tiled_kernel() {
+    with_gpu(|rt| {
+        // Tq values chosen around ROWS_PER_TG = 8: exactly one threadgroup, a
+        // partial tail, and several full ones. The tail is where a grid derived
+        // from the wrong constant would silently drop rows.
+        let cases: &[(Shape, Option<usize>)] = &[
+            (
+                Shape {
+                    b: 1,
+                    tq: 8,
+                    tkv: 8,
+                    h: 4,
+                    hkv: 2,
+                    d: 128,
+                },
+                Some(1024),
+            ),
+            (
+                Shape {
+                    b: 1,
+                    tq: 9,
+                    tkv: 9,
+                    h: 4,
+                    hkv: 2,
+                    d: 128,
+                },
+                Some(1024),
+            ),
+            (
+                Shape {
+                    b: 2,
+                    tq: 19,
+                    tkv: 19,
+                    h: 4,
+                    hkv: 2,
+                    d: 128,
+                },
+                Some(1024),
+            ),
+            (
+                Shape {
+                    b: 1,
+                    tq: 17,
+                    tkv: 17,
+                    h: 2,
+                    hkv: 1,
+                    d: 256,
+                },
+                Some(1024),
+            ),
+            // Window narrower than the history: rows differ in key range, which
+            // is the case the tiled kernel had to take a union over.
+            (
+                Shape {
+                    b: 1,
+                    tq: 33,
+                    tkv: 33,
+                    h: 4,
+                    hkv: 2,
+                    d: 128,
+                },
+                Some(4),
+            ),
+            (
+                Shape {
+                    b: 1,
+                    tq: 40,
+                    tkv: 40,
+                    h: 2,
+                    hkv: 1,
+                    d: 256,
+                },
+                Some(3),
+            ),
+            // Global (causal) at the D=512 head dim.
+            (
+                Shape {
+                    b: 1,
+                    tq: 9,
+                    tkv: 9,
+                    h: 2,
+                    hkv: 1,
+                    d: 512,
+                },
+                None,
+            ),
+            (
+                Shape {
+                    b: 1,
+                    tq: 24,
+                    tkv: 24,
+                    h: 2,
+                    hkv: 1,
+                    d: 512,
+                },
+                None,
+            ),
+            // GQA group of 4.
+            (
+                Shape {
+                    b: 1,
+                    tq: 12,
+                    tkv: 12,
+                    h: 8,
+                    hkv: 2,
+                    d: 128,
+                },
+                Some(1024),
+            ),
+            // Cross-attention shape: Tq != Tkv.
+            (
+                Shape {
+                    b: 1,
+                    tq: 5,
+                    tkv: 40,
+                    h: 4,
+                    hkv: 2,
+                    d: 128,
+                },
+                Some(1024),
+            ),
+        ];
+        for (i, &(s, window)) in cases.iter().enumerate() {
+            let (rows, gen, want) = run_rows(rt, s, window, 0, 0, 0.125, 0x4000 + i as u64);
+            check(
+                &format!("rows[{i}] Tq={} d={} w={window:?}", s.tq, s.d),
+                &rows,
+                &want,
+            );
+            check(
+                &format!("tiled[{i}] Tq={} d={} w={window:?}", s.tq, s.d),
+                &gen,
+                &want,
+            );
+        }
+    });
+}
+
+/// Decode offsets through the row-parallel path: `q_pos_offset` beyond the
+/// dispatch, and a `kv_pos_offset` that masks everything.
+#[test]
+fn rows_honours_position_offsets_and_masks_to_zero() {
+    with_gpu(|rt| {
+        let s = Shape {
+            b: 1,
+            tq: 4,
+            tkv: 40,
+            h: 4,
+            hkv: 2,
+            d: 128,
+        };
+        let (rows, gen, want) = run_rows(rt, s, Some(8), 36, 0, 0.125, 0x5001);
+        check("rows offset", &rows, &want);
+        check("tiled offset", &gen, &want);
+
+        // Every key past the query position: the whole output is zeros.
+        let (rows, _, _) = run_rows(rt, s, Some(1024), 0, 5000, 0.125, 0x5002);
+        for (i, v) in rows.iter().enumerate() {
+            assert!(v.is_finite(), "rows[{i}] is {v}, want a finite zero");
+            assert_eq!(*v, 0.0, "rows[{i}] = {v}, want 0");
+        }
+    });
+}
+
+/// The decode kernel's chunking constant must match the shader's `KV_CHUNK`.
+/// They are two hand-maintained numbers and the reduce pass derives its chunk
+/// count from the host's, so a drift would read partials at the wrong stride.
+#[test]
+fn decode_chunk_constant_matches_the_shader() {
+    let src = include_str!("../kernels/flash_attn_decode.metal");
+    let line = src
+        .lines()
+        .find(|l| l.contains("constant uint KV_CHUNK"))
+        .expect("KV_CHUNK not declared in flash_attn_decode.metal");
+    let want: usize = line
+        .split('=')
+        .nth(1)
+        .and_then(|x| x.trim().trim_end_matches(';').parse().ok())
+        .expect("could not parse KV_CHUNK");
+    assert_eq!(
+        want,
+        nn::DECODE_KV_CHUNK,
+        "shader KV_CHUNK and nn::DECODE_KV_CHUNK disagree"
+    );
+}
+
+#[test]
+fn decode_matches_the_reference_and_the_general_kernel() {
+    with_gpu(|rt| {
+        // Head dims, windows and offsets chosen to cross a chunk boundary
+        // (KV_CHUNK = 256) rather than sit inside one: the multi-chunk rescale
+        // is the whole point of this path and a single-chunk case would not
+        // exercise it.
+        let cases: &[(Shape, Option<usize>, u32)] = &[
+            // Global, several chunks, decode offset at the end of the history.
+            (
+                Shape {
+                    b: 1,
+                    tq: 1,
+                    tkv: 1000,
+                    h: 2,
+                    hkv: 1,
+                    d: 512,
+                },
+                None,
+                999,
+            ),
+            // Exactly on a chunk boundary.
+            (
+                Shape {
+                    b: 1,
+                    tq: 1,
+                    tkv: 512,
+                    h: 2,
+                    hkv: 1,
+                    d: 512,
+                },
+                None,
+                511,
+            ),
+            // One short of a boundary, so the last chunk is partial.
+            (
+                Shape {
+                    b: 1,
+                    tq: 1,
+                    tkv: 257,
+                    h: 4,
+                    hkv: 2,
+                    d: 128,
+                },
+                Some(1024),
+                256,
+            ),
+            // Window narrower than the history: whole leading chunks are masked.
+            (
+                Shape {
+                    b: 2,
+                    tq: 1,
+                    tkv: 900,
+                    h: 4,
+                    hkv: 2,
+                    d: 128,
+                },
+                Some(300),
+                899,
+            ),
+            // Window narrower than one chunk.
+            (
+                Shape {
+                    b: 1,
+                    tq: 1,
+                    tkv: 800,
+                    h: 4,
+                    hkv: 1,
+                    d: 256,
+                },
+                Some(64),
+                799,
+            ),
+            // GQA with a group of 4.
+            (
+                Shape {
+                    b: 1,
+                    tq: 1,
+                    tkv: 700,
+                    h: 8,
+                    hkv: 2,
+                    d: 128,
+                },
+                Some(1024),
+                699,
+            ),
+            // A single key: the degenerate one-chunk, one-term case.
+            (
+                Shape {
+                    b: 1,
+                    tq: 1,
+                    tkv: 1,
+                    h: 2,
+                    hkv: 1,
+                    d: 128,
+                },
+                Some(8),
+                0,
+            ),
+        ];
+        for (i, &(s, window, q_off)) in cases.iter().enumerate() {
+            let (dec, gen, want) = run_decode(rt, s, window, q_off, 0, 0.125, 0x2000 + i as u64);
+            check(&format!("decode[{i}] d={} w={window:?}", s.d), &dec, &want);
+            check(&format!("general[{i}] d={} w={window:?}", s.d), &gen, &want);
+        }
+    });
+}
+
+/// A query with nothing unmasked must be zeros, not NaN — the same rule the
+/// general kernels follow, and the case where the rescale would compute
+/// `exp(-inf - -inf)` if it were not guarded.
+#[test]
+fn decode_emits_zeros_for_a_fully_masked_query() {
+    with_gpu(|rt| {
+        // kv_pos_offset pushes every key past the query position, so the causal
+        // rule masks all of them.
+        let s = Shape {
+            b: 1,
+            tq: 1,
+            tkv: 600,
+            h: 2,
+            hkv: 1,
+            d: 128,
+        };
+        let (dec, gen, _) = run_decode(rt, s, Some(1024), 0, 5000, 0.125, 0x3001);
+        for (i, v) in dec.iter().enumerate() {
+            assert!(v.is_finite(), "decode[{i}] is {v}, want a finite zero");
+            assert_eq!(*v, 0.0, "decode[{i}] = {v}, want 0");
+        }
+        for (i, v) in gen.iter().enumerate() {
+            assert_eq!(*v, 0.0, "general[{i}] = {v}, want 0");
+        }
+    });
+}
+
 /// Prefill: `Tq == Tkv`, both offsets zero, window wide enough to be inert —
 /// so this is plain causal attention and isolates the tiling from the masking.
 #[test]

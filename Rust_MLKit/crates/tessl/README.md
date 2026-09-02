@@ -207,22 +207,301 @@ sequenceDiagram
 
 ---
 
-## Performance vs. PyTorch MPS
+## Performance vs. PyTorch MPS and MLX
 
-Measurements taken on Apple M5 Pro utilizing `bench/paired_cross_runtime.py`. The benchmark harness interleaves `tessl` and PyTorch MPS iterations round-by-round to cancel GPU thermal throttling and frequency scaling drift.
+Apple M5 Pro, via [`bench/paired_cross_runtime.py`](bench/paired_cross_runtime.py).
+The harness interleaves the tessl and comparison lanes **round by round** rather
+than running each sweep once, because two single sweeps of the identical
+benchmark disagreed by 16–21% on the torch lane alone — more than most of the
+differences being reported. Every geomean below covers the **whole 8-shape
+ladder**; the run aborts rather than averaging over the shapes that happened to
+report. Artifact: [`bench/results/gemm_speed_ladder_m5pro.json`](bench/results/gemm_speed_ladder_m5pro.json).
 
-*Geomean of per-shape medians over 5 rounds across an 8-shape ladder:*
+*Geomean of per-shape medians, 5 alternating rounds × 30 iterations, 8 shapes:*
 
-| Precision Mode | vs. PyTorch MPS | Worst Shape | Best Shape | Peak Throughput (M5 Pro) |
+| Precision Mode | vs. torch MPS | worst shape | best shape | vs. MLX |
 |---|---|---|---|---|
-| **bf16 → f32 accumulate** | **1.11×** *(Outperforms MPS)* | 1.01× | 1.22× | **29,022 GFLOP/s** (`square_4096`) |
-| **f32 exact** | **1.07×** | 0.92× | 1.47× | **10,897 GFLOP/s** (`square_2048`) |
-| **tf32-relaxed vs. PyTorch f32** | **2.01×** | 1.49× | 2.90× | **18,040 GFLOP/s** (`square_4096`) |
+| **bf16 → f32 accumulate** | **1.00×** | 0.91× | 1.06× | 2.67× |
+| **f32 exact** | **1.07×** | 0.90× | 1.62× | 0.98× |
+| **tf32-relaxed** vs. their **f32** | **2.10×** | 1.61× | 2.31× | 1.94× |
+
+| Lane | Peak GFLOP/s | at |
+|---|---|---|
+| `tensorops-bf16` | **26,702** | `square_4096` |
+| `mps-bf16` | 26,104 | `mlp_up` |
+| `tensorops-tf32` | **15,872** | `tall_k1024` |
+| `mlx-bf16` | 6,850 | `tall_k1024` |
+| `mlx-f32` | 6,665 | `mlp_up` |
+| `mps-f32` | 6,524 | `mlp_up` |
+| `tensorops-f32` | **6,492** | `mlp_down` |
+| `simdgroup-f32` | 2,710 | `tall_k1024` |
 
 > [!WARNING]
-> **Benchmarking Rigor:**
-> - **Clock Drift:** Single-run cross-runtime benchmarks can fluctuate by 15–20% on identical workloads due to Apple Silicon dynamic power governor adjustments. Always use paired, interleaved sweeps (`bench_gemm_tnnt_tune` or `paired_cross_runtime.py`).
-> - **Dispatch Floor:** Below ~2 GFLOP of total work, both runtimes hit a ~0.25 ms host submit-and-wait floor, measuring host driver dispatch latency rather than raw shader throughput.
+> **The bf16 row is a correction.** This table previously claimed **1.11×
+> "(Outperforms MPS)"** for bf16. Re-measured over the full ladder it is
+> **1.00×** (5 rounds), and **1.03×** on an independent 9-round × 40-iteration
+> confirmation. tessl bf16 is at *parity* with torch MPS bf16, not ahead of it.
+>
+> The structure matters more than the geomean. Per shape, tessl bf16 wins only
+> on the two smallest squares — 1.26× at 512³ and 1.34× at 1024³, both with
+> per-round spreads reaching 2.15× and 3.38× — and sits at **0.86×–0.95× on
+> `mlp_up`, `square_4096`, `qkv_proj` and `tall_k1024`**. The small squares are
+> the dispatch-floor regime this file's own note warns about, so the geomean was
+> being carried by exactly the shapes that measure host submit latency rather
+> than shader throughput. On the shapes that determine training throughput,
+> torch MPS bf16 is marginally ahead.
+
+Reading the rest:
+
+- **tf32-relaxed's 2.10×** is the one large, robust win, and it reproduces the
+  previously recorded 2.01× within round-to-round noise. It is *not* a
+  like-for-like comparison — see the accuracy section directly below.
+- **f32 exact at 1.07×** also reproduces its prior figure, but the spread is
+  wide (0.90×–1.62×) and the win is concentrated at 512³; from 2048³ up it is
+  0.92×–1.06×, i.e. parity.
+- **The 2.67× over MLX bf16 says more about MLX than about tessl.** MLX's bf16
+  matmul peaks at 6,850 GFLOP/s here against torch MPS's 26,104 — roughly 4×
+  slower — so it is the weak baseline of the two. torch MPS is the one worth
+  measuring against, and there the honest answer is parity.
+- **Absolute GFLOP/s did not reproduce** the previously recorded peaks (29,022
+  bf16 / 10,897 f32 / 18,040 tf32). That is the quantity the paired design
+  explicitly says not to compare across runs — thermal state and background load
+  move it — which is why the ratios above are the durable claim and these peaks
+  are reported only as same-run context.
+
+> [!NOTE]
+> **Benchmarking rigor.**
+> - **Dispatch floor.** Below ~2 GFLOP of total work, both runtimes hit a
+>   ~0.25 ms host submit-and-wait floor, measuring driver dispatch latency rather
+>   than shader throughput. `square_512` is near that floor and its ratios should
+>   not be read as kernel performance — see the bf16 correction above for what
+>   happens when they are.
+> - **Clock drift.** Single-run cross-runtime benchmarks fluctuate 15–20% on
+>   identical workloads under the Apple Silicon power governor. Always use a
+>   paired, interleaved sweep — `paired_cross_runtime.py` for cross-runtime, or
+>   `bench_gemm_coop_ab` / `bench_gemm_tnnt_tune` for kernel-vs-kernel A/B.
+
+## Flash attention
+
+The three attention kernels had thorough correctness coverage and **no timing
+lane at all**. [`bench_flash_attn`](src/bin/bench_flash_attn.rs) and
+[`bench/attn_paired.py`](bench/attn_paired.py) closed that over 10 prefill and
+decode configurations at 4:1 GQA — and the measurement found the kernels were
+**11× slower than torch-MPS and 20.5× slower than MLX**, geomean, with a worst
+case of 271×. Both causes are now fixed.
+
+**Shipping path vs. the baselines, 5 alternating rounds × 20 iterations.
+>1 means tessl is slower.**
+
+| Config | torch before | torch after | MLX before | MLX after |
+|---|---|---|---|---|
+| `swa128_prefill_512` | 7.1× | **0.78×** | 9.4× | 1.21× |
+| `swa128_prefill_2048` | 7.7× | **1.67×** | 8.1× | 1.67× |
+| `swa128_prefill_4096` | 4.4× | **0.89×** | 4.8× | 0.94× |
+| `swa256_prefill_2048` | 4.6× | **0.88×** | 8.6× | 1.66× |
+| `global512_prefill_1024` | 35.1× | **1.59×** | 54.8× | 2.54× |
+| `swa128_decode_1k` | 23.7× | **1.44×** | 27.0× | 2.40× |
+| `swa128_decode_4k` | 14.6× | **0.89×** | 22.8× | 1.94× |
+| `swa128_decode_b8_4k` | 2.7× | **0.30×** | 9.9× | 1.06× |
+| `swa256_decode_4k` | 24.7× | **0.83×** | 47.3× | 1.95× |
+| `global512_decode_4k` | 29.1× | **0.17×** | 271.1× | 1.69× |
+| **GEOMEAN** | **11.0×** | **0.79×** | **20.5×** | **1.63×** |
+
+Against torch-MPS the shipping path is now **faster than the baseline** on 8 of
+10 configs; against MLX it is 1.63× slower, down from 20.5×. Artifacts:
+[before](bench/results/attn_speed_m5pro.json),
+[after](bench/results/attn_speed_routed_m5pro.json).
+
+### What was wrong, and what replaced it
+
+Both causes were visible at the dispatch in [`nn.rs`](src/nn.rs): a grid of
+`ceil(Tq/BR) × B·H` threadgroups of **32 threads**, with the inner loops guarded
+by `row_valid = lid < BR`.
+
+**1. Decode was starved of parallelism.** No split over the KV axis, so
+single-sequence decode launched `B·H` threadgroups — **8** for
+`global512_decode_4k` — each walking a 4,096-key history serially, and at
+`Tq = 1` only **one lane in 32** was row-valid. The slowdown tracked threadgroup
+count almost monotonically: 8 → 271×, 16 → 47×, 32 → 27×, 256 → 10×.
+
+→ [`flash_attn_decode.metal`](kernels/flash_attn_decode.metal), FlashDecoding:
+one simdgroup per KV chunk, so the grid is `n_chunks × B·H`. Each chunk emits
+`(m, l, acc[D])` and a second pass combines them with the exact rescale.
+
+**2. Prefill had grid but not throughput.** `swa128_prefill_4096` launched
+16,384 threadgroups and was still 4.8× slower than MLX, so occupancy was not the
+binding constraint there — **8 of 32 lanes doing scalar FMAs** was. It ran at
+**241 GFLOP/s, 3.7% of this machine's own f32 GEMM peak**, against MLX at 998.
+
+→ [`flash_attn_rows.metal`](kernels/flash_attn_rows.metal): one simdgroup per
+query *row*, lane `L` owning head dims `L, L+32, L+64, …`. Prefill went to
+**984–1343 GFLOP/s**, 4.5–21× faster than the tiled kernel:
+
+| Config | tiled | row-parallel | speedup | GFLOP/s |
+|---|---|---|---|---|
+| `swa128_prefill_512` | 10.6 ms | 1.65 ms | 6.4× | 203 → 1306 |
+| `swa128_prefill_2048` | 123.5 ms | 23.3 ms | 5.3× | 209 → 1109 |
+| `swa128_prefill_4096` | 293.5 ms | 61.1 ms | 4.8× | 205 → 984 |
+| `swa256_prefill_2048` | 135.3 ms | 24.8 ms | 5.5× | 191 → 1039 |
+| `global512_prefill_1024` | 177.7 ms | 8.3 ms | **21.4×** | 48 → 1036 |
+
+Both new kernels share one design, and three properties do the work:
+
+- **every lane is live**, and the K/V reads are one coalesced 128-byte line per
+  simdgroup step;
+- **the P@V accumulate needs no cross-lane communication** — each lane owns its
+  own slice of the output row in registers, so there is no `Oacc` threadgroup
+  array and no barrier around it;
+- a score is one `simd_sum`, which every lane then holds, so the online-softmax
+  state is uniform and the kernels are divergence free.
+
+The row-parallel kernel gains a fourth: because a simdgroup owns *one* row
+rather than a BR tile, it walks that row's exact key range. The tiled kernel had
+to take the union window over its rows and mask inside it, so it iterated key
+blocks that were fully masked for most of the tile. Here masked keys are never
+visited.
+
+### Routing
+
+`flash_attn_swa` and `flash_attn_global_h512` now pick the kernel:
+
+```rust
+if tq == 1 && B*H < ATTN_SPLIT_KV_BELOW_TG { decode } else { rows }
+```
+
+The threshold is 128 threadgroups, measured rather than guessed: at `B·H = 8`
+the KV split wins 0.59 ms against 2.29, at 16 it wins 0.61 against 0.68, at 32
+the two are within noise, and at 256 the split *loses* 0.96 against 0.65 because
+the grid is already full and its second pass is pure overhead.
+
+The tiled kernels remain as [`flash_attn_swa_tiled`](src/nn.rs) /
+`flash_attn_global_h512_tiled` — they are the A/B baseline the benchmark
+measures against and the second opinion the tests score against, not dead code.
+`TESSL_ATTN_TILED=1` forces them.
+
+### Correctness
+
+Both new paths are scored against the same f64 reference as everything else, and
+match the kernel they replace to the digit (5.117e-07 vs 5.117e-07 at
+`swa128_decode_4k`). [`tests/attention.rs`](tests/attention.rs) grew from 6 tests
+to 12: seventeen shape/window/GQA cases across the two paths, `Tq` values that
+straddle the rows-per-threadgroup boundary, windows narrower than one chunk,
+cross-attention shapes where `Tq != Tkv`, fully-masked queries that must yield
+zeros rather than `exp(-inf - -inf)` NaN, and two shader-constant cross-checks
+(`KV_CHUNK`, `SG_PER_TG`) where a drift between the host's copy and the
+shader's would silently drop rows or read partials at the wrong stride.
+
+> [!NOTE]
+> The existing `global_h512_is_causal_and_ignores_the_window` test caught a real
+> regression during this work. The tiled h512 kernel has no `window` parameter,
+> so that entry point's contract is to ignore one; the routed kernels take a
+> `window` and treat 0 as global. Passing `dims` through unchanged would have
+> given callers sliding-window attention from the global entry point. The global
+> path now zeroes the window before routing.
+
+---
+
+### What each speed ratio costs in accuracy
+
+A speed ratio is only a claim if the lane producing it is as correct as the lane
+it is measured against, so the two are reported together.
+
+[`bench/parity_ladder.py`](bench/parity_ladder.py) sweeps a grid of **8 shapes ×
+5 operand distributions × 4 seeds = 320 scored cells per lane**, scoring each
+against a float64 reference computed per cell, alongside MLX and torch on those
+same operands. Artifact:
+[`bench/results/gemm_parity_grid_m5pro.json`](bench/results/gemm_parity_grid_m5pro.json).
+
+Three numbers are reported per lane, because they answer different questions and
+disagree by orders of magnitude:
+
+| Lane | Out | normwise | worst element | budget used |
+|---|---|---|---|---|
+| `tensorops-f32` | f32 | 5.109e-06 | 1.04e+02 | **0.079×** |
+| `simdgroup-f32` / `mlx-f32` / `torch-mps-f32` | f32 | 5.109e-06 | 1.04e+02 | 0.079× |
+| `tensorops-tf32` | f32 | 1.517e-03 | 2.94e+04 | **0.238×** |
+| `tensorops-bf16` | f32 | 5.469e-03 | 3.08e+05 | **0.936×** |
+| `mlx-bf16` / `torch-mps-bf16` | bf16 | 7.145e-03 | 3.08e+05 | 0.921× |
+
+- **normwise** = max\|err\| / max\|ref\|. This is the only number this harness
+  used to report, and the only one the table above used to carry.
+- **worst element** = max per-element relative error. Where cancellation makes an
+  output near zero, a bf16 result can be wrong by **3.08e+05 relative** while the
+  normwise figure reads 5.5e-03. Both are correct; they describe different
+  things, and quoting only the first invites the reader to conclude individual
+  outputs are good to ~0.5%. They are not.
+- **budget used** = the fraction of the per-element bound
+  `(γ_{K+8} + 2·u_in)·Σ\|a·b\| + u_out·\|ref\|` that the lane consumes — the same
+  bound [`tests/common/mod.rs`](tests/common/mod.rs) asserts against. **This is
+  the number that decides pass or fail**, and exceeding 1.0 aborts the run.
+
+#### The operand distribution is a benchmark input, and it dominates
+
+The grid sweeps `uniform`, `normal`, `log_uniform`, `near_cancel` and
+`heavy_tail`. Uniform operands — all this harness used to run — are the *easiest*
+case: magnitudes sit within one order of each other, so every partial sum stays
+well scaled. Budget consumed, worst cell per distribution:
+
+| Lane | uniform | normal | log_uniform | near_cancel | heavy_tail | spread |
+|---|---|---|---|---|---|---|
+| `tensorops-f32` | 0.009× | 0.011× | 0.035× | 0.050× | 0.079× | **9.0×** |
+| `tensorops-tf32` | 0.026× | 0.032× | 0.114× | 0.096× | 0.238× | **9.2×** |
+| `tensorops-bf16` | 0.076× | 0.103× | 0.413× | 0.063× | **0.936×** | **14.9×** |
+
+**bf16 runs at 93.6% of its error budget under heavy-tailed operands, and at
+7.6% under uniform.** Reporting only the uniform figure understated budget
+consumption by ~15× and left the impression of 92% headroom where the true worst
+case has 6%. MLX and torch bf16 land at 0.921× on the same cell, so this is bf16
+arithmetic reaching its theoretical bound rather than a tessl defect — but it is
+a property of the format that a single-distribution benchmark could not see.
+
+Note the two axes move in *opposite* directions: for f32, larger shapes consume
+*less* budget (0.009× at 512³ down to 0.002× at 4096³, because the γ_K bound
+grows faster than the realised error), while heavier-tailed operands consume
+~9× more. Sweeping one axis alone is misleading in either direction.
+
+Reading the three speed rows against these:
+
+- **f32 exact — 1.07× is like-for-like.** `tensorops-f32` is **bit-identical** to
+  torch-MPS and to the simdgroup fallback at every shape measured, and to MLX at
+  1024/2048/4096 (MLX diverges only at `square_512`, where it is slightly *more*
+  accurate — a different kernel path at small sizes). All four consume the same
+  0.079× of budget.
+- **bf16 → f32 accumulate — the accuracy edge over MLX/torch is real but small.**
+  tessl is closer to the reference at every cell (normwise 5.47e-03 vs 7.15e-03),
+  partly because it returns f32 where they return bf16, which is why the scorer
+  records `out_dtype` per lane. On budget consumed the three are within 2%.
+- **tf32-relaxed — 2.10× costs 0.238× of budget** against f32's 0.079×, i.e.
+  ~3× the headroom consumed, and up to 2.94e+04 worst-element relative error.
+  Sound for a tolerance-bearing workload, not a drop-in f32 result — which is
+  why the mode is opt-in (`set_relaxed_precision`) rather than default.
+
+> [!NOTE]
+> Bit-inequality with another runtime is **not** an error signal here and is not
+> scored. Reduced-precision lanes can never match f32 bit-for-bit by
+> construction, and even two f32 lanes differ constantly from summation order
+> alone: at M=N=256, K=1024, `probe_gemm_parity` reports 57,091 of 65,536
+> elements differing between the TensorOps and CPU f32 lanes while both sit at
+> max error 6.335e-5 against the f64 reference.
+
+> [!IMPORTANT]
+> **The parity path is fail-closed at every step.** `bench_gemm_sweep` pre-zeroes
+> C so a lane that writes nothing scores as out-of-tolerance rather than
+> inheriting the previous lane's result, refuses to dump a non-finite result or
+> non-finite operands, and writes its `parity_manifest.json` *last and only on
+> success*. The scorer exits non-zero on a missing lane, seed or grid cell, a
+> shape mismatch, a non-finite value, a degenerate reference, a lane with no
+> declared unit roundoff, or **any lane exceeding its per-element budget** — and
+> when a budget is breached it names whether tessl alone, the comparison runtime
+> alone, or every runtime exceeded it, because those call for opposite responses.
+>
+> [`bench/test_parity_harness.py`](bench/test_parity_harness.py) holds **56
+> assertions** against that whole class — adversarial dumps, grid-merge cases,
+> budget verdicts and CLI/env contracts. Only the CLI section needs a GPU:
+>
+> ```bash
+> python3 bench/test_parity_harness.py
+> ```
 
 ---
 
@@ -335,9 +614,17 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 | `bench_gemm_tnnt_tune` | TN/NT tile sweep; the paired, round-interleaved A/B comparison lane. |
 | `bench_gemm_tile_tune` | Exhaustive tile geometry ($SM \times SN$) and $BK$ ladder benchmark. |
 | `bench_gemm_tnnt_tune` | Paired A/B tuning evaluation for TN/NT descriptor and accumulate kernels. |
-| `bench_gemm_sweep` | Automated cross-runtime sweep (`f32`, `tf32`, `bf16`) with JSON telemetry output. |
+| `bench_gemm_sweep` | Cross-runtime GEMM timing (`f32`, `tf32`, `bf16`), JSON out. `--dump-parity DIR` writes operands and every lane's result for the numeric scorer. |
+| `bench_flash_attn` | The attention kernels over 10 prefill/decode configs, timing the tiled baseline, the shipping routed path, and each fast kernel in one run. `--dump-parity DIR` writes Q/K/V/O for the f64 scorer. |
 | `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against reference SIMD implementations. |
-| `bench/paired_cross_runtime.py` | Python harness driving paired `tessl` vs. PyTorch MPS / MLX evaluation. |
+| `bench_nn_kernels` | RMSNorm, MLP gating, Q4/Q8 GEMV, reductions. |
+| `bench/paired_cross_runtime.py` | Paired, round-interleaved `tessl` vs. PyTorch MPS / MLX GEMM evaluation. |
+| `bench/parity_ladder.py` | Drives the GEMM numeric check across the shape × distribution grid. |
+| `bench/flash_attn_torch_mlx.py` | torch-MPS and MLX SDPA lanes plus the f64 attention reference. |
+| `bench/attn_paired.py` | Paired, round-interleaved attention evaluation. |
+| `bench_gemm_variants` | TN / NT / accumulate / split-K / batched / epilogue / f16 GEMM lanes. |
+| `bench/kernel_coverage.py` | Measures which kernels the suite actually dispatches, via `TESSL_KERNEL_TRACE`. `--check` gates on 100%. |
+| `bench/test_parity_harness.py` | Adversarial tests for every harness. Only the CLI sections need a GPU. |
 
 ---
 
@@ -358,6 +645,22 @@ All runtime configuration parameters use the canonical `TESSL_*` prefix. Legacy 
 | `TESSL_ICB_FREEZE_BINDS` | `0` | Freezes argument table buffer bindings directly into ICB commands. |
 | `TESSL_ICB_RANGE_BATCH` | `0` | Coalesces contiguous ICB command ranges into single execution dispatches. |
 | `TESSL_SKIP_AOT` | `0` | Bypasses `build.rs` AOT shader compilation and reuses existing `default.metallib`. |
+
+Benchmark-only variables, read by the sweep binaries rather than the runtime.
+All of them **fail loud** on a malformed or unknown value rather than falling
+back to the default silently.
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `BENCH_ITERS` / `BENCH_WARMUP` | `50` / `10` | Timed iterations and warmup per lane. `BENCH_ITERS` must be ≥ 1. |
+| `BENCH_SHAPES` | built-in ladder | `MxNxK,…` override for the GEMM timing sweep. Rejected alongside `--dump-parity`, which selects its shape by label. |
+| `BENCH_PARITY_SHAPE` | `square_1024` | Ladder label the GEMM parity dump scores. |
+| `BENCH_PARITY_DIST` | `uniform` | Operand distribution: `uniform`, `normal`, `log_uniform`, `near_cancel`, `heavy_tail`. |
+| `BENCH_PARITY_SEEDS` | `8` | Operand draws per parity dump. Must be ≥ 1. |
+| `BENCH_ATTN_CFGS` | all | Comma-separated attention config labels. |
+| `BENCH_ATTN_DIST` | `uniform` | Operand distribution for the attention sweep. |
+| `TESSL_KERNEL_TRACE` | unset | Records every kernel a run dispatches, for `bench/kernel_coverage.py`. One relaxed load on the dispatch path when unset. |
+| `TESSL_ATTN_TILED` | unset | Forces the original BR-tiled attention kernels instead of the row-parallel / KV-split ones. A/B only; the tiled path is 4.8–21× slower. |
 
 ---
 
@@ -422,6 +725,64 @@ Four of the six entries here have since shipped: the [fused epilogue](#-fused-ge
 | **No CPU fallback** | No Metal 4 device means nothing runs. | Deliberate: the crate is an Apple-silicon runtime, and a silent CPU path would make "GPU" benchmarks meaningless. |
 
 The typed `nn` API covers 11 kernels in depth (RMSNorm, MLP gating, Q8 GEMV, KV stores) and the remaining promoted ones through shape-checked entry points; the MLX Q4 family is reached via `Q4MlxBank` rather than 15 separate signatures.
+
+### Benchmark coverage: 84/84, measured
+
+Every kernel entry point in the shipped metallib is dispatched by a benchmark.
+That is measured rather than claimed: `TESSL_KERNEL_TRACE=1` makes the runtime
+record every name passed to `GpuRuntime::pipeline` — the single site where a
+kernel is selected — and each bench binary prints its trace on exit, on every
+exit path including early returns and errors.
+
+```bash
+python3 bench/kernel_coverage.py --check   # non-zero if any kernel is unmeasured
+```
+
+| Suite | Kernels dispatched |
+|---|---|
+| `bench_nn_kernels` | 44 |
+| `bench_gemm_variants` (+`TESSL_GEMM_ACCUM`) | 23 |
+| `bench_gemm_sweep` (timing + `--dump-parity`) | 12 |
+| `bench_flash_attn` | 3 |
+| **union** | **84 / 84** |
+
+> [!WARNING]
+> **This section previously published wrong numbers** — "67 kernel entry
+> points", "28 of 67 untimed", later "25 of 67". All three were wrong in both
+> directions, and the tooling that produced them was the reason:
+>
+> - **The census was wrong.** A scan for `^kernel void` misses every kernel
+>   declared through the `NN_COOP_KERNEL` / `TN_NT_COOP_KERNEL` macro families —
+>   16 entry points, including every `_64x64_sg4` cooperative variant. The true
+>   count is **84**, confirmed against `xcrun metal-nm default.metallib`.
+> - **Coverage was inferred, not measured.** Grepping a kernel's name out of the
+>   bench sources reported `matmul2d_tensorops_*` as untimed (it is reached
+>   through a dispatcher) and a name in a comment as timed.
+>
+> Measured from a clean start, the real figure was **22 of 84 (26%)**. The
+> inventory is now cross-checked against the compiled metallib and **fails**
+> rather than undercounting if the two disagree, or if a kernel-declaring macro
+> appears that the scan cannot parse.
+
+What closing the gap took, and what it found:
+
+- **`bench_gemm_variants`** (new) — TN, NT, their accumulating and split-K
+  forms, strided-batched, the fused epilogue and the f16 operand path: 18
+  kernels including both layouts the backward pass runs on. No cross-runtime
+  lane here on purpose — `a.T @ b` in torch or MLX may materialise the
+  transpose rather than fuse it, so a ratio would compare tessl's fused kernel
+  against transpose-plus-GEMM and read as a kernel result.
+- **`bench_nn_kernels`** (extended) — the 19-kernel MLX-format Q4 family, the
+  fused RMSNorm+QKV+RoPE variants, KV-cache stores, the sampling tail,
+  embedding lookup, typed copies and reverse casts.
+- Two selectors had to be enumerated rather than sampled: `Q4MlxRowVariant`,
+  `Q4MlxLayout` and `QkvRopeVariant` each *select a kernel* rather than hint at
+  one, so a lane that fixes them measures one entry point and silently leaves
+  its siblings unmeasured. That is precisely how they came to be uncovered.
+- `matmul2d_tensorops_*_64x64_sg4` needs `N <= 512`, and the bf16 TN/NT
+  entry points need `PrecisionMode::Bf16` — a lane calling `gemm_tn_train`
+  under `F32` silently measures the f32 kernel and reports it under a bf16
+  name.
 
 ---
 

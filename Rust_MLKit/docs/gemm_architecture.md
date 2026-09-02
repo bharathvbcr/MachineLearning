@@ -117,6 +117,96 @@ GEMM_FUZZ_SEED=0xdeadbeef GEMM_FUZZ_CASES=1200 \
   cargo test --release --lib -- --test-threads=1 --nocapture gemm_randomized_shape_fuzz
 ```
 
+```bash
+# Cross-runtime numeric parity over the whole ladder. A job of its own, not a
+# side effect of the timing sweep: every lane, every operand draw, scored
+# against a per-draw f64 reference alongside MLX and torch. Covers f32 exact,
+# tf32-relaxed and bf16 -- the dump was once filtered to `-f32` lane names,
+# which left the two reduced-precision lanes unscored while the report still
+# printed clean.
+#
+# The driver walks one label at a time (dump -> score -> delete). The ladder at
+# eight draws is ~12 GB of .npy if dumped at once; streaming caps peak disk at
+# one shape, ~3.5 GB at the widest.
+cd Rust_MLKit/crates/tessl
+python3 bench/parity_ladder.py --dists all --seeds 4 \
+    --out bench/results/gemm_parity_grid_m5pro.json
+```
+
+```bash
+# One shape, if that is all you need. The driver above is this, in a loop.
+BENCH_PARITY_SHAPE=mlp_down BENCH_PARITY_DIST=heavy_tail BENCH_PARITY_SEEDS=8 \
+  cargo run --release --bin bench_gemm_sweep -- --dump-parity /tmp/parity
+python3 bench/gemm_sweep_mlx.py --parity-dir /tmp/parity
+```
+
+```bash
+# The harness itself: 21 fabricated adversarial dumps (missing lane, missing
+# seed, NaN result, shape mismatch, degenerate reference, malformed manifest,
+# no-op lane, over-budget lane), grid-merge cases, budget verdicts and CLI/env
+# contracts -- 56 assertions. Only the CLI section needs a GPU, and it announces
+# a skip rather than passing vacuously.
+python3 bench/test_parity_harness.py
+```
+
+Measured on M5 Pro over an **8 shape x 5 distribution x 4 seed grid**
+(`bench/results/gemm_parity_grid_m5pro.json`), 320 scored cells per lane. Three
+numbers per lane, because they answer different questions:
+
+| lane | out | normwise | worst element | budget used | worst cell |
+|---|---|---|---|---|---|
+| `tensorops-f32` | f32 | 5.109e-06 | 1.04e+02 | 0.079x | `mlp_up`/heavy_tail |
+| `simdgroup-f32` / `mlx-f32` / `torch-mps-f32` | f32 | 5.109e-06 | 1.04e+02 | 0.079x | `mlp_up`/heavy_tail |
+| `tensorops-tf32` | f32 | 1.517e-03 | 2.94e+04 | 0.238x | `mlp_up`/heavy_tail |
+| `tensorops-bf16` | f32 | 5.469e-03 | 3.08e+05 | 0.936x | `mlp_up`/heavy_tail |
+| `mlx-bf16` / `torch-mps-bf16` | bf16 | 7.145e-03 | 3.08e+05 | 0.921x | `mlp_up`/heavy_tail |
+
+`normwise` is max|err| / max|ref| -- the only number this harness used to
+report. It cannot see a per-element failure: where cancellation drives an output
+near zero, a bf16 result is wrong by **3.08e+05 relative** while normwise reads
+5.5e-03. `budget used` is the fraction of `(gamma_{K+8} + 2*u_in)*sum|a.b| +
+u_out*|ref|` consumed -- the same per-element bound `tests/common/mod.rs`
+asserts -- and it is what decides pass or fail. Above 1.0 the run aborts.
+
+**The operand distribution is a benchmark input and it dominates.** Uniform
+operands, all this harness used to run, are the easiest case. Budget consumed,
+worst cell per distribution:
+
+| lane | uniform | normal | log_uniform | near_cancel | heavy_tail | spread |
+|---|---|---|---|---|---|---|
+| `tensorops-f32` | 0.009x | 0.011x | 0.035x | 0.050x | 0.079x | 9.0x |
+| `tensorops-tf32` | 0.026x | 0.032x | 0.114x | 0.096x | 0.238x | 9.2x |
+| `tensorops-bf16` | 0.076x | 0.103x | 0.413x | 0.063x | **0.936x** | **14.9x** |
+
+bf16 runs at 93.6% of its error budget under heavy-tailed operands and 7.6%
+under uniform -- a single-distribution benchmark understated it ~15x. MLX and
+torch bf16 hit 0.921x on the same cell, so this is bf16 arithmetic reaching its
+theoretical bound, not a tessl defect. The two axes move oppositely: for f32,
+larger shapes consume *less* budget (0.009x at 512^3 to 0.002x at 4096^3,
+because the gamma_K bound grows faster than the realised error) while heavier
+tails consume ~9x more. Sweeping one axis alone misleads in either direction.
+
+`tensorops-f32` is bit-identical to torch-MPS and to the simdgroup fallback at
+every shape measured, and to MLX at 1024/2048/4096; MLX diverges only at
+`square_512`, where it is slightly more accurate (5.62e-07 vs 9.85e-07) -- a
+different kernel path at small sizes.
+
+Bit-inequality is not scored: reduced-precision lanes cannot match f32
+bit-for-bit by construction, and two f32 lanes differ constantly from summation
+order alone while sitting at identical distance from the reference.
+
+Every stage fails closed. `bench_gemm_sweep` pre-zeroes C, refuses non-finite
+operands or results, rejects `BENCH_SHAPES` alongside `--dump-parity` and an
+unknown `BENCH_PARITY_SHAPE` / `BENCH_PARITY_DIST`, and writes its manifest last
+and only on success. The scorer exits non-zero on a missing lane, seed or grid
+cell, a shape mismatch, a non-finite value, a degenerate reference, a lane with
+no declared unit roundoff, or any lane over budget -- and a budget breach names
+whether tessl alone, the comparison runtime alone, or every runtime exceeded it,
+because those call for opposite responses. The ladder driver enforces the same
+whole-grid rule across cells and cross-checks the Rust `SHAPES` ladder and the
+requested distribution against every dump, which is what caught a stale binary
+silently dumping `square_1024` for every label during development.
+
 The fuzz fails if any selectable NN kernel is chosen for under 1% of cases. That
 assertion is load-bearing: the first version of the fuzz passed three injected
 coop-kernel faults because independent per-dimension sampling reached the gate
@@ -140,8 +230,30 @@ rather than printing a page of `skip(pipe)` and exiting 0.
 |---|---|
 | `bench_gemm_coop_ab` | Paired, **interleaved** kernel A/B. Use this for kernel comparisons. |
 | `bench_gemm_tile_tune` | Broad tile/BK ladder. Blocked-style timing — see the warning below. |
-| `bench_gemm_sweep` | Cross-runtime lane (f32 exact / tf32 / bf16), JSON out. |
-| `bench/paired_cross_runtime.py` | Alternates the tessl and torch/MLX lanes round by round. |
+| `bench_gemm_sweep` | Cross-runtime timing lane (f32 exact / tf32 / bf16), JSON out. |
+| `bench_gemm_sweep --dump-parity DIR` | Separate job, no timing: every lane x `BENCH_PARITY_SEEDS` draws at `BENCH_PARITY_SHAPE`, plus the manifest the scorer validates against. |
+| `bench/parity_ladder.py` | Drives the above across the whole ladder, one shape at a time, and merges. Use this for the accuracy numbers. |
+| `bench/test_parity_harness.py` | Adversarial cases for every harness. Only the CLI sections need a GPU. |
+| `bench_gemm_variants` | TN / NT / accumulate / split-K / batched / epilogue / f16 lanes -- the 18 GEMM kernels the cross-runtime sweep cannot reach. |
+| `bench/kernel_coverage.py` | Measures which kernels the suite dispatches (`TESSL_KERNEL_TRACE`), cross-checked against `metal-nm default.metallib`. `--check` gates on 100%. |
+| `bench_flash_attn` + `bench/attn_paired.py` | The attention kernels, prefill and decode. The benchmark found them 11x (torch) / 20.5x (MLX) slower, geomean, worst case 271x; both causes were dispatch geometry rather than arithmetic, and the row-parallel + KV-split rewrites brought the shipping path to 0.79x / 1.63x. See the tessl README. |
+| `bench/paired_cross_runtime.py` | Alternates the tessl and torch/MLX lanes round by round. Aborts rather than reporting a geomean over part of the ladder; `--out` writes the artifact. |
+
+Measured speed, M5 Pro, 5 alternating rounds x 30 iters over the full ladder
+(`bench/results/gemm_speed_ladder_m5pro.json`): tf32-relaxed **2.10x** torch
+MPS f32, f32-exact **1.07x** torch MPS f32, bf16 **1.00x** torch MPS bf16.
+
+That last number is a correction -- the README claimed 1.11x. An independent
+9-round x 40-iter run agrees at 1.03x. The failure was structural rather than
+arithmetic: tessl bf16 wins only at 512^3 (1.26x) and 1024^3 (1.34x), both in
+the dispatch-floor regime with per-round spreads to 3.38x, and runs 0.86x-0.95x
+on `mlp_up`, `square_4096`, `qkv_proj` and `tall_k1024`. A geomean over a ladder
+that includes dispatch-bound shapes reports host submit latency as if it were
+shader throughput. The ratios that did reproduce (1.07x, 2.01x -> 2.10x) are the
+ones whose wins are not concentrated at the floor.
+
+Absolute GFLOP/s did not reproduce earlier peaks and is not expected to; it is
+the quantity the paired design exists to avoid comparing across runs.
 
 **Timing protocol matters more than anything else here.** Measuring a baseline
 block and a variant block minutes apart puts all GPU clock drift into the ratio:
