@@ -7,11 +7,16 @@ the Transformer-vs-SSM A/B honest (guide §2.5, §8).
 
 | mixer      | what it is                 | cost in T | deps                         |
 |------------|----------------------------|-----------|------------------------------|
-| attention  | full pairwise mixing       | quadratic | none (SDPA / FlashAttention) |
+| attention  | full pairwise mixing       | quadratic | none (SDPA); `--flash_cuda` |
 | swa        | local window + sink tokens | linear    | none (SDPA, masked)          |
 | mingru     | minimal parallel RNN       | linear    | none (pure torch reference)  |
 | mamba2     | selective state-space (SSD)| linear    | none (pure torch, slow)      |
 | gdn        | gated linear attention     | linear    | none (pure torch, slow)      |
+
+The attention arm has one optional exception to the no-toolchain rule: `--flash_cuda`
+routes the plain-causal path through `nanolab/csrc/flash_attn_cuda.cu`, a custom kernel
+built on demand with `nvcc`. It is off by default, falls back to SDPA whenever it cannot
+run, and has never been executed — see `nanolab/README.md` and gap E17.
 
 The recurrent mixers here are *correctness-first, pure-PyTorch* references — no
 mamba-ssm / flash-linear-attention CUDA kernels required (guide notes those as

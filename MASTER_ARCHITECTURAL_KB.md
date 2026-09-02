@@ -30,7 +30,7 @@
 | Tree | Role |
 |------|------|
 | `parameter-golf/` | Sprint trainers, QAT/export, GDN verify refs, toy APRDH |
-| `nanolab/` | Mixer bakeoffs, WY GDN / SSD Mamba, optimizer experiments |
+| `nanolab/` | Mixer bakeoffs, WY GDN / SSD Mamba, optimizer experiments; `csrc/` holds a CUDA flash-attention kernel that has never been run (open problem 11) |
 | `Rust_MLKit/arch_02_value_resid/metal-native/` | Soft + FA_TILED + banked/Polar Muon training on Metal |
 | `Rust_MLKit/gemma-metal/` | Gemma-4 E4B/31B Metal inference, DFlash port, FA kernels |
 | `Rust_MLKit/reference/ablation_results/` | Locked ablation champions |
@@ -664,6 +664,19 @@ a wrong budget at another. Both were caught by controls, not by review.
    coverage does; restoring a clean basis is a measurement, not a code change.
 10. **No external replication** — one author, one codebase, mostly one machine, for
     a paper whose thesis is that single-lab results do not transfer.
+11. **The CUDA flash-attention kernel has never executed** —
+    `nanolab/csrc/flash_attn_cuda.cu` (FA-2 causal GQA, forward and backward, an FMA
+    path and an `mma.sync` tensor-core path with `cp.async` double buffering) was
+    written on a machine with no NVIDIA GPU. Its *arithmetic* is verified: a CPU mirror
+    of every kernel's index arithmetic — the tensor-core ones at lane granularity —
+    matches a brute-force reference and its autograd gradients to ≤6e-15 in float64.
+    Its *execution* is not, and neither is its speed. Grade **C** by the table above
+    (design intent plus a CPU proof of the arithmetic); it is deliberately absent from
+    the ten achievements, which require an A or B number, and **no throughput figure
+    for it appears anywhere in this repository**. The incumbent is not a straw man —
+    SDPA on CUDA already reaches a CUTLASS FlashAttention-2 — so the open question is
+    whether it beats what is already there at any shape this lab runs, and "it does
+    not" is a legitimate answer. Minutes on a CUDA box. Spec: backlog E17.
 
 ---
 

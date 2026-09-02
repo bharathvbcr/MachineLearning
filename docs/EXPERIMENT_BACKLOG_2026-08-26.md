@@ -788,6 +788,71 @@ question are now priced by the harness rather than by hand.
 
 ---
 
+## Tier 3 — systems verification (no paper claim attached)
+
+### E17 — the CUDA flash-attention kernel has never executed
+
+**Status: CODE COMPLETE 2026-09-02, uncompiled and unrun.**
+
+`nanolab/csrc/flash_attn_cuda.cu` is FA-2 causal GQA for CUDA, ported from this repo's
+Metal kernels and keeping their contract: `Q [B,T,H,D]`, `K/V [B,T,Hkv,D]`, a `[B,H,T]`
+natural-log LSE tape, `Delta = sum dO*O`, `dss = p*(dp - Delta)*scale`. Forward and
+backward, each with an FMA path (fp32/fp16/bf16, head_dim 32/64/128) and a tensor-core
+path (`mma.sync.aligned.m16n8k16`, f16/bf16, sm_80+; backward at head_dim 32/64, where
+the register file allows it), tiles staged with `cp.async` and double buffered. Opt-in
+behind `cfg.flash_cuda` / `--flash_cuda`, off by default, with masked paths
+(block-causal, SWA) staying on SDPA.
+
+It was written on a machine with no NVIDIA GPU and no `nvcc`. **It has never been
+compiled and never run.** No throughput figure for it exists, and this entry is the
+reason none should be quoted.
+
+**What is already established, on CPU.** `csrc/flash_attn_sim.py` mirrors the index
+arithmetic of every kernel — the tensor-core ones at lane granularity, each of the 32
+lanes holding exactly the fragment elements the PTX layout gives it — and matches
+brute-force attention and its autograd gradients to **≤6e-15 in float64**, across
+head_dim 32/64/128, T not aligned to the 64-row block or the 32-key tile (33, 37, 80,
+100), and GQA groups 1/2/4. That is suite 19's lesson — *a custom kernel is worthless
+until verified against a brute-force reference* — applied to a kernel that could not be
+executed where it was written. The whole `.cu` also type-checks against real torch
+headers with every `(dtype × head_dim)` instantiation forced, via a CUDA shim; that pass
+caught one real defect (`__launch_bounds__` parses its argument as a comma-separated
+list, so `Tiles<scalar_t, HEAD_DIM>::BR` there was two arguments).
+
+**What is not, and cannot be from here.** Two assumptions are handled unequally on
+purpose, because they fail differently:
+
+| assumption | failure mode | check |
+|---|---|---|
+| mma fragment layout | deterministic, order-1 wrong | `mma_probe` on the device at load; the tensor-core path stays **off** unless it agrees with a plain matmul |
+| `cp.async` synchronisation | a *race* | none possible — a race passes a probe by luck. Closest available: a stale tile breaks run-to-run reproducibility, which the CUDA test asserts |
+
+**What closes this.** Minutes on any CUDA box, in this order:
+
+```bash
+python -m nanolab.tests            # 2 skipped checks here become live: the FMA
+                                   # and tensor-core kernels vs a float64 reference,
+                                   # gradient reproducibility, the layout probe
+python -m nanolab.flash_cuda --batch 8 --seq 1024 --heads 12 --kv_heads 4 --dtype bf16
+```
+
+The bench prints SDPA / FMA / mma with correctness deltas **above** the timings, so a
+fast wrong answer cannot read as a win. Bisect handles if it misbehaves: `kAsyncStaging`
+in the `.cu` reverts to synchronous staging with the double-buffer structure intact, and
+`use_mma=False` reaches the untouched FMA path.
+
+**What it is for, so the result can be read honestly.** On CUDA the incumbent is not a
+straw man: `F.scaled_dot_product_attention` already dispatches to a CUTLASS
+FlashAttention-2 with `cp.async` pipelining and swizzled shared memory this kernel does
+not have. Beating it is not the hypothesis. The kernel exists for native GQA (no
+`repeat_interleave` widening of K/V, no transposes), deterministic gradients, an
+algebraic twin of the Metal kernels for cross-backend parity work, and a base for the
+masked variants SDPA can only serve by materialising a dense `[T,T]` mask — the SWA +
+sinks path E12/E15/E16 run through today. A result of "SDPA still wins at every shape we
+run" is a publishable outcome for this entry, not a failure of it.
+
+---
+
 ## Explicitly not planned, and why
 
 - **A Titans / test-time-memory mixer.** Referenced in reading notes only; implementing
@@ -811,6 +876,12 @@ and 2; E13; E14; E8 (360 runs across difficulty x budget). Any further Metal-tra
 still gated on restoring `fineweb10B_sp1024` from an external copy, not on compute.
 
 **Remaining, in the order they earn their cost:**
+
+00. **E17 — compile and run the CUDA flash-attention kernel.** Ahead of everything else
+    only because it is the cheapest item on the list: minutes on any CUDA box, no jobs,
+    no budget. It turns two skipped checks in `nanolab/tests.py` into live ones and
+    replaces the empty performance column with a measurement. Until it runs, the kernel
+    is unexecuted code and this backlog says so in E17.
 
 0. **E12 / E15 / E16 — the sliding-window board.** Code complete and tested 2026-08-31,
    unrun. One command (`swaboard`), 285 runs, 33–90 GPU-h, $152–414, spec and cost basis
