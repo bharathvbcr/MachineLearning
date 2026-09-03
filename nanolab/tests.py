@@ -3496,6 +3496,25 @@ def mqar_calibrate_and_grid_accept_the_lr_rule_they_are_given():
             "swaboard forwards --lr-rule to fewer than both mqar phases"
 
 
+@test
+def e10_carries_the_co_leader_so_placement_is_a_within_suite_comparison():
+    """E10 asks whether the hybrid's attention PLACEMENT matters. Every arm in
+    it is really being compared against `hybrid_mingru10_attn2` (10+2, last-2),
+    the board's co-leader -- but that arm was measured in a different suite, so
+    "bookend vs 10+2" crossed suites, which is the confound E10 exists to
+    remove. It must be IN the suite, and in the stage the launcher reads, or the
+    comparison silently goes back to being cross-suite.
+    """
+    from .crossover_replicate import RATIO_ARMS, stage_by_name
+    assert "hybrid_mingru10_attn2" in RATIO_ARMS, (
+        "E10's reference arm is missing from RATIO_ARMS, so bookend-vs-10+2 is "
+        f"a cross-suite comparison again; got {RATIO_ARMS}")
+    armed = stage_by_name("ratio32")["arms"].split(",")
+    assert "hybrid_mingru10_attn2" in armed, (
+        "ratio32 stage would not queue the reference arm even though "
+        f"RATIO_ARMS names it; stage arms are {armed}")
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = skipped = 0

@@ -311,9 +311,16 @@ SWA_ARMS = ("attention", "gdn",
 # same two references for the same reason.
 SWA2K_ARMS = ("attention", "gdn",
               "swa_w64", "swa_w256", "swa_w512", "swa_w64_nosink")
-# The four E10 arms, as one name so a launcher cannot list three of them.
+# The E10 arms, as one name so a launcher cannot list a subset of them.
+# `hybrid_mingru10_attn2` is the board's co-leader and the arm every other row
+# here is being compared AGAINST, but it was originally measured in a different
+# suite -- so "bookend vs 10+2" was a cross-suite comparison, which is exactly
+# the confound E10 exists to remove. It is carried here so the comparison is
+# within-suite on `final_val`, at this suite's own recipe. The runner skips
+# completed jobs (`job_done`), so the four original arms do not re-run.
 RATIO_ARMS = ("hybrid_mingru11_attn1", "hybrid_mingru_periodic",
-              "hybrid_mingru_bookend", "hybrid_mingru8_attn4")
+              "hybrid_mingru_bookend", "hybrid_mingru8_attn4",
+              "hybrid_mingru10_attn2")
 
 
 def scale_to_token_budget(batch_size: int, block_size: int = 512,
