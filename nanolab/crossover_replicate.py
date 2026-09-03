@@ -725,12 +725,28 @@ def lock_recipe(out_root: Path) -> dict:
         # shared field still refuses, which is the point of the lock.
         conflicts = {k: (old[k], rec[k]) for k in old.keys() & rec.keys()
                      if old[k] != rec[k]}
+        # Adding an arm is not mixing recipes. Every field that decides how a
+        # job trains -- batch, budget, lr_horizon, eval_iters, block, device --
+        # is compared as before; `arms` alone is allowed to GROW, because a new
+        # arm changes nothing about the runs already in the directory and they
+        # stay exactly as comparable as they were. This is what E10 needs: its
+        # reference arm has to sit IN the suite for placement to be a
+        # within-suite comparison, and forcing it into its own directory would
+        # rebuild the cross-suite confound the experiment exists to remove.
+        # Shrinking or diverging still refuses -- that loses runs or silently
+        # re-points a suite at a different board.
+        if "arms" in conflicts and set(old["arms"]) < set(rec["arms"]):
+            conflicts.pop("arms")
         if conflicts:
             raise SystemExit(
                 f"refusing to mix recipes in {path}:\n  have {old}\n  want {rec}"
                 f"\n  conflicting fields: {sorted(conflicts)}")
         if old.keys() != rec.keys():
             merged = {**rec, **old}
+            # `old` wins every shared key above, which would write the stale
+            # four-arm list back over the five-arm one we just accepted.
+            if set(old.get("arms", ())) < set(rec.get("arms", ())):
+                merged["arms"] = rec["arms"]
             if "workers" not in old:
                 # Never backfill tenancy from the CURRENT launch -- that would
                 # write a guess about a run that already happened into its own
@@ -747,6 +763,10 @@ def lock_recipe(out_root: Path) -> dict:
                     merged["workers"] = prior
             path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
             return merged
+        if set(old.get("arms", ())) < set(rec.get("arms", ())):
+            grown = {**old, "arms": rec["arms"]}
+            path.write_text(json.dumps(grown, indent=2) + "\n", encoding="utf-8")
+            return grown
         return old
     path.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
     return rec

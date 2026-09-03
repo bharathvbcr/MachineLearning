@@ -3515,6 +3515,69 @@ def e10_carries_the_co_leader_so_placement_is_a_within_suite_comparison():
         f"RATIO_ARMS names it; stage arms are {armed}")
 
 
+@test
+def lock_recipe_lets_arms_grow_but_refuses_every_other_drift():
+    """E10 needs a fifth arm added to a suite that already has four runs' worth
+    of results. Adding an arm changes nothing about how the existing jobs
+    trained, so they stay exactly as comparable as they were -- but the lock
+    treated any `arms` difference as mixing recipes, which would have forced
+    the reference arm into its own directory and rebuilt the cross-suite
+    confound E10 exists to remove.
+
+    The exemption is deliberately one-way and arms-only: a SHRINKING or
+    DIVERGING arm list still refuses (it loses runs, or silently re-points a
+    suite at a different board), and every field that decides how a job trains
+    still refuses on any disagreement.
+    """
+    import json, tempfile
+    from pathlib import Path
+    from unittest import mock
+    from . import crossover_replicate as cr
+
+    base = {"batch_size": 32, "eval_iters": 20, "token_budget": 50_000_000,
+            "lr_horizon": None, "prefix": "cx32r", "compile": False,
+            "workers": 3, "device": "NVIDIA GH200 480GB"}
+    four = ["a", "b", "c", "d"]
+
+    def attempt(disk_arms, launch_arms, **overrides):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "recipe.json").write_text(
+                json.dumps({**base, "arms": disk_arms}), encoding="utf-8")
+            want = {**base, **overrides, "arms": launch_arms}
+            with mock.patch.object(cr, "current_recipe", lambda: dict(want)):
+                out = cr.lock_recipe(root)
+            on_disk = json.loads((root / "recipe.json").read_text(encoding="utf-8"))
+            return out, on_disk
+
+    # growing is allowed, and the grown list must be persisted
+    out, on_disk = attempt(four, four + ["e"])
+    assert out["arms"] == four + ["e"], f"grow rejected or not returned: {out['arms']}"
+    assert on_disk["arms"] == four + ["e"], (
+        f"grown arms not written back; recipe.json still says {on_disk['arms']}")
+
+    # shrinking still refuses
+    try:
+        attempt(four, four[:2])
+        raise AssertionError("shrinking the arm list was allowed")
+    except SystemExit:
+        pass
+
+    # diverging (same length, different members) still refuses
+    try:
+        attempt(four, ["a", "b", "c", "z"])
+        raise AssertionError("a diverging arm list was allowed")
+    except SystemExit:
+        pass
+
+    # a real recipe field still refuses even while arms legitimately grow
+    try:
+        attempt(four, four + ["e"], token_budget=20_000_000)
+        raise AssertionError("token_budget drift rode in behind an arm addition")
+    except SystemExit:
+        pass
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = skipped = 0
