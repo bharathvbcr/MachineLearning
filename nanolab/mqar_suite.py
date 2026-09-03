@@ -395,6 +395,12 @@ def main() -> None:
                     help="E16: comma-separated batch sizes to test per cell. "
                          "Finds the smallest batch at which the reference arm "
                          "saturates, writes calibration.json, and STOPS.")
+    ap.add_argument("--calib-seeds", type=int, default=3,
+                    help="reference seeds per batch in --calibrate. Separate "
+                         "from --seeds (which is per-arm in the grid) because "
+                         "saturation is a Bernoulli event, not a threshold: "
+                         "3 estimates its rate to +-0.4 and cannot separate a "
+                         "high-p cell from luck. Raise it to measure the rate.")
     ap.add_argument("--lr-rule", default="sqrt", choices=list(MQAR_LR_RULES),
                     help="how the batch-256 base LR moves with batch. The "
                          "original sweep was effectively 'none', which is why it "
@@ -429,8 +435,8 @@ def main() -> None:
 
     if a.calibrate:
         batches = [int(x) for x in a.calibrate.split(",") if x.strip()]
-        picked = calibrate(cells, batches, a.device, steps=a.steps,
-                           lr_rule=a.lr_rule)
+        picked = calibrate(cells, batches, a.device, seeds=a.calib_seeds,
+                           steps=a.steps, lr_rule=a.lr_rule)
         path = out / "calibration.json"
         path.write_text(json.dumps({str(k): v for k, v in picked.items()},
                                    indent=2) + "\n", encoding="utf-8")

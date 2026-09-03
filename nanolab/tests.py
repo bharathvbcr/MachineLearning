@@ -3362,6 +3362,31 @@ def mqar_lr_scales_with_batch_and_is_inert_at_the_base():
 
 
 @test
+def mqar_calibration_seed_count_is_reachable_from_the_cli():
+    """The 2026-09-02 recalibration found saturation is a Bernoulli event, not a
+    threshold: 30 runs landed at recall <=0.248 or exactly 1.000, never between.
+    A 3-seed block is then a p^3 test, so `calibrate` MUST be tellable to use
+    more seeds -- and there was no flag that reached it. --seeds is the grid's
+    per-arm count and must NOT be reused, or a bare --calibrate silently costs
+    5x more."""
+    import argparse, inspect
+    from . import mqar_suite as ms
+
+    msrc = inspect.getsource(ms.main)
+    assert "seeds=a.calib_seeds" in msrc, \
+        "main() cannot set calibrate's seed count"
+    assert "seeds=a.seeds" not in msrc.split("if a.calibrate:")[1].split("\n\n")[0], \
+        "calibrate mode reuses the grid's --seeds; a bare --calibrate gets 5x dearer"
+
+    # The flag exists, is an int, and leaves the cheap 3-seed default alone.
+    ap = argparse.ArgumentParser()
+    src = inspect.getsource(ms.main)
+    assert '--calib-seeds' in src, "no --calib-seeds flag"
+    ns_default = 3
+    assert inspect.signature(ms.calibrate).parameters["seeds"].default == ns_default, \
+        "calibrate's own default drifted from the documented cheap default"
+
+
 def mqar_calibrate_and_grid_accept_the_lr_rule_they_are_given():
     """Both MQAR entry points build configs; a rule threaded into one and not the
     other is a NameError on a rented GPU, which is how it was actually found --
