@@ -2829,6 +2829,47 @@ def mqar_control_cell_makes_swa_identical_to_attention():
 
 
 @test
+def e16_control_cell_is_identical_forward_but_not_backward():
+    """The mask argument (see `mqar_control_cell_makes_swa_identical_to_attention`)
+    proves swa_w64 and attention are the SAME FUNCTION at seq 63. It does not
+    prove they TRAIN the same, and measurement on the GH200 says they do not:
+    the forward is bit-identical in fp32 and bf16, but the backward differs by
+    3.6e-4 in bf16 because an explicit attn_mask and `is_causal` reach SDPA
+    through different kernels.
+
+    That gap is why the seq-63 control has to be RUN and cannot be argued. MQAR
+    saturation is bistable, so a 1e-4 difference in one step is free to compound
+    into a different basin 3000 steps later. What the control then measures is
+    the board's resolution: any seq-255 gap smaller than the spread between two
+    provably identical arms is not interpretable.
+
+    Asserted on CPU, where both paths are bit-identical in both directions, so
+    the test pins the FORWARD claim everywhere and documents the backward one.
+    """
+    m, cfg = _toy_model(mixer="swa", block_size=63, swa_window=64, swa_sinks=4)
+    x, y = _batch(cfg)
+    g = torch.Generator().manual_seed(7)
+    with torch.no_grad():                    # o_proj is zero-init: see the
+        for blk in m.blocks:                 # vacuous-test note in the sibling
+            blk.mixer.o_proj.weight.copy_(   # test above.
+                torch.randn(blk.mixer.o_proj.weight.shape, generator=g) * 0.05)
+
+    def fwd(window):
+        for blk in m.blocks:
+            blk.mixer.swa_window = window
+            blk.mixer.swa_sinks = 4 if window else 0
+            blk.mixer._mask_cache.clear()
+        m.eval()
+        with torch.no_grad():
+            return m(x)[0]
+
+    assert torch.equal(fwd(64), fwd(0)), \
+        "swa_w64 is not bit-identical to attention at the seq-63 control cell"
+    # ...and the cell is only a control because the window really does span it.
+    assert cfg.block_size == 63 < 64, "control geometry drifted"
+
+
+@test
 def mqar_refuses_a_multi_cell_sweep_without_calibration():
     """Batch decides whether the head forms at all, and the threshold moves with
     sequence length. A multi-cell sweep on one batch would report `not solved`
