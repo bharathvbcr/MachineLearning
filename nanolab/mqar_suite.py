@@ -31,6 +31,12 @@ arithmetic). Measured 2026-08-28 on the GH200::
 So the probe's answer to "can this architecture do in-context recall" is decided
 by batch size before any architecture is compared: 0.55 says no, 1.00 says
 perfectly, from the same model. Report the batch alongside any recall number.
+
+That batch-256 calibration is E8's 15-token cell and DOES NOT TRANSFER. On
+E16's longer cells the direction reverses: at seq 255 the reference arm solves
+at bs 64 and stops solving at 128, 256 and 512, and scaling the LR with the
+batch does not recover it (see `mqar_lr_for_batch`). Bigger is not safer here,
+so every cell carries its own batch and no cell inherits another's.
 """
 from __future__ import annotations
 
@@ -97,18 +103,25 @@ MQAR_LR_RULES = ("sqrt", "linear", "none")
 def mqar_lr_for_batch(lr: float, batch: int, rule: str = "sqrt") -> float:
     """Scale a batch-256 learning rate to another batch.
 
-    E16's calibration swept batch 64 -> 512 at a FIXED 1e-3 and concluded no
-    batch saturated the reference arm. The seq-511 evidence says that conclusion
-    was about the LR, not the task: recall went 0.052 / 1.000 / 1.000 at bs 64
-    and 0.049 / 0.049 / 0.049 at bs 512. Larger batches got monotonically WORSE,
-    which is not what a capacity or context limit looks like -- a bigger batch is
-    strictly more information per step. It is what a step size too small for the
-    batch looks like.
+    WARNING -- the hypothesis this was written for was FALSIFIED by its own
+    re-run; the rules are kept because batch/LR coupling is real, not because
+    scaling fixed E16. The original argument was: E16's calibration swept batch
+    64 -> 512 at a FIXED 1e-3 and found larger batches monotonically WORSE
+    (seq 511: 0.052 / 1.000 / 1.000 at bs 64, 0.049 / 0.049 / 0.049 at bs 512),
+    which is not what a capacity limit looks like -- a bigger batch is strictly
+    more information per step -- so it had to be a step size too small.
 
-    `sqrt` is the default because the optimizer is AdamW: the linear rule is the
-    SGD result, and applying it to Adam at 8x batch overshoots badly. Both are
-    offered because neither is a law, and `none` reproduces the old behaviour
-    exactly for anyone re-running the original sweep.
+    Re-running the whole sweep with `sqrt` on 2026-09-02 reproduced the pattern
+    with the step size scaled up 2.8x. At seq 255, bs 64 saturated 2/3 and every
+    larger batch saturated 0/3. Scaling the LR did not move the batch effect; it
+    only shuffled which seeds landed in which basin (seq 511 / bs 64 went 2/3
+    under `none` to 1/3 under `sqrt`). See `calibrate` for what the sweep was
+    actually measuring.
+
+    `sqrt` remains the default because the optimizer is AdamW: the linear rule is
+    the SGD result, and applying it to Adam at 8x batch overshoots badly. Both
+    are offered because neither is a law, and `none` reproduces the pre-2026-09
+    behaviour exactly for anyone re-running the original sweep.
     """
     if rule not in MQAR_LR_RULES:
         raise ValueError(f"unknown lr rule {rule!r}; known: {MQAR_LR_RULES}")
@@ -339,6 +352,17 @@ def calibrate(cells, batches, device, seeds=3, steps=3000, ref="attention",
     trainable here". Sequence length changes that threshold, so E8's calibrated
     256 does not transfer to a 511-token cell by assumption.
 
+    MEASURED 2026-09-02, and it changes how this function should be read: at
+    these cells saturation is BISTABLE, not thresholded. Across 30 runs every
+    recall landed at <=0.248 or at exactly 1.000, never between -- so `SOLVED`
+    is not a cutoff through a distribution, it separates two modes. What varies
+    with batch is the RATE at which the run finds the upper mode, and a
+    `seeds`-of-`seeds` block is therefore a p^n test on a Bernoulli event. At
+    n=3 that cannot separate a genuinely high-rate cell from luck: seq 255 / bs
+    64 read 2/3 in one sweep and 7/10 in the next, and the single cell that
+    "passed" 3/3 is one draw, not a threshold. Raise `seeds` (--calib-seeds)
+    when the answer has to mean something.
+
     Returns {pairs: batch_or_None}. None means NO tested batch saturated, which
     is a refusal to price the cell, not a default to fall back on.
     """
@@ -366,9 +390,12 @@ def calibrate(cells, batches, device, seeds=3, steps=3000, ref="attention",
                       f"({seeds}/{seeds} seeds)")
                 break
         if picked[pairs] is None:
-            print(f"  => seq={seq}: NO tested batch saturated {ref}. This cell "
-                  f"is not measurable at these batches; raise the batch or the "
-                  f"step budget before running arms on it.")
+            print(f"  => seq={seq}: NO tested batch saturated {ref} in "
+                  f"{seeds}/{seeds} seeds. Note this is a rate, not a wall: "
+                  f"raising the batch is measured to make it WORSE here, so "
+                  f"re-read the per-seed lines above -- a cell that solved on "
+                  f"some seeds is measurable as a solve RATE at that batch, "
+                  f"and only a cell that solved on none is out of reach.")
     return picked
 
 

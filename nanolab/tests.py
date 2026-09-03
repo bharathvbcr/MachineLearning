@@ -3362,6 +3362,48 @@ def mqar_lr_scales_with_batch_and_is_inert_at_the_base():
 
 
 @test
+def every_test_in_this_file_is_actually_registered():
+    """A test only runs if `@test` put it in _RESULTS, and an edit that inserts
+    a new function between a decorator and its def silently DE-registers the
+    original. That happened twice on 2026-09-03 -- once in a commit -- and the
+    total stayed at 136 both times, so the suite reported green for a check
+    that no longer ran: the exact failure `Skip` exists to prevent. Counting is
+    not enough; the file has to be audited against its own registry."""
+    import inspect, sys
+    src = inspect.getsource(sys.modules[__name__]).splitlines()
+    registered = {f.__name__ for f in _RESULTS}
+    orphans = []
+    for i, ln in enumerate(src):
+        if not ln.startswith("def ") or ln.startswith("def main"):
+            continue
+        name = ln[4:].split("(")[0]
+        if name.startswith("_") or name == "test":
+            continue
+        if name not in registered:
+            orphans.append(f"{name} (line {i+1})")
+    assert not orphans, ("top-level test functions missing @test, so they "
+                         f"never run: {orphans}")
+
+
+@test
+def mqar_does_not_re_advise_the_falsified_batch_fix():
+    """The LR-scaling hypothesis was falsified by its own re-run (2026-09-02):
+    sqrt scaling reproduced the monotone-worse-with-batch pattern it was meant
+    to explain. The docstring that argued for it and the refusal that told the
+    operator to raise the batch both have to carry the correction, or the next
+    reader spends another $5 rediscovering it."""
+    import inspect
+    from . import mqar_suite as ms
+
+    assert "FALSIFIED" in (ms.mqar_lr_for_batch.__doc__ or ""), \
+        "mqar_lr_for_batch still argues the hypothesis its re-run refuted"
+    assert "BISTABLE" in (ms.calibrate.__doc__ or ""), \
+        "calibrate still frames saturation as a threshold, not a rate"
+    assert "raise the batch or the" not in inspect.getsource(ms.calibrate), \
+        "the refusal still advises raising the batch, which is measured to hurt"
+
+
+@test
 def mqar_calibration_seed_count_is_reachable_from_the_cli():
     """The 2026-09-02 recalibration found saturation is a Bernoulli event, not a
     threshold: 30 runs landed at recall <=0.248 or exactly 1.000, never between.
@@ -3387,6 +3429,7 @@ def mqar_calibration_seed_count_is_reachable_from_the_cli():
         "calibrate's own default drifted from the documented cheap default"
 
 
+@test
 def mqar_calibrate_and_grid_accept_the_lr_rule_they_are_given():
     """Both MQAR entry points build configs; a rule threaded into one and not the
     other is a NameError on a rented GPU, which is how it was actually found --
