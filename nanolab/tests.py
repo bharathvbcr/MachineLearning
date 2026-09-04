@@ -4160,6 +4160,75 @@ def a_one_expert_moe_is_the_dense_ffn_at_init():
 
 
 @test
+def an_evaluated_moe_loss_is_pure_cross_entropy():
+    """E19 was a units bug, not a model bug. `Model.forward` folded the Switch
+    load-balancing aux into the loss it returned, and `train.evaluate` reports
+    exactly that number, so every MoE arm's `final_val` carried a term the dense
+    arms never paid. At perfect balance the term is `moe_aux_weight * n_layer`
+    -- 0.01 * 12 = 0.12 nats on the 50M board -- which is 0.12 of the 0.127-nat
+    gap that made the board "uninterpretable".
+
+    A 1-expert top-1 MoE IS a dense SwiGLU (softmax over one logit is 1.0), so
+    with identical weights its evaluated loss must equal dense's to floating
+    point. Against the pre-fix model this fails by exactly 0.01 * n_layer.
+    """
+    import torch
+    from .config import build_config
+    from .model import build_model
+    kw = dict(run_name="p", mixer="attention", n_layer=4, d_model=64, n_head=2,
+              head_dim=32, block_size=32, vocab_size=128, tie_embeddings=False,
+              fused_ce=False)
+    dense = build_model(build_config("cpu_smoke", dict(kw, ffn="swiglu")))
+    moe = build_model(build_config(
+        "cpu_smoke", dict(kw, ffn="moe", moe_experts=1, moe_top_k=1)))
+
+    # Randomize before copying: every residual down-projection is zero at init,
+    # so an untrained block is the identity and the comparison would hold for
+    # the wrong reason -- the same trap the SWA and looping tests carry a guard
+    # for.
+    with torch.no_grad():
+        for pm in dense.parameters():
+            if pm.ndim >= 2:
+                pm.normal_(0, 0.02)
+        src, dst = dense.state_dict(), moe.state_dict()
+        for k, v in src.items():
+            k2 = k.replace(".ffn.", ".ffn.experts.0.")
+            if k2 in dst and dst[k2].shape == v.shape:
+                dst[k2] = v.clone()
+            elif k in dst and dst[k].shape == v.shape:
+                dst[k] = v.clone()
+        moe.load_state_dict(dst)
+
+    x = torch.randint(0, 128, (2, 32))
+    y = torch.randint(0, 128, (2, 32))
+
+    dense.eval(); moe.eval()
+    with torch.no_grad():
+        _, ld = dense(x, y)
+        _, lm = moe(x, y)
+    delta = abs((lm - ld).item())
+    assert delta < 1e-5, (
+        "evaluated 1-expert MoE loss is not the dense loss: delta "
+        f"{delta:.6f}; moe_aux_weight * n_layer would be "
+        f"{0.01 * kw['n_layer']:.4f}")
+
+    # The other direction, so the fix cannot silently become "drop the aux":
+    # in TRAINING mode the regularizer must still be paid, or a real MoE trains
+    # with no load-balancing pressure at all and its routers are free to
+    # collapse with nothing in the loss to stop them.
+    dense.train(); moe.train()
+    _, ld_t = dense(x, y)
+    _, lm_t = moe(x, y)
+    gap = (lm_t - ld_t).item()
+    want = 0.01 * kw["n_layer"]          # 1 expert => aux is exactly 1.0/block
+    assert abs(gap - want) < 1e-5, (
+        f"training-mode MoE loss should carry the aux ({want:.4f}); got "
+        f"{gap:.6f}")
+    assert abs(float(moe.aux_loss) - want) < 1e-5, (
+        f"model.aux_loss should expose the weighted term; got {moe.aux_loss}")
+
+
+@test
 def e21_ladder_varies_width_alone_and_can_be_read_at_each_width():
     """The width ladder exists to answer whether the attention-vs-minGRU
     ranking moves with scale. Three things have to hold or it answers something

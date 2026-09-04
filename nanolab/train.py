@@ -49,12 +49,21 @@ def evaluate(model, batcher, cfg, ctx, optimizers=None):
         optimizers[0].eval()
     model.eval()
     losses = torch.zeros(cfg.eval_iters)
+    # Record the load-balancing term as well as excluding it from the loss.
+    # `model.aux_loss` is still COMPUTED in eval mode, it is just no longer
+    # added (see Model.forward). E19's MoE board could not be reinterpreted
+    # after the fact because no metric carried this number; for E>1 experts it
+    # depends on how balanced the router actually is, so it cannot be
+    # reconstructed analytically the way the 1-expert case can.
+    auxes = torch.zeros(cfg.eval_iters)
     with torch.no_grad():
         for i in range(cfg.eval_iters):
             x, y = batcher.batch()
             with ctx:
                 _, loss = model(x, y)
             losses[i] = loss.item()
+            auxes[i] = float(model.aux_loss)
+    model.last_eval_aux = auxes.mean().item()
     model.train()
     if sf:
         optimizers[0].train()
@@ -238,6 +247,12 @@ def train(cfg, overfit: int = 0, batchers=None):
                 schedule.observe(val)          # ReduceLROnPlateau
             if cfg.tokenizer == "char":        # char models: bits-per-char (§3)
                 extra["bpc"] = val / math.log(2)
+            if cfg.ffn == "moe":
+                # not added to val_loss -- logged so the router's balance is a
+                # measured quantity rather than an assumption. At perfect
+                # balance this is moe_aux_weight * n_layer; above that the
+                # router is collapsing.
+                extra["val_aux"] = model.last_eval_aux
             log.eval(step, val_loss=val,
                      val_ppl=math.exp(min(val, 20)), tokens=tokens_seen, **extra)
             if val < best_val:

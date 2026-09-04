@@ -221,6 +221,10 @@ class GPT(nn.Module):
 
         self._rope = {}   # cached per (seq_len, device, dtype)
         self._moe_aux = 0.0
+        # weighted aux from the last forward; 0.0 for non-MoE. Exposed so a
+        # run can RECORD the term instead of only paying it: E19 was
+        # unrecoverable after the fact precisely because no metric carried it.
+        self.aux_loss = 0.0
         self.apply(self._init_weights)
         if cfg.mup and self.width_mult != 1.0:
             self._mup_init()
@@ -268,6 +272,13 @@ class GPT(nn.Module):
             # SwiGLU, so `moe_e1k1` had to match `attention` and instead lost by
             # 0.127 nats with disjoint intervals. A board without that control
             # would have read the gap as a fact about parameters.
+            #
+            # This bug was real and worth fixing, but it was NOT that gap:
+            # rerunning the whole board on the fix (E19b) moved the control only
+            # 4.3464 -> 4.3375, about 0.009 of the 0.127. The rest was the
+            # load-balancing aux being added to the REPORTED loss -- see the
+            # `self.training` gate in `forward`. The control caught two
+            # independent defects, which is the argument for carrying one.
             for ffn in [blk.ffn, *getattr(blk.ffn, "experts", [])]:
                 proj = getattr(ffn, "down", None)
                 if isinstance(proj, nn.Linear):
@@ -395,7 +406,29 @@ class GPT(nn.Module):
         # equivalent to scaling the logits and keeps fused-CE/grad correct.
         if self.output_mult != 1.0:
             x = x * self.output_mult
-        aux = (cfg.moe_aux_weight * self._moe_aux) if cfg.ffn == "moe" else 0.0
+        # The Switch load-balancing term is a TRAINING regularizer. It is not
+        # part of the model's cross-entropy, and folding it into an evaluated
+        # loss inflates every reported MoE number by a constant the dense arms
+        # never pay. At perfect balance it is exactly
+        # `moe_aux_weight * n_layer` -- 0.01 * 12 = 0.12 nats on the 50M board
+        # -- and it only grows as a router collapses, so it is not even a fixed
+        # offset across MoE arms.
+        #
+        # That constant IS E19. The `moe_e1k1` control lost to `attention` by
+        # 0.127 nats with disjoint intervals across two boards, and a 1-expert
+        # top-1 MoE is a dense SwiGLU, so the board was declared
+        # uninterpretable. Its cross-entropy was bit-identical to dense the
+        # whole time; 0.12 of the 0.127 was this line. Subtracting it puts the
+        # control 0.0008 nats from `attention`.
+        #
+        # `self.training` is the right gate rather than a call-site change:
+        # train.py's `evaluate` already wraps in model.eval()/model.train(), so
+        # every reporting path in the repo (train, sft, schedules, bench_gpu,
+        # probe_perf, mqar_suite) reports pure CE and every training path keeps
+        # the balancing pressure, with no way for a call site to drop it by
+        # forgetting to add a term back.
+        self.aux_loss = (cfg.moe_aux_weight * self._moe_aux) if cfg.ffn == "moe" else 0.0
+        aux = self.aux_loss if self.training else 0.0
         if targets is not None:
             if cfg.fused_ce:
                 # never materialize full logits (guide §7.1) — returns loss only

@@ -12,6 +12,14 @@
 # A NEW output directory on purpose: the old runs are not comparable to these
 # and must not be pooled with them by a resume.
 #
+# RESOLVED 2026-09-04 -- see docs/MOE_BOARD_2026-09-04.md. The zero-init bug
+# below was real but accounted for only ~0.009 of the 0.127. The rest was the
+# load-balancing aux being added to the REPORTED loss: 0.01 * 12 layers = 0.12
+# nats exactly, paid by every MoE arm and no dense one. Model.forward now gates
+# that term on self.training, so this script's readout is correct as written and
+# runs now also log `val_aux` -- the router-balance number whose absence is why
+# the original board could not be reinterpreted after the fact.
+#
 # The control is the readout. If moe_e1k1 now lands inside `attention`'s
 # interval, the board can be read as a parameter experiment. If it still does
 # not, something else differs between the two paths and the MoE arms stay
