@@ -1620,16 +1620,45 @@ def cmd_status(args) -> None:
 
 
 def _arm_from_run_dir(run_dir: Path) -> str | None:
-    """Parse arm name from ``cx50_<arm>_s<seed>`` / config, not from process env."""
+    """Parse arm name from ``<prefix>_<arm>_s<seed>`` / config, not process env.
+
+    Both halves of this used to be wrong for any arm that differs from another
+    only by its Config overrides, which is every arm E18 and E19 added:
+
+      * the prefix list was hardcoded, so a suite launched with a new
+        CROSSOVER_JOB_PREFIX (``cx32loop``) matched none of them and the name
+        never resolved. The suite records its prefix in recipe.json; use that.
+      * the config fallback matched on (mixer, layer_mixers) alone and returned
+        the FIRST hit. `attention`, `attn3`, `attn6`, `looped_attn3x4`,
+        `looped_attn6x2` and all three MoE arms share mixer="attention" and an
+        empty layer_mixers, so all 25 runs of E18 resolved to `attention` and
+        the table would have reported one pooled row mixing five architectures.
+
+    The fallback now scores candidates by how many of their overrides the config
+    actually satisfies and takes the most specific unique match, so `attention`
+    (no overrides, matches everything) can never shadow a more specific arm. A
+    genuine tie means two arms are configured identically, which is a defect in
+    the arm table rather than something to resolve by ordering, so it raises.
+    """
     name = run_dir.name
+    known = {a.name for a in ARMS}
+    prefixes = []
+    rec_path = run_dir.parent / "recipe.json"
+    if rec_path.exists():
+        try:
+            recorded = json.loads(rec_path.read_text(encoding="utf-8")).get("prefix")
+        except json.JSONDecodeError:
+            recorded = None
+        if isinstance(recorded, str) and recorded:
+            prefixes.append(recorded + "_")
+    prefixes += ["cx20h_", "cx50_", "cx32_", "cx20_", "cx8_", "smoke_"]
     body = name
-    for pfx in ("cx20h_", "cx50_", "cx32_", "cx20_", "cx8_", "smoke_"):
+    for pfx in prefixes:
         if body.startswith(pfx):
             body = body[len(pfx):]
             break
     if "_s" in body:
         body = body.rsplit("_s", 1)[0]
-    known = {a.name for a in ARMS}
     if body in known:
         return body
     cfg_path = run_dir / "config.json"
@@ -1638,10 +1667,19 @@ def _arm_from_run_dir(run_dir: Path) -> str | None:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     mixer = cfg.get("mixer")
     layers = cfg.get("layer_mixers") or ""
-    for arm in ARMS:
-        if arm.mixer == mixer and (arm.layer_mixers or "") == layers:
-            return arm.name
-    return mixer if isinstance(mixer, str) else None
+    cands = [a for a in ARMS
+             if a.mixer == mixer and (a.layer_mixers or "") == layers
+             and all(cfg.get(k) == v for k, v in a.overrides)]
+    if not cands:
+        return mixer if isinstance(mixer, str) else None
+    best = max(len(a.overrides) for a in cands)
+    top = [a for a in cands if len(a.overrides) == best]
+    if len(top) > 1:
+        raise SystemExit(
+            f"{run_dir.name}: {len(top)} arms are configured identically "
+            f"({', '.join(a.name for a in top)}); the run cannot be attributed "
+            "to one of them. Give them distinguishing overrides.")
+    return top[0].name
 
 
 def _val_at_or_after(curve: list[dict], target: float) -> float | None:

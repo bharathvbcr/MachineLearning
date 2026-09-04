@@ -3747,20 +3747,25 @@ def the_probe_mfu_and_the_model_agree_on_looped_flops():
     """
     from .config import build_config
     from .model import build_model, flops_per_token_for
-    from .crossover_replicate import _mfu_from_toks
-    import os
+    from .crossover_replicate import _mfu_from_toks, resolve_peak_flops
     kw = dict(run_name="probe", mixer="attention", n_layer=3, d_model=128,
               n_head=4, head_dim=32, block_size=64, vocab_size=256,
               tie_embeddings=False)
-    os.environ.setdefault("PEAK_FLOPS", "1e12")
+    # Read the peak the PROBE will use rather than forcing one. An earlier
+    # version did os.environ.setdefault("PEAK_FLOPS", "1e12"), which is a no-op
+    # on any machine that already exports a real peak -- so the test passed on
+    # a laptop and failed on the GPU box it is meant to protect.
+    peak = resolve_peak_flops(strict=False)
+    if not peak:
+        raise Skip("no PEAK_FLOPS resolvable on this machine")
     for loops in (1, 2, 4):
         cfg = build_config("cpu_smoke", dict(kw, n_loops=loops))
         est = flops_per_token_for(cfg, cfg.estimate_params(),
                                   cfg.estimate_block_params())
-        # the probe's own path, via a known tok/s and peak
+        # the probe's own path, at a known tok/s, inverted through that peak
         mfu = _mfu_from_toks("attention", 1.0, cfg)
-        assert abs(mfu * 1e12 - est) < 1.0, (
-            f"loops={loops}: probe MFU implies {mfu*1e12:.6e} flops/token, "
+        assert abs(mfu * peak - est) <= 1e-9 * est, (
+            f"loops={loops}: probe MFU implies {mfu*peak:.6e} flops/token, "
             f"the shared formula says {est:.6e}")
     # and the estimate must actually move with loops, or the test is vacuous
     f1 = _mfu_from_toks("attention", 1.0, build_config("cpu_smoke", dict(kw, n_loops=1)))
@@ -3942,6 +3947,88 @@ def e18_and_e19_bracket_the_dense_reference_at_one_compute_budget():
         f, p = built(n)
         assert abs(f - ref_f) / ref_f < 0.01, f"{n} is not compute-matched"
         assert p > ref_p, f"{n} should have MORE params than dense"
+
+
+@test
+def arm_names_resolve_for_arms_that_differ_only_by_overrides():
+    """Every arm E18 and E19 added shares mixer="attention" and an empty
+    layer_mixers, differing only in Config overrides. The old resolver matched
+    on (mixer, layer_mixers) and returned the FIRST hit, so all 25 runs of E18
+    resolved to `attention` and the table would have reported one pooled row
+    mixing five architectures as if it were the baseline.
+
+    `attention` has no overrides, so it matches every attention-mixer config.
+    It must never shadow a more specific arm.
+    """
+    import json, tempfile
+    from pathlib import Path
+    from .crossover_replicate import _arm_from_run_dir, ARMS
+    spec = {a.name: dict(a.overrides) for a in ARMS}
+    base = dict(mixer="attention", layer_mixers="", n_layer=12, n_loops=1,
+                ffn="swiglu", moe_experts=8, moe_top_k=2)
+    cases = ["attention", "attn3", "attn6", "looped_attn3x4", "looped_attn6x2",
+             "moe_e1k1", "moe_e4k1", "moe_e8k1"]
+    with tempfile.TemporaryDirectory() as d:
+        suite = Path(d)
+        (suite / "recipe.json").write_text(json.dumps({"prefix": "cx32loop"}),
+                                           encoding="utf-8")
+        for arm in cases:
+            run = suite / f"cx32loop_{arm}_s42"
+            run.mkdir()
+            (run / "config.json").write_text(
+                json.dumps({**base, **spec[arm]}), encoding="utf-8")
+            got = _arm_from_run_dir(run)
+            assert got == arm, f"{run.name} resolved to {got!r}, expected {arm!r}"
+
+
+@test
+def arm_resolution_uses_the_suites_recorded_prefix():
+    """The prefix list was hardcoded, so a suite launched with a new
+    CROSSOVER_JOB_PREFIX matched none of the entries and no name resolved from
+    the directory at all. The suite records its prefix in recipe.json.
+    """
+    import json, tempfile
+    from pathlib import Path
+    from .crossover_replicate import _arm_from_run_dir
+    with tempfile.TemporaryDirectory() as d:
+        suite = Path(d)
+        (suite / "recipe.json").write_text(json.dumps({"prefix": "totallynew"}),
+                                           encoding="utf-8")
+        run = suite / "totallynew_mingru_s7"
+        run.mkdir()
+        # no config.json on purpose: the NAME must be enough
+        assert _arm_from_run_dir(run) == "mingru"
+    # and the legacy prefixes keep working for suites with no recipe.json
+    with tempfile.TemporaryDirectory() as d:
+        run = Path(d) / "cx50_mingru_s7"
+        run.mkdir()
+        assert _arm_from_run_dir(run) == "mingru"
+
+
+@test
+def two_identically_configured_arms_raise_instead_of_being_guessed():
+    """A tie at maximum specificity means two arms are configured identically.
+    Resolving that by list order is how five architectures became one row; it is
+    a defect in the arm table and must be reported as one.
+    """
+    import json, tempfile
+    from pathlib import Path
+    from unittest import mock
+    from . import crossover_replicate as cr
+    twin_a = cr.Arm("twin_a", "attention", overrides=(("n_layer", 7),))
+    twin_b = cr.Arm("twin_b", "attention", overrides=(("n_layer", 7),))
+    with tempfile.TemporaryDirectory() as d:
+        run = Path(d) / "unmatched_name_s1"
+        run.mkdir()
+        (run / "config.json").write_text(
+            json.dumps({"mixer": "attention", "layer_mixers": "", "n_layer": 7}),
+            encoding="utf-8")
+        with mock.patch.object(cr, "ARMS", (twin_a, twin_b)):
+            try:
+                cr._arm_from_run_dir(run)
+                raise AssertionError("identically configured arms were guessed")
+            except SystemExit as e:
+                assert "configured identically" in str(e), str(e)
 
 
 def main():

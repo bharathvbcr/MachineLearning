@@ -42,10 +42,31 @@ export CROSSOVER_EVAL_ITERS=20
 export CROSSOVER_TOKEN_BUDGET=50000000
 python3 -u -m nanolab.crossover_replicate launch \
   --out nanolab/out/crossover50m_moe32 --workers 2
-echo "e19 launch exit=$? $(date -u +%FT%TZ)"
+rc=$?
+echo "e19 launch exit=$rc $(date -u +%FT%TZ)"
+# A hardcoded "exit=0" at the end of a stage is what turned two crashes into a
+# clean-looking log earlier in this session and idled the GPU for 54 minutes.
+# A failed launch has nothing to wait for, so stop here and say so.
+if [ "$rc" -ne 0 ]; then
+  echo "e19 exit=$rc $(date -u +%FT%TZ)  LAUNCH FAILED, no jobs ran"
+  exit "$rc"
+fi
 sleep 60
 while pgrep -f "crossover_replicate worker" >/dev/null; do sleep 60; done
 echo "e19 workers drained $(date -u +%FT%TZ)"
 python3 -u -m nanolab.crossover_replicate table \
   --out nanolab/out/crossover50m_moe32 2>&1 | tail -25
-echo "e19 exit=0 $(date -u +%FT%TZ)"
+# Report what actually finished, from the queue, not from the exit code of a
+# formatter. The table renderer printed an all-"--" table for a suite whose 25
+# runs had completed, so it is not evidence either way.
+python3 - <<'PYEOF'
+import json
+from collections import Counter
+q = json.load(open("nanolab/out/crossover50m_moe32/queue.json"))
+c = Counter(j["status"] for j in q["jobs"])
+print("e19 queue:", dict(c), "of", len(q["jobs"]))
+for j in q["jobs"]:
+    if j["status"] == "done":
+        print("  ", j["id"], j.get("detail", ""))
+PYEOF
+echo "e19 exit=$? $(date -u +%FT%TZ)"
