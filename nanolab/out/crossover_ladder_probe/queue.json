@@ -423,9 +423,11 @@
       "layer_mixers": "",
       "seed": 1337,
       "note": "E21 ladder: d_model 768, LR x16.0",
-      "status": "running",
+      "status": "done",
       "worker": 1,
-      "started": 1788531679.239504
+      "started": 1788531679.239504,
+      "finished": 1788531878.4522278,
+      "detail": "best_val=5.199858"
     },
     {
       "id": "cx32lad_w768_attention_lr320_s1337",
@@ -434,9 +436,11 @@
       "layer_mixers": "",
       "seed": 1337,
       "note": "E21 ladder: d_model 768, LR x32.0",
-      "status": "running",
+      "status": "done",
       "worker": 0,
-      "started": 1788531679.6040058
+      "started": 1788531679.6040058,
+      "finished": 1788531880.9974487,
+      "detail": "best_val=5.261701"
     },
     {
       "id": "cx32lad_w1152_attention_lr160_s1337",
@@ -445,7 +449,11 @@
       "layer_mixers": "",
       "seed": 1337,
       "note": "E21 ladder: d_model 1152, LR x16.0",
-      "status": "pending"
+      "status": "done",
+      "worker": 1,
+      "started": 1788531878.7857244,
+      "finished": 1788532179.0583265,
+      "detail": "best_val=5.187717"
     },
     {
       "id": "cx32lad_w1152_attention_lr320_s1337",
@@ -454,7 +462,11 @@
       "layer_mixers": "",
       "seed": 1337,
       "note": "E21 ladder: d_model 1152, LR x32.0",
-      "status": "pending"
+      "status": "done",
+      "worker": 0,
+      "started": 1788531881.1931024,
+      "finished": 1788532181.4062474,
+      "detail": "best_val=5.279570"
     }
   ]
 }
