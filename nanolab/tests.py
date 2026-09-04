@@ -4074,6 +4074,71 @@ def a_wall_clock_stage_refuses_a_tenancy_it_was_not_sized_for():
             f"refused, but not for the tenancy reason: {e}"
 
 
+@test
+def every_residual_down_projection_is_zero_at_init_including_moe_experts():
+    """The zero-init stabilizer tested `ffn.down`, which a MoE does not have --
+    its projections live on ffn.experts[i].down -- so every MoE run in this repo
+    trained without a stabilizer every dense arm gets, and nothing said so.
+
+    E19 caught it only because it carried a 1-expert control: at n_exp=1, top-1
+    routing is mathematically identical to a dense SwiGLU, so moe_e1k1 had to
+    match `attention` and instead lost by 0.127 nats with disjoint intervals. A
+    board without that control would have read the gap as a fact about
+    parameters.
+    """
+    from .config import build_config
+    from .model import build_model
+    kw = dict(run_name="p", mixer="attention", n_layer=2, d_model=64, n_head=4,
+              head_dim=16, block_size=32, vocab_size=64, tie_embeddings=False)
+    for tag, extra in (("dense", {}),
+                       ("moe_e1k1", dict(ffn="moe", moe_experts=1, moe_top_k=1)),
+                       ("moe_e8k1", dict(ffn="moe", moe_experts=8, moe_top_k=1))):
+        m = build_model(build_config("cpu_smoke", dict(kw, **extra)))
+        found = []
+        for b in m.blocks:
+            for f in [b.ffn, *getattr(b.ffn, "experts", [])]:
+                d = getattr(f, "down", None)
+                if d is not None:
+                    found.append(float(d.weight.detach().norm()))
+        assert found, f"{tag}: found no down projections at all; test is vacuous"
+        assert max(found) == 0.0, (
+            f"{tag}: {sum(1 for n in found if n)} of {len(found)} residual down "
+            f"projections are non-zero at init (max norm {max(found):.4f})")
+    # the expert count must actually be reaching the check, or e8k1 proves nothing
+    m8 = build_model(build_config("cpu_smoke", dict(kw, ffn="moe",
+                                                    moe_experts=8, moe_top_k=1)))
+    n8 = sum(1 for b in m8.blocks for f in getattr(b.ffn, "experts", []))
+    assert n8 == 16, f"expected 16 experts across 2 blocks, saw {n8}"
+
+
+@test
+def a_one_expert_moe_is_the_dense_ffn_at_init():
+    """The property the E19 control relies on: n_exp=1 with top-1 routing has a
+    softmax over a single logit, so the weight is exactly 1.0 and the layer is
+    its one expert. If this stops holding, `moe_e1k1` is no longer a control and
+    the board loses the only thing that can separate a parameter effect from a
+    code-path effect.
+    """
+    import torch
+    from .config import build_config
+    from .model import build_model
+    kw = dict(run_name="p", mixer="attention", n_layer=1, d_model=32, n_head=4,
+              head_dim=8, block_size=16, vocab_size=32, tie_embeddings=False,
+              ffn="moe", moe_experts=1, moe_top_k=1)
+    m = build_model(build_config("cpu_smoke", dict(kw)))
+    ffn = m.blocks[0].ffn
+    # give the single expert real weights so the comparison is not vacuous
+    with torch.no_grad():
+        for pm in ffn.experts[0].parameters():
+            pm.normal_(0, 0.02)
+    x = torch.randn(2, 16, 32)
+    got = ffn(x)
+    want = ffn.experts[0](x.reshape(-1, 32)).view(2, 16, 32)
+    assert torch.allclose(got, want, atol=1e-6), (
+        "1-expert MoE is not its own expert; max delta "
+        f"{(got-want).abs().max().item():.3e}")
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = skipped = 0

@@ -257,9 +257,21 @@ class GPT(nn.Module):
                 proj = getattr(mixer, attr, None)
                 if isinstance(proj, nn.Linear):
                     nn.init.zeros_(proj.weight)
-            ffn = blk.ffn
-            if isinstance(getattr(ffn, "down", None), nn.Linear):
-                nn.init.zeros_(ffn.down.weight)
+            # Every residual-path down projection, including the ones inside a
+            # MoE. This used to test `ffn.down` only, which a MoE does not have
+            # -- its projections live on ffn.experts[i].down -- so every MoE run
+            # ever made in this repo trained WITHOUT the stabilizer that every
+            # dense arm gets, and nothing said so.
+            #
+            # E19 caught it only because it carried a 1-expert control. At
+            # n_exp=1, top-1 routing is mathematically identical to a dense
+            # SwiGLU, so `moe_e1k1` had to match `attention` and instead lost by
+            # 0.127 nats with disjoint intervals. A board without that control
+            # would have read the gap as a fact about parameters.
+            for ffn in [blk.ffn, *getattr(blk.ffn, "experts", [])]:
+                proj = getattr(ffn, "down", None)
+                if isinstance(proj, nn.Linear):
+                    nn.init.zeros_(proj.weight)
 
     def set_causal(self, causal: bool):
         """Toggle causal vs bidirectional attention across all layers. Used by
