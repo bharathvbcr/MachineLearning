@@ -282,6 +282,8 @@ SUITE_DOC = {
     "e1_mup": "muP cells of PAPER 8.4's 2x2 at s24; matrix_lr transferred from e1_proxy",
     "e1_mup_basin": "s24 muP either side of the transferred LR -- verifies the transfer",
     "e1_mup_tuned": "s24 muP at its OWN target-width optimum, n=5 -- muP's actual answer",
+    "e1_mup_tuned_spattn": "e1_mup_tuned with SP's attention temperature -- the cell PAPER 8.4 rows 1-3 actually ask for",
+    "e1_sp_coldattn": "SP with muP's 1/d attention temperature -- separates muP from the temperature correction",
     "e1_sp_basin": "s24 SP matrix-LR sweep at the TARGET width, 5 seeds -- prices the inherited LR",
     "e1_sp_sched20": "SP at the s23 recipe (20M cosine) -- readout rows 2 and 3",
     "e1_mup_sched20": "muP at the s23 recipe (20M cosine) -- readout rows 2 and 3",
@@ -299,11 +301,12 @@ SUITE_ORDER = tuple(SUITE_DOC)
 MUP_TRANSFER_SUITES = ("e1_mup", "e1_mup_basin", "e1_mup_tuned",
                        "e1_mup_sched20", "e1_mup_bs8", "e1_mup_spattn",
                        "e1_mup_sched20_spattn", "e1_mup_bs8_spattn",
-                       "e1_mup_basin_spattn")
+                       "e1_mup_basin_spattn", "e1_mup_tuned_spattn")
 # Suites that run muP at its MEASURED target-width optimum rather than at the
 # transferred value, and so wait on the basin as well as on the proxy.
 MUP_ANCHOR_SUITES = ("e1_mup_tuned", "e1_mup_sched20", "e1_mup_bs8",
-                     "e1_mup_sched20_spattn", "e1_mup_bs8_spattn")
+                     "e1_mup_sched20_spattn", "e1_mup_bs8_spattn",
+                     "e1_mup_tuned_spattn")
 
 # Every suite whose cells are merged into, or compared against, a board measured
 # on the GH200 that ran suites 22-26. Running these anywhere else replaces a
@@ -516,6 +519,35 @@ def build_matrix(sp_cells: str = "rerun", transfer: dict | None = None,
         for seed in SEEDS:
             jobs.append(_mup_job("e1_mup_tuned", arm, seed, S24, transfer,
                                  anchor=anchor if anchor is not None else {}))
+
+    # --- The cell PAPER 8.4 rows 1-3 actually ask for. The readouts want muP at
+    # its MEASURED optimum (e1_mup_tuned), and every corrected `*_spattn` cell
+    # runs at the transferred 1x -- which the basin shows is not the optimum
+    # (4x attention / 2x minGRU, verified from the ledger and UNCHANGED by the
+    # temperature correction; minGRU's curve is identical between the two
+    # basins, as it must be, since minGRU has no attention logits for the term
+    # to touch). Crossing token moves 4.37M -> 19.25M across that basin, so
+    # reading rows 1-3 off the 1x cell would repeat the mis-tuning error the
+    # correction exists to remove. This is the last compute PAPER 8.4 needs.
+    # See docs/MUP_ROWS_2026-09-04.md.
+    for arm in ARMS:
+        for seed in SEEDS:
+            jobs.append(_mup_job("e1_mup_tuned_spattn", arm, seed, S24, transfer,
+                                 anchor=anchor if anchor is not None else {},
+                                 extra_cfg=dict(mup_sqrt_attn_scale=True)))
+
+    # --- The separator. Every corrected cell changes muP AND the attention
+    # temperature at once, so none of them can say which one moved a crossing.
+    # This is the mirror: standard parametrization everywhere, with muP's 1/d
+    # temperature and nothing else. If it also inverts the schedule ordering,
+    # the inversion is the temperature; if it does not, it is muP. It takes no
+    # transfer and no anchor -- it is an SP cell, so it runs at SP's own
+    # inherited learning rate exactly as e1_sp_rerun does, and differs from that
+    # suite in one term.
+    for arm in ARMS:
+        for seed in SEEDS:
+            jobs.append(_job("e1_sp_coldattn", arm, seed,
+                             dict(sp_inv_d_attn_scale=True), **S24))
 
     # --- E1c'': SP's own learning-rate curve at the target width. The inherited
     # value is a point on this curve and is contributed by e1_sp_rerun, so only the
@@ -1633,6 +1665,8 @@ PARAMETRIZATION_CONTROL = {
     "e1_mup_sched20_spattn": "e1_sp_sched20",
     "e1_mup_bs8_spattn": "e1_sp_bs8",
     "e1_mup_sched20": "e1_sp_sched20", "e1_mup_bs8": "e1_sp_bs8",
+    "e1_mup_tuned_spattn": "e1_sp_rerun",
+    "e1_sp_coldattn": "e1_sp_rerun",
     "e1_perlayer_sp": "e1_sp_rerun", "e1_embed_lr": "e1_sp_rerun",
 }
 
