@@ -329,6 +329,29 @@ ARMS: tuple[Arm, ...] = (
 # suite rather than read across from another one -- the same within-suite rule
 # E10 had to be fixed to obey.
 LOOP_ARMS = ("attention", "looped_attn3x4", "looped_attn6x2", "attn3", "attn6")
+
+# E19: the OTHER side of the parameter axis at fixed compute. E18's looped arms
+# hold compute and REMOVE parameters; a top-1 MoE holds active compute and ADDS
+# them -- `moe_top_k` experts run per token no matter how many exist. Together
+# they bracket `attention` from both directions, which is what makes the pair a
+# test of "parameters at fixed compute" rather than two unrelated arms.
+#
+# top_k=1 on purpose. The Config default is top_k=2, which would run TWO FFNs
+# per token against dense's one and confound the parameter effect with a
+# compute effect -- the exact mistake E18's controls exist to prevent.
+ARMS = ARMS + (
+    Arm("moe_e4k1", "attention", note="4 experts, top-1: ~4x FFN params, ~1x active compute",
+        overrides=(("ffn", "moe"), ("moe_experts", 4), ("moe_top_k", 1))),
+    Arm("moe_e8k1", "attention", note="8 experts, top-1: ~8x FFN params, ~1x active compute",
+        overrides=(("ffn", "moe"), ("moe_experts", 8), ("moe_top_k", 1))),
+    # The control that makes it falsifiable, same shape as E18's attn3/attn6:
+    # 1 expert top-1 IS a dense SwiGLU, but routed through the MoE code path.
+    # If it does not match `attention`, the gap is the router and the aux loss,
+    # not the extra parameters, and the whole board reads differently.
+    Arm("moe_e1k1", "attention", note="control: 1 expert = dense FFN through the MoE path",
+        overrides=(("ffn", "moe"), ("moe_experts", 1), ("moe_top_k", 1))),
+)
+MOE_ARMS = ("attention", "moe_e1k1", "moe_e4k1", "moe_e8k1")
 # `attention` and `gdn` are carried IN these suites rather than read across from
 # suite 26 / E9. Those rows were measured on a GH200; these will not be. Joining
 # them would compare architectures across hardware, which is the confound this

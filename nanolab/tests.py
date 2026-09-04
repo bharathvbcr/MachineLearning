@@ -3862,6 +3862,88 @@ def no_stage_chain_waits_on_pgrep():
         + "\n  ".join(bad))
 
 
+@test
+def e19_moe_arms_add_parameters_without_adding_compute():
+    """E19 is the mirror of E18. E18's looped arms hold compute and REMOVE
+    parameters; a top-1 MoE holds active compute and ADDS them. Together they
+    bracket `attention` from both directions, which is what makes the pair a
+    test of "parameters at fixed compute" rather than two unrelated boards.
+
+    top_k must be 1. The Config default is 2, which would run TWO FFNs per token
+    against dense's one and confound the parameter effect with a compute effect
+    -- the exact mistake E18's controls exist to prevent.
+    """
+    from .config import build_config
+    from .model import build_model
+    from .crossover_replicate import ARMS, MOE_ARMS
+    spec = {a.name: dict(a.overrides) for a in ARMS if a.name in MOE_ARMS}
+    assert set(spec) == set(MOE_ARMS), "MOE_ARMS names an unregistered arm"
+    assert "attention" in MOE_ARMS, "E19 must carry its own dense reference"
+    assert "moe_e1k1" in MOE_ARMS, (
+        "E19 needs the 1-expert control: without it, a gap between dense and "
+        "MoE cannot be told apart from the router and aux loss")
+
+    def built(name):
+        cfg = build_config("crossover50m",
+                           dict({"run_name": "p", "mixer": "attention"}, **spec[name]))
+        return cfg, build_model(cfg)
+
+    ref_cfg, ref = built("attention")
+    ref_f = ref.flops_per_token()
+    ref_p = ref.num_params(non_embedding=True)
+    for name in MOE_ARMS:
+        if name == "attention":
+            continue
+        o = spec[name]
+        assert o.get("moe_top_k") == 1, (
+            f"{name} has top_k={o.get('moe_top_k')}; anything above 1 runs extra "
+            "FFNs per token and confounds parameters with compute")
+        cfg, m = built(name)
+        f, n = m.flops_per_token(), m.num_params(non_embedding=True)
+        # active compute must stay put -- the router gate is the only extra work
+        assert abs(f - ref_f) / ref_f < 0.01, (
+            f"{name} flops/token moved {abs(f-ref_f)/ref_f:.2%} from dense; "
+            "a top-1 MoE should be compute-matched")
+        if o["moe_experts"] == 1:
+            assert abs(n - ref_p) / ref_p < 0.01, (
+                f"moe_e1k1 has {n/1e6:.1f}M params vs dense {ref_p/1e6:.1f}M; "
+                "1 expert top-1 IS a dense FFN and must match")
+        else:
+            assert n > 1.5 * ref_p, (
+                f"{name} has {n/1e6:.1f}M params vs dense {ref_p/1e6:.1f}M; "
+                "the whole point is that it adds parameters")
+
+
+@test
+def e18_and_e19_bracket_the_dense_reference_at_one_compute_budget():
+    """The two boards are only a parameter axis if they sit at the SAME compute.
+    Checked jointly so a later edit to either one cannot quietly break the pair.
+    """
+    from .config import build_config
+    from .model import build_model
+    from .crossover_replicate import ARMS, LOOP_ARMS, MOE_ARMS
+    spec = {a.name: dict(a.overrides) for a in ARMS}
+
+    def built(name):
+        cfg = build_config("crossover50m",
+                           dict({"run_name": "p", "mixer": "attention"}, **spec[name]))
+        m = build_model(cfg)
+        return m.flops_per_token(), m.num_params(non_embedding=True)
+
+    ref_f, ref_p = built("attention")
+    below = [n for n in LOOP_ARMS if spec[n].get("n_loops", 1) > 1]
+    above = [n for n in MOE_ARMS if spec[n].get("moe_experts", 1) > 1]
+    assert below and above, "the bracket needs arms on both sides"
+    for n in below:
+        f, p = built(n)
+        assert abs(f - ref_f) / ref_f < 0.01, f"{n} is not compute-matched"
+        assert p < ref_p, f"{n} should have FEWER params than dense"
+    for n in above:
+        f, p = built(n)
+        assert abs(f - ref_f) / ref_f < 0.01, f"{n} is not compute-matched"
+        assert p > ref_p, f"{n} should have MORE params than dense"
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = skipped = 0
