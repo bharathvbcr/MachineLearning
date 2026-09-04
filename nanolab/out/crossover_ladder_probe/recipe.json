@@ -214,6 +214,48 @@
       "head_dim": 64,
       "lr": 0.0048,
       "matrix_lr": 0.2
+    },
+    "w384_attention_lr160": {
+      "d_model": 384,
+      "n_head": 6,
+      "head_dim": 64,
+      "lr": 0.0096,
+      "matrix_lr": 0.4
+    },
+    "w384_attention_lr320": {
+      "d_model": 384,
+      "n_head": 6,
+      "head_dim": 64,
+      "lr": 0.0192,
+      "matrix_lr": 0.8
+    },
+    "w768_attention_lr160": {
+      "d_model": 768,
+      "n_head": 12,
+      "head_dim": 64,
+      "lr": 0.0096,
+      "matrix_lr": 0.4
+    },
+    "w768_attention_lr320": {
+      "d_model": 768,
+      "n_head": 12,
+      "head_dim": 64,
+      "lr": 0.0192,
+      "matrix_lr": 0.8
+    },
+    "w1152_attention_lr160": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0096,
+      "matrix_lr": 0.4
+    },
+    "w1152_attention_lr320": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0192,
+      "matrix_lr": 0.8
     }
   },
   "swa_chunk": -1,
@@ -250,7 +292,13 @@
     "w1152_mingru_lr10",
     "w1152_mingru_lr20",
     "w1152_mingru_lr40",
-    "w1152_mingru_lr80"
+    "w1152_mingru_lr80",
+    "w384_attention_lr160",
+    "w384_attention_lr320",
+    "w768_attention_lr160",
+    "w768_attention_lr320",
+    "w1152_attention_lr160",
+    "w1152_attention_lr320"
   ],
   "prefix": "cx32lad",
   "device": "NVIDIA GH200 480GB",

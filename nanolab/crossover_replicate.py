@@ -385,7 +385,18 @@ LADDER_WIDTHS = (384, 768, 1152)
 # Worth keeping straight in the writeup: this says the repo's base LR is low
 # FOR A 10M-TOKEN RUN, which is the regime the probe is in. Shorter runs favour
 # higher LRs, so it is NOT evidence that the 50M boards were mistuned.
-LADDER_LR_MULTS = (0.5, 1.0, 2.0, 4.0, 8.0)
+# 16.0/32.0 exist for ATTENTION only in practice: after the 8.0 extension the
+# minGRU cells all found interior optima at 4.0 (w384 5.2696/5.1651/5.1772,
+# w768 5.0765/5.0494/5.0919, w1152 5.0002/4.9947/5.0479) while all three
+# attention cells were still falling at 8.0. The probe script queues only the
+# attention arms at these two multipliers; generating them for both mixers
+# keeps the arm table symmetric and costs nothing unqueued.
+#
+# That the two mixers peak at DIFFERENT learning rates is the ladder's first
+# real finding, and it is the mechanism the paper is about: any board that
+# hands both arms one shared LR is reading them at different distances from
+# their own optima.
+LADDER_LR_MULTS = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
 _LADDER_BASE_LR, _LADDER_BASE_MATRIX_LR = 6e-4, 0.025
 _ladder = []
 for _w in LADDER_WIDTHS:
