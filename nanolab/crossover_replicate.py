@@ -54,6 +54,7 @@ MATCHED32_OUT = Path("nanolab/out/crossover50m_matched32")
 # one directory. Sharing the directory would either trip that guard or, worse,
 # silently blend two arm sets under one recipe.json.
 RATIO32_OUT = Path("nanolab/out/crossover50m_ratio32")
+WCLOOP32_OUT = Path("nanolab/out/crossover_wcloop32")
 # E12: sliding-window attention, the arm the section 4.5 board never had.
 # arXiv:2608.28444 reports SWA(w=64, s=4) matching or beating post-trained
 # linear attention; this board's linear-attention family is GDN, already at n=5
@@ -92,6 +93,14 @@ WALLCLOCK_ARMS = ("attention", "hybrid_mingru10_attn2",
                   "hybrid_gdn_periodic", "hybrid_gdn_bookend")
 # Chosen as phase 1's budget: what the fastest arm needs for the 50M board.
 WALLCLOCK_SECONDS = 691.0
+# E20: the same rule applied to E18's depth axis. Measured, not chosen: at
+# tenancy 3 the fastest arm (attn3, 74156 tok/wall-s) needs 674.3s for the 50M
+# board, so 674s is the budget every arm gets. It is a severe handicap for
+# `attention` on purpose -- it buys only 22.5M tokens there against attn3's
+# 50M, and whether that 2.2x reverses the token-matched ranking IS the
+# experiment. Re-derive with effective_rate_by_arm(tenancy=3) if loop32 is
+# ever re-measured; a stale constant here silently unmatches the wall clock.
+WALLCLOCK_LOOP_SECONDS = 674.0
 DRIFTED_ARMS = (
     "mamba2", "gdn", "mla",
     "hybrid_gdn10_attn2", "hybrid_gdn_periodic", "hybrid_gdn_bookend",
@@ -522,6 +531,11 @@ RATE_SUITES = (
     # the repo, which is exactly what sizing the retry requires.
     "nanolab/out/crossover_wallclock32_unmatched",
     "nanolab/out/crossover_wallclock32",
+    # E18/E19. Both ran at workers=3 and both carry arms that exist nowhere
+    # else, so without them a wall-clock board over the depth or parameter axis
+    # cannot be sized at all -- `wallclock_budgets` refuses rather than guess.
+    "nanolab/out/crossover50m_loop32",
+    "nanolab/out/crossover50m_moe32",
 )
 
 
@@ -920,6 +934,27 @@ ISOLATE_STAGES: tuple[dict, ...] = (
         "arms": ",".join(SWA2K_ARMS),
         "prefix": "cx2kswa",
         "workers": 2,
+    },
+    {
+        # E20: E18's arms matched on WALL CLOCK instead of tokens. E18 showed
+        # looping beats its own depth control at equal tokens; this asks whether
+        # that survives the cost basis practitioners actually pay. attn3 runs
+        # 2.2x faster than attention, so under this rule it trains on 2.2x the
+        # tokens -- exactly the kind of change that reorders a board.
+        "name": "wcloop32",
+        "out": WCLOOP32_OUT,
+        "batch": 32,
+        "eval_iters": 20,
+        "token_budget": TOKEN_BUDGET,      # overridden per arm; kept for the record
+        "wall_clock_s": WALLCLOCK_LOOP_SECONDS,
+        "lr_horizon": None,
+        "arms": ",".join(LOOP_ARMS),
+        "prefix": "cxwcl",
+        # 3, not 1: the rates this budget is sized from were measured at
+        # tenancy 3 in E18, and `wallclock_budgets` documents that a tok/s from
+        # another tenancy does not transfer. Running at 1 would put the arms
+        # back out of wall-clock match, which is the one thing this stage holds.
+        "workers": 3,
     },
     {
         "name": "ratio32",
@@ -1901,6 +1936,7 @@ cmd_matched20 = _stage_cmd("matched20")
 cmd_bs8 = _stage_cmd("bs8")
 cmd_matched32 = _stage_cmd("matched32")
 cmd_ratio32 = _stage_cmd("ratio32")
+cmd_wcloop32 = _stage_cmd("wcloop32")
 cmd_swa32 = _stage_cmd("swa32")
 cmd_swa2k = _stage_cmd("swa2k")
 cmd_ctx2048 = _stage_cmd("ctx2048")
@@ -2588,6 +2624,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("bs8", "attn vs minGRU, suite-14 8.192M tokens, bs8, n=5"),
         ("matched32", "8 drifted arms, 50M, bs32, eval_iters=20, n=5"),
         ("ratio32", "E10: 4 minGRU hybrid ratios/placements, 50M, bs32, n=5"),
+        ("wcloop32", "E20: E18's depth arms matched on WALL CLOCK, 674s, n=5"),
         ("swa32", "E12: SWA(64/128/256, 4) + sink ablation, 50M, bs32, n=5"),
         ("swa2k", "E15: the SWA arms at context 2048, 50M, bs8, n=5"),
         ("ctx2048", "E9: 5 families at context 2048, 50M, bs8, n=5"),
@@ -2653,6 +2690,7 @@ def main():
         "bs8": cmd_bs8,
         "matched32": cmd_matched32,
         "ratio32": cmd_ratio32,
+        "wcloop32": cmd_wcloop32,
         "swa32": cmd_swa32,
         "swa2k": cmd_swa2k,
         "ctx2048": cmd_ctx2048,

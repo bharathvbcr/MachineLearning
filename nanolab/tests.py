@@ -4031,6 +4031,49 @@ def two_identically_configured_arms_raise_instead_of_being_guessed():
                 assert "configured identically" in str(e), str(e)
 
 
+@test
+def e20_matches_wall_clock_at_the_tenancy_its_rates_were_measured_at():
+    """`wallclock_budgets` documents that a tok/s measured at one tenancy does
+    not transfer: the first attempt at the wall-clock suite sized budgets from
+    three-to-a-GPU rates and then ran single-tenant, producing a 1.70x spread in
+    the one quantity the suite exists to hold constant.
+
+    E20's budget is sized from E18's rates, and E18 ran at workers=3. So the
+    stage must declare workers=3, and the suite it reads those rates from must
+    be in RATE_SUITES or the sizing cannot happen at all.
+    """
+    from .crossover_replicate import stage_by_name, RATE_SUITES, LOOP_ARMS
+    st = stage_by_name("wcloop32")
+    assert st["wall_clock_s"], "E20 is a wall-clock stage and must declare one"
+    assert st["workers"] == 3, (
+        f"E20 declares workers={st['workers']} but its budgets are sized from "
+        "E18's tenancy-3 rates; running at another tenancy unmatches the wall "
+        "clock, which is the only thing this stage holds constant")
+    assert "nanolab/out/crossover50m_loop32" in RATE_SUITES, (
+        "E18's suite is not in RATE_SUITES, so E20's arms have no measured "
+        "throughput and wallclock_budgets will refuse to size them")
+    assert tuple(st["arms"].split(",")) == tuple(LOOP_ARMS), (
+        "E20 must carry exactly E18's arms; a different arm set is a different "
+        "comparison and cannot be read against E18's token-matched board")
+
+
+@test
+def a_wall_clock_stage_refuses_a_tenancy_it_was_not_sized_for():
+    """The guard that makes the above enforceable at launch, not just in this
+    file. Sizing and running at different tenancies is silent -- every arm still
+    trains, just for different amounts of wall clock.
+    """
+    from types import SimpleNamespace
+    from . import crossover_replicate as cr
+    run = cr._stage_cmd("wcloop32")
+    try:
+        run(SimpleNamespace(workers=1, detach=True, gpus=1))
+        raise AssertionError("wall-clock stage accepted a mismatched tenancy")
+    except SystemExit as e:
+        assert "wall-clock" in str(e) or "tenancy" in str(e) or "workers" in str(e), \
+            f"refused, but not for the tenancy reason: {e}"
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = skipped = 0
