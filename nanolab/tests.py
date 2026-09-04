@@ -3578,6 +3578,164 @@ def lock_recipe_lets_arms_grow_but_refuses_every_other_drift():
         pass
 
 
+@test
+def n_loops_1_is_bit_identical_to_the_unlooped_model():
+    """The looped path must not perturb every arm already on every board. This
+    pins that n_loops=1 runs the pre-loop code exactly, not merely closely.
+    """
+    import torch
+    from .config import build_config
+    from .model import build_model
+    kw = dict(run_name="probe", mixer="attention", n_layer=4, d_model=64,
+              n_head=4, head_dim=16, block_size=32, vocab_size=64,
+              tie_embeddings=False)
+    torch.manual_seed(0); a = build_model(build_config("cpu_smoke", dict(kw)))
+    torch.manual_seed(0); b = build_model(build_config("cpu_smoke", dict(kw, n_loops=1)))
+    x = torch.randint(0, 64, (2, 32))
+    a.eval(); b.eval()
+    with torch.no_grad():
+        la, _ = a(x); lb, _ = b(x)
+    assert torch.equal(la, lb), (
+        f"n_loops=1 changed the forward; max delta {(la-lb).abs().max().item():.3e}")
+
+
+@test
+def looping_actually_reruns_the_blocks_and_shares_the_weights():
+    """Two independent things, both of which a broken implementation fakes.
+
+    A loop that silently runs once would leave the forward unchanged; a loop
+    that rebuilt the blocks per pass would not be a LOOPED transformer at all,
+    it would just be a deeper model with more parameters. So check the output
+    moves AND the parameter count does not.
+    """
+    import torch
+    from .config import build_config
+    from .model import build_model
+    kw = dict(run_name="probe", mixer="attention", n_layer=3, d_model=64,
+              n_head=4, head_dim=16, block_size=32, vocab_size=64,
+              tie_embeddings=False)
+    torch.manual_seed(0); one = build_model(build_config("cpu_smoke", dict(kw)))
+    torch.manual_seed(0); four = build_model(build_config("cpu_smoke", dict(kw, n_loops=4)))
+    n1 = sum(p.numel() for p in one.parameters())
+    n4 = sum(p.numel() for p in four.parameters())
+    assert n1 == n4, (
+        f"looping added parameters ({n1} -> {n4}); the blocks are being rebuilt "
+        "per pass instead of reused, which is not a looped transformer")
+    # The blocks ship with ZERO-INIT output projections, so an untrained block
+    # is exactly the identity and looping the identity is still the identity.
+    # Comparing at init would pass whether or not the loop ran -- a vacuous
+    # test. Give both models the same NON-zero weights first.
+    with torch.no_grad():
+        torch.manual_seed(1)
+        for pm in one.parameters():
+            pm.normal_(0, 0.02)
+        for pa, pb in zip(one.parameters(), four.parameters()):
+            pb.copy_(pa)
+    x = torch.randint(0, 64, (2, 32))
+    one.eval(); four.eval()
+    with torch.no_grad():
+        lo, _ = one(x); lf, _ = four(x)
+    assert not torch.allclose(lo, lf), (
+        "n_loops=4 produced the same logits as n_loops=1, so the extra passes "
+        "never ran")
+    # and the extra passes must reach the gradients too
+    four.train()
+    logits, _ = four(x)
+    logits.sum().backward()
+    grads = [p.grad for p in four.blocks.parameters() if p.grad is not None]
+    assert grads and any(g.abs().sum() > 0 for g in grads), \
+        "looped blocks received no gradient"
+
+
+@test
+def looped_flops_charge_the_blocks_per_pass_and_the_embedding_once():
+    """MFU is the number this suite reports throughput in, and model.py's own
+    docstring records that a silently wrong FLOPs term for a new arm has bitten
+    this repo before. A looped stack runs its blocks `n_loops` times and its
+    embedding once, so neither 6*N nor 6*N*loops is right.
+    """
+    from .config import build_config
+    from .model import build_model, mixer_flops_per_token
+    kw = dict(run_name="probe", mixer="attention", n_layer=3, d_model=64,
+              n_head=4, head_dim=16, block_size=32, vocab_size=64,
+              tie_embeddings=False)
+    c1 = build_config("cpu_smoke", dict(kw))
+    c4 = build_config("cpu_smoke", dict(kw, n_loops=4))
+    m1, m4 = build_model(c1), build_model(c4)
+    f1, f4 = m1.flops_per_token(), m4.flops_per_token()
+    assert f4 > f1, f"looping did not raise flops_per_token ({f1} -> {f4})"
+    assert f4 < 4 * f1, (
+        f"flops_per_token scaled the WHOLE model by n_loops ({f1} -> {f4}); the "
+        "embedding and head run once per token, not once per pass")
+    block_params = sum(p.numel() for b in m1.blocks for p in b.parameters())
+    want = f1 + 6 * block_params * 3 + mixer_flops_per_token(c1) * 3
+    assert f4 == want, f"looped flops {f4} != expected {want}"
+
+
+@test
+def e18_pairs_every_looped_arm_with_its_unlooped_control():
+    """"Looping buys depth" is unfalsifiable without a same-parameter control:
+    looped_attn3x4 losing to a 12-layer baseline could just be a 3-layer model
+    being small. Every looped arm must have a no-loop twin at the same n_layer
+    in the suite, and the 12-layer reference must be carried IN the suite
+    rather than read across from another one.
+    """
+    from .crossover_replicate import ARMS, LOOP_ARMS
+    spec = {a.name: dict(a.overrides) for a in ARMS if a.name in LOOP_ARMS}
+    assert set(spec) == set(LOOP_ARMS), "LOOP_ARMS names an unregistered arm"
+    assert "attention" in LOOP_ARMS, "E18 must carry its own 12-layer reference"
+    looped = {n: o for n, o in spec.items() if o.get("n_loops", 1) > 1}
+    assert looped, "E18 has no looped arm"
+    depths = {n: o.get("n_layer") for n, o in spec.items()
+              if o.get("n_loops", 1) == 1}
+    for name, o in looped.items():
+        assert o["n_layer"] in depths.values(), (
+            f"{name} has n_layer={o['n_layer']} and no unlooped control at that "
+            f"depth; controls present: {depths}")
+        # compute-matched to the 12-layer reference, or the comparison is not
+        # the one E18 claims to make
+        assert o["n_layer"] * o["n_loops"] == 12, (
+            f"{name} is not compute-matched to the 12-layer reference: "
+            f"{o['n_layer']}x{o['n_loops']}")
+
+
+@test
+def cached_decode_refuses_a_looped_stack_instead_of_guessing():
+    """forward_hidden_window threads ONE cache per block. A looped stack reuses
+    each block every pass, so pass 2 would append to pass 1's cache and attend
+    to keys from the wrong depth -- plausible tokens, silently wrong. It must
+    raise, not return.
+    """
+    import torch
+    from .config import build_config
+    from .model import build_model
+    kw = dict(run_name="probe", mixer="attention", n_layer=2, d_model=64,
+              n_head=4, head_dim=16, block_size=32, vocab_size=64,
+              tie_embeddings=False, n_loops=3)
+    m = build_model(build_config("cpu_smoke", dict(kw)))
+    caches = [{} for _ in m.blocks]
+    try:
+        m.forward_hidden_window(torch.randint(0, 64, (1, 4)), 0, caches, True)
+        raise AssertionError("cached decode silently served a looped stack")
+    except NotImplementedError:
+        pass
+
+
+@test
+def n_loops_zero_fails_closed():
+    """n_loops=0 would build a model that runs no blocks and still trains an
+    embedding and a head -- a very fast, very bad arm rather than a broken one.
+    """
+    from .config import build_config
+    try:
+        build_config("cpu_smoke", dict(run_name="probe", mixer="attention",
+                                       n_loops=0))
+        raise AssertionError("n_loops=0 was accepted")
+    except AssertionError as e:
+        if "was accepted" in str(e):
+            raise
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = skipped = 0

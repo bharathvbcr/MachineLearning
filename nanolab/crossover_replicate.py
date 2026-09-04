@@ -298,7 +298,37 @@ ARMS: tuple[Arm, ...] = (
     Arm("hybrid_mingru10_swa2", "mingru", "mingru*10,swa*2",
         "E12: the board's co-leader with its attention windowed",
         overrides=(("swa_window", 128), ("swa_sinks", 4))),
+    # E18: the DEPTH axis, which no board in this repo has ever varied. Every
+    # arm above is 12 layers, so parameter count and compute move together and
+    # the two matching rules -- equal tokens and equal wall clock -- have never
+    # been able to disagree about an architecture.
+    #
+    # A looped (universal) transformer breaks that: `n_loops` applies the same
+    # blocks repeatedly, so the two arms below have the PARAMETERS of 3 and 6
+    # layers and the COMPUTE of 12. Under equal tokens they are param-starved;
+    # under equal wall clock they are param-starved AND get fewer steps. The
+    # prediction this suite exists to test is that their rank against the
+    # 12-layer baseline moves between those two rules.
+    Arm("looped_attn3x4", "attention",
+        note="3 blocks applied 4x: params of 3 layers, compute of 12",
+        overrides=(("n_layer", 3), ("n_loops", 4))),
+    Arm("looped_attn6x2", "attention",
+        note="6 blocks applied 2x: params of 6 layers, compute of 12",
+        overrides=(("n_layer", 6), ("n_loops", 2))),
+    # The controls, and they are the point. Without them "looping buys depth"
+    # cannot be falsified: looped_attn3x4 losing to attention could just be a
+    # 3-layer model being small. These are the SAME parameter counts with the
+    # loop removed, so the loop is the only difference.
+    Arm("attn3", "attention", note="control: 3 layers, no loop",
+        overrides=(("n_layer", 3),)),
+    Arm("attn6", "attention", note="control: 6 layers, no loop",
+        overrides=(("n_layer", 6),)),
 )
+
+# E18. `attention` is carried so the 12-layer reference is measured in this
+# suite rather than read across from another one -- the same within-suite rule
+# E10 had to be fixed to obey.
+LOOP_ARMS = ("attention", "looped_attn3x4", "looped_attn6x2", "attn3", "attn6")
 # `attention` and `gdn` are carried IN these suites rather than read across from
 # suite 26 / E9. Those rows were measured on a GH200; these will not be. Joining
 # them would compare architectures across hardware, which is the confound this

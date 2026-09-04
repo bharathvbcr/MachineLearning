@@ -53,6 +53,11 @@ class Config:
 
     # ---- model: the modern stack vs GPT-2 defaults (guide §2) ----
     n_layer: int = 12
+    # Looped / universal transformer: apply the whole block stack `n_loops`
+    # times, reusing the SAME weights each pass. Effective depth is
+    # n_layer * n_loops while the parameter count stays that of n_layer.
+    # 1 is an ordinary transformer and is the default everywhere.
+    n_loops: int = 1
     d_model: int = 768
     n_head: int = 12
     n_kv_head: int = 0           # 0 -> = n_head (MHA). <n_head enables GQA (§2.1).
@@ -229,6 +234,10 @@ class Config:
         if self.n_kv_head == 0:
             self.n_kv_head = self.n_head
         assert self.mixer in MIXERS, f"mixer must be one of {MIXERS}"
+        # Fail closed and loud: n_loops=0 would silently build a model that
+        # runs no blocks at all and still trains an embedding + head, which
+        # would look like a very fast, very bad arm rather than a broken one.
+        assert self.n_loops >= 1, f"n_loops must be >= 1, got {self.n_loops}"
         # Checked here, not in the mixer, so a bad window is caught while the
         # config is built rather than after a cluster job has been billed.
         assert self.swa_window >= 1, f"swa_window must be >=1, got {self.swa_window}"

@@ -313,6 +313,17 @@ class GPT(nn.Module):
         else:
             cos = sin = None
         v0 = None
+        if cfg.n_loops != 1:
+            # One cache per block is exactly wrong for a looped stack: pass 2
+            # would append to pass 1's cache and silently attend to keys from
+            # the wrong depth. A correct version needs n_layer * n_loops
+            # caches and a caller that knows to build them. Refuse rather than
+            # return plausible, wrong tokens.
+            raise NotImplementedError(
+                f"cached decode does not support n_loops={cfg.n_loops}; it "
+                "allocates one cache per block, which a looped stack reuses "
+                "at every pass. Use the uncached forward, or extend the cache "
+                "to n_layer * n_loops entries.")
         for blk, cache in zip(self.blocks, caches):
             h, raw_v = blk.forward_cached(h, cos, sin, v0, cache, commit, causal)
             if v0 is None and raw_v is not None:
@@ -334,13 +345,22 @@ class GPT(nn.Module):
         else:
             cos = sin = None
         v0 = None
-        for blk in self.blocks:
-            if cfg.grad_checkpoint and self.training:
-                x, raw_v = checkpoint(blk, x, cos, sin, v0, use_reentrant=False)
-            else:
-                x, raw_v = blk(x, cos, sin, v0)
-            if v0 is None and raw_v is not None:
-                v0 = raw_v          # capture layer-0 values for value residual
+        # `n_loops` applies the SAME blocks repeatedly (looped / universal
+        # transformer): effective depth n_layer * n_loops at the parameter
+        # count of n_layer. n_loops == 1 is the ordinary single pass and is
+        # bit-identical to the pre-loop code path.
+        for _ in range(cfg.n_loops):
+            for blk in self.blocks:
+                if cfg.grad_checkpoint and self.training:
+                    x, raw_v = checkpoint(blk, x, cos, sin, v0, use_reentrant=False)
+                else:
+                    x, raw_v = blk(x, cos, sin, v0)
+                if v0 is None and raw_v is not None:
+                    # Layer 0 of the UNROLLED stack, i.e. the first block on the
+                    # first pass. Later passes re-read this same v0, which is
+                    # what makes the value residual a fixed anchor rather than
+                    # something that drifts once per loop.
+                    v0 = raw_v
         # collect MoE load-balancing aux loss (0 if no MoE layers)
         if cfg.ffn == "moe":
             self._moe_aux = sum(b.ffn.aux for b in self.blocks if b.ffn.aux is not None)
@@ -387,7 +407,22 @@ class GPT(nn.Module):
             ffn_params = sum(p.numel() for b in self.blocks for p in b.ffn.experts.parameters())
             inactive = ffn_params * (1 - cfg.moe_top_k / cfg.moe_experts)
             N -= int(inactive)
-        return 6 * N + mixer_flops_per_token(cfg)
+        loops = cfg.n_loops
+        if loops > 1:
+            # A looped stack runs its BLOCK parameters `loops` times per token
+            # while the embedding and the head still run once. 6*N*loops would
+            # bill the embedding for passes it never makes; plain 6*N would bill
+            # the blocks for one pass out of `loops`. Both corrupt MFU, in
+            # opposite directions -- and this module's own docstring records
+            # that a silently wrong FLOPs term for a new arm has bitten this
+            # repo before. So charge the block parameters the extra passes and
+            # nothing else.
+            block_params = sum(p.numel() for b in self.blocks
+                               for p in b.parameters())
+            if cfg.ffn == "moe" and cfg.moe_experts > cfg.moe_top_k:
+                block_params -= int(inactive)
+            N += block_params * (loops - 1)
+        return 6 * N + mixer_flops_per_token(cfg) * loops
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
