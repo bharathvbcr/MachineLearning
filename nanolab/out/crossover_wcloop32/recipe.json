@@ -1,0 +1,43 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "workers": 3,
+  "gpus": 1,
+  "budget_by_arm": {
+    "attention": 22544384,
+    "attn3": 49971200,
+    "attn6": 35602432,
+    "looped_attn3x4": 23789568,
+    "looped_attn6x2": 23379968
+  },
+  "arm_overrides": {
+    "looped_attn3x4": {
+      "n_layer": 3,
+      "n_loops": 4
+    },
+    "looped_attn6x2": {
+      "n_layer": 6,
+      "n_loops": 2
+    },
+    "attn3": {
+      "n_layer": 3
+    },
+    "attn6": {
+      "n_layer": 6
+    }
+  },
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "token_budget": 50000000,
+  "lr_horizon": null,
+  "arms": [
+    "attention",
+    "looped_attn3x4",
+    "looped_attn6x2",
+    "attn3",
+    "attn6"
+  ],
+  "prefix": "cxwcl",
+  "device": "NVIDIA GH200 480GB",
+  "compile": false
+}
