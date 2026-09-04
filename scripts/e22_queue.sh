@@ -46,6 +46,13 @@ run_stage e1_sp_coldattn \
 
 python3 -u scripts/gpu_bundle.py --analyse 2>&1 | tail -40
 
+# Pull the artifacts NOW, not at the end. E21 phase 2 finished 30/30 and then
+# the box went away before anything was synced; its per-seed metrics.jsonl are
+# gone, and .gitignore had been publishing exactly those filenames since gap B3.
+# Run this from the laptop alongside the board:
+#     bash scripts/pull_artifacts.sh gpu_bundle
+echo "REMINDER: run scripts/pull_artifacts.sh from the laptop before this box goes away"
+
 # --- 3: the MoE board on the fixed reporting path. A NEW out dir on purpose:
 # pre-fix runs carry the load-balancing aux inside final_val and must never be
 # pooled with these by a resume.
