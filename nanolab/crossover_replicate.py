@@ -376,7 +376,16 @@ MOE_ARMS = ("attention", "moe_e1k1", "moe_e4k1", "moe_e8k1")
 # head_dim is pinned at 64 so width moves through n_head alone; changing both
 # would confound width with head geometry.
 LADDER_WIDTHS = (384, 768, 1152)
-LADDER_LR_MULTS = (0.5, 1.0, 2.0)
+# 0.5/1.0/2.0 was the first sweep and it was entirely on the wrong side: at
+# 10M tokens ALL SIX cells picked 2.0, the top edge, with loss monotone
+# decreasing in LR (e.g. w768 attention 5.4948 / 5.3608 / 5.2701). An argmin at
+# the edge is not an argmin, so 4.0 and 8.0 extend it until the optimum is
+# interior. The existing 18 runs are unaffected and are skipped on relaunch.
+#
+# Worth keeping straight in the writeup: this says the repo's base LR is low
+# FOR A 10M-TOKEN RUN, which is the regime the probe is in. Shorter runs favour
+# higher LRs, so it is NOT evidence that the 50M boards were mistuned.
+LADDER_LR_MULTS = (0.5, 1.0, 2.0, 4.0, 8.0)
 _LADDER_BASE_LR, _LADDER_BASE_MATRIX_LR = 6e-4, 0.025
 _ladder = []
 for _w in LADDER_WIDTHS:
@@ -834,6 +843,18 @@ def lock_recipe(out_root: Path) -> dict:
         # re-points a suite at a different board.
         if "arms" in conflicts and set(old["arms"]) < set(rec["arms"]):
             conflicts.pop("arms")
+            # `arm_overrides` is keyed BY arm, so it grows with the arm list and
+            # would refuse the very addition just allowed. Growing it is safe on
+            # exactly one condition: every arm already on disk keeps the
+            # overrides it was measured under. A CHANGED value there is the
+            # thing this field exists to catch -- it would silently reuse a
+            # directory holding runs measured at a different window, width or
+            # learning rate -- so that still refuses.
+            old_ov = old.get("arm_overrides") or {}
+            new_ov = rec.get("arm_overrides") or {}
+            if "arm_overrides" in conflicts and all(
+                    k in new_ov and new_ov[k] == v for k, v in old_ov.items()):
+                conflicts.pop("arm_overrides")
         if conflicts:
             raise SystemExit(
                 f"refusing to mix recipes in {path}:\n  have {old}\n  want {rec}"
@@ -844,6 +865,7 @@ def lock_recipe(out_root: Path) -> dict:
             # four-arm list back over the five-arm one we just accepted.
             if set(old.get("arms", ())) < set(rec.get("arms", ())):
                 merged["arms"] = rec["arms"]
+                merged["arm_overrides"] = rec.get("arm_overrides")
             if "workers" not in old:
                 # Never backfill tenancy from the CURRENT launch -- that would
                 # write a guess about a run that already happened into its own
@@ -861,7 +883,8 @@ def lock_recipe(out_root: Path) -> dict:
             path.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
             return merged
         if set(old.get("arms", ())) < set(rec.get("arms", ())):
-            grown = {**old, "arms": rec["arms"]}
+            grown = {**old, "arms": rec["arms"],
+                     "arm_overrides": rec.get("arm_overrides")}
             path.write_text(json.dumps(grown, indent=2) + "\n", encoding="utf-8")
             return grown
         return old

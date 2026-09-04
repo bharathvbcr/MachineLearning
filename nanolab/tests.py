@@ -3542,8 +3542,10 @@ def lock_recipe_lets_arms_grow_but_refuses_every_other_drift():
     def attempt(disk_arms, launch_arms, **overrides):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
-            (root / "recipe.json").write_text(
-                json.dumps({**base, "arms": disk_arms}), encoding="utf-8")
+            disk = {**base, "arms": disk_arms}
+            if "arm_overrides" in overrides:
+                disk["arm_overrides"] = {a: {"lr": 0.001} for a in disk_arms}
+            (root / "recipe.json").write_text(json.dumps(disk), encoding="utf-8")
             want = {**base, **overrides, "arms": launch_arms}
             with mock.patch.object(cr, "current_recipe", lambda: dict(want)):
                 out = cr.lock_recipe(root)
@@ -3574,6 +3576,24 @@ def lock_recipe_lets_arms_grow_but_refuses_every_other_drift():
     try:
         attempt(four, four + ["e"], token_budget=20_000_000)
         raise AssertionError("token_budget drift rode in behind an arm addition")
+    except SystemExit:
+        pass
+
+    # `arm_overrides` is keyed by arm, so it grows with the arm list. Adding a
+    # key must be allowed or the arms addition above is refused by its own
+    # side-effect; CHANGING an existing arm's overrides must still refuse,
+    # because that silently reuses a directory holding runs measured at a
+    # different width, window or learning rate.
+    ov4 = {a: {"lr": 0.001} for a in four}
+    out, on_disk = attempt(four, four + ["e"],
+                           arm_overrides={**ov4, "e": {"lr": 0.002}})
+    assert out["arms"] == four + ["e"], "adding an arm_overrides key was refused"
+    assert on_disk["arm_overrides"]["e"] == {"lr": 0.002}, (
+        f"grown arm_overrides not persisted: {on_disk.get('arm_overrides')}")
+    try:
+        attempt(four, four + ["e"],
+                arm_overrides={**ov4, "a": {"lr": 9.9}, "e": {"lr": 0.002}})
+        raise AssertionError("a CHANGED arm override rode in behind an addition")
     except SystemExit:
         pass
 

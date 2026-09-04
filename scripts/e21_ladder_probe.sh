@@ -10,8 +10,13 @@
 #
 # So measure instead of parametrize. Three widths (384/768/1152, head_dim
 # pinned at 64 so width moves through n_head alone), two mixers (attention and
-# minGRU -- the pair whose ranking the paper is about), three LRs each. Phase 2
+# minGRU -- the pair whose ranking the paper is about), FIVE LRs each. Phase 2
 # then re-runs each width at ITS OWN best LR with n=5.
+#
+# Five, not three, because the first sweep (0.5/1.0/2.0) was entirely on the
+# wrong side: all six cells picked 2.0, the top edge, loss monotone decreasing
+# in LR. An argmin at the edge is not an argmin. 4.0 and 8.0 extend it; the 18
+# runs already on disk are skipped on relaunch.
 #
 # 10M tokens, not 50M. This phase only has to RANK three learning rates within
 # a width, and at 50M it would cost ~6h to do it. The caveat is real and worth
@@ -25,18 +30,9 @@ set -u
 cd "$HOME/MLSystemsLab" || exit 1
 export PATH="$HOME/.local/bin:$PATH"
 
-# Wait on E19b's LOG MARKER, never pgrep -- see scripts/overnight.sh.
-deadline=$(( $(date +%s) + 6*3600 ))
-while ! grep -q "^e19b exit=" nanolab/out/e19b.log 2>/dev/null; do
-  if [ "$(date +%s)" -gt "$deadline" ]; then
-    echo "e19b overran 6h; starting anyway"
-    break
-  fi
-  sleep 120
-done
-echo "e19b done, e21 probe start $(date -u +%FT%TZ)"
+echo "e21 probe start $(date -u +%FT%TZ)"
 
-export CROSSOVER_ARMS=w384_attention_lr05,w384_attention_lr10,w384_attention_lr20,w384_mingru_lr05,w384_mingru_lr10,w384_mingru_lr20,w768_attention_lr05,w768_attention_lr10,w768_attention_lr20,w768_mingru_lr05,w768_mingru_lr10,w768_mingru_lr20,w1152_attention_lr05,w1152_attention_lr10,w1152_attention_lr20,w1152_mingru_lr05,w1152_mingru_lr10,w1152_mingru_lr20
+export CROSSOVER_ARMS=w384_attention_lr05,w384_attention_lr10,w384_attention_lr20,w384_attention_lr40,w384_attention_lr80,w384_mingru_lr05,w384_mingru_lr10,w384_mingru_lr20,w384_mingru_lr40,w384_mingru_lr80,w768_attention_lr05,w768_attention_lr10,w768_attention_lr20,w768_attention_lr40,w768_attention_lr80,w768_mingru_lr05,w768_mingru_lr10,w768_mingru_lr20,w768_mingru_lr40,w768_mingru_lr80,w1152_attention_lr05,w1152_attention_lr10,w1152_attention_lr20,w1152_attention_lr40,w1152_attention_lr80,w1152_mingru_lr05,w1152_mingru_lr10,w1152_mingru_lr20,w1152_mingru_lr40,w1152_mingru_lr80
 export CROSSOVER_JOB_PREFIX=cx32lad
 export CROSSOVER_BATCH=32
 export CROSSOVER_EVAL_ITERS=20
@@ -91,8 +87,14 @@ for k, v in vals.items():
 print("\n  best LR per cell (feeds phase 2):")
 for (w, mx), (lr, v) in sorted(best.items()):
     print("    %-8s %-10s -> %-6s  final_val %.4f" % (w, mx, lr, v))
+# The edges are the FIRST and LAST multipliers actually swept, read from the
+# arm table rather than hardcoded -- the previous version still named lr20 as
+# the top edge after the sweep had been extended to lr80, which would have
+# reported "no edge picked" for exactly the failure it exists to catch.
+from nanolab.crossover_replicate import LADDER_LR_MULTS
+_tags = [f"lr{str(m).replace('.', '')}" for m in sorted(LADDER_LR_MULTS)]
 edge = [f"{w}/{mx}={lr}" for (w, mx), (lr, _) in best.items()
-        if lr in ("lr05", "lr20")]
+        if lr in (_tags[0], _tags[-1])]
 if edge:
     print("\n  WARNING: these cells picked an EDGE of the sweep, so the true "
           "optimum may lie outside it: " + ", ".join(sorted(edge)))
