@@ -39,10 +39,15 @@ run_stage() {   # name, then the command
 
 # --- 1 + 2: the muP cells. Both are unblocked -- the proxy and the basin anchor
 # already exist on disk, so neither waits on anything.
+#
+# --workers 1, NOT 2. gpu_bundle refuses to co-locate two of its jobs on one
+# device and says so ("OOMs at this model size"); the crossover runner's 2-3
+# workers are not transferable to it. Copying that convention here cost two
+# refused stages on 2026-09-04.
 run_stage e1_mup_tuned_spattn \
-  python3 -u scripts/gpu_bundle.py --only e1_mup_tuned_spattn --workers 2
+  python3 -u scripts/gpu_bundle.py --only e1_mup_tuned_spattn --workers 1
 run_stage e1_sp_coldattn \
-  python3 -u scripts/gpu_bundle.py --only e1_sp_coldattn --workers 2
+  python3 -u scripts/gpu_bundle.py --only e1_sp_coldattn --workers 1
 
 python3 -u scripts/gpu_bundle.py --analyse 2>&1 | tail -40
 
