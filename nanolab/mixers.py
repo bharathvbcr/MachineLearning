@@ -220,8 +220,12 @@ class Attention(nn.Module):
         self.mup = cfg.mup
         # muP prescribes 1/d attention logits; mup_sqrt_attn_scale keeps SP's
         # 1/sqrt(d) so the term can be ablated on its own.
-        self.attn_scale = (1.0 / cfg.head_dim
-                           if cfg.mup and not cfg.mup_sqrt_attn_scale
+        # One term, reachable from both sides: muP turns 1/d ON and
+        # mup_sqrt_attn_scale turns it back off; sp_inv_d_attn_scale turns it ON
+        # under SP. The two flags cannot both apply (Config.__post_init__).
+        inv_d = ((cfg.mup and not cfg.mup_sqrt_attn_scale)
+                 or cfg.sp_inv_d_attn_scale)
+        self.attn_scale = (1.0 / cfg.head_dim if inv_d
                            else 1.0 / math.sqrt(cfg.head_dim))
         d = cfg.d_model
         self.q_proj = nn.Linear(d, cfg.n_head * cfg.head_dim, bias=False)

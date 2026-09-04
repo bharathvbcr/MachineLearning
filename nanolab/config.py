@@ -89,6 +89,13 @@ class Config:
     # q.k grows as Theta(sqrt(d)) and 1/d leaves attention at 99.8% of uniform
     # entropy at init (measured, d_model=768, head_dim=64). Isolates that term.
     mup_sqrt_attn_scale: bool = False
+    # The MIRROR ablation: standard parametrization everywhere, with muP's 1/d
+    # attention temperature. Every corrected `*_spattn` cell changes muP AND the
+    # temperature at once, so none of them can say which one moved a result;
+    # this arm changes the temperature alone under SP and separates them. See
+    # docs/MUP_ROWS_2026-09-04.md. Mutually exclusive with `mup`, where
+    # `mup_sqrt_attn_scale` already governs the same term from the other side.
+    sp_inv_d_attn_scale: bool = False
     # Per-layer standard-parametrization LR prescription (Everett et al.,
     # arXiv:2407.05872, Table 1, Adam column): hidden and readout learning rates
     # scale as 1/sqrt(width) while the embedding LR stays constant. Mutually
@@ -238,6 +245,11 @@ class Config:
         # runs no blocks at all and still trains an embedding + head, which
         # would look like a very fast, very bad arm rather than a broken one.
         assert self.n_loops >= 1, f"n_loops must be >= 1, got {self.n_loops}"
+        # Two flags governing one term: let them contradict and the recorded
+        # recipe would no longer say what temperature a run used.
+        assert not (self.sp_inv_d_attn_scale and self.mup), (
+            "sp_inv_d_attn_scale is the SP-side ablation; under mup the term is "
+            "governed by mup_sqrt_attn_scale")
         # Checked here, not in the mixer, so a bad window is caught while the
         # config is built rather than after a cluster job has been billed.
         assert self.swa_window >= 1, f"swa_window must be >=1, got {self.swa_window}"

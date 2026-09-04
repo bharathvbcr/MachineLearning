@@ -2281,6 +2281,43 @@ def mup_attention_temperature_is_the_arm_asymmetric_term():
 
 
 
+@test
+def sp_inv_d_attention_scale_is_reachable_and_matches_mup():
+    """The separator arm for PAPER 8.4. Every corrected `*_spattn` cell
+    changes muP AND the attention temperature at once, so none of them can
+    say which one moved a crossing. `sp_inv_d_attn_scale` changes the
+    temperature ALONE, under standard parametrization.
+
+    Before this flag existed the combination was unreachable: with
+    mup=False the scale was 1/sqrt(d) unconditionally.
+    """
+
+    import math
+    from .config import Config
+    from .mixers import Attention
+    kw = dict(mixer="attention", head_dim=64, d_model=256, n_head=4)
+    sp = Attention(Config(**kw))
+    cold = Attention(Config(**kw, sp_inv_d_attn_scale=True))
+    mup = Attention(Config(**kw, mup=True))
+    assert math.isclose(sp.attn_scale, 1.0 / math.sqrt(64)), sp.attn_scale
+    assert math.isclose(cold.attn_scale, 1.0 / 64), (
+        "sp_inv_d_attn_scale must select muP's 1/d temperature under SP; got "
+        f"{cold.attn_scale}")
+    assert math.isclose(cold.attn_scale, mup.attn_scale), (
+        "the SP-side ablation must land on exactly muP's temperature, or it "
+        "separates nothing")
+    # muP's own ablation still wins on the muP side, and the two cannot combine.
+    back = Attention(Config(**kw, mup=True, mup_sqrt_attn_scale=True))
+    assert math.isclose(back.attn_scale, 1.0 / math.sqrt(64)), back.attn_scale
+    try:
+        Config(**kw, mup=True, sp_inv_d_attn_scale=True)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(
+            "two flags governing one term must not be allowed to contradict")
+
+
 def _mqar(**over):
     from .config import Config
     from .mqar import vocab_for
