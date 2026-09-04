@@ -3736,6 +3736,132 @@ def n_loops_zero_fails_closed():
             raise
 
 
+@test
+def the_probe_mfu_and_the_model_agree_on_looped_flops():
+    """`_mfu_from_toks` and `GPT.flops_per_token` must not drift. The function's
+    own comment records that a private copy of this formula in the probe once
+    charged every non-attention mixer ZERO attention FLOPs. Delegating the mixer
+    term fixed that, but the `6*N` half stayed duplicated and n_loops broke it
+    the same way -- a looped arm's MFU came out low in the probe and right in
+    the model, with nothing to reveal the disagreement.
+    """
+    from .config import build_config
+    from .model import build_model, flops_per_token_for
+    from .crossover_replicate import _mfu_from_toks
+    import os
+    kw = dict(run_name="probe", mixer="attention", n_layer=3, d_model=128,
+              n_head=4, head_dim=32, block_size=64, vocab_size=256,
+              tie_embeddings=False)
+    os.environ.setdefault("PEAK_FLOPS", "1e12")
+    for loops in (1, 2, 4):
+        cfg = build_config("cpu_smoke", dict(kw, n_loops=loops))
+        est = flops_per_token_for(cfg, cfg.estimate_params(),
+                                  cfg.estimate_block_params())
+        # the probe's own path, via a known tok/s and peak
+        mfu = _mfu_from_toks("attention", 1.0, cfg)
+        assert abs(mfu * 1e12 - est) < 1.0, (
+            f"loops={loops}: probe MFU implies {mfu*1e12:.6e} flops/token, "
+            f"the shared formula says {est:.6e}")
+    # and the estimate must actually move with loops, or the test is vacuous
+    f1 = _mfu_from_toks("attention", 1.0, build_config("cpu_smoke", dict(kw, n_loops=1)))
+    f4 = _mfu_from_toks("attention", 1.0, build_config("cpu_smoke", dict(kw, n_loops=4)))
+    assert f4 > f1, "probe MFU did not change with n_loops at all"
+
+
+@test
+def estimate_params_still_equals_blocks_plus_embeddings():
+    """`estimate_params` was split into block + embedding halves so the looped
+    FLOPs term could charge them differently. The split must not have changed
+    the total, which every existing MFU number on disk depends on.
+    """
+    from .config import build_config
+    for kw in (dict(n_layer=12, d_model=768, tie_embeddings=False),
+               dict(n_layer=3, d_model=256, tie_embeddings=True),
+               dict(n_layer=6, d_model=512, ffn="relu2", tie_embeddings=False)):
+        cfg = build_config("cpu_smoke", dict(kw, run_name="probe",
+                                             mixer="attention", vocab_size=1024))
+        d, V = cfg.d_model, cfg.vocab_size
+        emb = V * d * (1 if cfg.tie_embeddings else 2)
+        assert cfg.estimate_params() == cfg.estimate_block_params() + emb, (
+            f"{kw}: {cfg.estimate_params()} != "
+            f"{cfg.estimate_block_params()} + {emb}")
+        assert cfg.estimate_block_params() > 0
+
+
+@test
+def looped_moe_sums_the_aux_loss_over_every_pass():
+    """`ffn.aux` is overwritten on every forward. Reading it after the last pass
+    reports one pass's routing out of n_loops, so the load-balancing pressure on
+    a looped MoE would be silently divided by the loop count and its routers
+    would drift toward collapse with nothing to show it.
+    """
+    import torch
+    from .config import build_config
+    from .model import build_model
+    kw = dict(run_name="probe", mixer="attention", n_layer=2, d_model=64,
+              n_head=4, head_dim=16, block_size=32, vocab_size=64,
+              tie_embeddings=False, ffn="moe", moe_experts=4, moe_top_k=1)
+    x = torch.randint(0, 64, (2, 32))
+    torch.manual_seed(0); one = build_model(build_config("cpu_smoke", dict(kw)))
+    torch.manual_seed(0); three = build_model(build_config("cpu_smoke", dict(kw, n_loops=3)))
+    one.eval(); three.eval()
+    with torch.no_grad():
+        one(x); three(x)
+    a1, a3 = float(one._moe_aux), float(three._moe_aux)
+    assert a1 > 0, "single-pass MoE reported no aux loss; test is vacuous"
+    assert a3 > 1.5 * a1, (
+        f"looped MoE aux {a3:.6f} is not accumulating over 3 passes "
+        f"(single pass {a1:.6f}); it is reporting one pass out of three")
+
+
+def _pgrep_wait_offenders(root) -> list[str]:
+    """Lines that busy-wait on `pgrep` for something that has a log to wait on.
+
+    Rule: a `while pgrep` wait is allowed ONLY when the pattern names a worker
+    POOL (the word "worker"), because a pool of interchangeable processes has no
+    log marker of its own. Anything else is a named stage, and a stage writes a
+    completion line -- wait on that instead.
+    """
+    import re
+    from pathlib import Path
+    out = []
+    for f in sorted(Path(root).glob("*.sh")):
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            if not re.search(r"while\s+(!\s*)?pgrep", line):
+                continue
+            if "worker" in line:
+                continue
+            out.append(f"{f.name}:{i}: {line.strip()}")
+    return out
+
+
+@test
+def no_stage_chain_waits_on_pgrep():
+    """A `while pgrep -f <pattern>` wait between chained GPU stages is the bug
+    that cost this repo 79 minutes of idle GPU, and it bit twice in one session.
+
+    Both failures are the same shape -- the pattern matches a process that is
+    not the work:
+      1. the work is launched as `tmux new-session -d -s x "python -m foo ..."`,
+         and tmux's OWN argv carries that whole inner string, so the pattern
+         keeps matching long after the python exits;
+      2. the waiter is an inline `bash -c "... pgrep -f <pattern> ..."`, so the
+         pattern sits in the waiter's own argv as well.
+
+    A marker the work itself writes to its log cannot match anything but the
+    work. Waiting on a worker POOL by name stays allowed: interchangeable
+    workers have no log marker of their own.
+    """
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent / "scripts"
+    if not root.is_dir():
+        raise Skip("no scripts/ directory")
+    bad = _pgrep_wait_offenders(root)
+    assert not bad, (
+        "stage chains must wait on a log marker, not pgrep:\n  "
+        + "\n  ".join(bad))
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = skipped = 0

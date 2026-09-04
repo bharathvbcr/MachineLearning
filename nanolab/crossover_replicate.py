@@ -2449,11 +2449,15 @@ def cmd_probe(args) -> None:
 
 
 def _mfu_from_toks(mixer: str, tok_s: float, cfg) -> float:
-    from .model import mixer_flops_per_token
+    from .model import flops_per_token_for
     # Delegated, not reimplemented: this used to hardcode `attention`/`mla` and
     # charge every other mixer ZERO attention FLOPs, so adding a mixer produced
-    # a quietly wrong MFU here and a correct one in model.py.
-    flops = 6 * cfg.estimate_params() + mixer_flops_per_token(cfg)
+    # a quietly wrong MFU here and a correct one in model.py. Delegating the
+    # MIXER term fixed that; the `6*N` term stayed a private copy here and
+    # n_loops broke it again the same way, understating a looped arm's MFU by
+    # about the loop factor. The WHOLE formula is now owned by model.py.
+    flops = flops_per_token_for(cfg, cfg.estimate_params(),
+                                cfg.estimate_block_params())
     # NaN, not 0.0 and not a guessed peak, when the device is unknown: a run
     # command resolves PEAK_FLOPS strictly before any job starts, so reaching
     # here without one means nobody established a device. `nan%` in the table is

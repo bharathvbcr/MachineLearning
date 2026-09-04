@@ -257,16 +257,25 @@ class Config:
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
 
-    def estimate_params(self) -> int:
-        """Rough non-embedding-aware parameter count for the attention path."""
-        d, L, V = self.d_model, self.n_layer, self.vocab_size
+    def estimate_block_params(self) -> int:
+        """Rough parameter count of the BLOCK stack alone, no embeddings.
+
+        Split out from ``estimate_params`` because a looped stack runs these
+        parameters ``n_loops`` times per token while the embedding and head run
+        once, so the FLOPs term needs the two halves separately.
+        """
+        d = self.d_model
         ffn_hidden = _swiglu_hidden(d) if self.ffn == "swiglu" else 4 * d
         per_layer = (
             4 * d * d                 # attn q,k,v,o (approx, ignores GQA shrink)
             + (3 if self.ffn == "swiglu" else 2) * d * ffn_hidden  # FFN
         )
-        emb = V * d * (1 if self.tie_embeddings else 2)
-        return L * per_layer + emb
+        return self.n_layer * per_layer
+
+    def estimate_params(self) -> int:
+        """Rough non-embedding-aware parameter count for the attention path."""
+        emb = self.vocab_size * self.d_model * (1 if self.tie_embeddings else 2)
+        return self.estimate_block_params() + emb
 
 
 def _resolve_mixer_name(name: str) -> str:

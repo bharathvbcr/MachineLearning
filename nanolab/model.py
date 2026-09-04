@@ -349,6 +349,7 @@ class GPT(nn.Module):
         # transformer): effective depth n_layer * n_loops at the parameter
         # count of n_layer. n_loops == 1 is the ordinary single pass and is
         # bit-identical to the pre-loop code path.
+        moe_aux = None
         for _ in range(cfg.n_loops):
             for blk in self.blocks:
                 if cfg.grad_checkpoint and self.training:
@@ -361,9 +362,18 @@ class GPT(nn.Module):
                     # what makes the value residual a fixed anchor rather than
                     # something that drifts once per loop.
                     v0 = raw_v
-        # collect MoE load-balancing aux loss (0 if no MoE layers)
+            # Collected INSIDE the loop, once per pass. `ffn.aux` is overwritten
+            # on every forward, so reading it after the last pass would report
+            # one pass's routing out of n_loops -- the load-balancing pressure
+            # would be silently divided by the loop count and the routers of a
+            # looped MoE would drift toward collapse with nothing to show it.
+            # Each pass routes independently, so each pass's aux counts.
+            if cfg.ffn == "moe":
+                per_pass = sum(b.ffn.aux for b in self.blocks
+                               if b.ffn.aux is not None)
+                moe_aux = per_pass if moe_aux is None else moe_aux + per_pass
         if cfg.ffn == "moe":
-            self._moe_aux = sum(b.ffn.aux for b in self.blocks if b.ffn.aux is not None)
+            self._moe_aux = moe_aux if moe_aux is not None else 0.0
         return self.norm_f(x)
 
     def forward(self, idx, targets=None):
@@ -407,22 +417,10 @@ class GPT(nn.Module):
             ffn_params = sum(p.numel() for b in self.blocks for p in b.ffn.experts.parameters())
             inactive = ffn_params * (1 - cfg.moe_top_k / cfg.moe_experts)
             N -= int(inactive)
-        loops = cfg.n_loops
-        if loops > 1:
-            # A looped stack runs its BLOCK parameters `loops` times per token
-            # while the embedding and the head still run once. 6*N*loops would
-            # bill the embedding for passes it never makes; plain 6*N would bill
-            # the blocks for one pass out of `loops`. Both corrupt MFU, in
-            # opposite directions -- and this module's own docstring records
-            # that a silently wrong FLOPs term for a new arm has bitten this
-            # repo before. So charge the block parameters the extra passes and
-            # nothing else.
-            block_params = sum(p.numel() for b in self.blocks
-                               for p in b.parameters())
-            if cfg.ffn == "moe" and cfg.moe_experts > cfg.moe_top_k:
-                block_params -= int(inactive)
-            N += block_params * (loops - 1)
-        return 6 * N + mixer_flops_per_token(cfg) * loops
+        block_params = sum(p.numel() for b in self.blocks for p in b.parameters())
+        if cfg.ffn == "moe" and cfg.moe_experts > cfg.moe_top_k:
+            block_params -= int(inactive)
+        return flops_per_token_for(cfg, N, block_params)
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -437,6 +435,24 @@ class GPT(nn.Module):
             nxt = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, nxt), dim=1)
         return idx
+
+
+def flops_per_token_for(cfg, total_params: int, block_params: int) -> float:
+    """Per-token FLOPs for ``cfg``, given its parameter split. SOLE OWNER.
+
+    Both `GPT.flops_per_token` (which knows the real parameter counts) and
+    `crossover_replicate._mfu_from_toks` (which only has Config estimates) call
+    this. They must, because `_mfu_from_toks` already carried a private copy of
+    this formula once: that copy hardcoded attention/mla and charged every other
+    mixer ZERO attention FLOPs, so adding a mixer gave a quietly wrong MFU in
+    the probe and a correct one here. Delegating the MIXER term fixed that, but
+    the `6*N` term stayed duplicated -- and n_loops broke it again the same way,
+    because a looped arm runs its BLOCK parameters n_loops times per token while
+    the embedding and head still run once. Now there is one formula.
+    """
+    loops = cfg.n_loops
+    n = total_params + block_params * (loops - 1)
+    return 6 * n + mixer_flops_per_token(cfg) * loops
 
 
 def mixer_flops_per_token(cfg) -> int:
