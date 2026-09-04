@@ -1,0 +1,66 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "workers": 2,
+  "gpus": 1,
+  "budget_by_arm": null,
+  "arm_overrides": {
+    "w384_attention_lr80": {
+      "d_model": 384,
+      "n_head": 6,
+      "head_dim": 64,
+      "lr": 0.0048,
+      "matrix_lr": 0.2
+    },
+    "w384_mingru_lr40": {
+      "d_model": 384,
+      "n_head": 6,
+      "head_dim": 64,
+      "lr": 0.0024,
+      "matrix_lr": 0.1
+    },
+    "w768_attention_lr80": {
+      "d_model": 768,
+      "n_head": 12,
+      "head_dim": 64,
+      "lr": 0.0048,
+      "matrix_lr": 0.2
+    },
+    "w768_mingru_lr40": {
+      "d_model": 768,
+      "n_head": 12,
+      "head_dim": 64,
+      "lr": 0.0024,
+      "matrix_lr": 0.1
+    },
+    "w1152_attention_lr80": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0048,
+      "matrix_lr": 0.2
+    },
+    "w1152_mingru_lr40": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0024,
+      "matrix_lr": 0.1
+    }
+  },
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "token_budget": 50000000,
+  "lr_horizon": null,
+  "arms": [
+    "w384_attention_lr80",
+    "w384_mingru_lr40",
+    "w768_attention_lr80",
+    "w768_mingru_lr40",
+    "w1152_attention_lr80",
+    "w1152_mingru_lr40"
+  ],
+  "prefix": "cx32lad50",
+  "device": "NVIDIA GH200 480GB",
+  "compile": false
+}

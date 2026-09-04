@@ -122,14 +122,22 @@ Arms are generated in `nanolab/crossover_replicate.py` as `LADDER_PROBE_ARMS`
 from `LADDER_WIDTHS` × mixer × `LADDER_LR_MULTS`; phase 2 names its six cells
 explicitly through `CROSSOVER_ARMS`.
 
-Phase 2's raw run directories were on the rented GPU box and were **not** synced
-before the instance became unreachable on 2026-09-04; the table above is the
-suite's own readout, captured from the stage log. Phase 1's 36 `metrics.jsonl`
-are present under `nanolab/out/crossover_ladder_probe/`.
+All 66 `metrics.jsonl` are committed — 36 under
+`nanolab/out/crossover_ladder_probe/` and 30 under
+`nanolab/out/crossover_ladder50m/`.
+
+They came close to not being. The instance was re-addressed on 2026-09-04 and
+presented a host key that did not match `known_hosts`; for several hours the box
+was assumed lost and this table survived only as a transcription of the stage
+log. It was a new IP, not a new machine. Recomputed from the recovered run
+directories, every cell reproduces the transcribed table to within 4e-5, which
+is rounding in the fourth decimal. `scripts/pull_artifacts.sh` exists so the
+next board does not depend on that luck.
 
 ## Appendix — phase 2 stage log, verbatim
 
-Kept in full because the run directories it summarises are no longer reachable.
+Kept in full: it was the only record of these 30 runs for several hours, and it
+is what the recovered `metrics.jsonl` were checked against.
 
 ```
 e21 phase2 start 2026-09-04T14:35:14Z
