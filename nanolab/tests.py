@@ -4139,6 +4139,46 @@ def a_one_expert_moe_is_the_dense_ffn_at_init():
         f"{(got-want).abs().max().item():.3e}")
 
 
+@test
+def e21_ladder_varies_width_alone_and_can_be_read_at_each_width():
+    """The width ladder exists to answer whether the attention-vs-minGRU
+    ranking moves with scale. Three things have to hold or it answers something
+    else:
+
+      * head_dim pinned across widths, so width moves through n_head alone --
+        otherwise width is confounded with head geometry;
+      * BOTH mixers present at EVERY width, or there is no ranking to compare
+        at that width;
+      * the LR multipliers actually distinct, since the whole point of the
+        probe is to read each width at its own best LR rather than transfer one
+        across widths by an unvalidated parametrization (see E13).
+    """
+    from .crossover_replicate import ARMS, LADDER_PROBE_ARMS, LADDER_WIDTHS
+    spec = {a.name: (a.mixer, dict(a.overrides))
+            for a in ARMS if a.name in LADDER_PROBE_ARMS}
+    assert len(spec) == len(LADDER_PROBE_ARMS), "a ladder arm is not registered"
+    heads = {o["head_dim"] for _, o in spec.values()}
+    assert heads == {64}, f"head_dim varies across the ladder: {heads}"
+    by_width = {}
+    for name, (mx, o) in spec.items():
+        by_width.setdefault(o["d_model"], {}).setdefault(mx, set()).add(o["lr"])
+    assert set(by_width) == set(LADDER_WIDTHS), (
+        f"widths present {sorted(by_width)} != declared {sorted(LADDER_WIDTHS)}")
+    for w, mixers in by_width.items():
+        assert {"attention", "mingru"} <= set(mixers), (
+            f"width {w} carries only {sorted(mixers)}; a ranking needs both")
+        for mx, lrs in mixers.items():
+            assert len(lrs) >= 3, (
+                f"width {w} arm {mx} has {len(lrs)} distinct LR(s); the probe "
+                "cannot pick a best LR from fewer than three")
+        # n_head must track the width, or the model is not actually wider
+        assert w % 64 == 0
+    widths = sorted(by_width)
+    assert widths[-1] / widths[0] >= 2.5, (
+        f"ladder spans only {widths[-1]/widths[0]:.1f}x in width; too narrow to "
+        "say anything about scale")
+
+
 def main():
     torch.set_num_threads(2)
     passed = failed = skipped = 0

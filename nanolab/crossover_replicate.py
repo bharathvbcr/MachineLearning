@@ -361,6 +361,36 @@ ARMS = ARMS + (
         overrides=(("ffn", "moe"), ("moe_experts", 1), ("moe_top_k", 1))),
 )
 MOE_ARMS = ("attention", "moe_e1k1", "moe_e4k1", "moe_e8k1")
+
+# E21: the WIDTH ladder -- the backlog's "loudest reviewer objection", that
+# everything here is one small scale. Every board in this repo is d_model 768.
+#
+# The reason it stayed unpriced is the LR, not the compute. E13 established
+# that this repo's muP cells measured a broken attention temperature, so
+# transferring one LR across widths by muP would reintroduce exactly the
+# confound the paper carries a caveat about. The alternative that needs no
+# unvalidated parametrization is to MEASURE: run every width at three learning
+# rates and read each width at its own best. That is what the probe below is
+# for, and it is why this is 18 runs before it is 18 more.
+#
+# head_dim is pinned at 64 so width moves through n_head alone; changing both
+# would confound width with head geometry.
+LADDER_WIDTHS = (384, 768, 1152)
+LADDER_LR_MULTS = (0.5, 1.0, 2.0)
+_LADDER_BASE_LR, _LADDER_BASE_MATRIX_LR = 6e-4, 0.025
+_ladder = []
+for _w in LADDER_WIDTHS:
+    for _mx in ("attention", "mingru"):
+        for _m in LADDER_LR_MULTS:
+            _ladder.append(Arm(
+                f"w{_w}_{_mx}_lr{str(_m).replace('.', '')}", _mx,
+                note=f"E21 ladder: d_model {_w}, LR x{_m}",
+                overrides=(("d_model", _w), ("n_head", _w // 64),
+                           ("head_dim", 64),
+                           ("lr", _LADDER_BASE_LR * _m),
+                           ("matrix_lr", _LADDER_BASE_MATRIX_LR * _m))))
+ARMS = ARMS + tuple(_ladder)
+LADDER_PROBE_ARMS = tuple(a.name for a in _ladder)
 # `attention` and `gdn` are carried IN these suites rather than read across from
 # suite 26 / E9. Those rows were measured on a GH200; these will not be. Joining
 # them would compare architectures across hardware, which is the confound this
