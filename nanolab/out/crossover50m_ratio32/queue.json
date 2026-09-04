@@ -259,6 +259,71 @@
       "started": 1787786706.7163231,
       "finished": 1787787836.837707,
       "detail": "best_val=4.183357"
+    },
+    {
+      "id": "cx32r_hybrid_mingru10_attn2_s1337",
+      "arm": "hybrid_mingru10_attn2",
+      "mixer": "mingru",
+      "layer_mixers": "mingru*10,attention*2",
+      "seed": 1337,
+      "note": "minGRU inductive bias + last-2 attention",
+      "status": "done",
+      "worker": 1,
+      "started": 1788479690.1565168,
+      "finished": 1788481512.5483232,
+      "detail": "best_val=4.218649"
+    },
+    {
+      "id": "cx32r_hybrid_mingru10_attn2_s42",
+      "arm": "hybrid_mingru10_attn2",
+      "mixer": "mingru",
+      "layer_mixers": "mingru*10,attention*2",
+      "seed": 42,
+      "note": "minGRU inductive bias + last-2 attention",
+      "status": "done",
+      "worker": 2,
+      "started": 1788479690.1910899,
+      "finished": 1788481503.2817783,
+      "detail": "best_val=4.219785"
+    },
+    {
+      "id": "cx32r_hybrid_mingru10_attn2_s100",
+      "arm": "hybrid_mingru10_attn2",
+      "mixer": "mingru",
+      "layer_mixers": "mingru*10,attention*2",
+      "seed": 100,
+      "note": "minGRU inductive bias + last-2 attention",
+      "status": "done",
+      "worker": 0,
+      "started": 1788479690.2235963,
+      "finished": 1788481509.5504935,
+      "detail": "best_val=4.201350"
+    },
+    {
+      "id": "cx32r_hybrid_mingru10_attn2_s2026",
+      "arm": "hybrid_mingru10_attn2",
+      "mixer": "mingru",
+      "layer_mixers": "mingru*10,attention*2",
+      "seed": 2026,
+      "note": "minGRU inductive bias + last-2 attention",
+      "status": "done",
+      "worker": 2,
+      "started": 1788481503.2888384,
+      "finished": 1788482711.9674702,
+      "detail": "best_val=4.218325"
+    },
+    {
+      "id": "cx32r_hybrid_mingru10_attn2_s777",
+      "arm": "hybrid_mingru10_attn2",
+      "mixer": "mingru",
+      "layer_mixers": "mingru*10,attention*2",
+      "seed": 777,
+      "note": "minGRU inductive bias + last-2 attention",
+      "status": "done",
+      "worker": 0,
+      "started": 1788481510.1438398,
+      "finished": 1788482715.6609287,
+      "detail": "best_val=4.209822"
     }
   ]
 }
