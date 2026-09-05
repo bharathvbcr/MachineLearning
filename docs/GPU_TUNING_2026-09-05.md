@@ -59,20 +59,44 @@ the GPU idle time a single job leaves behind.* An arm's MFU predicts its sign.
 |---|---:|---:|---:|---:|
 | `attention` | 113.6K tok/s | 220.9K | **1.94x** | 31 s |
 | `mingru` | 91.8K | 179.6K | **1.96x** | 29 s |
-| `moe_e8k1` | 55.9K | 60.5K | 1.08x | 0 s |
-| `gdn` | 26.0K | 25.2K | 0.97x | 1 s |
-| `hybrid_mingru8_attn4` | 98.1K | 98.1K | 1.00x (fell back) | 29 s |
+| `gdn` | 26.4K | 83.7K | **3.17x** | 603 s (244 s warm) |
+| `hybrid_mingru8_attn4` | 98.0K | 191.2K | **1.95x** | 38 s |
+| `hybrid_mingru_periodic` | 96.4K | 187.9K | **1.95x** | 56 s |
+| `moe_e8k1` | 55.0K | 65.5K | 1.19x | 23 s |
+
+**Two rows of this table were wrong in its first version, and the error was in
+the harness, not the box.** `gdn` was reported at 0.97x and
+`hybrid_mingru8_attn4` at 1.00x ("fell back to eager"), with Dynamo's
+`recompile_limit (8)` named as the cause. Re-measured one arm per process with
+`dynamo.reset()` between them, gdn is **3.17x** and the hybrid **1.95x**, and
+*raising the limit to 64 changes nothing* (1.95x either way) -- which falsifies
+the recompile-limit story outright.
+
+The real cause was the measurement: the first probe built every arm
+sequentially in ONE process. Dynamo's cache is global and keyed by code object,
+and `forward` is the same code object for every arm, so guard variants
+accumulated across arms until the budget blew and later arms fell back. The
+suite launches each job as its own process and would never have hit this. A
+harness that measures arms in one process cannot measure compile at all.
+
+`gdn`'s 3.17x is a kernel-level number and its compile is expensive -- 603 s
+cold, 244 s once Inductor's on-disk cache is warm. End to end for a 50M job:
+1894 s eager against 603 + 597 = 1200 s. Across five seeds with the cache
+warming, roughly **2.1x**, which is the number to plan with.
 
 `compile=False` is hardcoded in `job_config` and `current_recipe`, and `train.py`
 additionally refuses to compile anything but a pure-attention stack. Both date
 from an Inductor stall on aarch64 that torch 2.7.0 does not reproduce.
 
-The old gate was wrong in both directions. It *excluded* a pure minGRU stack,
-which gains the most of anything measured; and it would have *admitted* the
-hybrids, which blow Dynamo's recompile limit (`hit config.recompile_limit (8)`,
-`last reason: GLOBAL_STATE changed: grad_mode` — the eval/train switch) and fall
-back to eager. The condition that actually predicts the win is **one mixer kind
-throughout**, which is what the gate now tests.
+The old gate was wrong in both directions, though not for the reason first
+given here. It *excluded* a pure minGRU stack (1.96x) and a pure GDN stack
+(3.17x, the largest win measured). It also excluded the hybrids -- which was
+first justified by their blowing Dynamo's recompile limit, and that turned out
+to be an artefact of measuring every arm in one process. Measured properly the
+hybrids reach **1.95x**, so **the one-mixer-kind condition is not the right gate
+either**: every arm tested gains, from 1.19x (`moe_e8k1`) to 3.17x (`gdn`).
+Compile everything, and let the recorded recipe field keep compiled and eager
+runs in separate directories.
 
 This is a numerics change: Inductor fuses and re-associates. `compile` is now a
 recorded recipe field (`CROSSOVER_COMPILE`, default off), so a compiled run
