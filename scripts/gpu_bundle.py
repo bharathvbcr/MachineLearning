@@ -299,6 +299,7 @@ SUITE_DOC = {
     "e1_mup_sched6_spattn": "tuned muP-spattn on a 6M cosine -- tests whether row 3's collapse is real or a schedule-regime artifact",
     "e1_sp_sched6": "SP on the 6M cosine -- the control row 3's test needs",
     "e1_sp_bs8_tuned": "SP at batch 8 at SP's OWN target-width optimum -- asks whether row 4 is about muP or just about a better LR",
+    "e1_sp_bs8_perarm": "e1_sp_bs8_tuned with minGRU at its OTHER candidate LR -- robustness of a section-withdrawing claim to an unresolved argmin",
     "e1_sp_basin": "s24 SP matrix-LR sweep at the TARGET width, 5 seeds -- prices the inherited LR",
     "e1_sp_sched20": "SP at the s23 recipe (20M cosine) -- readout rows 2 and 3",
     "e1_mup_sched20": "muP at the s23 recipe (20M cosine) -- readout rows 2 and 3",
@@ -660,6 +661,24 @@ def build_matrix(sp_cells: str = "rerun", transfer: dict | None = None,
             for seed in SEEDS:
                 jobs.append(_job("e1_sp_bs8_tuned", arm, seed,
                                  dict(matrix_lr=0.003125), **S25))
+
+        # e1_sp_bs8_tuned answered row 4 -- SP at 0.003125 crosses at 3.252M on
+        # 5/5 seeds where SP at the inherited 0.025 crosses on none -- and that
+        # answer withdraws PAPER 4.4. It rests on "SP's own optimum is
+        # 0.003125", which is sign-consistent for attention and NOT for minGRU:
+        # 0.003125 and 0.00625 are tied inside the seed spread on e1_sp_basin.
+        #
+        # The crossing is between the two arms, so minGRU's learning rate moves
+        # it directly. This runs each arm at its own best candidate -- attention
+        # 0.003125, minGRU 0.00625 -- which is also what PAPER 8.1 says a fair
+        # comparison looks like. If the crossing survives, the withdrawal of 4.4
+        # does not depend on resolving that argmin. If it does not, it does, and
+        # the argmin has to be settled before the claim is made.
+        for arm in ARMS:
+            for seed in SEEDS:
+                jobs.append(_job("e1_sp_bs8_perarm", arm, seed,
+                                 dict(matrix_lr=0.003125 if arm == "attention"
+                                      else 0.00625), **S25))
     for arm in ARMS:
         for seed in SEEDS:
             jobs.append(_mup_job("e1_mup_bs8", arm, seed, S25, transfer,
@@ -1726,6 +1745,7 @@ PARAMETRIZATION_CONTROL = {
     "e1_mup_tuned_spattn": "e1_sp_rerun",
     "e1_sp_coldattn": "e1_sp_rerun",
     "e1_sp_bs8_tuned": "e1_sp_bs8",
+    "e1_sp_bs8_perarm": "e1_sp_bs8",
     "e1_mup_sched6_spattn": "e1_sp_sched6",
     "e1_perlayer_sp": "e1_sp_rerun", "e1_embed_lr": "e1_sp_rerun",
 }
