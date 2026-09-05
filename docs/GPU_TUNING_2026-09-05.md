@@ -167,10 +167,28 @@ constraint on the 8 GB card this repo started on. Unfused is **1.29x** faster on
 attention (145.6K vs 113.1K) and 1.24x on the hybrid, for +10.8 GB.
 
 **GDN chunk width.** `mixer_chunk` is 32; width 128 runs **1.98x** faster
-(53.2K vs 26.9K) for +7.7 GB. Adoptable only if the width changes the
-floating-point order and not the operator — the first check of that was vacuous
-(zero-initialised output projection made both sides all zeros) and is being
-redone by `scripts/tune_gdnchunk2.py`.
+(53.2K vs 26.9K) for +7.7 GB. **Validated**: on fixed projections at the board's
+head count and context, every width agrees with the O(T) reference to 3e-6-1.6e-5
+max absolute (relative RMS 2e-7-6e-7), identically under both `gdn_rule`
+variants; width 128 differs from the configured 32 by 7.2e-6. So the width
+changes the floating-point association order, not the operator, and the win is
+adoptable at a numerics cost far below compile's.
+
+| chunk | tok/s | max abs vs O(T) reference | max abs vs chunk 32 |
+|---|---:|---:|---:|
+| 16 | 14.5K | 3.34e-06 | 4.77e-06 |
+| **32 (current)** | 26.9K | 3.34e-06 | — |
+| 64 | 46.3K | 4.29e-06 | 3.34e-06 |
+| **128** | **53.2K** | 9.06e-06 | 7.15e-06 |
+| 256 | 44.3K | 1.57e-05 | 1.81e-05 |
+
+The first attempt at this check was vacuous — it compared a freshly built model
+against its own reference with a zero-initialised output projection, so both
+sides were all zeros and every width "agreed" to exactly 0.000e+00 with a nan
+relative RMS. The rewrite asserts the reference is non-trivial before believing
+any agreement, which then caught a second fault: the delta rule only stays
+bounded for unit keys, which `GatedDeltaNet._project` supplies (`F.normalize`)
+and synthetic Gaussian projections do not.
 
 ### What was ruled out
 
