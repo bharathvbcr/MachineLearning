@@ -64,20 +64,41 @@ the GPU idle time a single job leaves behind.* An arm's MFU predicts its sign.
 | `hybrid_mingru_periodic` | 96.4K | 187.9K | **1.95x** | 56 s |
 | `moe_e8k1` | 55.0K | 65.5K | 1.19x | 23 s |
 
-**Two rows of this table were wrong in its first version, and the error was in
-the harness, not the box.** `gdn` was reported at 0.97x and
-`hybrid_mingru8_attn4` at 1.00x ("fell back to eager"), with Dynamo's
-`recompile_limit (8)` named as the cause. Re-measured one arm per process with
-`dynamo.reset()` between them, gdn is **3.17x** and the hybrid **1.95x**, and
-*raising the limit to 64 changes nothing* (1.95x either way) -- which falsifies
-the recompile-limit story outright.
+**Three rows of this table were wrong in its first version, and the error was in
+the harness, not the box.** `hybrid_mingru8_attn4` was reported at 1.00x, `gdn`
+at 0.97x and `moe_e8k1` at 1.08x. Adding `dynamo.reset()` between arms, they are
+**1.95x**, **3.17x** and **1.19x**.
 
-The real cause was the measurement: the first probe built every arm
-sequentially in ONE process. Dynamo's cache is global and keyed by code object,
-and `forward` is the same code object for every arm, so guard variants
-accumulated across arms until the budget blew and later arms fell back. The
-suite launches each job as its own process and would never have hit this. A
-harness that measures arms in one process cannot measure compile at all.
+The recompile limit was the right mechanism and the wrong culprit. The probe's
+log carries exactly ONE Dynamo warning, and where it falls settles it:
+
+```
+attention   compiled 31s -> 1.94x
+mingru      compiled 29s -> 1.96x
+hybrid      eager measured...
+  W [0/8] torch._dynamo hit config.recompile_limit (8)
+     function: 'forward' (nanolab/model.py:410)
+     last reason: 0/7: GLOBAL_STATE changed: grad_mode
+hybrid      compiled 29s -> 1.00x
+gdn         compiled  1s -> 0.97x     <- 1 second is not a compile
+moe_e8k1    compiled  0s -> 1.08x     <- neither is 0
+```
+
+The counter is **per code object**, and `forward` at `model.py:410` is the same
+object for every arm. attention's and minGRU's compiles plus the hybrid's
+`grad_mode` flips spent the budget of 8; the limit happened to trip during the
+hybrid, which is why the hybrid was blamed for it. Once tripped, Dynamo
+permanently skips that frame, so `gdn` and `moe_e8k1` never attempted
+compilation at all -- the 1 s and 0 s are the tell, and the single warning is
+Dynamo warning once per frame rather than once per arm.
+
+So the first version's diagnosis was wrong in attribution, not in mechanism: it
+is not that a stack with two mixer kinds exhausts the budget, it is that
+**every arm measured in one process shares one budget**. The suite launches each
+job as its own process and never had the problem. An earlier revision of this
+page claimed that raising the limit to 64 "falsifies the recompile-limit story";
+that inference was invalid, because the limit-64 cell also had `dynamo.reset()`
+applied and so never exercised the accumulation case.
 
 `gdn`'s 3.17x is a kernel-level number and its compile is expensive -- 603 s
 cold, 244 s once Inductor's on-disk cache is warm. End to end for a 50M job:
@@ -90,13 +111,18 @@ from an Inductor stall on aarch64 that torch 2.7.0 does not reproduce.
 
 The old gate was wrong in both directions, though not for the reason first
 given here. It *excluded* a pure minGRU stack (1.96x) and a pure GDN stack
-(3.17x, the largest win measured). It also excluded the hybrids -- which was
-first justified by their blowing Dynamo's recompile limit, and that turned out
-to be an artefact of measuring every arm in one process. Measured properly the
-hybrids reach **1.95x**, so **the one-mixer-kind condition is not the right gate
-either**: every arm tested gains, from 1.19x (`moe_e8k1`) to 3.17x (`gdn`).
-Compile everything, and let the recorded recipe field keep compiled and eager
-runs in separate directories.
+(3.17x, the largest win measured). It also excluded the hybrids, justified by
+their blowing Dynamo's recompile limit -- which they do not do on their own; the
+budget was spent by the arms measured before them in the same process. Measured
+with a reset the hybrids reach **1.95x**, so **the one-mixer-kind condition is
+not the right gate either**: every arm tested gains, from 1.19x (`moe_e8k1`) to
+3.17x (`gdn`). Compile everything, and let the recorded recipe field keep
+compiled and eager runs in separate directories.
+
+The one thing worth carrying forward from the original diagnosis: the
+`grad_mode` flip is real. The suite evaluates 61 times per 50M run inside
+`torch.no_grad()`, and each flip is a guard miss. One arm per process has
+budget for that; five arms sharing one process do not.
 
 This is a numerics change: Inductor fuses and re-associates. `compile` is now a
 recorded recipe field (`CROSSOVER_COMPILE`, default off), so a compiled run
