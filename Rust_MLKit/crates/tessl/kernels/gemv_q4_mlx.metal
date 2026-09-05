@@ -7,6 +7,7 @@
 //   gemv_q4_mlx_simd* — true qmv_fast peel + bfloat2 sb; row-major or Interleaved4
 #include <metal_stdlib>
 #include "gelu.h"
+#include "q4_mlx_dot.h"
 using namespace metal;
 
 constant uint GEMV_TG = 128u;
@@ -385,46 +386,6 @@ constant uint SIMD_PACKS = 2u;
 constant uint SIMD_VPT = 8u * SIMD_PACKS;     // 16
 constant uint SIMD_BLOCK = SIMD_SIZE * SIMD_VPT; // 512
 
-/// MLX load_vector bits=4: store x with 16^k prescale + return sum(x).
-inline float load_x16_qdot(device const bfloat *x, thread float *xp)
-{
-    bfloat4 x0 = ((device const bfloat4 *)(x))[0];
-    bfloat4 x1 = ((device const bfloat4 *)(x + 4u))[0];
-    bfloat4 x2 = ((device const bfloat4 *)(x + 8u))[0];
-    bfloat4 x3 = ((device const bfloat4 *)(x + 12u))[0];
-    float a0 = float(x0.x), a1 = float(x0.y), a2 = float(x0.z), a3 = float(x0.w);
-    float a4 = float(x1.x), a5 = float(x1.y), a6 = float(x1.z), a7 = float(x1.w);
-    float a8 = float(x2.x), a9 = float(x2.y), a10 = float(x2.z), a11 = float(x2.w);
-    float a12 = float(x3.x), a13 = float(x3.y), a14 = float(x3.z), a15 = float(x3.w);
-    float sum = (a0 + a1 + a2 + a3) + (a4 + a5 + a6 + a7)
-              + (a8 + a9 + a10 + a11) + (a12 + a13 + a14 + a15);
-    // values_per_thread chunk of 4: /1, /16, /256, /4096
-    xp[0] = a0;             xp[1] = a1 / 16.0f;   xp[2] = a2 / 256.0f;  xp[3] = a3 / 4096.0f;
-    xp[4] = a4;             xp[5] = a5 / 16.0f;   xp[6] = a6 / 256.0f;  xp[7] = a7 / 4096.0f;
-    xp[8] = a8;             xp[9] = a9 / 16.0f;   xp[10] = a10 / 256.0f; xp[11] = a11 / 4096.0f;
-    xp[12] = a12;           xp[13] = a13 / 16.0f; xp[14] = a14 / 256.0f; xp[15] = a15 / 4096.0f;
-    return sum;
-}
-
-/// MLX qdot bits=4 over 16 values (2×uint / 4×ushort): scale*accum + sum*bias.
-inline float qdot16(
-    device const uchar *w,
-    thread const float *xp,
-    float scale,
-    float bias,
-    float xsum)
-{
-    device const ushort *ws = (device const ushort *)w;
-    float accum = 0.0f;
-    for (uint i = 0u; i < 4u; ++i) {
-        const ushort ww = ws[i];
-        accum += xp[4u * i] * float(ww & 0x000fu)
-               + xp[4u * i + 1u] * float(ww & 0x00f0u)
-               + xp[4u * i + 2u] * float(ww & 0x0f00u)
-               + xp[4u * i + 3u] * float(ww & 0xf000u);
-    }
-    return scale * accum + xsum * bias;
-}
 
 kernel void gemv_q4_mlx_simd(
     device const uchar *packed [[buffer(0)]],

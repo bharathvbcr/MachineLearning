@@ -67,10 +67,42 @@ fn validate_gemm(
     Ok((m, n, k))
 }
 
-/// Tall-K / small-MN → split-K accumulate.
+/// Tall-K / small-MN → split-K accumulate, f32 exact lane.
 /// Attn dW: M=N=128, K=BT=4096. MLP dW: one side = mlp_dim=384.
+///
+/// The f32 threshold is the historical one: that lane is the golden-parity
+/// path and its split-K-versus-descriptor crossover has not been measured.
+/// The bf16 coop lanes have, and take [`prefer_tn_splitk_bf16`].
 fn prefer_tn_splitk(m: usize, n: usize, k: usize) -> bool {
-    k >= 2048 && m <= 384 && n <= 384 && m.min(n) <= 128
+    k >= 2048 && splitk_shape(m, n)
+}
+
+/// Smallest `K` at which split-K beats the single-dispatch coop bf16 TN
+/// kernel on the small-`M`/`N` dW shapes.
+///
+/// Paired A/B through `gemm_tn_train` at bf16, twenty GEMMs per command
+/// buffer, six order-balanced rounds on an M5 Pro (2026-09-05,
+/// bench/results/splitk_gate_m5pro.txt), split-K time ÷ coop time: at
+/// `K = 4096` the coop kernel won 1.06–1.23x (128x128, 128x384, 384x128) and
+/// still 1.09x at 8192; split-K first won at 12288 (0.91x) and pulled away
+/// with depth (0.70–0.83x at 16384–32768, where the coop kernel's six
+/// threadgroups walk `K` alone). The gate used to sit at 2048 on a
+/// sync-per-iteration measurement that could not resolve the difference.
+const SPLITK_MIN_K_BF16: usize = 12288;
+
+/// [`prefer_tn_splitk`] for the bf16 coop TN lanes (train and accumulate).
+///
+/// The accumulate lane is gated by the train measurement: its coop
+/// alternative is the 64x64 accumulate kernel, which fills the grid at least
+/// as well as the 128x64 train kernel measured, so its crossover is no
+/// shallower — inferred, not measured, and that lane is opt-in.
+fn prefer_tn_splitk_bf16(m: usize, n: usize, k: usize) -> bool {
+    k >= SPLITK_MIN_K_BF16 && splitk_shape(m, n)
+}
+
+/// The dW shapes split-K exists for: both extents small and one at most 128.
+fn splitk_shape(m: usize, n: usize) -> bool {
+    m <= 384 && n <= 384 && m.min(n) <= 128
 }
 
 /// K columns per split-K partition below the partition cap.
@@ -1092,7 +1124,7 @@ pub fn gemm_tn_train(
         let m = a_bf.shape[1];
         let n = b_bf.shape[1];
         assert_eq!(c.shape, &[m, n]);
-        if prefer_tn_splitk(m, n, k) {
+        if prefer_tn_splitk_bf16(m, n, k) {
             return gemm_tn_splitk_bf16(&a_bf, &b_bf, c, k);
         }
         // Coop kernel: register accumulator, C written once, no zero pre-pass.
@@ -1328,7 +1360,7 @@ pub fn gemm_tn_accum_train(
     if use_accum && use_bf16_gemm(rt, backend) {
         let a_bf = ensure_bf16(a_km)?;
         let b_bf = ensure_bf16(b_kn)?;
-        if prefer_tn_splitk(m, n, k) {
+        if prefer_tn_splitk_bf16(m, n, k) {
             return gemm_tn_splitk_bf16_opts(&a_bf, &b_bf, c, k, /*zero_first=*/ false);
         }
         let pipeline = rt.pipeline("matmul2d_tensorops_tn_accum_bf16_f32")?;
@@ -1875,6 +1907,25 @@ mod tests {
     /// tile over `M <= 64` rows is at least half padding, and a grid of fewer
     /// than 64 of the default tiles leaves most of the GPU idle; both were
     /// measured to favour the 64x64 tile (bench/results/bf16_smallm_coop_m5pro.txt).
+    /// The bf16 split-K gate opens at the measured crossover, not at every
+    /// tall K; the f32 lane keeps its historical gate.
+    #[test]
+    fn splitk_gate_opens_at_the_measured_depth() {
+        // Below the crossover the coop kernel is faster at every dW shape tried.
+        assert!(!prefer_tn_splitk_bf16(128, 128, 4096));
+        assert!(!prefer_tn_splitk_bf16(128, 384, 8192));
+        assert!(!prefer_tn_splitk_bf16(64, 64, 8192));
+        // From the crossover on, split-K wins and pulls away with depth.
+        assert!(prefer_tn_splitk_bf16(128, 384, 12288));
+        assert!(prefer_tn_splitk_bf16(128, 128, 16384));
+        assert!(prefer_tn_splitk_bf16(64, 64, 32768));
+        // Shape conditions are shared: only small-M/N dW shapes split.
+        assert!(!prefer_tn_splitk_bf16(384, 384, 32768));
+        assert!(!prefer_tn_splitk_bf16(512, 128, 32768));
+        assert!(prefer_tn_splitk(128, 128, 4096));
+        assert!(!prefer_tn_splitk(128, 128, 1024));
+    }
+
     #[test]
     fn nn_coop_kernel_selects_the_narrow_tile_by_grid_fill() {
         let sm = |m, n, k| nn_coop_kernel(m, n, k, CoopElem::Bf16).1.sm;

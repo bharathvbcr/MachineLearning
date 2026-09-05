@@ -200,6 +200,14 @@ fn main() {
 
     // Metal can retain file-backed library data after loading. Never relink a
     // pathname baked into a prior binary: each build owns an immutable artifact.
+    //
+    // Immutable, not eternal: every earlier build's artifact in this OUT_DIR is
+    // removed first. A binary that referenced one of them is rebuilt by Cargo
+    // whenever this script reruns (`TESSL_METALLIB` is baked in through
+    // `rustc-env`, and dependents read `DEP_TESSL_METALLIB`), so nothing
+    // current can still name a swept path, and OUT_DIR no longer grows by one
+    // metallib per build.
+    sweep_previous_metallibs(&out_dir);
     let build_id = format!(
         "{}-{}",
         std::process::id(),
@@ -223,6 +231,22 @@ fn main() {
     // same path to direct dependents as `DEP_TESSL_METALLIB`.
     println!("cargo:metallib={}", metallib_out.display());
     println!("cargo:rustc-env=TESSL_METALLIB={}", metallib_out.display());
+}
+
+/// Delete `default-*.metallib` left in `out_dir` by previous builds.
+fn sweep_previous_metallibs(out_dir: &Path) {
+    let Ok(entries) = fs::read_dir(out_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("default-") && name.ends_with(".metallib") {
+            // A stale artifact that cannot be removed is not an error worth a
+            // red build; it costs disk, not correctness.
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Compile one kernel under `metal_std`; on failure return the compiler's

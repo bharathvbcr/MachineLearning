@@ -30,13 +30,21 @@ use objc2_metal::{
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// Const arena for Metal 4 scalar binds (distinct offsets; reset after sync).
 // 31B dense decode packs hundreds of binder consts across mid-commits within a
 // token before a waiting sync; 1 MiB exhausted mid-token. 16 MiB covers full
 // product shapes with headroom (still tiny vs Hot weight residency).
 const METAL4_CONST_ARENA_BYTES: usize = 16 * 1024 * 1024;
+
+/// Constant-arena bytes a scope may bind. A scope that opens with less than
+/// this free first drains the GPU with a waiting commit, which rewinds the
+/// arena, so the scope never fails part-way through for lack of arena.
+/// Exhaustion used to fail the scope and poison the runtime, with nothing
+/// forcing the flush that would have freed it (audit R8). Reaching the
+/// reserve takes hundreds of thousands of unsynchronized dispatches.
+pub(crate) const CONST_ARENA_SCOPE_RESERVE: usize = 1 << 20;
 
 /// Default pool freelist cap (~2 GiB of cached slabs).
 const DEFAULT_POOL_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024;
@@ -373,6 +381,10 @@ struct ActiveMetal4Batch {
     /// The previous scope on `encoder` ended with an unbarriered dispatch
     /// (hazard mode). The next scope opens with a barrier and clears it.
     hazard_pending: bool,
+    /// `encoder` already holds the runtime's persistent argument table, left
+    /// by the previous scope; the next one skips `setArgumentTable`. Cleared
+    /// whenever the encoder is created (audit R10c).
+    arg_table_latched: bool,
 }
 
 /// Leading text of the one `bump_alloc_f32` error that means "try the pool".
@@ -539,7 +551,10 @@ pub struct GpuRuntime {
     /// drain.
     pending_retirement: Mutex<Vec<PendingRetirement>>,
     /// Self weak handle so Drop on pooled buffers can schedule recycle.
-    self_weak: Mutex<Weak<GpuRuntime>>,
+    /// Set exactly once in [`GpuRuntime::new`], right after the `Arc` exists;
+    /// a `OnceLock` so no lock can be poisoned and no reader can observe an
+    /// unset value as a silently dangling `Weak`.
+    self_weak: OnceLock<Weak<GpuRuntime>>,
     /// Probed working-set / wired budget (P0b).
     memory_info: Mutex<DeviceMemoryInfo>,
 }
@@ -716,12 +731,12 @@ impl GpuRuntime {
             residency_dirty: Mutex::new(false),
             pending_cold_recycle: Mutex::new(Vec::new()),
             pending_retirement: Mutex::new(Vec::new()),
-            self_weak: Mutex::new(Weak::new()),
+            self_weak: OnceLock::new(),
             memory_info: Mutex::new(mem_info),
         });
-        if let Ok(mut w) = rt.self_weak.lock() {
-            *w = Arc::downgrade(&rt);
-        }
+        rt.self_weak
+            .set(Arc::downgrade(&rt))
+            .expect("self_weak is set once, here");
         Ok(rt)
     }
 
@@ -906,10 +921,13 @@ impl GpuRuntime {
     /// Weak handle used by allocation owners whose Drop implementations must
     /// not create an `Arc` cycle with the runtime that owns their residency set.
     pub(crate) fn weak_handle(&self) -> Weak<GpuRuntime> {
+        // A buffer built on a dangling handle would never be unregistered from
+        // residency or recycled, with no diagnostic; refusing loudly is the
+        // only acceptable failure, and `new` makes it unreachable.
         self.self_weak
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .get()
+            .cloned()
+            .expect("GpuRuntime::new sets self_weak before any allocation")
     }
 
     /// Leak one strong reference to every object an in-flight unretained MTL4
@@ -1142,11 +1160,17 @@ impl GpuRuntime {
         if kind == BufferKind::Cold {
             crate::infer_trace::on_cold_alloc();
         }
-        let mut pool = self.pool.lock().map_err(|e| e.to_string())?;
-        let (buffer, _from_pool) = pool.alloc(&self.device, nbytes)?;
+        let (buffer, _from_pool) = {
+            // The pool lock covers only the pool: `register_residency` sends
+            // an Objective-C message and takes two more locks, none of which
+            // need the pool held (the recycle path takes them sequentially,
+            // never nested).
+            let mut pool = self.pool.lock().map_err(|e| e.to_string())?;
+            pool.alloc(&self.device, nbytes)?
+        };
         // Always (re)register — freelist buffers were removed on recycle.
         self.register_residency(&buffer);
-        let weak = self.self_weak.lock().map(|g| g.clone()).unwrap_or_default();
+        let weak = self.weak_handle();
         // Same reason as the runtime Arc above: the pooled buffer holds a
         // `Retained<ProtocolObject<dyn MTLBuffer>>`, and `GpuBuffer` is cloned
         // into every `Tensor` view that borrows it.
@@ -1565,6 +1589,7 @@ impl GpuRuntime {
                 alloc_idx,
                 anchors,
                 hazard_pending: false,
+                arg_table_latched: false,
             });
         }
         Ok(())
@@ -1575,9 +1600,17 @@ impl GpuRuntime {
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
     {
         let m4 = &self.metal4;
+        // A scope that opens on a nearly full constant arena drains the GPU
+        // first; the waiting commit rewinds the arena and the scope gets all
+        // of it. A stall, where the old fail-closed policy poisoned the
+        // runtime (audit R8; `a_nearly_full_constant_arena_is_drained_before_
+        // a_scope_opens`).
+        if self.const_arena_free() < CONST_ARENA_SCOPE_RESERVE {
+            self.commit_m4(true)?;
+        }
         // Clone Retained encoder so we do not hold `active_m4` across `f`
         // (nested with_binder / flush would otherwise deadlock the Mutex).
-        let (enc, pending_edge) = {
+        let (enc, pending_edge, table_latched) = {
             let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
             self.ensure_m4_cb_open(&mut guard)?;
             let batch = guard
@@ -1594,16 +1627,18 @@ impl GpuRuntime {
                     MTL4VisibilityOptions::Device,
                 );
                 batch.encoder = Some(e);
+                batch.arg_table_latched = false;
             }
             let pending_edge = std::mem::take(&mut batch.hazard_pending);
+            let table_latched = batch.arg_table_latched;
             let enc = batch
                 .encoder
                 .as_ref()
                 .ok_or_else(|| "M4 encoder missing".to_string())?
                 .clone();
-            (enc, pending_edge)
+            (enc, pending_edge, table_latched)
         };
-        let (outcome, anchors, hazard_pending) = {
+        let (outcome, anchors, hazard_pending, holds_table) = {
             let mut cursor = m4.const_cursor.lock().map_err(|e| e.to_string())?;
             let mut binder = crate::dispatch::Binder::new(
                 enc.as_ref(),
@@ -1624,12 +1659,16 @@ impl GpuRuntime {
                 m4.argument_table.max_buffers as usize,
                 self,
             );
+            if table_latched {
+                binder.assume_persistent_table();
+            }
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 f(&mut binder).and_then(|_| binder.finish())
             }));
             let anchors = binder.take_in_flight_anchors();
             let hazard_pending = binder.hazard_pending();
-            (outcome, anchors, hazard_pending)
+            let holds_table = binder.holds_persistent_table();
+            (outcome, anchors, hazard_pending, holds_table)
         };
 
         // A closure can fail or panic after it has already emitted Metal
@@ -1653,6 +1692,7 @@ impl GpuRuntime {
             // Carried even when the closure failed: whatever it dispatched is
             // still in the encoder, and the batch is poisoned separately.
             batch.hazard_pending = hazard_pending;
+            batch.arg_table_latched = holds_table;
             if successful {
                 batch.dispatches += 1;
                 batch.since_commit += 1;
@@ -1762,6 +1802,10 @@ impl GpuRuntime {
         let mut guard = self.active_m4.lock().map_err(|e| e.to_string())?;
         let Some(batch) = guard.as_mut() else {
             if wait {
+                // No batch, but the arena may still hold a cursor from a run
+                // that ended without one; rewind it once nothing is in flight.
+                self.wait_all_allocators()?;
+                self.reset_const_arena();
                 self.drain_completed_allocations();
             }
             return Ok(());
@@ -1784,10 +1828,11 @@ impl GpuRuntime {
                 // poisoned for the rest of the process.
                 //
                 // The wait above dominates every in-flight allocator event, so
-                // no GPU work can still be reading the arena here.
-                if let Ok(mut c) = self.metal4.const_cursor.lock() {
-                    *c = 0;
-                }
+                // no GPU work can still be reading the arena here. (That
+                // measurement predates natural-width alignment: a scalar now
+                // costs four bytes, and a scope that opens under
+                // `CONST_ARENA_SCOPE_RESERVE` drains first.)
+                self.reset_const_arena();
                 *guard = None;
                 self.drain_completed_allocations();
             }
@@ -1882,9 +1927,7 @@ impl GpuRuntime {
                 }
             }
             // Reset const arena only after GPU catch-up.
-            if let Ok(mut c) = m4.const_cursor.lock() {
-                *c = 0;
-            }
+            self.reset_const_arena();
             *guard = None;
             drop(guard);
             // Safe to removeAllocation + freelist now that CB completed.
@@ -1895,6 +1938,26 @@ impl GpuRuntime {
             batch.cb_open = false;
         }
         Ok(())
+    }
+
+    /// Bytes of the constant arena not yet written since its last rewind.
+    fn const_arena_free(&self) -> usize {
+        let cursor = *self
+            .metal4
+            .const_cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.metal4.const_staging.length().saturating_sub(cursor)
+    }
+
+    /// Rewind the constant arena. Only once every submitted command buffer
+    /// has completed: the GPU reads scalars straight out of it.
+    fn reset_const_arena(&self) {
+        *self
+            .metal4
+            .const_cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = 0;
     }
 
     fn wait_all_allocators(&self) -> Result<(), String> {
@@ -2326,6 +2389,146 @@ mod tests {
         assert!(cursor > 0, "const arena cursor should advance");
         rt.synchronize().unwrap();
         assert_eq!(*rt.metal4.const_cursor.lock().unwrap(), 0);
+    }
+
+    /// Fill `buf` with `1, 2, 3, ...` as f32.
+    fn fill_ramp(buf: &crate::tensor::GpuBuffer, n: usize) {
+        unsafe {
+            let p = buf.metal().contents().as_ptr() as *mut f32;
+            for i in 0..n {
+                *p.add(i) = (i + 1) as f32;
+            }
+        }
+    }
+
+    fn read_f32s(buf: &crate::tensor::GpuBuffer, n: usize) -> Vec<f32> {
+        unsafe {
+            std::slice::from_raw_parts(buf.metal().contents().as_ptr() as *const f32, n).to_vec()
+        }
+    }
+
+    /// One `copy_f32` scope over `n` floats with `extra` unread scalars bound
+    /// before `n`, so `n` itself lands at a small arena offset.
+    fn copy_scope(
+        rt: &GpuRuntime,
+        src: &crate::tensor::GpuBuffer,
+        dst: &crate::tensor::GpuBuffer,
+        n: usize,
+        extra: usize,
+    ) -> Result<(), String> {
+        let pipe = rt.pipeline("copy_f32")?;
+        let tpt = pipe.threadExecutionWidth().min(n).max(1);
+        let groups = n.div_ceil(tpt);
+        rt.with_binder(|bnd| {
+            bnd.set_pipeline(&pipe);
+            bnd.bind_gpu_buf(src, 0);
+            bnd.bind_gpu_buf(dst, 1);
+            for i in 0..extra {
+                bnd.bind_u32(0xdead_beef, 3 + i);
+            }
+            bnd.bind_u32(n as u32, 2);
+            bnd.dispatch(mtl_size(groups, 1, 1), mtl_size(tpt, 1, 1));
+            Ok(())
+        })
+    }
+
+    /// Audit R8: a scalar costs the arena four bytes, a pair eight, anything
+    /// wider sixteen. Every payload used to be rounded up to sixteen.
+    #[test]
+    fn constant_arena_charges_natural_width() {
+        let rt = GpuRuntime::new().expect("runtime");
+        rt.set_async_encode(true).unwrap();
+        let pipe = rt.pipeline("copy_f32").expect("pipe");
+        rt.with_binder(|bnd| {
+            bnd.set_pipeline(&pipe);
+            bnd.bind_u32(1, 2);
+            bnd.bind_u32(2, 3);
+            bnd.bind_f32(3.5, 4);
+            let _ = bnd.bind_bytes(&[7u8; 8], 5);
+            let _ = bnd.bind_bytes(&[9u8; 12], 6);
+            bnd.barrier();
+            Ok(())
+        })
+        .unwrap();
+        // Three scalars end at 12; the pair aligns to 16 and ends at 24; the
+        // 12-byte payload aligns to 32 and ends at 44.
+        assert_eq!(*rt.metal4.const_cursor.lock().unwrap(), 44);
+        rt.synchronize().unwrap();
+        assert_eq!(*rt.metal4.const_cursor.lock().unwrap(), 0);
+    }
+
+    /// The GPU reads a constant that natural-width alignment puts at a
+    /// four-byte offset. Not a regression test: it is the evidence the
+    /// alignment rule in `write_constants` rests on.
+    #[test]
+    fn a_kernel_reads_a_scalar_at_a_four_byte_offset() {
+        let rt = GpuRuntime::new().expect("runtime");
+        let n = 48usize;
+        let src = rt.alloc_buffer(n * 4).expect("src");
+        let dst = rt.alloc_buffer(n * 4).expect("dst");
+        fill_ramp(&src, n);
+        // Sync mode: the arena is rewound after every scope, so the one unread
+        // scalar puts `n` at offset 4 exactly.
+        copy_scope(&rt, &src, &dst, n, 1).expect("copy");
+        rt.synchronize().unwrap();
+        assert_eq!(read_f32s(&dst, n), read_f32s(&src, n));
+    }
+
+    /// Audit R8: a scope that opens on a nearly full arena drains the GPU and
+    /// starts on a rewound one; it used to fail the bind and poison the
+    /// runtime.
+    #[test]
+    fn a_nearly_full_constant_arena_is_drained_before_a_scope_opens() {
+        let rt = GpuRuntime::new().expect("runtime");
+        rt.set_async_encode(true).unwrap();
+        let n = 64usize;
+        let src = rt.alloc_buffer(n * 4).expect("src");
+        let mid = rt.alloc_buffer(n * 4).expect("mid");
+        let dst = rt.alloc_buffer(n * 4).expect("dst");
+        fill_ramp(&src, n);
+        // A batch is open with one scope in it; then pretend a long
+        // unsynchronized run has used all but eight bytes of the arena.
+        copy_scope(&rt, &src, &mid, n, 0).expect("first scope");
+        *rt.metal4.const_cursor.lock().unwrap() = rt.metal4.const_staging.length() - 8;
+        copy_scope(&rt, &mid, &dst, n, 3).expect("scope on a nearly full arena");
+        rt.synchronize().unwrap();
+        assert_eq!(read_f32s(&dst, n), read_f32s(&src, n));
+        assert_eq!(*rt.metal4.const_cursor.lock().unwrap(), 0);
+        // And the runtime is still usable.
+        copy_scope(&rt, &src, &dst, n, 0).expect("later scope");
+        rt.synchronize().unwrap();
+    }
+
+    /// Audit R10c: `setArgumentTable` is issued once per encoder, not once
+    /// per scope. Two scopes on one open batch cost one set between them; a
+    /// waiting commit ends the encoder and the next scope sets it again.
+    #[test]
+    fn argument_table_is_set_once_per_encoder_not_once_per_scope() {
+        use crate::dispatch::ARG_TABLE_SETS;
+        let rt = GpuRuntime::new().expect("runtime");
+        rt.set_async_encode(true).unwrap();
+        let n = 32usize;
+        let src = rt.alloc_buffer(n * 4).expect("src");
+        let a = rt.alloc_buffer(n * 4).expect("a");
+        let b = rt.alloc_buffer(n * 4).expect("b");
+        fill_ramp(&src, n);
+        let before = ARG_TABLE_SETS.with(|c| c.get());
+        copy_scope(&rt, &src, &a, n, 0).expect("scope 1");
+        copy_scope(&rt, &a, &b, n, 0).expect("scope 2");
+        assert_eq!(
+            ARG_TABLE_SETS.with(|c| c.get()) - before,
+            1,
+            "one set for two scopes"
+        );
+        rt.synchronize().unwrap();
+        assert_eq!(read_f32s(&b, n), read_f32s(&src, n));
+        copy_scope(&rt, &src, &b, n, 0).expect("scope on a new encoder");
+        assert_eq!(
+            ARG_TABLE_SETS.with(|c| c.get()) - before,
+            2,
+            "a new encoder sets it again"
+        );
+        rt.synchronize().unwrap();
     }
 }
 

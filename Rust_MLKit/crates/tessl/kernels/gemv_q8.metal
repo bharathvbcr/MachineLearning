@@ -82,7 +82,10 @@ kernel void gemv_q8(
                  i < (ulong)group_size;
                  i += (ulong)Q8_SIMD_SIZE * 4ul) {
                 const ulong c = c0 + i;
-                const float4 xv = float4(x[c], x[c + 1u], x[c + 2u], x[c + 3u]);
+                // `vec4_ok` makes `c` a multiple of four floats and `x` is a
+                // buffer base, so this is one aligned 16-byte load where four
+                // scalar loads used to sit in the innermost loop.
+                const float4 xv = ((device const float4 *)(x + c))[0];
                 for (uint r = 0u; r < Q8_SIMD_ROWS; ++r) {
                     const uint row = row0 + r;
                     if (row >= rows) break;

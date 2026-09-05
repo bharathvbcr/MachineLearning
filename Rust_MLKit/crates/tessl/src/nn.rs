@@ -1967,7 +1967,9 @@ fn route_attn(
 /// Scalar indices for `_with_scalars`: 4 = `B`, 5 = `Tq`, 7 = `H`, 8 = `Hkv`,
 /// 9 = `window`, 10 = `scale` (f32), plus the callback's validated capacity
 /// argument at slot 13 for D=128 or slot 14 for D=256. Buffers 6, 11 and 12 are
-/// bound here.
+/// bound here. For D=256 slot 13 is the kernel's `out_bf16` flag; this entry
+/// point validates `o` as f32, so the wrapper binds that slot to 0 after the
+/// callback whatever the callback did with it.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attn_swa(
     rt: &Arc<GpuRuntime>,
@@ -2132,6 +2134,15 @@ pub unsafe fn flash_attn_swa_with_scalars(
         set_gpu_buf(bnd, q_pos_offset, 11);
         set_gpu_buf(bnd, kv_pos_offset, 12);
         scalars(bnd, kv_capacity);
+        if head_dim == AttnHeadDim::D256 {
+            // The D=256 kernel reads `out_bf16` from slot 13, which the D=128
+            // kernel uses for its capacity. `o` was validated as f32 above, so
+            // a callback that left the slot unbound (a stale bind from an
+            // earlier dispatch in this scope) or set it would have the kernel
+            // write two-byte values into a four-byte output. This wrapper
+            // owns the slot: bound to 0 after the callback, whatever it did.
+            set_u32(bnd, 0, 13);
+        }
     })
 }
 
@@ -3477,17 +3488,6 @@ pub fn validate_gemv_q4(
             ("x", x),
         ],
     )?;
-    if !tiled {
-        let bytes = (shape.cols as usize).saturating_mul(4);
-        let limit = rt.max_threadgroup_memory();
-        if bytes > limit {
-            return Err(format!(
-                "{entry}: caching x needs {bytes} bytes of threadgroup memory but this \
-                 device allows {limit}; cols {} is too large for this kernel",
-                shape.cols
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -3514,36 +3514,27 @@ pub unsafe fn gemv_q4_with_scalars(
     }
 
     let p = rt.pipeline(entry)?;
-    // The two kernels take *different* grids, and until 2026-08-31 both were
-    // dispatched with the one-thread-per-row geometry in the `else` arm.
+    // The two kernels take *different* grids.
+    //
+    // `gemv_q4` is one simdgroup per `SIMD_ROWS_PER_TG / 2` output rows with
+    // lanes striding K, the geometry `gemv_q8` and the MLX simd GEMVs use. It
+    // was one thread per row with `x` staged in dynamic threadgroup memory
+    // until 2026-09-05, which is where the `cols` ceiling this wrapper used to
+    // enforce came from; there is no cache and no ceiling now.
     //
     // `gemv_q4_tiled` indexes its output row by `threadgroup_position_in_grid`
     // and returns when that exceeds `rows`, so it needs one threadgroup per row.
-    // Handing it `rows.div_ceil(128)` groups meant it wrote the first
-    // `rows / 128` rows and left every other row of `y` untouched — no error, no
-    // partial-write signal, just whatever was in the buffer before. Measured at
-    // 512 rows it wrote 4 and left 508 holding a sentinel. The benchmark is what
-    // caught it: 3,077 GB/s is not a number this machine can produce, and it was
-    // doing 0.8% of the work.
-    //
-    // It also declares its scratch statically (`threadgroup float
-    // partial[GEMV_TG]`) and never caches `x`, so the dynamic threadgroup
-    // allocation, and the `cols` ceiling that exists to bound it, belong to the
-    // one-thread-per-row kernel alone.
-    let (groups, tptg, tg_mem) = if tiled {
-        (shape.rows as usize, GEMV_TILED_TPTG, None)
+    // Until 2026-08-31 it was handed the row kernel's grid and wrote the first
+    // `rows / 128` rows, leaving every other row of `y` untouched — no error, no
+    // partial-write signal. The benchmark caught it: 3,077 GB/s is not a number
+    // this machine can produce. It declares its scratch statically
+    // (`threadgroup float partial[GEMV_TG]`).
+    let (groups, tptg) = if tiled {
+        (shape.rows as usize, GEMV_TILED_TPTG)
     } else {
-        let bytes = (shape.cols as usize).saturating_mul(4);
-        let t = reduction_tptg(
-            p.maxTotalThreadsPerThreadgroup(),
-            GEMV_ROW_TPTG,
-            GEMV_ROW_TPTG,
-        )
-        .min(shape.rows as usize)
-        .max(1);
-        ((shape.rows as usize).div_ceil(t), t, Some((0, bytes)))
+        (simd_gemv_threadgroups(shape.rows), SIMD_TPTG)
     };
-    dispatch_tg_1d(rt, &p, groups, tptg, tg_mem, |bnd| {
+    dispatch_tg_1d(rt, &p, groups, tptg, None, |bnd| {
         set_gpu_buf(bnd, bank.packed, 0);
         set_gpu_buf(bnd, bank.scales, 1);
         set_gpu_buf(bnd, bank.zeros, 2);
@@ -3553,10 +3544,13 @@ pub unsafe fn gemv_q4_with_scalars(
     })
 }
 
-/// Threads per group for the one-thread-per-row Q4 GEMV kernels.
+/// Threads per group for the one-thread-per-row MLX Q4 GEMV kernels
+/// (`gemv_q4_mlx`, `gemv_q4_mlx_wide`), which still stage `x` in dynamic
+/// threadgroup memory.
 ///
 /// 128 amortizes the shared `x` cache across enough rows to pay for staging it,
-/// without making the tail group wasteful on short matrices.
+/// without making the tail group wasteful on short matrices. The signed-nibble
+/// `gemv_q4` left this geometry on 2026-09-05 for one simdgroup per four rows.
 const GEMV_ROW_TPTG: usize = 128;
 
 /// Threads per threadgroup for `gemv_q4_tiled`.
@@ -4777,8 +4771,23 @@ struct RowReduceLayout {
 /// Threads per group for a row reduction: a power of two, capped by the
 /// kernel's scratch depth and the pipeline's own limit, and never more than
 /// the row is wide.
+/// Most lanes a row reduction (softmax, row sum/max, RMSNorm) is given.
+///
+/// Rows wider than this stride the extra elements through the same lanes.
+/// Measured 2026-09-05 against the 1024-lane maximum with the simdgroup-first
+/// reductions (bench/results/row_reduction_simd_m5pro.txt): 256 lanes were
+/// 1.9x faster on `row_sum` and 1.18x on softmax at 1024 columns, 1.27x on
+/// RMSNorm at 64 rows, and within noise everywhere wider — a 1024-lane group
+/// leaves a core little else to schedule, and the barrier it pays scales with
+/// its size.
+const REDUCE_ROW_MAX_LANES: usize = 256;
+
 fn reduce_tptg(max_threads: usize, cols: usize) -> usize {
-    reduction_tptg(max_threads, cols.next_power_of_two().max(1), REDUCE_MAX_TG)
+    reduction_tptg(
+        max_threads,
+        cols.next_power_of_two().max(1),
+        REDUCE_ROW_MAX_LANES.min(REDUCE_MAX_TG),
+    )
 }
 
 /// `out[r, :] = softmax(x[r, :])` over `rows` rows of `cols` each.

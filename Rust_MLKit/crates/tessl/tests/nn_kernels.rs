@@ -671,3 +671,33 @@ fn kv_ring_densify_refuses_zero_capacity() {
         assert!(err.contains("non-zero"), "unexpected error: {err:?}");
     });
 }
+
+/// RMSNorm at every lane boundary of the simdgroup-first reduction: one lane
+/// short of, exactly at, and one past a simdgroup and the 256-lane launch cap,
+/// plus a single element and rows wider than the cap.
+#[test]
+fn rms_norm_agrees_with_the_reference_at_every_lane_boundary() {
+    with_gpu(|rt| {
+        let rows = 5usize;
+        for &dim in &[1usize, 31, 32, 33, 255, 256, 257, 511, 512, 513, 2560, 4097] {
+            let x = random_f32(rows * dim, 0xE0 + dim as u64);
+            let w: Vec<f32> = random_f32(dim, 0xE1 + dim as u64)
+                .iter()
+                .map(|v| 1.0 + 0.5 * v)
+                .collect();
+            let eps = 1e-6;
+            let want = rms_norm_ref(&x, &w, rows, dim, eps);
+            let xb = buf(rt, &x);
+            let wb = buf(rt, &w);
+            let ob = empty(rt, rows * dim);
+            nn::rms_norm_f32(rt, &xb, &wb, &ob, rows as u32, dim as u32, eps).unwrap();
+            rt.synchronize().unwrap();
+            close(
+                &format!("rms_norm dim={dim}"),
+                &ob.read_f32()[..rows * dim],
+                &want,
+                1e-4,
+            );
+        }
+    });
+}

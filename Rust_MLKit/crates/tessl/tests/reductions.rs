@@ -216,3 +216,53 @@ fn scalar_row_reductions_reject_input_output_aliasing() {
         assert_eq!(rt.take_dispatch_count(), 0);
     });
 }
+
+/// Every lane assignment of the simdgroup-first reductions, against f64.
+///
+/// The reductions fold each simdgroup with a shuffle and then fold the
+/// simdgroup partials with a second one, so the shapes that matter are the
+/// ones where a row is one lane short of, exactly at, or one lane past a
+/// simdgroup or the 256-lane launch cap — and a row wider than the cap, where
+/// lanes stride several elements each. `cols = 1` reduces a single lane.
+#[test]
+fn reductions_agree_with_f64_at_every_lane_boundary() {
+    with_gpu(|rt| {
+        let rows = 3usize;
+        for &cols in &[
+            1usize, 31, 32, 33, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1024, 2048, 4097, 9001,
+        ] {
+            let x = random_f32(rows * cols, 0xD0 + cols as u64)
+                .iter()
+                .map(|v| v * 6.0)
+                .collect::<Vec<f32>>();
+            let xb = buf(rt, &x);
+            let ob = empty(rt, rows * cols);
+            let sb = empty(rt, rows);
+            let mb = empty(rt, rows);
+            nn::softmax_rows_f32(rt, &xb, &ob, rows as u32, cols as u32).unwrap();
+            nn::row_sum_f32(rt, &xb, &sb, rows as u32, cols as u32).unwrap();
+            nn::row_max_f32(rt, &xb, &mb, rows as u32, cols as u32).unwrap();
+            rt.synchronize().unwrap();
+            let (got, sums, maxes) = (ob.read_f32(), sb.read_f32(), mb.read_f32());
+            for r in 0..rows {
+                let row = &x[r * cols..(r + 1) * cols];
+                let want = softmax_ref(row);
+                for c in 0..cols {
+                    let (g, w) = (got[r * cols + c], want[c]);
+                    assert!(
+                        (g - w).abs() <= 1e-6 + 2e-5 * w.abs(),
+                        "softmax[{r},{c}] cols={cols}: got {g} want {w}"
+                    );
+                }
+                let sum: f64 = row.iter().map(|v| *v as f64).sum();
+                assert!(
+                    (sums[r] as f64 - sum).abs() <= 1e-4 * (1.0 + sum.abs()),
+                    "row_sum[{r}] cols={cols}: got {} want {sum}",
+                    sums[r]
+                );
+                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                assert_eq!(maxes[r], max, "row_max[{r}] cols={cols}");
+            }
+        }
+    });
+}

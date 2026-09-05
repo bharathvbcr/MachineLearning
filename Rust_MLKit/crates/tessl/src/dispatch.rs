@@ -15,8 +15,20 @@ use objc2_metal::{
     MTLResidencySet, MTLResource, MTLResourceID, MTLSize, MTLStages,
 };
 
-use crate::runtime::{mtl_size, GpuRuntime, InFlightAnchor, ARGUMENT_TABLE_MAX_BUFFERS};
+use crate::runtime::{mtl_size, GpuRuntime, InFlightAnchor};
 use crate::tensor::{GpuBuffer, Tensor};
+
+/// `[[threadgroup(n)]]` slots a compute function can declare. Metal's own
+/// index space for threadgroup memory arguments, unrelated to the argument
+/// table's buffer slots.
+pub const THREADGROUP_MEMORY_SLOTS: usize = 32;
+
+#[cfg(test)]
+thread_local! {
+    /// `setArgumentTable` calls issued by binders on this thread; the
+    /// once-per-encoder test reads it.
+    pub(crate) static ARG_TABLE_SETS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// How a [`Binder`] scope orders its dispatches, carried in from the runtime.
 ///
@@ -105,7 +117,7 @@ pub struct Binder<'a> {
     max_buffers: usize,
     max_threads: Option<usize>,
     static_tg_memory: Option<usize>,
-    dynamic_tg_memory: [usize; ARGUMENT_TABLE_MAX_BUFFERS],
+    dynamic_tg_memory: [usize; THREADGROUP_MEMORY_SLOTS],
     dynamic_tg_memory_total: usize,
     enc: &'a ProtocolObject<dyn MTL4ComputeCommandEncoder>,
     table: &'a ProtocolObject<dyn MTL4ArgumentTable>,
@@ -114,7 +126,9 @@ pub struct Binder<'a> {
     /// Raw Objective-C objects retained until this batch's allocator event
     /// completes. Metal 4 command buffers do not retain their object graph.
     in_flight_anchors: Vec<InFlightAnchor>,
-    /// A2: latch `setArgumentTable` once per binder scope (table is persistent).
+    /// `setArgumentTable` has been issued on this encoder. Once per encoder,
+    /// not per scope: the runtime carries the latch from one scope to the
+    /// next (see [`Self::holds_persistent_table`]).
     arg_table_latched: bool,
     /// Pointer identity of the last adopted / latched argument table (skip redundant
     /// `setArgumentTable` when the same table is reused across tape cmds).
@@ -289,6 +303,23 @@ impl<'a> Binder<'a> {
         self.hazard_pending
     }
 
+    /// Adopt the runtime's persistent table as already bound on the encoder,
+    /// left there by the previous scope. Pointer identity is recorded so a
+    /// tape-path adopt of a different table still re-sets it.
+    pub(crate) fn assume_persistent_table(&mut self) {
+        self.arg_table_latched = true;
+        self.last_arg_table_ptr = Some(self.table as *const _ as usize);
+    }
+
+    /// Whether the encoder leaves this scope holding the runtime's persistent
+    /// table, so the next scope on it can skip `setArgumentTable`. False after
+    /// a tape-path adopt of another table or an indirect execute. A fresh
+    /// binder per scope used to re-issue the set on every op even though the
+    /// encoder is reused across scopes (audit R10c).
+    pub(crate) fn holds_persistent_table(&self) -> bool {
+        self.arg_table_latched && self.last_arg_table_ptr == Some(self.table as *const _ as usize)
+    }
+
     /// Validate and bind one concrete buffer address without making any claim
     /// about whether the caller can retain that buffer for an ICB tape.
     ///
@@ -336,8 +367,21 @@ impl<'a> Binder<'a> {
         if self.error.is_some() {
             return 0;
         }
-        let start = self.const_cursor.checked_add(15).map(|n| n & !15);
-        let end = start.and_then(|n| n.checked_add(bytes.len().max(4)));
+        // Natural alignment, four to sixteen bytes: a scalar takes four, a
+        // pair eight, anything wider sixteen. Metal's constant address space
+        // wants the payload's own alignment, and rounding every payload up to
+        // sixteen charged the arena four times over for the u32/f32 scalars
+        // that make up nearly all of it (audit R8).
+        // `constant_arena_charges_natural_width` pins the rule;
+        // `a_kernel_reads_a_scalar_at_a_four_byte_offset` shows the GPU reads
+        // a four-aligned constant correctly.
+        let len = bytes.len().max(4);
+        let align = len.next_power_of_two().min(16);
+        let start = self
+            .const_cursor
+            .checked_add(align - 1)
+            .map(|n| n & !(align - 1));
+        let end = start.and_then(|n| n.checked_add(len));
         let (Some(start), Some(end)) = (start, end) else {
             self.fail("constant arena offset overflow");
             return 0;
@@ -366,7 +410,7 @@ impl<'a> Binder<'a> {
                 .as_ptr()
                 .cast::<u8>()
                 .add(start);
-            std::ptr::write_bytes(dst, 0, bytes.len().max(4));
+            std::ptr::write_bytes(dst, 0, len);
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
         }
         *self.const_cursor = end;
@@ -392,7 +436,7 @@ impl<'a> Binder<'a> {
             max_buffers,
             max_threads: None,
             static_tg_memory: None,
-            dynamic_tg_memory: [0; ARGUMENT_TABLE_MAX_BUFFERS],
+            dynamic_tg_memory: [0; THREADGROUP_MEMORY_SLOTS],
             dynamic_tg_memory_total: 0,
             enc,
             table,
@@ -425,6 +469,8 @@ impl<'a> Binder<'a> {
             return;
         }
         self.enc.setArgumentTable(Some(self.table));
+        #[cfg(test)]
+        ARG_TABLE_SETS.with(|n| n.set(n.get() + 1));
         self.arg_table_latched = true;
         self.last_arg_table_ptr = Some(self.table as *const _ as usize);
     }
@@ -449,6 +495,8 @@ impl<'a> Binder<'a> {
             return false;
         }
         self.enc.setArgumentTable(Some(table));
+        #[cfg(test)]
+        ARG_TABLE_SETS.with(|n| n.set(n.get() + 1));
         self.arg_table_latched = true;
         self.last_arg_table_ptr = Some(ptr);
         true
@@ -678,11 +726,17 @@ impl<'a> Binder<'a> {
     }
 
     /// Dynamic threadgroup memory (`threadgroup T *ptr [[threadgroup(index)]]`).
+    ///
+    /// `[[threadgroup(n)]]` is its own index space, separate from
+    /// `[[buffer(n)]]`, with its own limit ([`THREADGROUP_MEMORY_SLOTS`]).
+    /// It used to be bounded by the buffer bind count, which was conservative
+    /// but not a Metal fact, and would have moved for no reason with the
+    /// argument-table size.
     pub fn set_threadgroup_memory(&mut self, index: usize, length: usize) {
-        // Same slot space as the buffer binds, and previously unchecked while
-        // every `bind_*` validated. An out-of-range index reached Metal
-        // directly.
-        if !self.valid_index(index) {
+        if index >= THREADGROUP_MEMORY_SLOTS {
+            self.fail(format!(
+                "threadgroup memory index {index} out of range (limit {THREADGROUP_MEMORY_SLOTS})"
+            ));
             return;
         }
         let Some(static_bytes) = self.static_tg_memory else {
@@ -858,6 +912,11 @@ impl<'a> Binder<'a> {
         unsafe {
             self.enc.executeCommandsInBuffer_withRange(icb, range);
         }
+        // The latch does not trust the table binding to survive an indirect
+        // execute: the next dispatch, in this scope or a later one on the
+        // same encoder, sets it again.
+        self.arg_table_latched = false;
+        self.last_arg_table_ptr = None;
         crate::infer_trace::on_dispatch();
         self.hazard_pending = self.skip_auto_barriers;
         if !self.skip_auto_barriers {
@@ -1120,6 +1179,26 @@ mod tests {
         for (i, v) in out.iter().take(n).enumerate() {
             assert_eq!(*v, (i as f32) * 2.0);
         }
+    }
+
+    /// `[[threadgroup(n)]]` has its own slot space: the last slot Metal allows
+    /// is accepted and the first past it is refused by name, independent of
+    /// how many buffer slots the argument table has.
+    #[test]
+    fn threadgroup_memory_index_is_bounded_by_its_own_slot_space() {
+        let rt = GpuRuntime::new().expect("runtime");
+        let pipe = rt.pipeline("copy_f32").unwrap();
+        let err = rt
+            .with_binder(|bnd| {
+                bnd.set_pipeline(&pipe);
+                bnd.set_threadgroup_memory(THREADGROUP_MEMORY_SLOTS, 16);
+                Ok(())
+            })
+            .expect_err("slot past the threadgroup limit");
+        assert!(
+            err.contains("threadgroup memory index 32 out of range"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

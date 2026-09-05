@@ -122,7 +122,7 @@ flowchart TD
 - **`BufferKind::Hot`**: Persistent allocations (model weights, optimizer state, KV cache banks). They remain resident while a logical owner is live; after the final owner drops, removal waits for all in-flight work and the storage is retired rather than entering the reusable Cold freelist.
 - **`BufferKind::Cold`**: Intermediate activations. Managed via an active freelist pool with a default 2 GiB cap (`DEFAULT_POOL_CACHE_BYTES`). Unused slabs are evicted via `removeAllocation` upon command buffer completion.
 - **`BufferKind::Bump`**: Ephemeral scratch memory allocated linearly from pre-committed slabs. Bump cursors are reset at synchronization points without individual buffer deallocations.
-- **Constant Arena (16 MiB)**: Eliminates per-dispatch host allocation overhead for scalars and small metadata buffers by writing directly into a shared staging buffer at 16-byte aligned offsets.
+- **Constant Arena (16 MiB)**: Eliminates per-dispatch host allocation overhead for scalars and small metadata buffers by writing directly into a shared staging buffer at naturally aligned offsets (four bytes for a scalar, sixteen for wider payloads). A scope that opens with less than 1 MiB free drains the GPU first, so the arena is rewound rather than exhausted.
 
 > [!NOTE]
 > The usual steady-state path encodes without a host wait while at least one of the two allocator slots is available. If both slots are still in flight, the runtime applies a bounded `MTLSharedEvent` wait as backpressure. Callers may also request completion explicitly through [`GpuRuntime::synchronize`](src/runtime.rs) or a waiting commit.
@@ -142,7 +142,7 @@ flowchart TD
     BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup<br/>(Portable SIMD Fallback)"]
     BackendCheck -- TensorOps --> LayoutCheck{"Layout Resolution"}
 
-    LayoutCheck -- "TN Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
+    LayoutCheck -- "TN Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(M,N &lt;= 384, min(M,N) &lt;= 128;<br/>K &gt;= 2048 f32 exact, K &gt;= 12288 bf16 — measured)"}
     SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn_splitk_*<br/>(Split-K partial reductions,<br/>at most 32 barriered partitions)"]
     SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn_*<br/>(128x64 sg4 Cooperative Destination)"]
     LayoutCheck -- "NT Layout" --> CoopNT["matmul2d_tensorops_nt_*<br/>(128x64 sg4 Cooperative Destination;<br/>NT never splits K)"]

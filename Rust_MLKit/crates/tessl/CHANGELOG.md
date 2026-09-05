@@ -8,6 +8,19 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Added
 
+- **`tests/gemm_flag_paths.rs`** — the four shipped accumulate kernels and the
+  exact-f32 kernels' interior branch run under the flags that select them
+  (`TESSL_GEMM_ACCUM`, `TESSL_GEMM_ACCUM_DX`, `TESSL_GEMM_INTERIOR`), each
+  configuration in a child process, checked against the f64 reference with the
+  previous C folded in, and with `TESSL_KERNEL_TRACE` proving the accumulate
+  kernels ran and the temp-plus-`add_inplace_f32` fallback did not. Audit G7:
+  under the default environment no test executed any of that code.
+
+- **`clear_binder_encode_nop`** — the one public switch for binder-nop, and it
+  can only disarm. The raw `set_binder_encode_nop(bool)` is crate-private now
+  (see Removed); a downstream step that must never start under a stale replay
+  flag calls the new function first.
+
 - **Fail-closed cross-runtime performance evidence.**
   `bench/paired_cross_runtime.py` and `bench/attn_paired.py` now require an even
   outer-round count of at least 4 (default 6) for exact AB/BA balance and enough
@@ -159,6 +172,33 @@ All notable changes to `tessl` are recorded here. The format follows
   run-to-run noise floor at ~3%.
 
 ### Fixed
+
+- **The D=256 sliding-window wrapper owns the output-format slot.**
+  `flash_attn_swa_with_scalars` binds scalar slot 13 (`out_bf16` for the D=256
+  shader, the capacity slot for D=128) to 0 itself, after the callback, because
+  it validated `o` as f32. A callback that set the slot, or left a stale 1
+  from an earlier dispatch in the scope, had the kernel pack two-byte values
+  into the four-byte output; `swa_d256_wrapper_owns_the_output_format_slot`
+  does exactly that and reads the f64 reference back. (audit N14)
+
+- **A nearly full constant arena no longer poisons the runtime.** A scope that
+  opens with less than `CONST_ARENA_SCOPE_RESERVE` (1 MiB) free drains the GPU
+  with a waiting commit, which rewinds the arena, instead of failing its first
+  bind and latching `encode_failed` for the rest of the process. A waiting
+  commit with no open batch now rewinds the arena too. (audit R8)
+
+- **`self_weak` is a `OnceLock`** set once in `GpuRuntime::new`. The
+  poison-tolerant read that could hand `alloc_buffer_kind` a dangling `Weak`,
+  silently orphaning every later buffer from residency and the pool, is gone.
+  (audit R15)
+
+- **Threadgroup-memory slots have their own bound.** `set_threadgroup_memory`
+  checks its index against `THREADGROUP_MEMORY_SLOTS` (32), not the buffer
+  argument-table width. (audit R13)
+
+- **`build.rs` sweeps stale metallibs** from `OUT_DIR` before writing the new
+  `default-<build id>.metallib`; each build used to leave another ~1.1 MB
+  behind. (audit R16)
 
 - **`rms_qkv_rope` `q_only` corrupted Q rows whenever `T * Hq` was not a
   multiple of the SIMD width.** The q-only grid is `T * Hq` threads rounded
@@ -379,6 +419,76 @@ All notable changes to `tessl` are recorded here. The format follows
 
 ### Changed
 
+- **Constant arena: natural-width alignment.** A u32/f32 scalar costs the
+  arena four bytes, an eight-byte payload eight, anything wider sixteen; every
+  payload used to be rounded up to sixteen, charging the 16 MiB arena four
+  times over for the scalars that make up nearly all of it.
+  `a_kernel_reads_a_scalar_at_a_four_byte_offset` is the GPU-side evidence for
+  the rule. (audit R8)
+
+- **`setArgumentTable` once per encoder, not once per scope.** The open batch
+  carries the latch across `with_binder` scopes on one encoder and clears it
+  whenever the encoder is created; a tape-path adopt of another table or an
+  indirect execute clears it too. Measured as host time per `copy_f32` scope,
+  80k scopes per arm, seven ABBA rounds
+  (`bench/results/arg_table_latch_m5pro.txt`): median 2.6% faster inside a
+  0.62–1.13 spread, so kept for the removed send, not as a measured speedup.
+  (audit R10c)
+
+- **The pool lock no longer spans `addAllocation`.** `alloc_buffer_kind`
+  releases the pool mutex before registering residency. (audit R14)
+
+- **Row reductions are simdgroup-first, and rows get at most 256 lanes.**
+  `softmax_rows_f32`, `row_sum_f32`, `row_max_f32` and the RMSNorm family
+  reduced each row with a threadgroup-memory tree that paid a barrier per
+  round — ten rounds and eleven barriers at 1024 lanes. `reduce_row_add` /
+  `reduce_row_max` in `kernels/reduce_tree.h` fold each simdgroup with a
+  shuffle, publish one partial per simdgroup, and fold the partials with a
+  second shuffle across a single barrier; `REDUCE_TREE` is retired. Rows are
+  launched with at most 256 lanes (`REDUCE_ROW_MAX_LANES`, was 1024). Paired
+  A/B on an M5 Pro, twenty dispatches per command buffer, six order-balanced
+  rounds (2026-09-05, `bench/results/row_reduction_simd_m5pro.txt`), old
+  time ÷ new time at 4096 rows: softmax 1.13–2.32x up to 4096 columns and at
+  the memory roof beyond; `row_sum`/`row_max` 1.4–4.35x; RMSNorm 1.02–1.72x
+  (1.21x at the decode shape, 1.47x at 512 rows). Two things that did not
+  work are recorded there too: a serial fold of the simdgroup partials lost
+  to the tree from 32 simdgroups up, and a register-resident single-pass
+  softmax (audit N11) never beat re-reading the row, because the re-reads
+  are cache hits and the cost was the reduction. `tests/reductions.rs` and
+  `tests/nn_kernels.rs` now cover every lane boundary of the new fold.
+
+- **`gemv_q4` (signed nibble) is one simdgroup per four rows.** It was one
+  thread per row with `x` staged in threadgroup memory, so adjacent threads
+  read addresses `cols / 2` bytes apart and nothing coalesced — the geometry
+  `gemv_q8` left on 2026-08-31. Lanes now stride K eight nibbles (one
+  `uint`) at a time across group boundaries, so every lane is busy at every
+  admitted group size and the four rows a simdgroup owns share `x` out of
+  cache. 1.60–1.83x at 4096–11008 rows and every group size from 8 to 128,
+  3.36x at 256 rows, 188–220 GB/s (`bench/results/gemv_q4_simd_m5pro.txt`).
+  The 16 KiB `x` cache, the `cols` ceiling the host enforced for it, and the
+  opaque 16-byte-alignment error a ragged `cols` used to hit (audit N15) are
+  gone. `tests/quantized_gemv.rs` checks it and `gemv_q8` against an f64
+  reference at every lane boundary; neither had a numeric test before.
+
+- **The bf16 TN split-K gate opens at K = 12288, not 2048.** The gate rested
+  on a sync-per-iteration measurement that its own findings file said could
+  not resolve the difference (audit G8). Measured through `gemm_tn_train`
+  with the packed encoder (`bench/results/splitk_gate_m5pro.txt`): the
+  single coop dispatch beats split-K by 5–23% at K = 4096–8192 on every dW
+  shape, split-K first wins at 12288 and pulls away with depth (0.70x at
+  32768). `prefer_tn_splitk_bf16` carries the measured threshold for the bf16
+  train and accumulate lanes; the f32 exact lane keeps its historical 2048
+  gate, unmeasured and untouched as the golden-parity path.
+
+- **`qdot16` and `load_x16_qdot` have one owner.** The MLX Q4 lane dot was
+  copied into both `gemv_q4_mlx.metal` and `gemm_q4_mlx.metal`; both now
+  include `kernels/q4_mlx_dot.h`, where `qdot16` reads its sixteen nibbles
+  with one `uint2` load instead of four `ushort` loads (audit N13). Measured
+  neutral (0.99–1.07x) because the simd GEMV already runs at the memory
+  roof. `gemv_q8`'s vec4 path likewise takes one `float4` load of `x`
+  instead of four scalar loads (audit N12), measured neutral (1.00–1.04x)
+  and kept as an instruction-count reduction.
+
 - **The NN coop GEMM tile is chosen by grid fill, not by `N` alone.**
   `nn_coop_kernel` picked the 64×64 sg4 tile for `N <= 512` and the 128×64
   tile for everything else, ignoring `M`; no NN shape below `M = 512` had
@@ -539,6 +649,21 @@ is:
   through `nax_verify_readiness`.
 
 ### Removed
+
+- **Public `set_binder_encode_nop(bool)`.** While armed, every public encode
+  API on the thread returned `Ok(())` having done nothing, and a caller then
+  read stale device memory. Crate-private now; `clear_binder_encode_nop`
+  (Added) is the public, disarm-only replacement, and gemma-metal's seven call
+  sites use it. (audit R12)
+
+- **The accumulator clear before every cooperative `op.run`.** All eight
+  cooperative GEMM kernels zeroed their destination cooperative tensor before
+  `run` under `matmul2d_descriptor::mode::multiply`, where `run` assigns every
+  valid element and the accumulate and epilogue kernels load the previous C
+  afterwards (audit G12). Measured with and without on the bf16 NN kernel
+  (`bench/results/coop_clear_m5pro.txt`): within noise either way, so this is
+  dead-code removal, not a speedup.
+
 
 - `npy::seek_noop`, a public function that had no callers and performed no
   operation. NPY reads now use the standard `Seek::stream_position` API where

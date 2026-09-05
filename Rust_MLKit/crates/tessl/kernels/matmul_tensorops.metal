@@ -426,10 +426,6 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-        // set() wraps the is_valid_element mask check.
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (EPILOGUE) {
             // `beta * C_prev` reuses the accumulate path's trick: a second
@@ -479,9 +475,6 @@ inline void mm_nn_coop_f32acc(device ElemT *A, device ElemT *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (EPILOGUE) {
             if (beta != 0.0f) {
@@ -736,9 +729,6 @@ inline void mm_tn_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (ACCUM) {
             auto prevT = op.template get_destination_cooperative_tensor<
@@ -762,9 +752,6 @@ inline void mm_tn_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (ACCUM) {
             auto prevT = op.template get_destination_cooperative_tensor<
@@ -806,9 +793,6 @@ inline void mm_nt_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (ACCUM) {
             auto prevT = op.template get_destination_cooperative_tensor<
@@ -832,9 +816,6 @@ inline void mm_nt_coop_bf16(device bfloat *A, device bfloat *B, device float *C,
         auto cT = op.template get_destination_cooperative_tensor<
             metal::remove_addrspace_t<decltype(tA)>,
             metal::remove_addrspace_t<decltype(tB)>, float>();
-#pragma clang loop unroll(full)
-        for (uint16_t i = 0; i < cT.get_capacity(); ++i)
-            cT.set(i, 0.0f);
         op.run(tA, tB, cT);
         if (ACCUM) {
             auto prevT = op.template get_destination_cooperative_tensor<

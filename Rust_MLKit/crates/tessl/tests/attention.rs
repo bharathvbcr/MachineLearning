@@ -1812,3 +1812,75 @@ fn the_head_block_width_always_divides_the_head_count() {
         }
     }
 }
+
+/// D=256 shares its shader with a bf16-output variant selected by scalar slot
+/// 13, the slot the D=128 kernel uses for its capacity. The `_with_scalars`
+/// wrapper validates `o` as f32, so it owns that slot: a callback that binds
+/// it to 1, or leaves a stale 1 behind from an earlier dispatch in the scope,
+/// must not turn the four-byte output into packed two-byte values. Until the
+/// wrapper bound the slot itself (audit N14) this callback did exactly that.
+#[test]
+fn swa_d256_wrapper_owns_the_output_format_slot() {
+    with_gpu(|rt| {
+        let s = Shape {
+            b: 1,
+            tq: 11,
+            tkv: 11,
+            h: 2,
+            hkv: 1,
+            d: 256,
+        };
+        let (window, scale) = (4096usize, 0.0625f32);
+        let q = random_f32(s.b * s.tq * s.h * s.d, 0xD256);
+        let k = random_f32(s.b * s.tkv * s.hkv * s.d, 0xD257);
+        let v = random_f32(s.b * s.tkv * s.hkv * s.d, 0xD258);
+        let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+        let ob = seeded(rt, s.b * s.tq * s.h * s.d, UNWRITTEN);
+        let tkv = u32_buf(rt, s.tkv as u32);
+        let qo = u32_buf(rt, 0);
+        let ko = u32_buf(rt, 0);
+        let dims = AttnDims {
+            batch: s.b as u32,
+            tq: s.tq as u32,
+            heads: s.h as u32,
+            heads_kv: s.hkv as u32,
+            window: window as u32,
+            scale,
+        };
+        // SAFETY: binds the documented D=256 scalar slots with the validated
+        // capacity at 14; slot 13 is deliberately wrong, which the wrapper
+        // must correct because it, not the callback, owns the output format.
+        unsafe {
+            nn::flash_attn_swa_with_scalars(
+                rt,
+                AttnHeadDim::D256,
+                &qb,
+                &kb,
+                &vb,
+                &ob,
+                &tkv,
+                &qo,
+                &ko,
+                dims,
+                |bnd, kv_capacity| {
+                    bnd.bind_u32(dims.batch, 4);
+                    bnd.bind_u32(dims.tq, 5);
+                    bnd.bind_u32(dims.heads, 7);
+                    bnd.bind_u32(dims.heads_kv, 8);
+                    bnd.bind_u32(dims.window, 9);
+                    bnd.bind_f32(dims.scale, 10);
+                    bnd.bind_u32(1, 13);
+                    bnd.bind_u32(kv_capacity, 14);
+                },
+            )
+        }
+        .unwrap();
+        rt.synchronize().unwrap();
+        let want = reference(&q, &k, &v, s, Some(window), 0, 0, scale);
+        check(
+            "swa d256 with slot 13 bound to 1 by the callback",
+            &ob.read_f32()[..want.len()],
+            &want,
+        );
+    });
+}

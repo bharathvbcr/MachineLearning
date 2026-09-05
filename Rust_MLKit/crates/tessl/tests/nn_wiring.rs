@@ -706,61 +706,87 @@ fn qkv_rope_refuses_a_variant_operand_mismatch() {
     });
 }
 
+/// `gemv_q4` has no `cols` ceiling.
+///
+/// Until 2026-09-05 the row kernel staged all of `x` in dynamic threadgroup
+/// memory, so `cols * 4` bytes above the device limit were refused before
+/// encoding (and a `cols` that was not a multiple of four failed later with an
+/// alignment message naming neither the kernel nor `cols`, audit N15). The
+/// simdgroup kernel reads `x` from device memory, so a width the old kernel
+/// could not launch now validates, dispatches, and computes the right numbers.
 #[test]
-fn gemv_q4_refuses_a_cols_that_overflows_threadgroup_memory() {
+fn gemv_q4_has_no_cols_ceiling() {
     with_gpu(|rt| {
-        // The kernel caches all of `x` in threadgroup memory: cols * 4 bytes.
         let limit = rt.max_threadgroup_memory();
-        let group_size = 32usize;
-        let too_wide = (limit / std::mem::size_of::<f32>())
-            .checked_add(1)
-            .expect("threadgroup-memory limit column threshold")
-            .div_ceil(group_size)
-            .checked_mul(group_size)
-            .and_then(|cols| u32::try_from(cols).ok())
-            .expect("Metal threadgroup-memory limit must fit a u32 column count");
+        let group_size = 64usize;
+        // Wider than the old cache could hold, rounded up to a whole group.
+        let cols = (limit / std::mem::size_of::<f32>() + 1).div_ceil(group_size) * group_size;
+        let rows = 4usize;
+        assert!(cols * 4 > limit, "test setup must exceed the old ceiling");
+        let groups = rows * (cols / group_size);
+        let q: Vec<i8> = (0..rows * cols)
+            .map(|i| ((i * 13 + 5) % 16) as i8 - 8)
+            .collect();
+        let packed_bytes: Vec<u8> = q
+            .chunks(2)
+            .map(|p| ((p[0] as u8) & 0x0f) | (((p[1] as u8) & 0x0f) << 4))
+            .collect();
+        let scales: Vec<f32> = (0..groups).map(|i| 0.01 + (i % 3) as f32 * 0.005).collect();
+        let zeros: Vec<f32> = (0..groups).map(|i| (i % 4) as f32 * 0.5 - 1.0).collect();
+        let x: Vec<f32> = (0..cols)
+            .map(|c| ((c * 7 % 23) as f32 - 11.0) * 0.1)
+            .collect();
+        let want: Vec<f32> = (0..rows)
+            .map(|r| {
+                (0..cols)
+                    .map(|c| {
+                        let g = r * (cols / group_size) + c / group_size;
+                        scales[g] as f64 * (q[r * cols + c] as f64 - zeros[g] as f64) * x[c] as f64
+                    })
+                    .sum::<f64>() as f32
+            })
+            .collect();
+
+        let packed = rt
+            .alloc_buffer(packed_bytes.len())
+            .expect("packed allocation");
+        packed.write_bytes(&packed_bytes);
+        let sb = empty(rt, groups);
+        sb.write_f32(&scales);
+        let zb = empty(rt, groups);
+        zb.write_f32(&zeros);
+        let xb = empty(rt, cols);
+        xb.write_f32(&x);
+        let yb = empty(rt, rows);
         let shape = QuantShape {
-            rows: 8,
-            cols: too_wide,
+            rows: rows as u32,
+            cols: cols as u32,
             group_size: group_size as u32,
         };
-        let requested = shape.cols as usize * std::mem::size_of::<f32>();
-        assert!(
-            requested > limit,
-            "test setup must exceed the device limit: requested {requested}, limit {limit}"
-        );
-        let weights = shape.rows as usize * shape.cols as usize;
-        let groups = weights / group_size;
-
-        // Keep every operand valid and disjoint. Reusing one generous buffer
-        // here accidentally made this an aliasing test once GEMV began rejecting
-        // unordered output/input overlap, masking the launch-size invariant this
-        // regression is meant to isolate.
-        let packed = rt
-            .alloc_buffer(weights.div_ceil(2))
-            .expect("packed allocation");
-        let scales = empty(rt, groups);
-        let zeros = empty(rt, groups);
-        let x = empty(rt, shape.cols as usize);
-        let y = empty(rt, shape.rows as usize);
-        let err = nn::gemv_q4(
+        nn::gemv_q4(
             rt,
             Q4Bank {
                 packed: &packed,
-                scales: &scales,
-                zeros: &zeros,
+                scales: &sb,
+                zeros: &zb,
             },
-            &x,
-            &y,
+            &xb,
+            &yb,
             shape,
             false,
         )
-        .expect_err("threadgroup memory overflow");
-        assert!(
-            err.contains("threadgroup memory"),
-            "expected the threadgroup-memory ceiling, got: {err:?}"
-        );
-        assert_eq!(rt.take_dispatch_count(), 0);
+        .expect("a wide row is an ordinary dispatch now");
+        rt.synchronize().unwrap();
+        let got = yb.read_f32();
+        for r in 0..rows {
+            let tol = 2e-4 * want[r].abs().max(1.0);
+            assert!(
+                (got[r] - want[r]).abs() <= tol,
+                "gemv_q4 cols={cols} row {r}: got {} want {}",
+                got[r],
+                want[r]
+            );
+        }
     });
 }
 

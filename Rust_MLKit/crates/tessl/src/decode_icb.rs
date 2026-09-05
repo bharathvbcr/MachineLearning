@@ -1790,8 +1790,23 @@ thread_local! {
     static BINDER_ENCODE_NOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub fn set_binder_encode_nop(on: bool) {
+/// Arm or disarm binder-nop on this thread.
+///
+/// Crate-private on purpose: while it is armed every public encode API on
+/// this thread returns `Ok(())` having done nothing, and a caller then reads
+/// stale device memory. [`BinderEncodeNopGuard`] is the nesting-safe way to
+/// arm it; [`clear_binder_encode_nop`] is the only public switch, and it can
+/// only disarm.
+pub(crate) fn set_binder_encode_nop(on: bool) {
     BINDER_ENCODE_NOP.with(|flag| flag.set(on));
+}
+
+/// Disarm binder-nop on this thread, whatever armed it.
+///
+/// Safe to call at any time: encoding resumes. A downstream step that must
+/// never start under a stale replay flag calls this first.
+pub fn clear_binder_encode_nop() {
+    set_binder_encode_nop(false);
 }
 
 pub fn binder_encode_nop() -> bool {
