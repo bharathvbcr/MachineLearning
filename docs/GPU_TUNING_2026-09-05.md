@@ -211,6 +211,9 @@ so their difference is the floor any other difference must clear.
 |---|---:|---:|
 | a1 vs a2 — identical config, identical seeds | **0.0014** | 0.0031 |
 | a1 vs t3 — `--workers` 1 against 3 | **0.0012** | 0.0022 |
+| a1 vs m3 — `--workers` 3 with MPS (17 clients connected) | **0.0023** | 0.0055 |
+| eager vs compiled (attention) | **0.0023** | 0.0040 |
+| eager vs compiled (minGRU) | **0.0016** | 0.0030 |
 
 Tenancy's effect on the reported number is *smaller than re-running the same job*.
 That settles it: tenancy is recipe-neutral in practice, not just in principle.
@@ -261,7 +264,7 @@ markers), so it is a decision, not a recommendation.
 Ordered by (value × confidence). "Recipe-neutral" means the loss curve is
 provably unchanged — safe even for boards that pool with existing runs.
 
-### 1. Start an MPS daemon. It is the only free ~20% here — recipe-neutral
+### 1. Start an MPS daemon: ~20% back, at compile-sized numerics cost
 
 `workers` is a **recipe field**: `current_recipe()` records it and `lock_recipe`
 refuses a directory whose recorded tenancy differs. So for the boards that must
@@ -281,9 +284,31 @@ the best non-MPS configuration. The 20% is the tenancy tax being refunded.
 
 Operationally it needs no code change: `launch` copies `os.environ` into every
 worker (`crossover_replicate.py:1674`), so exporting `CUDA_MPS_PIPE_DIRECTORY`
-in the launching shell is enough. Two cautions: the daemon must be verified
-*serving* (`echo get_server_list | nvidia-cuda-mps-control` returning a pid —
-`pgrep` races its fork, which mislabelled a stage of this sprint), and MPS
+in the launching shell is enough.
+
+**But it is not numerically free, and this is the one place the first draft of
+this document over-claimed.** MPS changes no *recorded* recipe field, which is
+what makes it usable on a locked directory — but it does change kernel
+interleaving, and that perturbs non-deterministic backward kernels more than
+plain tenancy does:
+
+| condition vs the serial reference | mean abs `final_val` diff | max |
+|---|---:|---:|
+| same config, rerun (the floor) | 0.0014 | 0.0031 |
+| `--workers` 3, no MPS | 0.0012 | 0.0022 |
+| **`--workers` 3, MPS** | **0.0023** | **0.0055** |
+| eager vs compiled, for comparison | 0.0023 | 0.0040 |
+
+So MPS sits in the same category as `torch.compile`: about 1.6x the rerun floor,
+roughly 8x below the effects the boards resolve — worth taking, but it should be
+turned on for a whole board, not mid-way through one, and a board that pools with
+existing runs inherits that perturbation.
+
+Two operational cautions. The daemon must be verified *answering* — `pgrep`
+races its fork, and `get_server_list` returns an empty list until a client first
+attaches, so a freshly started daemon looks dead to a naive check; both mistakes
+cost this sprint a stage. Verify instead by counting the clients that connected
+(the control log records `NEW CLIENT`): the m3 condition above shows 17. And MPS
 weakens fault isolation, so a client that dies hard can take the server with it.
 
 ### 2. Pick tenancy per arm, from the arm's MFU — recipe-neutral, new dirs only
