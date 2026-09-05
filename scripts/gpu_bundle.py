@@ -127,7 +127,19 @@ ANCHOR = OUT_ROOT / "anchor.json"
 S24 = dict(batch=32, budget=LOCKED20_TOKEN_BUDGET, horizon=TOKEN_BUDGET, eval_iters=20)
 S23 = dict(batch=32, budget=LOCKED20_TOKEN_BUDGET, horizon=None, eval_iters=20)
 S25 = dict(batch=8, budget=SUITE14_TOKEN_BUDGET, horizon=None, eval_iters=20)
-RECIPES = {"s24": S24, "s23": S23, "s25": S25}
+# The schedule pair s23/s24 differ by 2.7x in learning rate AT SP's crossing
+# (12.4M tokens) but by only 1.07x at the TUNED muP crossing (3.56M) -- the two
+# cosines have barely separated that early. So "muP's crossings collapse across
+# schedules" (readout row 3, which fires) is confounded with the tuned LR having
+# moved the crossing out of the regime where the schedules differ at all.
+#
+# S6 is the matched-sensitivity control: a 6M cosine stopped at 20M puts the two
+# LRs 2.77x apart at 3.56M, which is what SP experienced at ITS crossing (2.69x).
+# If the muP crossings still collapse against THIS schedule, the schedule effect
+# really is a tuning artifact; if they separate, the collapse was the regime.
+# CosineSchedule clamps t at 1.0, so the tail past 6M runs at lr_floor_frac.
+S6 = dict(batch=32, budget=LOCKED20_TOKEN_BUDGET, horizon=6_000_000, eval_iters=20)
+RECIPES = {"s24": S24, "s23": S23, "s25": S25, "s6": S6}
 ARMS = ("attention", "mingru")
 HEAD_DIM = 64
 BASE_WIDTH = 256          # cfg.mup_base_width; the proxy sweep runs here
@@ -284,6 +296,8 @@ SUITE_DOC = {
     "e1_mup_tuned": "s24 muP at its OWN target-width optimum, n=5 -- muP's actual answer",
     "e1_mup_tuned_spattn": "e1_mup_tuned with SP's attention temperature -- the cell PAPER 8.4 rows 1-3 actually ask for",
     "e1_sp_coldattn": "SP with muP's 1/d attention temperature -- separates muP from the temperature correction",
+    "e1_mup_sched6_spattn": "tuned muP-spattn on a 6M cosine -- tests whether row 3's collapse is real or a schedule-regime artifact",
+    "e1_sp_sched6": "SP on the 6M cosine -- the control row 3's test needs",
     "e1_sp_basin": "s24 SP matrix-LR sweep at the TARGET width, 5 seeds -- prices the inherited LR",
     "e1_sp_sched20": "SP at the s23 recipe (20M cosine) -- readout rows 2 and 3",
     "e1_mup_sched20": "muP at the s23 recipe (20M cosine) -- readout rows 2 and 3",
@@ -301,12 +315,13 @@ SUITE_ORDER = tuple(SUITE_DOC)
 MUP_TRANSFER_SUITES = ("e1_mup", "e1_mup_basin", "e1_mup_tuned",
                        "e1_mup_sched20", "e1_mup_bs8", "e1_mup_spattn",
                        "e1_mup_sched20_spattn", "e1_mup_bs8_spattn",
-                       "e1_mup_basin_spattn", "e1_mup_tuned_spattn")
+                       "e1_mup_basin_spattn", "e1_mup_tuned_spattn",
+                       "e1_mup_sched6_spattn")
 # Suites that run muP at its MEASURED target-width optimum rather than at the
 # transferred value, and so wait on the basin as well as on the proxy.
 MUP_ANCHOR_SUITES = ("e1_mup_tuned", "e1_mup_sched20", "e1_mup_bs8",
                      "e1_mup_sched20_spattn", "e1_mup_bs8_spattn",
-                     "e1_mup_tuned_spattn")
+                     "e1_mup_tuned_spattn", "e1_mup_sched6_spattn")
 
 # Every suite whose cells are merged into, or compared against, a board measured
 # on the GH200 that ran suites 22-26. Running these anywhere else replaces a
@@ -548,6 +563,25 @@ def build_matrix(sp_cells: str = "rerun", transfer: dict | None = None,
         for seed in SEEDS:
             jobs.append(_job("e1_sp_coldattn", arm, seed,
                              dict(sp_inv_d_attn_scale=True), **S24))
+
+    # --- The control readout row 3 turns out to need. Row 3 fires on the tuned
+    # cells -- s24 last-crosses at 3.560M [3.458, 3.662] and s23 at 3.585M
+    # [3.475, 3.695], which overlap almost exactly, against SP's 12.369M vs
+    # 14.745M with DISJOINT intervals. But at 3.56M the 50M and 20M cosines are
+    # 1.07x apart, where at SP's crossing they are 2.69x apart. The collapse may
+    # therefore be the tuned LR moving the crossing to a place where there is no
+    # schedule difference left to detect.
+    #
+    # S6 restores the sensitivity: 2.77x apart at 3.56M. Same arms, same anchor,
+    # one recipe field changed.
+    for arm in ARMS:
+        for seed in SEEDS:
+            jobs.append(_mup_job("e1_mup_sched6_spattn", arm, seed, S6, transfer,
+                                 anchor=anchor if anchor is not None else {},
+                                 extra_cfg=dict(mup_sqrt_attn_scale=True)))
+    for arm in ARMS:
+        for seed in SEEDS:
+            jobs.append(_job("e1_sp_sched6", arm, seed, {}, **S6))
 
     # --- E1c'': SP's own learning-rate curve at the target width. The inherited
     # value is a point on this curve and is contributed by e1_sp_rerun, so only the
@@ -1667,6 +1701,7 @@ PARAMETRIZATION_CONTROL = {
     "e1_mup_sched20": "e1_sp_sched20", "e1_mup_bs8": "e1_sp_bs8",
     "e1_mup_tuned_spattn": "e1_sp_rerun",
     "e1_sp_coldattn": "e1_sp_rerun",
+    "e1_mup_sched6_spattn": "e1_sp_sched6",
     "e1_perlayer_sp": "e1_sp_rerun", "e1_embed_lr": "e1_sp_rerun",
 }
 

@@ -41,6 +41,7 @@ rsync -az --prune-empty-dirs \
   --include='metrics.jsonl' --include='config.json' --include='queue.json' \
   --include='recipe.json'   --include='ledger.json'  --include='summary.json' \
   --include='runs.jsonl'    --include='final_val.json' \
+  --include='crossings.json' --include='anchor.json' --include='transfer.json' \
   --include='*.log' \
   --exclude='*' \
   "$src" "$dst"
