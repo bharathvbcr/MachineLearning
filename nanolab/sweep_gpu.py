@@ -8,6 +8,9 @@ whole registry so you get one apples-to-apples table per axis:
   * optimizers  — muon / adamw / sgd / lion / schedulefree / sophia / prodigy
                   (mixer fixed)
   * ffn         — swiglu / relu2 / gelu / moe
+  * arm         — the crossover_replicate ARM registry (hybrids and per-arm
+                  overrides included), configured through `job_config` so a row
+                  is the cost of the job the suite runner would actually launch
 
 Everything else (params budget, context, batch, dtype, seed) is held fixed, so
 the only thing moving between rows is the one axis named in the header. Each row
@@ -18,6 +21,8 @@ the numbers you actually optimize against. OOM rows are reported, not fatal.
     python -m nanolab.sweep_gpu mixer    --batch_size 8
     python -m nanolab.sweep_gpu optimizer
     python -m nanolab.sweep_gpu ffn
+    python -m nanolab.sweep_gpu arm --arms attention,mingru,hybrid_mingru8_attn4 \
+        --batch_size 32 --block_size 512
 
 Use a fast, GPU-resident synthetic batch (no dataloader), so the ranking
 reflects the compute ceiling, not I/O.
@@ -26,6 +31,7 @@ reflects the compute ceiling, not I/O.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import time
 from pathlib import Path
@@ -83,6 +89,84 @@ def _row(label, r):
             f"loss {r['loss']:.2f}")
 
 
+def _bench_arm(name, args):
+    """Cost of one ARM at the board shape, built the way the runner builds it.
+
+    Goes through `crossover_replicate.job_config` rather than `build_config` so
+    the row carries the arm's `layer_mixers` and its own overrides (SWA window,
+    gdn_rule, mingru_expand, ...). Those are what make it that arm, and a bench
+    that dropped them would price a different model than the suite runs.
+    """
+    import os
+    from .crossover_replicate import job_config
+    # job_config reads the recipe from the environment; pin it to this sweep's
+    # shape so the row is the board's cost, not the module defaults.
+    os.environ["CROSSOVER_BATCH"] = str(args.batch_size)
+    os.environ["CROSSOVER_BLOCK"] = str(args.block_size)
+    os.environ["CROSSOVER_TOKEN_BUDGET"] = str(args.token_budget)
+    job = {"id": f"bench_{name}", "arm": name, "mixer": _arm_mixer(name),
+           "layer_mixers": _arm_layers(name), "seed": 1337}
+    cfg = job_config(job, Path("nanolab/out/_bench"))
+    try:
+        r = bench(cfg, args.peak_flops, iters=args.iters)
+        r["ok"] = True
+        r["params_total"] = cfg_params(cfg)
+        return r
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return {"ok": False, "err": "OOM"}
+    except Exception as e:
+        torch.cuda.empty_cache()
+        return {"ok": False, "err": f"{type(e).__name__}: {e}"}
+
+
+def cfg_params(cfg) -> int:
+    from .model import build_model
+    return build_model(cfg).num_params()
+
+
+def _arm_mixer(name: str) -> str:
+    from .crossover_replicate import ARMS
+    for a in ARMS:
+        if a.name == name:
+            return a.mixer
+    raise SystemExit(f"unknown arm {name!r}")
+
+
+def _arm_layers(name: str) -> str:
+    from .crossover_replicate import ARMS
+    for a in ARMS:
+        if a.name == name:
+            return a.layer_mixers
+    raise SystemExit(f"unknown arm {name!r}")
+
+
+def _sweep_arms(names, args):
+    print(f"\n########## GPU SWEEP: arm "
+          f"(bs{args.batch_size} ctx{args.block_size} {args.dtype}) ##########")
+    print("  each row is one suite arm at the board shape, via job_config\n")
+    rows = []
+    for name in names:
+        r = _bench_arm(name, args)
+        print(_row(name, r))
+        rows.append((name, r))
+        # 20+ rows in one process: without this the freed model/optimizer blocks
+        # stay in the caching allocator and the next row's peak_mem reads high.
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    ok = [(v, r) for v, r in rows if r["ok"]]
+    ok.sort(key=lambda vr: -vr[1]["tok_s"])
+    if ok:
+        base = ok[-1][1]["tok_s"]
+        print("\n  --- arm: ranked by throughput ---")
+        for rank, (v, r) in enumerate(ok, 1):
+            print(f"   {rank}. {v:<32} {format_count(r['tok_s'])} tok/s  "
+                  f"{r['ms_per_step']:7.1f} ms/step  {r['peak_mem_gb']:5.2f}GB  "
+                  f"{r['tok_s']/base:5.2f}x slowest")
+    return {v: r for v, r in rows}
+
+
 def _sweep(axis, values, fixed, args):
     print(f"\n########## GPU SWEEP: {axis} "
           f"(bs{args.batch_size} ctx{args.block_size} {args.dtype}) ##########")
@@ -112,7 +196,11 @@ def _sweep(axis, values, fixed, args):
 
 def main():
     p = argparse.ArgumentParser(description="GPU sweep over the nanolab registry")
-    p.add_argument("axis", choices=["all", "mixer", "optimizer", "ffn"])
+    p.add_argument("axis", choices=["all", "mixer", "optimizer", "ffn", "arm"])
+    p.add_argument("--arms", default="",
+                   help="comma-separated ARM names for the `arm` axis")
+    p.add_argument("--token_budget", type=int, default=50_000_000,
+                   help="token budget job_config scales the `arm` axis to")
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--block_size", type=int, default=1024)
     p.add_argument("--dtype", default="bf16")
@@ -142,6 +230,10 @@ def main():
 
     t0 = time.time()
     results = {}
+    if args.axis == "arm":
+        if not args.arms:
+            raise SystemExit("--arms is required for the `arm` axis")
+        results["arm"] = _sweep_arms(args.arms.split(","), args)
     if args.axis in ("all", "mixer"):
         results["mixer"] = _sweep("mixer", list(MIXERS),
                                   {"optimizer": args.optimizer}, args)
