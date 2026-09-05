@@ -11,9 +11,40 @@
 # have to be reset before any relaunch can see them, and the one that completed
 # is left alone. The minGRU arm stays `held` -- its learning rate is still
 # waiting on the repaired probe.
+#
+# Tenancy is NOT a free choice here. recipe.json for this directory locks
+# workers=2, and lock_recipe refuses any mismatch on a shared field, so the four
+# reruns must land at the tenancy s777 already ran at or they cannot pool with
+# it. --ignore-vram is required for the same reason: the planner sizes this cell
+# by SCALING the 768 measurement (40.2 GiB/job -> refuses 2), and its scaling is
+# demonstrably conservative -- it predicts 54.0 GiB for mingru w1536, which
+# measured 46.7 GB on this box today. Two attention jobs leave >30 GiB free,
+# which is well clear of the 9.27 GiB where the sampler silently switches paths,
+# so the pessimistic case here OOMs loudly rather than training on other tokens.
 set -u
 cd ~/MLSystemsLab
 export PATH=$HOME/.local/bin:$PATH
+
+# The first attempt died because a chain fired on a log marker while another
+# stage's workers still held 51 GiB. A marker says a script returned, not that
+# the card is free -- launch processes outlive the parent that printed it. Wait
+# for three consecutive clear checks before claiming the device.
+wait_for_idle() {
+  local quiet=0
+  echo "waiting for the GPU to go idle ($(date -u +%FT%TZ))"
+  for _ in $(seq 1 120); do
+    if pgrep -f "crossover_replicate (launch|worker)|mqar_suite" >/dev/null 2>&1; then
+      quiet=0
+    else
+      quiet=$((quiet+1))
+      [ "$quiet" -ge 3 ] && { echo "GPU idle at $(date -u +%FT%TZ)"; return 0; }
+    fi
+    sleep 20
+  done
+  echo "GPU still busy after 40 min; refusing to launch into a contended card"
+  return 1
+}
+wait_for_idle || { echo "e27_attn exit=1 $(date -u +%FT%TZ)"; exit 1; }
 
 echo "=== E27 attention half, rerun $(date -u +%FT%TZ) ==="
 python3 - <<'PY'
