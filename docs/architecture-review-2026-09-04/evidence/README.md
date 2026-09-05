@@ -72,3 +72,6 @@ The research docs added here do not alter the manuscript or its derived figures.
   identified comparator; do not rewrite historical results to make a check pass.
 - BINN raw W26 cells and the claimed 124/200 audit bundle were unavailable in the
   provided material. No result file here pretends to reconstruct them.
+- *2026-09-05:* the W26 cells (and W27's) are tracked in BINN's own repository under
+  `results/shd_attention_campaign_v3/`; they were outside this review's snapshot, not
+  missing from the record. Nothing here was recomputed from them.

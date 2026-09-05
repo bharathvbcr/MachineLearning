@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The queue that was waiting on GPU access, in dependency order.
 #
-# Three items, 40 jobs. Written 2026-09-04 while the box at 192.222.51.171 was
+# Three items, 40 jobs. Written 2026-09-04 while the box at <LAMBDA_IP> was
 # presenting a host key that did not match known_hosts, so none of it has run.
 # Nothing here is speculative: every arm is registered, unblocked, and its config
 # verified by `--dry-run`.

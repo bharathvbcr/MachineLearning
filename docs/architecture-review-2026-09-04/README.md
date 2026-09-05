@@ -54,6 +54,47 @@ Neither importing the snapshot nor adding these docs launches training, repairs
 the identified model issues, publishes results, or validates every systems
 benchmark. External BINN cell artifacts are not bundled here.
 
+## Status on September 5, 2026
+
+Dated additions; nothing above this section was rewritten.
+
+- **The comparators exist as code.** `1b6c5d0` (on `main`) adds `Config.gdn_rule`
+  (`repo` | `published`), `Config.moe_router_weight` (`renorm` | `raw`),
+  `Config.mingru_expand` and `Config.copy_probe`, each defaulting to the recorded
+  behaviour; sixteen arms (`gdn_pub`, `hybrid_gdn_periodic_pub`, `moe_e{1,4,8}k1_raw`,
+  `mingru_x1`, `hybrid_mingru8_attn4_x1`, `hybrid_mingru_periodic_x1`, `attention_untied`,
+  `attention_novr`, `attention_untied_novr`, `attn6_w512`, `attn6_w576`,
+  `w384_hybrid_mingru8_attn4_lr40/lr80`); stage scripts `scripts/e28_gdn_rule.sh` …
+  `scripts/e35_w384_ladder.sh`; `scripts/paired_board.py`; five new tests (172/172 pass).
+  The [Lambda handoff](LAMBDA_HANDOFF_2026-09-05.md) is the operating document.
+- **Costs were measured, not divided.** A tuning sprint on the GH200
+  (`docs/GPU_TUNING_2026-09-05.md`, on branch `claude/lambda-gh200-sept-2026-f54de2` at
+  the time of writing) timed every arm at the board shape. Input 04 §5.1 priced arms by
+  dividing recorded elapsed time by tenancy; for a saturating arm at three workers that
+  overstates per-job cost by about 2.7x, and the recall cells were under-priced several
+  times over. The handoff's §5 carries the re-priced program.
+- **The 8+4 hybrid's throughput deficit is an expansion cost.** At expansion 1 the
+  parity hybrid trains at attention's rate (131.2K vs 130.4K tok/s, sprint table A) with
+  +3.8% parameters, where the recorded hybrid runs at 0.85x with +19%. E30 decides
+  whether the CE margin survives; if it does, the parameter and throughput objections
+  fall together.
+- **A determinism floor now exists.** Two runs of one configuration and seed land
+  0.0014 nats apart in `final_val` (max 0.0031, ten runs, 5M tokens). The paired 8+4
+  margin of −0.0176 is about twelve times that floor; any future per-seed claim below
+  ~0.003 nats is indistinguishable from a rerun.
+- **E27 (width 1536) is half done.** Its minGRU learning-rate probe is complete (lr40,
+  interior; lr20 is tied within the floor); the minGRU arm is running; four of five
+  attention jobs OOMed when the repair collided with a tuning stage and need one relaunch
+  (handoff §2.2).
+- **BINN moved after this review's snapshot.** Wave 27 landed on 2026-09-05: the
+  read-out's order-dependence has a half-life of 261 ms at the headline anchor; the
+  QK-norm arm this review left open is NOT MET (a different read-out, −0.0692 accuracy);
+  the p30 dropout instrument is insensitive and wave 28 is registered to find the rate
+  at which it bites. The wave 26 and 27 cells this review could not see are tracked in
+  BINN's repository (`results/shd_attention_campaign_v3/`, 530 cells). BINN's own
+  number and verdict sweeps did not yet cover waves 26–27 on that date; the audit record
+  in BINN (`results/AUDIT_2026-09-05_…`) states this against the record.
+
 ## What the hybrid curves establish
 
 The paired learning-curve result is a useful addition to the endpoint review.
@@ -111,6 +152,9 @@ layers; count, placement, and parameter count must be distinguished.
 | A blocked scalar write means memory is full | The chosen direction may be unsuitable. Compare it with redirected writes and an oracle under the same constraints. |
 | A projected write solves retention | It preserves monitored predictions, including their errors. It may harm unmonitored queries, require large norms, or consume substantial computation. |
 | A small aggregate CE regression protects retrieval quality | A four-nat loss increase on 0.5% of tokens contributes only 0.02 aggregate nats. Measure capability-specific loss too. |
+| Per-job GPU cost is a suite's elapsed time divided by its tenancy (input 04 §5.1, §7) | Added 2026-09-05. Without MPS, co-resident processes time-slice: saturating arms (attention, minGRU, their hybrids, ~13% MFU) lose ~9% at any tenancy ≥ 2, dispatch-bound arms gain (GDN 1.53x). Elapsed ÷ tenancy overstates a saturating arm's cost by ~2.7x at three workers. Use the sprint's per-arm table (`docs/GPU_TUNING_2026-09-05.md`, table A). |
+| `compile = False` is forced by an Inductor stall on GH200 aarch64 | Added 2026-09-05. torch 2.7.0 on the same box compiles attention in 31 s at 1.94x. `compile` is now a recorded recipe field, default off; turning it on is a numerics decision (0.0023 nats mean shift), not a hardware constraint. |
+| BINN's wave-26 cells are unavailable | Added 2026-09-05. They were unavailable to this review's snapshot. They are tracked in BINN's repository under `results/shd_attention_campaign_v3/` together with wave 27's. |
 
 The [GDN probe](evidence/gdn_rule_probe.py) reproduces the difference between the
 implemented recurrence and the published decayed-read rule. This does not prove
@@ -129,6 +173,8 @@ queue was still running `e4k1` at 17:05 on 2026-09-04); use task-only CE. Preser
 historical experiment identities. Record tenancy per run on wall-clock boards: the
 loop board's token budgets were calibrated once at tenancy 3 and every seed reached
 its budget, so it is matched by construction (see the corrections table).
+*2026-09-05:* both comparators exist behind default-preserving flags (`gdn_rule`,
+`moe_router_weight`); E28 and E29 in the handoff are the boards that run them.
 
 Then use oracle binding, controlled compressibility, fixed-key least squares, and
 the constrained-update diagnostics in the [protocol](MEMORY_UPDATE_PROTOCOL.md).
@@ -169,6 +215,10 @@ use independent confirmation after architecture selection.
   overlapping entities, and distractors. Match count/order/coincidence tasks and
   test bin-width and timescale transfer. W25's recurrent mechanism was unevaluable;
   W26 is report-backed here and its saturation effect was not collapse-specific.
+  *2026-09-05:* W27 measured the timescale (τ½ = 261 ms, one anchor) and rejected the
+  QK-norm arm as a drop-in; the delay/entity/distractor factorial asked for here is not
+  registered in BINN. Its record's audit of this review is
+  `BINN/results/AUDIT_2026-09-05_THE_CROSS_REPOSITORY_REVIEW_READ_AGAINST_THE_RECORD.md`.
 - **Metal/decode:** select a modeling hypothesis before kernel co-design. Measure
   training, prefill, decode, state bytes, routing, and synchronization separately.
   A restored/rebuilt corpus needs explicit tokenizer provenance and new baselines

@@ -64,3 +64,30 @@ map and live files instead. That unavailable facet was not treated as a passed c
   differ in what they enumerate (unique targets versus link occurrences), not in outcome.
 - No model code, training configuration, experiment output, or manuscript file
   was changed.
+
+## Additions on September 5, 2026
+
+- Added `LAMBDA_HANDOFF_2026-09-05.md` (operating document for E27–E35) and revised it
+  the same day after (a) the code it specifies was committed (`1b6c5d0`), (b) the E27
+  repair was run once on the box and its attention half failed again, and (c) a GH200
+  tuning sprint measured per-arm cost, tenancy, MPS, compile and sampler behaviour
+  (`docs/GPU_TUNING_2026-09-05.md`, tuning branch). Its board prices were re-derived from
+  the sprint's measured per-job minutes; the first version's elapsed ÷ tenancy arithmetic
+  is retired in a dated note.
+- Added a "Status on September 5, 2026" section and four dated rows to the corrections
+  table in `README.md`; dated supersession notes in `EVIDENCE_REVIEW.md` (BINN row, the
+  wave-26 coverage sentence, the QK-normalization sentence) and `evidence/README.md`.
+  No earlier text was rewritten.
+- Verified for this pass: `python3 -m nanolab.tests` on the working tree that includes
+  the tuning branch's `nanolab/` port — 172/172 pass, 3 SKIP (no CUDA); the box's
+  `nanolab/*.py` md5-identical to that working tree (15:10 UTC); the E27 queue states,
+  probe `final_val`s and the running job read from the box at 15:05–15:11 UTC; the
+  BINN v3 cell corpus tracked in git (555 files); BINN's `check_every_number.py` and
+  `check_verdicts_transcribed.py` run at 15:30 UTC, both reporting waves 26–27 as
+  uncovered.
+- Not verified here: any number in the tuning report (read from the branch, not rerun);
+  the recall-cell cost used to re-price E28/E32 (the sprint's 229 s per run at four
+  workers, applied to every cell and tripled for 9000 steps, is arithmetic).
+- No model code, training configuration, experiment output, or manuscript numbers were
+  changed. `PAPER_2026-08_Recipe_Dependent_Rankings.md` §7.2 gained two dated limitation
+  notes (GDN operator variant; compile).
