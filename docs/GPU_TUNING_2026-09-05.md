@@ -93,6 +93,61 @@ For scale, two runs of the *same* configuration land 0.0014 nats apart (below),
 so compile moves the reported number by about 1.6x the nondeterminism that is
 already there, and roughly 8x less than the effects the boards measure.
 
+#### 1b. Compiling makes `fused_ce` a cost rather than a saving — 3.02x stacked
+
+`crossover50m` sets `fused_ce=True`, and the comment above it dates the choice:
+the measured throughput peak *"on the 3070 Ti (8 GB)"*, where 16 chunks
+*"frees the VRAM ... that lets bs32 fit"*. VRAM is the binding constraint on an
+8 GB card. It is not one here, and the setting stops being free the moment
+compile is available, because Inductor fuses the CE reduction itself — the
+hand-written chunking blocks the fusion it exists to provide.
+
+The 2x2, attention at bs32/ctx512, one fwd+bwd on fixed weights:
+
+| | tok/s | ms/step | peak |
+|---|---:|---:|---:|
+| fused/16, eager — **what the suite runs today** | 113.6K | 144.3 | 15.2 GB |
+| fused/16, compiled | 220.5K | 74.3 | 12.6 GB |
+| unfused, eager | 146.4K | 111.9 | 26.4 GB |
+| **unfused, compiled** | **342.6K** | 47.8 | 14.5 GB |
+
+Unfused is the memory-hungry option only while eager (+11.2 GB). Compiled, it
+costs **+1.9 GB** over fused and still lands *under* today's fused-eager
+footprint. So the recommended cell is both 3.02x faster and slightly lighter
+than the current one; there is no trade to make.
+
+Two independent checks that this is real. The compile column here is **1.94x**
+(113.6K -> 220.5K), the same number the five-seed end-to-end board produced
+(961 s -> 495 s) — a microbenchmark reproducing the board result is the evidence
+that the unfused column transfers too. And the eager column is **1.29x**
+(113.6K -> 146.4K), which reproduces the standalone fused-CE sweep in appendix F
+(113.1K -> 145.6K).
+
+Numerically it is the cheapest change on this page: unfused differs from fused
+by **9.9e-7 relative** on attention and **2.2e-5** on the 8+4 hybrid — at a loss
+near 15.36 that is 1.5e-5 and 3.4e-4 nats, one to two orders under the 0.0031
+nat rerun floor. `fused_ce_chunks` 16 and 4 give **bit-identical** losses, so the
+chunk count is not a second knob to sweep.
+
+`fused_ce` was *not* a recorded recipe field, so two runs differing on it would
+have pooled silently — the same confound `compile` is recorded to prevent. It is
+now gated and recorded exactly like `compile` (`CROSSOVER_FUSED_CE`, **default
+on**, so nothing changes until a run opts out):
+
+```python
+def cluster_fused_ce() -> bool:
+    raw = os.environ.get("CROSSOVER_FUSED_CE", "").strip().lower()
+    if not raw:
+        return True
+    return raw in ("1", "true", "yes")
+```
+
+Caveat, stated plainly: the 342.6K cell is a **microbenchmark**, not a board.
+Its compile half is corroborated by the end-to-end run above and its eager half
+by appendix F, but `unfused x compiled` has not itself been run through the
+suite for five seeds. Treat 3.02x as **measured on the step loop, inferred for
+the board** until a board confirms it.
+
 ### 2. Tenancy's sign is predicted by the arm's MFU
 
 The repo treats `workers` as a per-board choice and thirteen of the fifteen
@@ -566,6 +621,10 @@ row and a real job's VRAM.
 | `hybrid_mingru8_attn4` | fused/16 | 97.8K | 168 | 19.7 GB | 0.000622 |
 | `hybrid_mingru8_attn4` | fused/32 | 95.0K | 172 | 19.1 GB | 0.000628 |
 | `hybrid_mingru8_attn4` | unfused | 121.1K | 135 | 30.5 GB | 0.000630 |
+
+Every row above is **eager**. Read with section 1b: compiled, the ordering is
+unchanged but the memory column collapses — `unfused` drops from 26.4 GB to
+14.5 GB, which is what removes the reason `fused_ce` was turned on.
 
 ## G. What eval_iters buys
 
