@@ -54,7 +54,11 @@ def main() -> None:
     B, H, L, D = 2, 12, 512, 64          # the board's head count and context
     dev = "cuda"
     q = torch.randn(B, H, L, D, device=dev)
-    k = torch.randn(B, H, L, D, device=dev)
+    # The delta rule is only bounded for unit keys, and GatedDeltaNet._project
+    # L2-normalises them (`k = F.normalize(k, dim=-1)`). Raw Gaussian keys make
+    # the O(T) reference diverge to nan over 512 steps -- which the guard below
+    # caught on the first run, rather than reporting agreement between two nans.
+    k = torch.nn.functional.normalize(torch.randn(B, H, L, D, device=dev), dim=-1)
     v = torch.randn(B, H, L, D, device=dev)
     alpha = torch.rand(B, H, L, device=dev).clamp(0.90, 0.999)
     beta = torch.rand(B, H, L, device=dev).clamp(0.0, 1.0)
@@ -65,7 +69,8 @@ def main() -> None:
         scale = float(ref_seq.pow(2).mean().sqrt())
         # The guard the first probe lacked: if the reference is ~0, agreement is
         # meaningless and this must fail loudly rather than print zeros.
-        assert scale > 1e-3, f"reference is trivial (rms={scale:.3e}); check is vacuous"
+        assert scale > 1e-3 and scale == scale, (
+            f"reference is trivial or non-finite (rms={scale:.3e}); check is vacuous")
         base = gdn_chunked(q, k, v, alpha, beta, chunk=32, rule=rule)
         res[rule] = {"ref_rms": scale, "widths": {}}
         print(f"\n=== rule={rule}  (reference RMS {scale:.4f}) ===")

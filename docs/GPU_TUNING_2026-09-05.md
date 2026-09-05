@@ -76,8 +76,22 @@ throughout**, which is what the gate now tests.
 
 This is a numerics change: Inductor fuses and re-associates. `compile` is now a
 recorded recipe field (`CROSSOVER_COMPILE`, default off), so a compiled run
-cannot pool with an eager one by accident. What it costs in nats is being
-measured by `scripts/tune_compile_board.sh` at the time of writing.
+cannot pool with an eager one by accident.
+
+**Measured end to end**, five seeds x 20M tokens through the real suite runner,
+eager against compiled:
+
+| | eager | compiled |
+|---|---:|---:|
+| wall clock, 5 jobs | 961 s | **495 s** (1.94x) |
+| in-run rate | 131.1K tok/s | **289K tok/s** |
+| MFU | 10.6% | **23.3%** |
+| `final_val` vs eager, mean over seeds | — | **0.0023 nats** (max 0.0040) |
+
+Step 0 is bit-identical (15.3669 both); the trajectories then diverge slowly.
+For scale, two runs of the *same* configuration land 0.0014 nats apart (below),
+so compile moves the reported number by about 1.6x the nondeterminism that is
+already there, and roughly 8x less than the effects the boards measure.
 
 ### 2. Tenancy's sign is predicted by the arm's MFU
 
@@ -365,8 +379,14 @@ row and a real job's VRAM.
   here is a **ratio measured within one probe**, where both arms of the
   comparison saw the same conditions, so the 1.94x, 1.29x and 1.98x figures are
   unaffected. The absolute levels are not interchangeable across probes, and the
-  cause — allocator state accumulated across many model builds in one process,
-  versus a fresh process — is being re-measured (`drift` stage).
+  cause is now identified: re-running the *identical* `sweep_gpu` invocation
+  hours later reproduces it to within 1-3% (attention 130.5K vs 130.4K, mingru
+  102.6K vs 102.5K, hybrid 110.4K vs 110.4K), so the box did not slow down. The
+  low readings are a harness artifact of building many models in one process --
+  `sweep_gpu` collects and empties the allocator between rows, `tune_compile` and
+  `tune_fusedce` do not. Where a probe measured eager first and compiled second,
+  that biases *against* the change, which is why the probe's 1.94x and the
+  end-to-end board's 1.94x agree while the in-run rate ratio is 2.2x.
 
 * **One box, one driver version.** Nothing here transfers to the M5 Pro items
   (memo items 10, 12, 13) or to a different CUDA/driver stack.
