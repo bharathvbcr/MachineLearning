@@ -47,12 +47,36 @@ def job_seconds(row: dict, budget: int, eval_iters: int = 20) -> tuple[float, fl
     return train, ev
 
 
+def arm_speedup(arm: str, use_measured: bool, allow_mps: bool, fallback: float) -> float:
+    """Best measured aggregate-throughput multiplier for this arm, or fallback."""
+    if not use_measured:
+        return fallback
+    best = 1.0
+    tags = ["nomps"] + (["mps"] if allow_mps else [])
+    for tag in tags:
+        f = REPO / f"nanolab/out/_tune/tenancy_{tag}_{arm}.json"
+        if not f.exists():
+            continue
+        d = json.loads(f.read_text())
+        ok = {int(k): v["agg_tok_s"] for k, v in d["rows"].items() if v.get("ok")}
+        if 1 in ok and ok:
+            best = max(best, max(ok.values()) / ok[1])
+    return best
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cost", default="nanolab/out/_tune/arm_cost_t1.json")
     ap.add_argument("--tenancy-speedup", type=float, default=1.0,
-                    help="aggregate throughput multiplier at the chosen tenancy "
-                         "(1.0 = measure serially; see tune_tenancy.py)")
+                    help="fallback multiplier for arms with no measured tenancy "
+                         "curve (1.0 = serial)")
+    ap.add_argument("--use-measured-tenancy", action="store_true",
+                    help="read scripts/tune_tenancy.py output per arm and apply "
+                         "each arm's own best speed-up instead of one global "
+                         "number -- the sign differs by arm, so a single "
+                         "multiplier is wrong for any mixed board")
+    ap.add_argument("--mps", action="store_true",
+                    help="with --use-measured-tenancy, allow the MPS rows to win")
     ap.add_argument("--startup-s", type=float, default=35.0,
                     help="per-job process start: import, model build, corpus to GPU")
     args = ap.parse_args()
@@ -67,13 +91,19 @@ def main() -> None:
         if missing:
             print(f"{name:<36}  -- no measured row for {missing}")
             continue
+        sped = 0.0
         for a in arms:
             t, e = job_seconds(cost[a], budget)
             tr += t * seeds
             ev += e * seeds
+            # Each arm carries its own tenancy multiplier: attention loses at
+            # tenancy>1 without MPS while gdn gains 1.53x, so one board-wide
+            # number would be wrong for any board mixing the two.
+            sped += (t + e) * seeds / arm_speedup(
+                a, args.use_measured_tenancy, args.mps, args.tenancy_speedup)
         n_jobs = len(arms) * seeds
         st = n_jobs * args.startup_s
-        h = (tr + ev + st) / 3600 / args.tenancy_speedup
+        h = (sped + st) / 3600
         tot_h += h
         tot_train += tr / 3600
         tot_eval += ev / 3600
@@ -84,7 +114,11 @@ def main() -> None:
           f"{tot_eval:>8.2f}{'':>8}{tot_h:>8.2f}{tot_h*RATE:>8.2f}")
     print(f"\n  eval is {tot_eval/(tot_train+tot_eval)*100:.0f}% of compute "
           f"(eval_iters=20 is a recipe field: changing it moves every board's markers)")
-    print(f"  tenancy speedup applied: {args.tenancy_speedup:.2f}x")
+    if args.use_measured_tenancy:
+        print(f"  tenancy: each arm's own measured best"
+              f"{' (MPS rows allowed)' if args.mps else ' (no MPS)'}")
+    else:
+        print(f"  tenancy speedup applied: {args.tenancy_speedup:.2f}x")
     print(f"  excludes E28/E32 (recall grid: different shape, priced separately)")
 
 

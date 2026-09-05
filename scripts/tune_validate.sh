@@ -46,10 +46,22 @@ run_cond t3 3
 export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
 export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log
 mkdir -p "$CUDA_MPS_PIPE_DIRECTORY" "$CUDA_MPS_LOG_DIRECTORY"
-nvidia-cuda-mps-control -d && sleep 3
-pgrep -a nvidia-cuda-mps-control >/dev/null && echo "MPS: up" || echo "MPS: FAILED"
-run_cond m3 3
+mps_servers() { echo get_server_list | nvidia-cuda-mps-control 2>/dev/null | tr -d '[:space:]'; }
+if [ -z "$(mps_servers)" ]; then
+  nvidia-cuda-mps-control -d || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -n "$(mps_servers)" ] && break; sleep 1; done
+fi
+# Gate on the daemon actually serving, not on `pgrep` winning a race against its
+# fork -- that race already mislabelled one stage of this sprint. A condition
+# named m3 must not be a second copy of t3.
+if [ -z "$(mps_servers)" ]; then
+  echo "MPS: NOT SERVING -- skipping condition m3 rather than mislabelling it"
+else
+  echo "MPS: serving, server(s)=$(mps_servers)"
+  run_cond m3 3
+  echo "MPS: after m3, server(s)=$(mps_servers)"
+fi
 echo quit | nvidia-cuda-mps-control 2>/dev/null; sleep 2
-pgrep -a nvidia-cuda-mps-control >/dev/null && echo "MPS: STILL UP" || echo "MPS: down"
+[ -z "$(mps_servers)" ] && echo "MPS: down" || echo "MPS: STILL UP"
 
 echo "validate exit=$? $(date -u +%FT%TZ)"
