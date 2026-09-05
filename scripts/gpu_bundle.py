@@ -298,6 +298,7 @@ SUITE_DOC = {
     "e1_sp_coldattn": "SP with muP's 1/d attention temperature -- separates muP from the temperature correction",
     "e1_mup_sched6_spattn": "tuned muP-spattn on a 6M cosine -- tests whether row 3's collapse is real or a schedule-regime artifact",
     "e1_sp_sched6": "SP on the 6M cosine -- the control row 3's test needs",
+    "e1_sp_bs8_tuned": "SP at batch 8 at SP's OWN target-width optimum -- asks whether row 4 is about muP or just about a better LR",
     "e1_sp_basin": "s24 SP matrix-LR sweep at the TARGET width, 5 seeds -- prices the inherited LR",
     "e1_sp_sched20": "SP at the s23 recipe (20M cosine) -- readout rows 2 and 3",
     "e1_mup_sched20": "muP at the s23 recipe (20M cosine) -- readout rows 2 and 3",
@@ -636,6 +637,29 @@ def build_matrix(sp_cells: str = "rerun", transfer: dict | None = None,
         for arm in ARMS:
             for seed in SEEDS:
                 jobs.append(_job("e1_sp_bs8", arm, seed, {}, **S25))
+
+        # --- Row 4 fires: e1_mup_bs8_spattn crosses at 1.447M [1.302, 1.592] on
+        # 5/5 seeds where e1_sp_bs8 and e1_mup_bs8 both cross on ZERO. Its
+        # pre-registered reading withdraws PAPER 4.4's batch result as a tuning
+        # artifact -- a section-level claim resting on one cell.
+        #
+        # But "tuning artifact" and "muP" are different statements, and the
+        # tuned muP cell changes both at once. e1_sp_basin puts SP's own
+        # target-width optimum at matrix_lr 0.003125, 8x below the inherited
+        # 0.025 and worth +0.205 nats to attention there. This runs batch 8 at
+        # THAT learning rate under plain SP. If it crosses, row 4 is about
+        # tuning and not about muP at all, which is the stronger claim. If only
+        # the muP cell crosses, the rescue is specifically muP's.
+        #
+        # Two caveats for the writeup: 0.003125 was measured at batch 32 and is
+        # spent here at batch 8, so it is SP's optimum transferred across a
+        # batch change rather than measured at it; and minGRU's argmin on that
+        # curve is still not sign-consistent (0.003125 vs 0.00625 tied inside
+        # the seed spread), so the minGRU cell inherits that ambiguity.
+        for arm in ARMS:
+            for seed in SEEDS:
+                jobs.append(_job("e1_sp_bs8_tuned", arm, seed,
+                                 dict(matrix_lr=0.003125), **S25))
     for arm in ARMS:
         for seed in SEEDS:
             jobs.append(_mup_job("e1_mup_bs8", arm, seed, S25, transfer,
@@ -1701,6 +1725,7 @@ PARAMETRIZATION_CONTROL = {
     "e1_mup_sched20": "e1_sp_sched20", "e1_mup_bs8": "e1_sp_bs8",
     "e1_mup_tuned_spattn": "e1_sp_rerun",
     "e1_sp_coldattn": "e1_sp_rerun",
+    "e1_sp_bs8_tuned": "e1_sp_bs8",
     "e1_mup_sched6_spattn": "e1_sp_sched6",
     "e1_perlayer_sp": "e1_sp_rerun", "e1_embed_lr": "e1_sp_rerun",
 }
