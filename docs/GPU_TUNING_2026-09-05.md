@@ -155,8 +155,8 @@ free  7.4 GiB → memmap       → first batch [393, 7734, 416, 4737, 257, 1545,
 
 Construction happens *before* the model is built, so which path a worker takes
 depends on how many co-resident workers have already allocated — a race, not a
-setting. This is the one place tenancy is not recipe-neutral, and it fails
-silently: the fallback needs *less* VRAM, so it converts an OOM into a run that
+setting. This is the one place tenancy changes what a job *trains on* rather than
+merely how it is scheduled, and it fails silently: the fallback needs *less* VRAM, so it converts an OOM into a run that
 looks fine and trains on different tokens.
 
 ### 5. Two knobs that are simply mis-set for a 94 GiB card
@@ -203,7 +203,7 @@ and synthetic Gaussian projections do not.
 
 ## Does any of this change what a board measures?
 
-The gate for every recipe-neutral claim above. Same arms and seeds, 5M tokens,
+The gate for every claim above. Same arms and seeds, 5M tokens,
 one directory per condition; **a1 and a2 are the same configuration run twice**,
 so their difference is the floor any other difference must clear.
 
@@ -216,7 +216,12 @@ so their difference is the floor any other difference must clear.
 | eager vs compiled (minGRU) | **0.0016** | 0.0030 |
 
 Tenancy's effect on the reported number is *smaller than re-running the same job*.
-That settles it: tenancy is recipe-neutral in practice, not just in principle.
+
+That makes tenancy **numerically benign**. It does not make it recipe-neutral, and
+the two are separate claims this report earlier ran together: `workers` is a field
+`current_recipe()` records and `lock_recipe` enforces, so re-tenanting still forks
+run identity and the new jobs will not pool with the old ones. Only MPS changes no
+recorded field — and MPS is the one that is *not* numerically free, at 0.0023 nats.
 
 It also gives the repo a number it did not have. The trainer is **not run-to-run
 deterministic** — two identical jobs land ~0.0014 nats apart in `final_val` (max
@@ -311,7 +316,7 @@ cost this sprint a stage. Verify instead by counting the clients that connected
 (the control log records `NEW CLIENT`): the m3 condition above shows 17. And MPS
 weakens fault isolation, so a client that dies hard can take the server with it.
 
-### 2. Pick tenancy per arm, from the arm's MFU — recipe-neutral, new dirs only
+### 2. Pick tenancy per arm, from the arm's MFU — new dirs only
 
 The sign of the tenancy effect is predictable from how much GPU idle time a
 single job leaves behind:
@@ -344,7 +349,7 @@ terms are added — independent support for both.
 memmap fallback seeds a **CPU** one. Same seed, different token stream.
 Construction happens before the model is built, so which path a worker takes
 depends on how many co-resident workers have already allocated — a race, not a
-setting. This is the one place where tenancy is *not* recipe-neutral.
+setting. This is the one place where tenancy changes the token stream itself.
 
 ---
 
