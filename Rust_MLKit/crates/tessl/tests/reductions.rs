@@ -202,3 +202,17 @@ fn reductions_reject_empty_and_undersized_operands() {
         assert_eq!(rt.take_dispatch_count(), 0);
     });
 }
+
+#[test]
+fn scalar_row_reductions_reject_input_output_aliasing() {
+    with_gpu(|rt| {
+        let data = buf(rt, &[1.0, 2.0, 3.0, 4.0]);
+        let err = nn::row_sum_f32(rt, &data, &data, 2, 2)
+            .expect_err("row_sum output must not alias its unread input rows");
+        assert!(err.contains("overlap"), "{err}");
+        let err = nn::row_max_f32(rt, &data, &data, 2, 2)
+            .expect_err("row_max output must not alias its unread input rows");
+        assert!(err.contains("overlap"), "{err}");
+        assert_eq!(rt.take_dispatch_count(), 0);
+    });
+}

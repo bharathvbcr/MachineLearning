@@ -440,14 +440,15 @@ fn gate_up_gelu_i4_matches_two_gemvs_and_a_gelu() {
         let xr = round_trip_bf16(&x);
         let gate = dense_gemv(&bg.dense, &xr, rows, cols);
         let up = dense_gemv(&du, &xr, rows, cols);
-        // The kernel's GELU: clamp, tanh formulation, as `nn::mlp_gelu_tanh`.
+        // The kernel's GELU: clamp the cubic input, but retain the original
+        // projection in the outer factor so large values are not clipped.
         let want: Vec<f32> = gate
             .iter()
             .zip(&up)
             .map(|(g, u)| {
                 let xc = (*g as f64).clamp(-20.0, 20.0);
                 let inner = 0.797_884_560_802_865_4 * (xc + 0.044715 * xc * xc * xc);
-                (0.5 * xc * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
+                (0.5 * (*g as f64) * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
             })
             .collect();
 
@@ -479,6 +480,48 @@ fn gate_up_gelu_i4_matches_two_gemvs_and_a_gelu() {
         .unwrap();
         rt.synchronize().unwrap();
         close_rel("gate_up_gelu_i4", &mid.read_f32()[..rows], &want, 5e-3);
+    });
+}
+
+#[test]
+fn fused_q4_gelu_preserves_large_positive_activations() {
+    with_gpu(|rt| {
+        // One affine group per row. Zero scale + unit bias makes every decoded
+        // weight exactly one, so an all-one x produces gate=up=64. The old
+        // helper clamped GELU's outer factor and returned about 20*64 instead
+        // of the asymptotically correct 64*64.
+        let (rows, cols, group) = (16usize, 64usize, 64usize);
+        let packed = vec![0u8; rows * cols / 2];
+        let scale_bias: Vec<f32> = (0..rows).flat_map(|_| [0.0f32, 1.0f32]).collect();
+        let packed_buf = rt.alloc_buffer(packed.len()).unwrap();
+        packed_buf.write_bytes(&packed);
+        let sb = buf_bf16(rt, &scale_bias);
+        let x = buf(rt, &vec![1.0f32; cols]);
+        let mid = empty(rt, rows);
+        let bank = Q4MlxBank {
+            packed: &packed_buf,
+            scales_biases: &sb,
+        };
+
+        nn::gemv_q4_mlx_gate_up_gelu(
+            rt,
+            bank,
+            bank,
+            &x,
+            &mid,
+            shape(rows, cols, group),
+            nn::GateUpDispatch::Blocked,
+            false,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+
+        for (i, got) in mid.read_f32()[..rows].iter().copied().enumerate() {
+            assert!(
+                (got - 4096.0).abs() <= 1e-2,
+                "fused Q4 GELU row {i}: got {got}, want 4096"
+            );
+        }
     });
 }
 
@@ -561,5 +604,74 @@ fn gemm_add_folds_the_residual_in_both_layouts() {
                 );
             }
         }
+    });
+}
+
+/// Interleaved4 stores rows in tiles of four, so a bank whose row count is
+/// not a multiple of four is *larger* than its row-major twin: the packer pads
+/// to `rows.div_ceil(4) * 4` rows, and the kernels read the padding rows'
+/// nibbles and scale pairs before the `row < rows` guard discards those
+/// lanes. A validator that only checks the row-major extent accepts a buffer
+/// the kernel reads past the end of.
+#[test]
+fn interleaved4_banks_are_validated_at_their_tile_padded_extent() {
+    with_gpu(|rt| {
+        let (rows, cols, group) = (6usize, 64usize, 32usize);
+        let b = banks(rows, cols, group);
+        let padded_rows = rows.div_ceil(I4_ROWS) * I4_ROWS;
+        assert_eq!(b.i4_packed.len(), padded_rows * cols / 2);
+        assert_eq!(b.i4_sb.len(), padded_rows * (cols / group) * 2);
+        let x = random_f32(cols, 0x6);
+        let xb = buf_bf16(rt, &x);
+        let sh = shape(rows, cols, group);
+
+        // Sized for `rows` row-major rows: exactly what a layout-blind
+        // validator accepts, and less than the interleaved kernel reads.
+        let short_packed = rt.alloc_buffer(rows * cols / 2).unwrap();
+        short_packed.write_bytes(&b.i4_packed[..rows * cols / 2]);
+        let short_sb = buf_bf16(rt, &b.i4_sb[..rows * (cols / group) * 2]);
+        let full_packed = rt.alloc_buffer(b.i4_packed.len()).unwrap();
+        full_packed.write_bytes(&b.i4_packed);
+        let full_sb = buf_bf16(rt, &b.i4_sb);
+        let yb = seeded(rt, rows, UNWRITTEN);
+
+        for (what, packed, sb) in [
+            ("packed", &short_packed, &full_sb),
+            ("scales_biases", &full_packed, &short_sb),
+        ] {
+            let bank = Q4MlxBank {
+                packed,
+                scales_biases: sb,
+            };
+            let err = nn::gemv_q4_mlx_simd(rt, bank, &xb, &yb, sh, Q4MlxLayout::Interleaved4, None)
+                .expect_err(&format!(
+                    "{what} sized for {rows} row-major rows must be refused for Interleaved4"
+                ));
+            assert!(
+                err.contains(what) && err.contains("Interleaved4"),
+                "gemv_q4_mlx_simd: {err}"
+            );
+            let err = nn::gemm_q4_mlx(rt, bank, &xb, &yb, sh, 1, Q4MlxLayout::Interleaved4, None)
+                .expect_err("the GEMM reads the same padded bank");
+            assert!(err.contains(what), "gemm_q4_mlx: {err}");
+        }
+
+        // The padded buffers are accepted and the six real rows come out right.
+        nn::gemv_q4_mlx_simd(
+            rt,
+            Q4MlxBank {
+                packed: &full_packed,
+                scales_biases: &full_sb,
+            },
+            &xb,
+            &yb,
+            sh,
+            Q4MlxLayout::Interleaved4,
+            None,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        let want = dense_gemv(&b.dense, &round_trip_bf16(&x), rows, cols);
+        close_rel("padded i4 6x64", &yb.read_f32()[..rows], &want, 3e-3);
     });
 }

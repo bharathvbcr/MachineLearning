@@ -346,6 +346,84 @@ impl Impl {
     }
 }
 
+/// Benchmark controls parsed once, before Metal is initialized.
+///
+/// These used to be read from `std::env` inside [`launch_impl`], which put six
+/// environment lookups and string parses inside every timed kernel launch.
+/// Keeping the immutable result here makes the measurement path describe the
+/// dispatch rather than the host configuration parser.
+#[derive(Clone, Copy)]
+struct Tuning {
+    batch: usize,
+    include_all_impls: bool,
+    decode_lanes: Option<nn::RowsLanes>,
+    decode_head_block: Option<nn::DecodeHeadBlock>,
+    reduce_width: Option<usize>,
+    rows_groups: Option<nn::RowsGroups>,
+    decode_chunk: Option<nn::DecodeChunk>,
+    rows_lanes: Option<nn::RowsLanes>,
+}
+
+impl Tuning {
+    fn from_env() -> Result<Self, String> {
+        Ok(Self {
+            batch: batch_size()?,
+            include_all_impls: include_all_impls()?,
+            decode_lanes: optional_tuning("BENCH_ATTN_DECODE_R", nn::RowsLanes::parse)?,
+            decode_head_block: optional_tuning(
+                "BENCH_ATTN_DECODE_SGS",
+                nn::DecodeHeadBlock::parse,
+            )?,
+            reduce_width: optional_tuning("BENCH_ATTN_REDUCE_W", parse_reduce_width)?,
+            rows_groups: optional_tuning("BENCH_ATTN_ROWS_SGT", nn::RowsGroups::parse)?,
+            decode_chunk: optional_tuning("BENCH_ATTN_DECODE_CHUNK", nn::DecodeChunk::parse)?,
+            rows_lanes: optional_tuning("BENCH_ATTN_ROWS_R", nn::RowsLanes::parse)?,
+        })
+    }
+
+    fn decode_lanes(self, c: &Cfg) -> nn::RowsLanes {
+        self.decode_lanes
+            .unwrap_or_else(|| nn::decode_lanes_for(c.d as u32))
+    }
+
+    fn decode_chunk(self, c: &Cfg) -> nn::DecodeChunk {
+        self.decode_chunk
+            .unwrap_or_else(|| nn::decode_chunk_for(c.d as u32))
+    }
+
+    fn rows_lanes(self, c: &Cfg) -> nn::RowsLanes {
+        self.rows_lanes
+            .unwrap_or_else(|| nn::rows_lanes_for(c.d as u32))
+    }
+
+    fn rows_groups(self, c: &Cfg) -> nn::RowsGroups {
+        self.rows_groups
+            .unwrap_or_else(|| nn::rows_groups_for(c.d as u32))
+    }
+}
+
+fn optional_tuning<T>(
+    name: &str,
+    parse: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    match std::env::var(name) {
+        Ok(value) => parse(value.trim())
+            .map(Some)
+            .map_err(|e| format!("{name}: {e}")),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("{name}: {e}")),
+    }
+}
+
+fn parse_reduce_width(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(n) if (32..=1024).contains(&n) && n % 32 == 0 => Ok(n),
+        _ => Err(format!(
+            "must be a multiple of 32 in [32, 1024], got {value:?}"
+        )),
+    }
+}
+
 /// One dispatch of whichever kernel this configuration selects.
 /// The kernel an implementation dispatches for this config.
 ///
@@ -361,8 +439,13 @@ fn kernel_name(imp: Impl, c: &Cfg) -> Result<&'static str, String> {
     })
 }
 
-fn launch_impl(rt: &Arc<GpuRuntime>, c: &Cfg, b: &Bufs, imp: Impl) -> Result<(), String> {
-    let rows_lanes = || rows_lanes_override().unwrap_or_else(|| nn::rows_lanes_for(c.d as u32));
+fn launch_impl(
+    rt: &Arc<GpuRuntime>,
+    c: &Cfg,
+    b: &Bufs,
+    imp: Impl,
+    tuning: Tuning,
+) -> Result<(), String> {
     if imp == Impl::Decode {
         return nn::flash_attn_decode_with_chunk(
             rt,
@@ -376,10 +459,10 @@ fn launch_impl(rt: &Arc<GpuRuntime>, c: &Cfg, b: &Bufs, imp: Impl) -> Result<(),
             c.dims(),
             c.d as u32,
             c.tkv,
-            decode_chunk(c),
-            decode_lanes(c),
-            reduce_width(),
-            decode_head_block(),
+            tuning.decode_chunk(c),
+            tuning.decode_lanes(c),
+            tuning.reduce_width,
+            tuning.decode_head_block,
             false,
         );
     }
@@ -424,8 +507,8 @@ fn launch_impl(rt: &Arc<GpuRuntime>, c: &Cfg, b: &Bufs, imp: Impl) -> Result<(),
             b.ko,
             c.dims(),
             c.d as u32,
-            rows_lanes(),
-            rows_groups(c),
+            tuning.rows_lanes(c),
+            tuning.rows_groups(c),
             false,
         );
     }
@@ -470,14 +553,41 @@ fn launch(rt: &Arc<GpuRuntime>, c: &Cfg, b: &Bufs) -> Result<(), String> {
 /// batched and 178 us solo, so at decode sizes the solo number is almost
 /// entirely round-trip. A real decode loop pays that round trip once for a
 /// whole model step, not once per attention call.
-fn batch_size() -> usize {
-    match std::env::var("BENCH_ATTN_BATCHED") {
-        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
-            eprintln!("BENCH_ATTN_BATCHED must be a positive integer, got {v:?}");
-            std::process::exit(1);
-        }),
-        Err(_) => 1,
+fn batch_size() -> Result<usize, String> {
+    env_usize("BENCH_ATTN_BATCHED", 1, 1)
+}
+
+fn include_all_impls() -> Result<bool, String> {
+    match std::env::var("BENCH_ATTN_IMPLS") {
+        Ok(v) => parse_impl_selection(Some(&v)),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(e) => Err(format!("BENCH_ATTN_IMPLS: {e}")),
     }
+}
+
+fn parse_impl_selection(raw: Option<&str>) -> Result<bool, String> {
+    match raw {
+        Some(v) if v.trim() == "all" => Ok(true),
+        Some(v) => Err(format!(
+            "BENCH_ATTN_IMPLS={v:?} is not supported; expected \"all\" or unset"
+        )),
+        None => Ok(false),
+    }
+}
+
+fn parse_requested_configs(raw: Option<&str>) -> Result<Option<Vec<String>>, String> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let requested = raw
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect::<Vec<_>>();
+    if requested.is_empty() {
+        return Err("BENCH_ATTN_CFGS is set but names no configurations".to_string());
+    }
+    Ok(Some(requested))
 }
 
 fn time_cfg(
@@ -485,10 +595,11 @@ fn time_cfg(
     c: &Cfg,
     b: &Bufs,
     imp: Impl,
+    tuning: Tuning,
     warmup: usize,
     iters: usize,
 ) -> Result<Vec<f64>, String> {
-    let batch = batch_size().max(1);
+    let batch = tuning.batch;
     // Without this every dispatch gets its own command buffer and commits, so a
     // loop of `batch` launches costs `batch` submits and the batched arm
     // silently measures the same thing as solo. `bench_nn_kernels` carries the
@@ -499,7 +610,7 @@ fn time_cfg(
     }
     for _ in 0..warmup {
         for _ in 0..batch {
-            launch_impl(rt, c, b, imp)?;
+            launch_impl(rt, c, b, imp, tuning)?;
         }
         rt.synchronize()?;
     }
@@ -507,7 +618,7 @@ fn time_cfg(
     for _ in 0..iters {
         let t0 = Instant::now();
         for _ in 0..batch {
-            launch_impl(rt, c, b, imp)?;
+            launch_impl(rt, c, b, imp, tuning)?;
         }
         rt.synchronize()?;
         samples.push(t0.elapsed().as_secs_f64() * 1000.0 / batch as f64);
@@ -522,89 +633,6 @@ fn time_cfg(
 /// is caught rather than inheriting whatever the allocator handed back.
 const UNWRITTEN: f32 = -6.5e28;
 
-/// Lanes per key for the `tessl-decode` lane, from `BENCH_ATTN_DECODE_R`.
-fn decode_lanes(c: &Cfg) -> nn::RowsLanes {
-    match std::env::var("BENCH_ATTN_DECODE_R") {
-        Ok(v) => nn::RowsLanes::parse(v.trim()).unwrap_or_else(|e| {
-            eprintln!("BENCH_ATTN_DECODE_R: {e}");
-            std::process::exit(1);
-        }),
-        Err(_) => nn::decode_lanes_for(c.d as u32),
-    }
-}
-
-/// Which query heads share a threadgroup in the decode partial pass, from
-/// `BENCH_ATTN_DECODE_SGS` -- `one`, `group` or `all`.
-fn decode_head_block() -> Option<nn::DecodeHeadBlock> {
-    match std::env::var("BENCH_ATTN_DECODE_SGS") {
-        Ok(v) => Some(nn::DecodeHeadBlock::parse(v.trim()).unwrap_or_else(|e| {
-            eprintln!("BENCH_ATTN_DECODE_SGS: {e}");
-            std::process::exit(1);
-        })),
-        Err(_) => None,
-    }
-}
-
-/// Threads per threadgroup in the decode reduce pass, from
-/// `BENCH_ATTN_REDUCE_W`. A dispatch parameter, not a compiled constant, so
-/// the sweep costs no extra kernels.
-fn reduce_width() -> Option<usize> {
-    match std::env::var("BENCH_ATTN_REDUCE_W") {
-        Ok(v) => match v.trim().parse::<usize>() {
-            Ok(n) if (32..=1024).contains(&n) && n % 32 == 0 => Some(n),
-            _ => {
-                eprintln!("BENCH_ATTN_REDUCE_W must be a multiple of 32 in [32, 1024], got {v:?}");
-                std::process::exit(1);
-            }
-        },
-        Err(_) => None,
-    }
-}
-
-/// Simdgroups per threadgroup for the `tessl-rows` lane, from
-/// `BENCH_ATTN_ROWS_SGT`.
-fn rows_groups(c: &Cfg) -> nn::RowsGroups {
-    match std::env::var("BENCH_ATTN_ROWS_SGT") {
-        Ok(v) => nn::RowsGroups::parse(v.trim()).unwrap_or_else(|e| {
-            eprintln!("BENCH_ATTN_ROWS_SGT: {e}");
-            std::process::exit(1);
-        }),
-        Err(_) => nn::rows_groups_for(c.d as u32),
-    }
-}
-
-/// Keys per chunk for the `tessl-decode` lane, from `BENCH_ATTN_DECODE_CHUNK`.
-///
-/// Defaults to what the library ships for this head dim, like [`decode_lanes`].
-/// It used to default to a hardcoded `C256`, so the `tessl-decode` lane was
-/// measured at chunk 256 for every head dim while the routed path ran 128 --
-/// two different kernels reported as the same lane. The parity dump caught it:
-/// the routed and forced-decode outputs differed by 2.2e-08 where they should
-/// have been bit-identical.
-fn decode_chunk(c: &Cfg) -> nn::DecodeChunk {
-    match std::env::var("BENCH_ATTN_DECODE_CHUNK") {
-        Ok(v) => nn::DecodeChunk::parse(v.trim()).unwrap_or_else(|e| {
-            eprintln!("BENCH_ATTN_DECODE_CHUNK: {e}");
-            std::process::exit(1);
-        }),
-        Err(_) => nn::decode_chunk_for(c.d as u32),
-    }
-}
-
-/// Lanes per query row for the `tessl-rows` lane, from `BENCH_ATTN_ROWS_R`.
-///
-/// Defaults to whatever `nn::rows_lanes_for` routes to, so an unset sweep
-/// measures the shipping choice rather than an arbitrary one.
-fn rows_lanes_override() -> Option<nn::RowsLanes> {
-    match std::env::var("BENCH_ATTN_ROWS_R") {
-        Ok(v) => Some(nn::RowsLanes::parse(v.trim()).unwrap_or_else(|e| {
-            eprintln!("BENCH_ATTN_ROWS_R: {e}");
-            std::process::exit(1);
-        })),
-        Err(_) => None,
-    }
-}
-
 /// Emit the kernel trace for `bench/kernel_coverage.py`. Prints nothing when
 /// tracing is off, so normal runs are unchanged.
 fn emit_kernel_trace() {
@@ -617,7 +645,6 @@ fn emit_kernel_trace() {
 }
 
 fn run() -> Result<(), String> {
-    let rt = GpuRuntime::new()?;
     let args: Vec<String> = std::env::args().collect();
     let dump_dir = match args.iter().position(|a| a == "--dump-parity") {
         Some(i) => Some(
@@ -655,21 +682,19 @@ fn run() -> Result<(), String> {
 
     let warmup = env_usize("BENCH_WARMUP", 10, 0)?;
     let iters = env_usize("BENCH_ITERS", 50, 1)?;
+    let tuning = Tuning::from_env()?;
     let dist = match std::env::var("BENCH_ATTN_DIST") {
         Ok(v) => Dist::parse(v.trim())?,
         Err(std::env::VarError::NotPresent) => Dist::Uniform,
         Err(e) => return Err(format!("BENCH_ATTN_DIST: {e}")),
     };
     let only = match std::env::var("BENCH_ATTN_CFGS") {
-        Ok(v) => Some(
-            v.split(',')
-                .map(|x| x.trim().to_string())
-                .filter(|x| !x.is_empty())
-                .collect::<Vec<_>>(),
-        ),
+        Ok(v) => parse_requested_configs(Some(&v))?,
         Err(std::env::VarError::NotPresent) => None,
         Err(e) => return Err(format!("BENCH_ATTN_CFGS: {e}")),
     };
+
+    let rt = GpuRuntime::new()?;
     let cfgs: Vec<&Cfg> = match &only {
         None => CFGS.iter().collect(),
         Some(want) => {
@@ -725,16 +750,15 @@ fn run() -> Result<(), String> {
         // run time while contributing nothing: the batched arm exists to
         // isolate the *fast* kernels from submit cost. `BENCH_ATTN_IMPLS=all`
         // forces it back in.
-        let want_all = std::env::var("BENCH_ATTN_IMPLS").as_deref() == Ok("all");
-        let batched = batch_size().max(1) > 1;
-        let impls: &[Impl] = match (c.tq == 1, batched && !want_all) {
+        let batched = tuning.batch > 1;
+        let impls: &[Impl] = match (c.tq == 1, batched && !tuning.include_all_impls) {
             (true, false) => &[Impl::Tiled, Impl::Routed, Impl::Decode, Impl::Rows],
             (true, true) => &[Impl::Routed, Impl::Decode, Impl::Rows],
             (false, false) => &[Impl::Tiled, Impl::Routed, Impl::Rows],
             (false, true) => &[Impl::Routed, Impl::Rows],
         };
         for &imp in impls {
-            let samples = time_cfg(&rt, c, &bufs, imp, warmup, iters)?;
+            let samples = time_cfg(&rt, c, &bufs, imp, tuning, warmup, iters)?;
             let med = median(samples.clone())?;
             if med <= 0.0 {
                 return Err(format!("{}: median {med} ms is not positive", c.label));
@@ -753,7 +777,7 @@ fn run() -> Result<(), String> {
             );
             rows.push(format!(
                 r#"{{"cfg":"{}","kernel":"{kernel}","runtime":"{}","batched":{},"b":{},"tq":{},"tkv":{},"h":{},"hkv":{},"d":{},"window":{},"q_off":{},"kv_off":{},"median_ms":{med:.6},"best_ms":{best:.6},"live_pairs":{},"gflops":{gflops:.3},"dense_gflops":{:.3}}}"#,
-                c.label, imp.tag(), batch_size().max(1), c.b, c.tq, c.tkv, c.h, c.hkv, c.d,
+                c.label, imp.tag(), tuning.batch, c.b, c.tq, c.tkv, c.h, c.hkv, c.d,
                 match c.window { Some(w) => w as i64, None => -1 },
                 c.q_off, c.kv_off, c.live_pairs(),
                 c.dense_flop() / (med * 1e6)
@@ -777,7 +801,7 @@ fn run() -> Result<(), String> {
             let mut lanes = Vec::new();
             for &imp in impls {
                 o.write_f32(&vec![UNWRITTEN; c.q_elems()]);
-                launch_impl(&rt, c, &bufs, imp)?;
+                launch_impl(&rt, c, &bufs, imp, tuning)?;
                 rt.synchronize()?;
                 let out = o.read_f32()[..c.q_elems()].to_vec();
                 if let Some(i) = out.iter().position(|x| *x == UNWRITTEN) {
@@ -840,4 +864,52 @@ fn main() -> Result<(), String> {
     let outcome = run();
     emit_kernel_trace();
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_impl_selection, parse_reduce_width, parse_requested_configs};
+
+    #[test]
+    fn implementation_selection_rejects_silent_fallbacks() {
+        assert!(!parse_impl_selection(None).unwrap());
+        assert!(parse_impl_selection(Some(" all ")).unwrap());
+        assert!(parse_impl_selection(Some("default")).is_err());
+        assert!(parse_impl_selection(Some("")).is_err());
+    }
+
+    #[test]
+    fn configuration_selection_rejects_an_empty_override() {
+        assert!(parse_requested_configs(None).unwrap().is_none());
+        assert_eq!(
+            parse_requested_configs(Some("a, b")).unwrap().unwrap(),
+            ["a", "b"]
+        );
+        assert!(parse_requested_configs(Some(" , ")).is_err());
+    }
+
+    #[test]
+    fn reduce_width_is_warp_aligned_and_bounded() {
+        assert_eq!(parse_reduce_width("32").unwrap(), 32);
+        assert_eq!(parse_reduce_width("1024").unwrap(), 1024);
+        for invalid in ["", "0", "31", "33", "1056", "not-a-width"] {
+            assert!(parse_reduce_width(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn timed_launch_path_does_not_read_the_environment() {
+        let source = include_str!("bench_flash_attn.rs");
+        let launch = source
+            .split_once("fn launch_impl(")
+            .expect("launch_impl exists")
+            .1
+            .split_once("\nfn launch(")
+            .expect("launch_impl has a bounded source region")
+            .0;
+        assert!(
+            !launch.contains("std::env"),
+            "environment parsing inside launch_impl contaminates every timing sample"
+        );
+    }
 }

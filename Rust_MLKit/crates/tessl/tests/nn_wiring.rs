@@ -81,7 +81,12 @@ fn softcap_logits_matches_the_tanh_reference() {
     with_gpu(|rt| {
         let n = 512usize;
         // Span the range where a fast tanh would misbehave.
-        let logits: Vec<f32> = (0..n).map(|i| (i as f32 - 256.0) * 0.5).collect();
+        let mut logits: Vec<f32> = (0..n).map(|i| (i as f32 - 256.0) * 0.5).collect();
+        // Softcapping exists specifically to tame unbounded logits. Metal's
+        // tanh implementation overflows internally without an explicit clamp
+        // around this range, turning an otherwise finite row into NaNs.
+        logits[0] = -1.0e6;
+        logits[n - 1] = 1.0e6;
         let lb = buf(rt, &logits);
         let cap = buf(rt, &[30.0]);
 
@@ -95,6 +100,32 @@ fn softcap_logits_matches_the_tanh_reference() {
             "softcap produced non-finite"
         );
         close("softcap_logits", &got[..n], &want, 1e-4);
+    });
+}
+
+#[test]
+fn invalid_device_softcap_is_a_noop_instead_of_poisoning_logits() {
+    with_gpu(|rt| {
+        let logits = [-1.0e6, -1.0, 0.0, 1.0, 1.0e6];
+        for (label, invalid_cap) in [
+            ("zero", 0.0),
+            ("negative", -30.0),
+            ("infinite", f32::INFINITY),
+            ("nan", f32::NAN),
+        ] {
+            let lb = buf(rt, &logits);
+            let cap = buf(rt, &[invalid_cap]);
+
+            nn::softcap_logits(rt, &lb, &cap, logits.len() as u32).unwrap();
+            rt.synchronize().unwrap();
+
+            let got = lb.read_f32();
+            assert_eq!(
+                &got[..logits.len()],
+                &logits,
+                "invalid {label} softcap must leave finite logits unchanged"
+            );
+        }
     });
 }
 
@@ -680,24 +711,47 @@ fn gemv_q4_refuses_a_cols_that_overflows_threadgroup_memory() {
     with_gpu(|rt| {
         // The kernel caches all of `x` in threadgroup memory: cols * 4 bytes.
         let limit = rt.max_threadgroup_memory();
-        let too_wide = (limit / 4 + 1024) as u32;
+        let group_size = 32usize;
+        let too_wide = (limit / std::mem::size_of::<f32>())
+            .checked_add(1)
+            .expect("threadgroup-memory limit column threshold")
+            .div_ceil(group_size)
+            .checked_mul(group_size)
+            .and_then(|cols| u32::try_from(cols).ok())
+            .expect("Metal threadgroup-memory limit must fit a u32 column count");
         let shape = QuantShape {
             rows: 8,
             cols: too_wide,
-            group_size: 32,
+            group_size: group_size as u32,
         };
-        // Buffers are deliberately generous; the threadgroup-memory ceiling is
-        // what must fire, not an extent check.
-        let big = empty(rt, (too_wide as usize) * 8);
+        let requested = shape.cols as usize * std::mem::size_of::<f32>();
+        assert!(
+            requested > limit,
+            "test setup must exceed the device limit: requested {requested}, limit {limit}"
+        );
+        let weights = shape.rows as usize * shape.cols as usize;
+        let groups = weights / group_size;
+
+        // Keep every operand valid and disjoint. Reusing one generous buffer
+        // here accidentally made this an aliasing test once GEMV began rejecting
+        // unordered output/input overlap, masking the launch-size invariant this
+        // regression is meant to isolate.
+        let packed = rt
+            .alloc_buffer(weights.div_ceil(2))
+            .expect("packed allocation");
+        let scales = empty(rt, groups);
+        let zeros = empty(rt, groups);
+        let x = empty(rt, shape.cols as usize);
+        let y = empty(rt, shape.rows as usize);
         let err = nn::gemv_q4(
             rt,
             Q4Bank {
-                packed: &big,
-                scales: &big,
-                zeros: &big,
+                packed: &packed,
+                scales: &scales,
+                zeros: &zeros,
             },
-            &big,
-            &big,
+            &x,
+            &y,
             shape,
             false,
         )
@@ -707,5 +761,43 @@ fn gemv_q4_refuses_a_cols_that_overflows_threadgroup_memory() {
             "expected the threadgroup-memory ceiling, got: {err:?}"
         );
         assert_eq!(rt.take_dispatch_count(), 0);
+    });
+}
+
+/// The softcap belongs to the first pass only. Later passes reduce values that
+/// are already capped, and `tanh` is not idempotent: capping a partial maximum
+/// again shrinks it (`30·tanh(29.65/30) ≈ 22.7` instead of `29.65`), so a
+/// two-pass argmax returned a wrong value whenever the cap was on.
+#[test]
+fn argmax_f32_pass_applies_the_softcap_once_across_passes() {
+    with_gpu(|rt| {
+        let n = 50_000u32;
+        let mut logits = random_f32(n as usize, 0xB2);
+        let winner = 12_345usize;
+        logits[winner] = 77.0;
+        let lb = buf(rt, &logits);
+        let softcap = 30.0f32;
+        let cap = buf(rt, &[softcap]);
+
+        let g1 = nn::argmax_pass_groups(n);
+        let idx1 = buf_u32(rt, &vec![0u32; g1]);
+        let val1 = empty(rt, g1);
+        nn::argmax_f32_pass(rt, &lb, &idx1, &val1, None, &cap, n).unwrap();
+
+        let g2 = nn::argmax_pass_groups(g1 as u32);
+        assert_eq!(g2, 1, "test assumes the second pass collapses to one group");
+        let idx2 = buf_u32(rt, &vec![0u32; g2]);
+        let val2 = empty(rt, g2);
+        nn::argmax_f32_pass(rt, &val1, &idx2, &val2, Some(&idx1), &cap, g1 as u32).unwrap();
+        rt.synchronize().unwrap();
+
+        let want = softcap * (77.0f32 / softcap).tanh();
+        assert_eq!(idx2.read_u32()[0] as usize, winner);
+        let got = val2.read_f32()[0];
+        assert!(
+            (got - want).abs() < 1e-3,
+            "two-pass softcapped max: got {got}, want {want} (capping twice gives {})",
+            softcap * (want / softcap).tanh()
+        );
     });
 }

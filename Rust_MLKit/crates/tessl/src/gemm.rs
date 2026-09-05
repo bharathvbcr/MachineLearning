@@ -73,6 +73,41 @@ fn prefer_tn_splitk(m: usize, n: usize, k: usize) -> bool {
     k >= 2048 && m <= 384 && n <= 384 && m.min(n) <= 128
 }
 
+/// K columns per split-K partition below the partition cap.
+const SPLITK_K_TILE: usize = 256;
+/// Most partitions one split-K GEMM encodes. Each partition is a dispatch and
+/// a barrier inside the packed encoder, so an unbounded count would serialize
+/// thousands of tiny dispatches for a legal but very deep reduction.
+const MAX_SPLITK_PARTITIONS: usize = 32;
+
+/// `(k_tile, partition starts)` for a split-K reduction over `k`.
+///
+/// Up to `MAX_SPLITK_PARTITIONS * SPLITK_K_TILE` the historical 256-wide
+/// partitions are unchanged; past that the partition grows (to a multiple of
+/// the 32-wide K step) so the count stays at the cap.
+fn splitk_plan(k: usize) -> (u32, Vec<u32>) {
+    let parts = k.div_ceil(SPLITK_K_TILE).clamp(1, MAX_SPLITK_PARTITIONS);
+    let k_tile = (k.div_ceil(parts).div_ceil(32) * 32).max(SPLITK_K_TILE);
+    let starts = (0..k).step_by(k_tile).map(|k0| k0 as u32).collect();
+    (k_tile as u32, starts)
+}
+
+/// Every TensorOps kernel here is written for 32-wide simdgroups
+/// (`execution_simdgroups<N>` tiles, `tile_a[4][64]` in the simdgroup edge
+/// kernel), so a device reporting another width cannot be launched correctly.
+const TENSOROPS_SIMD_WIDTH: usize = 32;
+
+fn simd_width(pipeline: &ProtocolObject<dyn MTLComputePipelineState>) -> Result<usize, String> {
+    let width = pipeline.threadExecutionWidth();
+    if width != TENSOROPS_SIMD_WIDTH {
+        return Err(format!(
+            "GEMM kernels are compiled for {TENSOROPS_SIMD_WIDTH}-wide simdgroups; this \
+             device reports a thread execution width of {width}"
+        ));
+    }
+    Ok(width)
+}
+
 /// Tile sizes for TensorOps kernels (must match matmul_tensorops.metal).
 #[derive(Clone, Copy)]
 struct TileGeom {
@@ -157,7 +192,8 @@ fn validate_cast_input(src: &Tensor, dtype: DType) -> Result<(), String> {
 pub fn cast_f32_to_bf16(src: &Tensor) -> Result<Tensor, String> {
     validate_cast_input(src, DType::F32)?;
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_bf16(&src.shape)?;
+    // Every element is written by the cast below before any read.
+    let dst = rt.alloc_tensor_bf16_uninit(&src.shape)?;
     cast_f32_to_bf16_into(src, &dst)?;
     Ok(dst)
 }
@@ -199,7 +235,8 @@ pub fn cast_f32_to_bf16_hot(src: &Tensor) -> Result<Tensor, String> {
 pub fn cast_bf16_to_f32(src: &Tensor) -> Result<Tensor, String> {
     validate_cast_input(src, DType::BF16)?;
     let rt = src.runtime();
-    let dst = rt.alloc_tensor_f32(&src.shape)?;
+    // Every element is written by the cast below before any read.
+    let dst = rt.alloc_tensor_f32_uninit(&src.shape)?;
     let p = rt.pipeline("cast_bf16_to_f32")?;
     let n = src.numel();
     crate::dispatch::dispatch_1d(rt, &p, n, |bnd| {
@@ -323,12 +360,12 @@ pub fn gemm(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<
             let m_u = m as u32;
             let n_u = n as u32;
             let k_u = k as u32;
-            let (tg_w, tg_h, tpt) = threadgroup_geometry_simdgroup(&pipeline, m, n);
+            let (tg_w, tg_h, tpt) = threadgroup_geometry_simdgroup(&pipeline, m, n)?;
             rt.with_binder(|bnd| {
                 bnd.set_pipeline(&pipeline);
-                bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-                bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-                bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+                bnd.bind_tensor(a, 0);
+                bnd.bind_tensor(b, 1);
+                bnd.bind_tensor(c, 2);
                 bnd.bind_u32(m_u, 3);
                 bnd.bind_u32(n_u, 4);
                 bnd.bind_u32(k_u, 5);
@@ -361,18 +398,22 @@ impl BatchStrides {
     /// Contiguous batches of all three operands.
     pub fn contiguous(m: usize, n: usize, k: usize) -> Self {
         Self {
-            a: m * k,
-            b: k * n,
-            c: m * n,
+            // A constructor returning `Self` cannot report arithmetic failure.
+            // Saturating preserves the invalidity so `gemm_batched` rejects the
+            // stride, instead of panicking in debug or wrapping to a plausible
+            // small stride in release.
+            a: m.saturating_mul(k),
+            b: k.saturating_mul(n),
+            c: m.saturating_mul(n),
         }
     }
 
     /// Contiguous A and C against one shared B.
     pub fn shared_b(m: usize, n: usize, k: usize) -> Self {
         Self {
-            a: m * k,
+            a: m.saturating_mul(k),
             b: 0,
-            c: m * n,
+            c: m.saturating_mul(n),
         }
     }
 }
@@ -402,9 +443,12 @@ pub struct BatchedGemm {
 /// `C[i] = A[i] @ B[i]` for `spec.batch` matrices, in one dispatch.
 ///
 /// The batch is the grid's second dimension, so batching costs a pointer offset
-/// per threadgroup and nothing else — the tile geometry, the register
-/// accumulator and the swizzle are the single-matrix path's, and each element
-/// is bit-identical to the [`gemm`] that would have produced it.
+/// per threadgroup and nothing else. Each element is bit-identical to the
+/// [`gemm`] that would have produced it: both run the cooperative-destination
+/// kernels, whose per-element K reduction order does not depend on the tile
+/// extents. The batched kernels are instantiated at 128×64 only while [`gemm`]
+/// picks 64×64 for `N <= 512`, and `tests/gemm_batched.rs` pins the identity
+/// across that difference as well as at a matching geometry.
 ///
 /// Requires the cooperative-destination path (bf16, f16, or f32 with relaxed
 /// precision on TensorOps), for the same reason [`gemm_epilogue`] does.
@@ -433,6 +477,22 @@ pub fn gemm_batched(
     if m == 0 || n == 0 || k == 0 {
         return Err("batched GEMM requires nonzero m, n and k".into());
     }
+    for (name, value) in [("m", m), ("n", n), ("k", k), ("batch", batch)] {
+        if value > i32::MAX as usize {
+            return Err(format!(
+                "batched GEMM {name} exceeds signed 32-bit kernel indexing"
+            ));
+        }
+    }
+    let matrix_a = m
+        .checked_mul(k)
+        .ok_or_else(|| "batched GEMM: A matrix extent overflows usize".to_string())?;
+    let matrix_b = k
+        .checked_mul(n)
+        .ok_or_else(|| "batched GEMM: B matrix extent overflows usize".to_string())?;
+    let matrix_c = m
+        .checked_mul(n)
+        .ok_or_else(|| "batched GEMM: C matrix extent overflows usize".to_string())?;
     for t in [a, b, c] {
         t.validate()?;
         if t.numel() > i32::MAX as usize {
@@ -443,6 +503,9 @@ pub fn gemm_batched(
         || !std::sync::Arc::ptr_eq(a.runtime(), c.runtime())
     {
         return Err("batched GEMM tensors must belong to the same runtime".into());
+    }
+    if a.overlaps(c) || b.overlaps(c) {
+        return Err("batched GEMM output must not overlap either input".into());
     }
     if c.dtype != DType::F32 {
         return Err("batched GEMM writes f32 output".into());
@@ -461,13 +524,20 @@ pub fn gemm_batched(
         );
     }
 
+    if batch > 1 && strides.c < matrix_c {
+        return Err(format!(
+            "batched GEMM output batches overlap: C stride {} is smaller than one matrix ({matrix_c} elements)",
+            strides.c
+        ));
+    }
+
     // The last batch element must fit. Without this the kernel walks off the
     // end of whichever operand was sized for a smaller batch and reads whatever
     // happens to be resident.
     for (t, first, stride, what) in [
-        (a, m * k, strides.a, "A"),
-        (b, k * n, strides.b, "B"),
-        (c, m * n, strides.c, "C"),
+        (a, matrix_a, strides.a, "A"),
+        (b, matrix_b, strides.b, "B"),
+        (c, matrix_c, strides.c, "C"),
     ] {
         let need = stride
             .checked_mul(batch - 1)
@@ -506,12 +576,12 @@ pub fn gemm_batched(
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(&pipeline, tile);
+    let tpt = threads_per_tg(&pipeline, tile)?;
     rt.with_binder(|bnd| {
         bnd.set_pipeline(&pipeline);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);
@@ -666,6 +736,9 @@ pub fn gemm_epilogue(
                 bias.numel()
             ));
         }
+        if bias.overlaps(c) {
+            return Err("GEMM epilogue: bias overlaps output".into());
+        }
     }
 
     let kernel = if use_bf16 {
@@ -684,7 +757,7 @@ pub fn gemm_epilogue(
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(&pipeline, tile);
+    let tpt = threads_per_tg(&pipeline, tile)?;
     let (alpha, beta, act) = (epi.alpha, epi.beta, epi.activation as u32);
     let has_bias = u32::from(epi.bias.is_some());
     // Buffer 8 is read unconditionally by the kernel binding, so it must be
@@ -693,15 +766,15 @@ pub fn gemm_epilogue(
     let bias_buf = epi.bias.unwrap_or(c);
     rt.with_binder(|bnd| {
         bnd.set_pipeline(&pipeline);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);
         bnd.bind_u32(tiles_n as u32, 6);
         bnd.bind_u32(tiles_m as u32, 7);
-        bnd.bind_buf(bias_buf.buffer.metal(), bias_buf.byte_offset, 8);
+        bnd.bind_tensor(bias_buf, 8);
         bnd.bind_f32(alpha, 9);
         bnd.bind_f32(beta, 10);
         bnd.bind_u32(act, 11);
@@ -723,12 +796,39 @@ const TILE_COOP_NARROW: TileGeom = TileGeom {
     sn: 64,
     simdgroups: 4,
 };
+/// `M` at or below which a 128-row tile is at least half padding.
+const NARROW_TILE_MAX_ROWS: usize = 64;
+/// Fewer default (128×64) tiles than this leaves the M5 Pro's cores starved;
+/// see [`nn_coop_kernel`] for the measurement.
+const NARROW_TILE_MIN_GRID: usize = 64;
 
-/// Shape → coop NN kernel, from the 2026-08-30 M5 Pro tile tunes
-/// (bench/results/bf16_tile_tune_m5pro_coop.txt, bf16_tnnt_coop_m5pro.txt):
-/// 64×64 sg4 wins narrow-N shapes by ~6%; 128×64 sg4 everything else. The
-/// in-kernel column-panel swizzle covers the huge-square case (+11% at
-/// 4096³), which retired the earlier 256×64 sg8 wide entry it outran.
+/// Shape → coop NN kernel.
+///
+/// From the 2026-08-30 M5 Pro tile tunes (bench/results/bf16_tile_tune_m5pro_coop.txt,
+/// bf16_tnnt_coop_m5pro.txt): 64×64 sg4 wins narrow-N shapes by ~6%; 128×64
+/// sg4 everything else at `M >= 512`. The in-kernel column-panel swizzle
+/// covers the huge-square case (+11% at 4096³), which retired the earlier
+/// 256×64 sg8 wide entry it outran.
+///
+/// `M` below 512 had never been measured, and the selection ignored it. The
+/// 2026-09-04 paired A/B (bench/results/bf16_smallm_coop_m5pro.txt: bf16
+/// through `gemm`, twenty GEMMs per command buffer, six order-balanced rounds
+/// of eight calls, 128×64 time ÷ 64×64 time) found two more regimes where
+/// the 64×64 tile wins:
+///
+/// * `M <= 64`: a 128-row tile is at least half padding, so the default does
+///   double the MMA work for the same output. 1.35–1.74× at every N and K
+///   tried (768…4096).
+/// * A starved grid: when fewer than 64 of the 128×64 tiles cover C, the
+///   64×64 tile's twice-as-many threadgroups fill the GPU better than the
+///   bigger tile's arithmetic intensity pays back. 1.14–1.59× (`M = 128` at
+///   `N <= 3072`, `M <= 512` at `N = 768`); the default is within 5% or
+///   ahead from 64 tiles up (0.82× for the narrow tile at `M >= 256`,
+///   `N = K = 4096`), so the threshold sits at the first point the default
+///   wins, not the last point the narrow tile does.
+///
+/// `K` does not enter the choice: it stretches every threadgroup's inner
+/// loop equally.
 /// Operand element type for the cooperative-destination NN kernels.
 ///
 /// A three-way choice rather than the boolean this used to be: f16 and bf16
@@ -741,8 +841,10 @@ enum CoopElem {
     F16,
 }
 
-fn nn_coop_kernel(_m: usize, n: usize, _k: usize, elem: CoopElem) -> (&'static str, TileGeom) {
-    if n <= 512 {
+fn nn_coop_kernel(m: usize, n: usize, _k: usize, elem: CoopElem) -> (&'static str, TileGeom) {
+    let default_tiles = m.div_ceil(TILE_COOP_DEFAULT.sm) * n.div_ceil(TILE_COOP_DEFAULT.sn);
+    let narrow = n <= 512 || m <= NARROW_TILE_MAX_ROWS || default_tiles < NARROW_TILE_MIN_GRID;
+    if narrow {
         (
             match elem {
                 CoopElem::Bf16 => "matmul2d_tensorops_bf16_f32_64x64_sg4",
@@ -780,12 +882,12 @@ fn dispatch_tensorops_nn_coop(
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(pipeline, tile);
+    let tpt = threads_per_tg(pipeline, tile)?;
     rt.with_binder(|bnd| {
         bnd.set_pipeline(pipeline);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);
@@ -813,7 +915,7 @@ fn dispatch_tensorops_nn(
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(pipeline, tile);
+    let tpt = threads_per_tg(pipeline, tile)?;
     let z_width = zero_p.threadExecutionWidth();
     let z_tpt = z_width.min(numel).max(1);
     let z_groups = numel.div_ceil(z_tpt);
@@ -831,9 +933,9 @@ fn dispatch_tensorops_nn(
         }
 
         bnd.set_pipeline(pipeline);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);
@@ -884,13 +986,13 @@ fn dispatch_tensorops_accum(
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(pipeline, tile);
+    let tpt = threads_per_tg(pipeline, tile)?;
 
     rt.with_binder(|bnd| {
         bnd.set_pipeline(pipeline);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);
@@ -953,7 +1055,8 @@ pub fn gemm_tn_f32(
     // Default: explicit transpose + NN (golden-safe).
     let at = {
         let rt = a_km.runtime();
-        let out = rt.alloc_temp_f32(&[m, k])?;
+        // Fully written by the transpose before the GEMM reads it.
+        let out = rt.alloc_temp_f32_uninit(&[m, k])?;
         let p = rt.pipeline("transpose2d_f32")?;
         crate::dispatch::dispatch_1d(rt, &p, m * k, |bnd| {
             crate::dispatch::set_tensor(bnd, a_km, 0);
@@ -1029,13 +1132,12 @@ fn gemm_tn_splitk_f32_opts(
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(&pipeline, tile);
+    let tpt = threads_per_tg(&pipeline, tile)?;
     let numel = c.numel();
     let z_width = zero_p.threadExecutionWidth();
     let z_tpt = z_width.min(numel).max(1);
     let z_groups = numel.div_ceil(z_tpt);
-    let k_tile = 256u32;
-    let partitions: Vec<u32> = (0..k as u32).step_by(k_tile as usize).collect();
+    let (k_tile, partitions) = splitk_plan(k);
 
     // Zero once (optional) + all K-partitions in one binder.
     rt.with_binder(|bnd| {
@@ -1055,9 +1157,9 @@ fn gemm_tn_splitk_f32_opts(
             if pi > 0 && need_explicit {
                 bnd.barrier();
             }
-            bnd.bind_buf(a_km.buffer.metal(), a_km.byte_offset, 0);
-            bnd.bind_buf(b_kn.buffer.metal(), b_kn.byte_offset, 1);
-            bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+            bnd.bind_tensor(a_km, 0);
+            bnd.bind_tensor(b_kn, 1);
+            bnd.bind_tensor(c, 2);
             bnd.bind_u32(m as u32, 3);
             bnd.bind_u32(n as u32, 4);
             bnd.bind_u32(k as u32, 5);
@@ -1092,13 +1194,12 @@ fn gemm_tn_splitk_bf16_opts(
     let tiles_n = n.div_ceil(tile.sn);
     let tiles_m = m.div_ceil(tile.sm);
     let tg = morton_tg_count(tiles_n, tiles_m);
-    let tpt = threads_per_tg(&pipeline, tile);
+    let tpt = threads_per_tg(&pipeline, tile)?;
     let numel = c.numel();
     let z_width = zero_p.threadExecutionWidth();
     let z_tpt = z_width.min(numel).max(1);
     let z_groups = numel.div_ceil(z_tpt);
-    let k_tile = 256u32;
-    let partitions: Vec<u32> = (0..k as u32).step_by(k_tile as usize).collect();
+    let (k_tile, partitions) = splitk_plan(k);
 
     rt.with_binder(|bnd| {
         let need_explicit = bnd.needs_explicit_barriers();
@@ -1117,9 +1218,9 @@ fn gemm_tn_splitk_bf16_opts(
             if pi > 0 && need_explicit {
                 bnd.barrier();
             }
-            bnd.bind_buf(a_km.buffer.metal(), a_km.byte_offset, 0);
-            bnd.bind_buf(b_kn.buffer.metal(), b_kn.byte_offset, 1);
-            bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+            bnd.bind_tensor(a_km, 0);
+            bnd.bind_tensor(b_kn, 1);
+            bnd.bind_tensor(c, 2);
             bnd.bind_u32(m as u32, 3);
             bnd.bind_u32(n as u32, 4);
             bnd.bind_u32(k as u32, 5);
@@ -1152,7 +1253,8 @@ pub fn gemm_nt_f32(
 
     let bt = {
         let rt = b_nk.runtime();
-        let out = rt.alloc_temp_f32(&[k, n])?;
+        // Fully written by the transpose before the GEMM reads it.
+        let out = rt.alloc_temp_f32_uninit(&[k, n])?;
         let p = rt.pipeline("transpose2d_f32")?;
         crate::dispatch::dispatch_1d(rt, &p, n * k, |bnd| {
             crate::dispatch::set_tensor(bnd, b_nk, 0);
@@ -1256,7 +1358,8 @@ pub fn gemm_tn_accum_train(
     }
 
     // Fallback / Soft-bisect: temp + add (pre–Audit 6 P1a/P1a2 numerics).
-    let tmp = rt.alloc_temp_f32(&[m, n])?;
+    // Every element is written by the GEMM before `add_inplace` reads it.
+    let tmp = rt.alloc_temp_f32_uninit(&[m, n])?;
     gemm_tn_train(a_km, b_kn, &tmp, backend)?;
     let p = rt.pipeline("add_inplace_f32")?;
     crate::dispatch::dispatch_1d(rt, &p, c.numel(), |bnd| {
@@ -1315,7 +1418,8 @@ pub fn gemm_nt_accum_train(
         );
     }
 
-    let tmp = rt.alloc_temp_f32(&[m, n])?;
+    // Every element is written by the GEMM before `add_inplace` reads it.
+    let tmp = rt.alloc_temp_f32_uninit(&[m, n])?;
     gemm_nt_train(a_mk, b_nk, &tmp, backend)?;
     let p = rt.pipeline("add_inplace_f32")?;
     crate::dispatch::dispatch_1d(rt, &p, c.numel(), |bnd| {
@@ -1331,20 +1435,22 @@ pub fn gemm_auto(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Re
     gemm_train(a, b, c, backend)
 }
 
-fn threads_per_tg(pipeline: &ProtocolObject<dyn MTLComputePipelineState>, tile: TileGeom) -> usize {
-    let width = pipeline.threadExecutionWidth();
-    width * tile.simdgroups
+fn threads_per_tg(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    tile: TileGeom,
+) -> Result<usize, String> {
+    Ok(simd_width(pipeline)? * tile.simdgroups)
 }
 
 fn threadgroup_geometry_simdgroup(
     pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     m: usize,
     n: usize,
-) -> (usize, usize, usize) {
-    let width = pipeline.threadExecutionWidth();
+) -> Result<(usize, usize, usize), String> {
+    let width = simd_width(pipeline)?;
     let tg_w = n.div_ceil(16);
     let tg_h = m.div_ceil(16);
-    (tg_w, tg_h, width * 4)
+    Ok((tg_w, tg_h, width * 4))
 }
 
 /// CPU reference GEMM for tests.
@@ -1765,6 +1871,70 @@ mod tests {
         }
     }
 
+    /// The NN coop tile is chosen by grid fill, not by `N` alone. A 128-row
+    /// tile over `M <= 64` rows is at least half padding, and a grid of fewer
+    /// than 64 of the default tiles leaves most of the GPU idle; both were
+    /// measured to favour the 64x64 tile (bench/results/bf16_smallm_coop_m5pro.txt).
+    #[test]
+    fn nn_coop_kernel_selects_the_narrow_tile_by_grid_fill() {
+        let sm = |m, n, k| nn_coop_kernel(m, n, k, CoopElem::Bf16).1.sm;
+        // Narrow N, as before.
+        assert_eq!(sm(4096, 256, 1024), 64);
+        assert_eq!(sm(4096, 512, 1024), 64);
+        // Few rows: the 128-row tile would be mostly padding at any N.
+        assert_eq!(sm(16, 3072, 768), 64);
+        assert_eq!(sm(64, 4096, 4096), 64);
+        assert_eq!(sm(64, 8192, 4096), 64);
+        // Full tiles but a starved grid: 4 x 12 = 48 default tiles.
+        assert_eq!(sm(512, 768, 3072), 64);
+        assert_eq!(sm(128, 2048, 2048), 64);
+        // Enough default tiles to fill the GPU: 8 x 12 = 96, 1 x 64, 16 x 32.
+        assert_eq!(sm(1024, 768, 3072), 128);
+        assert_eq!(sm(128, 4096, 4096), 128);
+        assert_eq!(sm(2048, 2048, 2048), 128);
+        assert_eq!(sm(8192, 3072, 768), 128);
+        // The element type never changes the geometry.
+        for elem in [CoopElem::F16, CoopElem::RelaxedF32] {
+            assert_eq!(nn_coop_kernel(64, 3072, 768, elem).1.sm, 64);
+            assert_eq!(nn_coop_kernel(1024, 3072, 768, elem).1.sm, 128);
+        }
+    }
+
+    #[test]
+    fn splitk_plan_is_bounded_and_covers_k() {
+        for &k in &[2048usize, 4096, 8192, 8193, 65_536, 1 << 20, 3 * 65_536 + 7] {
+            let (k_tile, starts) = splitk_plan(k);
+            let k_tile = k_tile as usize;
+            assert!(
+                starts.len() <= MAX_SPLITK_PARTITIONS,
+                "k={k}: {} partitions",
+                starts.len()
+            );
+            assert_eq!(
+                k_tile % 32,
+                0,
+                "k={k}: tile {k_tile} is not a K-step multiple"
+            );
+            assert_eq!(starts[0], 0);
+            for pair in starts.windows(2) {
+                assert_eq!(
+                    (pair[1] - pair[0]) as usize,
+                    k_tile,
+                    "k={k}: gap or overlap"
+                );
+            }
+            let last = *starts.last().unwrap() as usize;
+            assert!(
+                last < k && last + k_tile >= k,
+                "k={k}: partitions do not cover K"
+            );
+        }
+        // Below the cap the historical 256-wide partitions are unchanged.
+        let (k_tile, starts) = splitk_plan(4096);
+        assert_eq!(k_tile, 256);
+        assert_eq!(starts, (0..4096u32).step_by(256).collect::<Vec<_>>());
+    }
+
     #[test]
     fn gemm_tn_splitk_tall_dw_shape() {
         let rt = tensorops_runtime();
@@ -2054,12 +2224,43 @@ mod stress_tests {
     //! bitwise determinism, sampled large-shape parity, and concurrent runtimes.
     //!
     //! Fast versions run in the default suite; `cargo test -- --ignored` runs
-    //! the deep fuzz. `STRESS_SEED=<u64>` reruns a failing seed.
+    //! the deep fuzz. `STRESS_SEED=<decimal-or-0x-u64>` reruns a failing seed.
 
     use super::*;
     use crate::runtime::PrecisionMode;
     use crate::tensor::{bf16_bits_to_f32, f32_to_bf16_bits};
     use crate::GpuRuntime;
+
+    const DEFAULT_STRESS_SEED: u64 = 0x5EED_2026_0830;
+
+    fn parse_stress_seed(raw: &str) -> Result<u64, String> {
+        let trimmed = raw.trim();
+        let (digits, radix) = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+            .map_or((trimmed, 10), |digits| (digits, 16));
+        if digits.is_empty() {
+            return Err(format!(
+                "STRESS_SEED={raw:?} is not a decimal or 0x-prefixed u64"
+            ));
+        }
+        let seed = u64::from_str_radix(digits, radix)
+            .map_err(|_| format!("STRESS_SEED={raw:?} is not a decimal or 0x-prefixed u64"))?;
+        if seed == 0 {
+            return Err(String::from(
+                "STRESS_SEED must be non-zero (xorshift64* has an all-zero lockup state)",
+            ));
+        }
+        Ok(seed)
+    }
+
+    fn stress_seed_from_env() -> Result<u64, String> {
+        match std::env::var("STRESS_SEED") {
+            Ok(raw) => parse_stress_seed(&raw),
+            Err(std::env::VarError::NotPresent) => Ok(DEFAULT_STRESS_SEED),
+            Err(e) => Err(format!("STRESS_SEED: {e}")),
+        }
+    }
 
     /// xorshift64* — deterministic, dependency-free.
     struct Rng(u64);
@@ -2284,10 +2485,7 @@ mod stress_tests {
     }
 
     fn fuzz(cases: usize) {
-        let seed = std::env::var("STRESS_SEED")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0x5EED_2026_0830u64);
+        let seed = stress_seed_from_env().unwrap_or_else(|e| panic!("{e}"));
         let rt = GpuRuntime::new().expect("GpuRuntime::new");
         assert!(
             rt.has_tensorops(),
@@ -2310,6 +2508,22 @@ mod stress_tests {
     #[test]
     fn gemm_fuzz_quick() {
         fuzz(160);
+    }
+
+    #[test]
+    fn stress_seed_parser_accepts_decimal_and_prefixed_hex() {
+        assert_eq!(parse_stress_seed("3735928559").unwrap(), 0xDEAD_BEEF);
+        assert_eq!(parse_stress_seed("0xdeadbeef").unwrap(), 0xDEAD_BEEF);
+        assert_eq!(parse_stress_seed("0XDEADBEEF").unwrap(), 0xDEAD_BEEF);
+        assert_eq!(parse_stress_seed(" 42 ").unwrap(), 42);
+    }
+
+    #[test]
+    fn stress_seed_parser_rejects_malformed_zero_and_overflow() {
+        for raw in ["", "0x", "not-a-seed", "-1", "18446744073709551616"] {
+            assert!(parse_stress_seed(raw).is_err(), "accepted {raw:?}");
+        }
+        assert!(parse_stress_seed("0").unwrap_err().contains("non-zero"));
     }
 
     /// Deep soak — `cargo test --release -- --ignored gemm_fuzz_deep`.

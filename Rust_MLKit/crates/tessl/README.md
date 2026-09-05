@@ -1,6 +1,6 @@
 # tessl
 
-**Low-overhead, zero-host-wait Metal 4 encode and GEMM runtime for Apple Silicon**, built on Metal Performance Primitives (MPP) TensorOps `matmul2d`.
+**Low-overhead, asynchronous Metal 4 encode and GEMM runtime for Apple Silicon**, built on Metal Performance Primitives (MPP) TensorOps `matmul2d`.
 
 `tessl` serves as the high-performance GPU substrate for neural network inference and training on Apple Silicon (e.g., [`gemma-metal`](../../gemma-metal/) and [`tessl-arch02`](../../arch_02_value_resid/metal-native/)).
 
@@ -12,9 +12,9 @@
 - **Hardware-Accelerated GEMM:** Native integration with MPP TensorOps `matmul2d` across NN, TN, and NT layouts in `f32`, `bf16` (with `f32` accumulate), and `tf32-relaxed` precision modes.
 - **Cooperative Register Accumulators:** High-throughput cooperative destination kernels (`get_destination_cooperative_tensor`) holding `f32` accumulators in GPU registers across the entire $K$-reduction, eliminating device memory round-trips for NN, TN, NT, and accumulating paths.
 - **In-Kernel Grid Swizzling & Bounds Checking:** Column-panel tile swizzling for large grids ($\ge 2048$ tiles) bounding operand rereads, combined with origin-shifted slice bounds checking for ragged edges.
-- **Zero-Wait Execution Pipeline:** Packed command encoding with bump-allocated constant arenas (16 MiB) and `MTLSharedEvent` synchronization—host threads never block mid-step.
-- **Neural-Network Kernel Library:** 44 model-agnostic kernels — RMSNorm, gated MLP activations, flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, and softcap/argmax sampling. These were promoted out of `gemma-metal`, where they were reachable only as raw strings through an overlay metallib.
-- **Decode ICB Capture & Replay:** Low-latency Indirect Command Buffer (ICB) capture and ping-pong replay with freeze-binds and range-batching for decode-shaped inference workloads.
+- **Bounded Asynchronous Execution Pipeline:** Packed command encoding with bump-allocated constant arenas (16 MiB), two allocator slots, and `MTLSharedEvent` synchronization. The common path keeps encoding while a peer command buffer runs; when both slots are busy, allocation applies a bounded completion wait instead of growing command-buffer state without limit.
+- **Neural-Network Kernel Library:** 53 measured model-agnostic dispatches — RMSNorm, gated MLP activations, flash attention (sliding-window $h{=}128/256$, global $h{=}512$), fused RMSNorm+QKV+RoPE, MLX-format Q4 GEMV/GEMM, Q8 GEMV, KV-cache stores, embedding lookup, and softcap/argmax sampling. These were promoted out of `gemma-metal`, where they were reachable only as raw strings through an overlay metallib.
+- **Opt-in Decode ICB Capture & Replay:** Low-latency Indirect Command Buffer (ICB) capture for mini and eligible E4B Hot layer graphs, with default-off freeze-binds and range-batching. Generic/full 31B graph capture and true command-buffer replay remain explicit gaps.
 
 > [!IMPORTANT]
 > **Platform Requirements:**
@@ -52,7 +52,7 @@ graph TD
         CmdBuf["MTL4CommandBuffer / Allocator"]
         ArgTable["MTL4ArgumentTable (31-slot)"]
         ResSet["MTLResidencySet (Hot / Cold Pools)"]
-        SharedEvt["MTLSharedEvent (Zero-wait Sync)"]
+        SharedEvt["MTLSharedEvent (Completion + Backpressure)"]
     end
 
     subgraph Shaders["Compiled Metallib Shaders"]
@@ -77,14 +77,14 @@ graph TD
 | [`gemm`](src/gemm.rs) | TensorOps `matmul2d` GEMM — NN, TN, and NT layouts; plain and accumulating; `f32`, `tf32-relaxed`, and `bf16→f32`; split-$K$; register-resident cooperative accumulators (`TILE_COOP_DEFAULT`, `TILE_COOP_NARROW`, `TILE_COOP_TN_NT`, `TILE_COOP_ACCUM`); column-panel grid swizzle; Morton 1D threadgroup dispatch walk. |
 | [`runtime`](src/runtime.rs) | Device initialization, Metal 4 command buffer and compute command encoder orchestration, residency sets, `Hot` / `Cold` / `Bump` buffer pools, packed binder scoping, 16 MiB bump constant arena, and `MTLSharedEvent` synchronization. |
 | [`dispatch`](src/dispatch.rs) | Metal 4 argument-table binding (`MTL4ArgumentTable`), constant staging cursor tracking, and 1D / 2D / 3D dispatch helpers. |
-| [`tensor`](src/tensor.rs) | Bounds-checked `GpuBuffer` / `Tensor` representations, multi-dimensional shape views, stride handling, and data types (`F32`, `Bf16`). |
+| [`tensor`](src/tensor.rs) | Bounds-checked `GpuBuffer` / `Tensor` representations, multi-dimensional shape views, stride handling, and data types (`F32`, `F16`, `Bf16`). |
 | [`ops`](src/ops.rs) | Elementwise utility launches (e.g., `softcap_f32`, activation scaling). |
-| [`nn`](src/nn.rs) | Neural-network kernels promoted out of `gemma-metal`: RMSNorm (`f32`, `bf16`, fused residual-add with layer scale), gated MLP activations (SiLU, `gelu_pytorch_tanh`), Q8 GEMV, KV-cache timestep stores and ring densify. Every entry point validates operand extents on the host before encoding. |
+| [`nn`](src/nn.rs) | Neural-network kernels promoted out of `gemma-metal`: RMSNorm (`f32`, `bf16`, fused residual-add with layer scale), gated MLP activations (SiLU, `gelu_pytorch_tanh`), Q8 GEMV, KV-cache timestep stores and ring densify. Every active raw buffer is checked for both extent and runtime ownership before encoding. KV stores additionally require an explicit logical capacity, allowing safe suballocations even though their live offsets reside on the device. |
 | [`npy`](src/npy.rs) | NumPy `.npy` binary serialization for validating GPU buffer outputs directly against host CPU references. |
 | [`decode_icb`](src/decode_icb.rs) | Indirect Command Buffer (ICB) capture, command stream tracing, freeze-bind argument management, and execution batching. |
 | [`cb_replay`](src/cb_replay.rs) | Ping-pong command buffer replay harness for decode-heavy token generation loops. |
 | [`infer_trace`](src/infer_trace.rs) | Execution tracing, timing hooks, and kernel profiling probes. |
-| [`mtl_tensor`](src/mtl_tensor.rs) | Quantized `MTLTensor` preparation (`Int8`, `Int4`, `Fp8E8M0`) for WWDC26-330 — gated behind the `quant-prep` feature. |
+| [`mtl_tensor`](src/mtl_tensor.rs) | Quantized `MTLTensor` preparation for WWDC26-330 — native `Int8` descriptors today, with `Int4` and `Fp8E8M0` retained as explicit planned/logical types that fail closed until the SDK bindings exist; gated behind the `quant-prep` feature. |
 
 ---
 
@@ -96,7 +96,7 @@ graph TD
 flowchart TD
     subgraph DeviceMemory["Unified System Memory (Metal 4 Device)"]
         subgraph Pools["tessl Managed Pools"]
-            Hot["Hot Pool<br/>(Weights & Persistent State)<br/>Resident for lifetime of run"]
+            Hot["Hot Pool<br/>(Weights & Persistent State)<br/>Resident while logically live"]
             Cold["Cold Pool<br/>(Intermediate Activations)<br/>Recycled + removeAllocation after CB"]
             Bump["Bump Pool<br/>(Per-step Ephemeral Slabs)<br/>Cursor reset on sync"]
         end
@@ -119,13 +119,13 @@ flowchart TD
 
 ### Memory Allocation Policies
 
-- **`BufferKind::Hot`**: Persistent allocations (model weights, optimizer state, KV cache banks). Added to the `MTLResidencySet` once at initialization and retained across steps.
+- **`BufferKind::Hot`**: Persistent allocations (model weights, optimizer state, KV cache banks). They remain resident while a logical owner is live; after the final owner drops, removal waits for all in-flight work and the storage is retired rather than entering the reusable Cold freelist.
 - **`BufferKind::Cold`**: Intermediate activations. Managed via an active freelist pool with a default 2 GiB cap (`DEFAULT_POOL_CACHE_BYTES`). Unused slabs are evicted via `removeAllocation` upon command buffer completion.
 - **`BufferKind::Bump`**: Ephemeral scratch memory allocated linearly from pre-committed slabs. Bump cursors are reset at synchronization points without individual buffer deallocations.
 - **Constant Arena (16 MiB)**: Eliminates per-dispatch host allocation overhead for scalars and small metadata buffers by writing directly into a shared staging buffer at 16-byte aligned offsets.
 
 > [!NOTE]
-> Steady-state execution never synchronizes with the host CPU during forward or backward passes. Synchronization occurs strictly at log, loss, or evaluation boundaries via [`GpuRuntime::synchronize`](src/runtime.rs).
+> The usual steady-state path encodes without a host wait while at least one of the two allocator slots is available. If both slots are still in flight, the runtime applies a bounded `MTLSharedEvent` wait as backpressure. Callers may also request completion explicitly through [`GpuRuntime::synchronize`](src/runtime.rs) or a waiting commit.
 
 ---
 
@@ -142,19 +142,20 @@ flowchart TD
     BackendCheck -- SimdGroup --> SimdGroupKernel["matmul_simdgroup<br/>(Portable SIMD Fallback)"]
     BackendCheck -- TensorOps --> LayoutCheck{"Layout Resolution"}
 
-    LayoutCheck -- "TN / NT Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
-    SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn/nt_splitk_*<br/>(Split-K partial reductions)"]
-    SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn/nt_bf16_f32<br/>(128x64 sg4 Cooperative Destination)"]
+    LayoutCheck -- "TN Layout" --> SplitKCheck{"prefer_tn_splitk?<br/>(K &gt;= 2048, M,N &lt;= 384,<br/>min(M,N) &lt;= 128)"}
+    SplitKCheck -- Yes --> SplitKKernel["matmul2d_tensorops_tn_splitk_*<br/>(Split-K partial reductions,<br/>at most 32 barriered partitions)"]
+    SplitKCheck -- No --> CoopTN["matmul2d_tensorops_tn_*<br/>(128x64 sg4 Cooperative Destination)"]
+    LayoutCheck -- "NT Layout" --> CoopNT["matmul2d_tensorops_nt_*<br/>(128x64 sg4 Cooperative Destination;<br/>NT never splits K)"]
 
     LayoutCheck -- "NN Layout" --> PrecisionCheck{"Precision Mode"}
     
     PrecisionCheck -- "f32 exact" --> F32Exact["matmul2d_tensorops_f32<br/>(Tile: 32x32, 1 simdgroup)"]
     
-    PrecisionCheck -- "bf16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>N &lt;= 512?"}
+    PrecisionCheck -- "bf16 / tf32-relaxed" --> NNTable{"nn_coop_kernel()<br/>N &lt;= 512, M &lt;= 64,<br/>or ceil(M/128)·ceil(N/64) &lt; 64?"}
     
-    NNTable -- "N &lt;= 512 (Narrow)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+    NNTable -- "Yes (Narrow: narrow N, few rows,<br/>or a starved grid)" --> NNNarrow["matmul2d_tensorops_*_64x64_sg4<br/>• TILE_COOP_NARROW (64x64, 4 simdgroups)<br/>• Column-panel swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
     
-    NNTable -- "N &gt; 512 (Default)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• Column-panel swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
+    NNTable -- "No (Default)" --> NNDefault["matmul2d_tensorops_*<br/>• TILE_COOP_DEFAULT (128x64, 4 simdgroups)<br/>• Column-panel swizzle if grid &gt;= 2048 tiles<br/>• Register accumulator, cT.store<br/>• Edge bounds-checked slices"]
 ```
 
 ### Cooperative Destination Tile Execution
@@ -170,7 +171,11 @@ All production `bf16` and `tf32-relaxed` kernels utilize cooperative destination
 
 ## Indirect Command Buffer (ICB) Decode Pipeline
 
-For auto-regressive generation where kernel execution times approach dispatch overheads, `tessl` provides Indirect Command Buffer (ICB) capture and tape replay.
+For auto-regressive generation where kernel execution times approach dispatch
+overheads, `tessl` provides an opt-in Indirect Command Buffer (ICB) capture and
+tape replay path for mini and eligible E4B Hot layer graphs. The diagram below
+describes that supported subset; it is not a generic/full 31B decode pipeline.
+`PingPongCbReplay`'s true command-buffer encode-once path remains scaffolding.
 
 ```mermaid
 sequenceDiagram
@@ -195,11 +200,13 @@ sequenceDiagram
         Host->>Tape: try_replay_icb(runtime)
         Tape->>ICB: executeCommandsInBuffer:withRange: (Zero setArgumentTable host tax)
         Host->>GPU: Submit MTL4CommandBuffer (Ping-Pong buffers)
-        GPU-->>Host: Signal MTLSharedEvent (Zero-wait async execution)
+        GPU-->>Host: Signal MTLSharedEvent (completion / slot reuse)
     end
 ```
 
 ### ICB Optimizations
+
+All three optimizations are default-off and require explicit opt-in:
 
 - **Freeze-Binds (`TESSL_ICB_FREEZE_BINDS=1`):** Inlines buffer bindings and threadgroup memory directly into the ICB commands, reducing host `setArgumentTable` invocations to zero at replay time.
 - **Range-Batching (`TESSL_ICB_RANGE_BATCH=1`):** Coalesces contiguous command spans between execution barriers into unified `executeCommandsInBuffer:withRange:` calls.
@@ -207,7 +214,37 @@ sequenceDiagram
 
 ---
 
-## Performance vs. PyTorch MPS and MLX
+## Performance evidence vs. PyTorch MPS and MLX
+
+> [!CAUTION]
+> No checked-in timing artifact currently satisfies the new publication schema
+> and carries `status: "published"`. Every numeric result in this section is a
+> historical observation from the named source snapshot, even where the prose
+> describes what that run measured in the present tense. It must not be read as
+> a speed claim for the current dirty tree. Re-run the gated driver on a stable
+> host before making one.
+
+### Latest checked-in result snapshot
+
+The compact table below makes the evidence state and ratio direction explicit.
+GEMM entries are throughput ratios (`tessl / comparison`, so greater than one is
+faster). Attention entries are latency ratios (`tessl / comparison`, so less
+than one is faster).
+
+| Historical snapshot | Coverage and sampling | vs. torch MPS | vs. MLX |
+|---|---|---:|---:|
+| GEMM exact f32, rep B | 8/8 shapes; 5 rounds × 30 iterations; 10 warmups | **1.045×** | **0.999×** |
+| GEMM relaxed tf32 against f32, rep B | 8/8 shapes; 5 × 30; 10 warmups | **2.145×** | **1.998×** |
+| GEMM bf16→f32 accumulation, rep B | 8/8 shapes; 5 × 30; 10 warmups | **0.979×** | **2.631×** |
+| Routed attention, rep C | 14/14 configs; 5 rounds × 20 iterations; 5 warmups | **0.624× latency** (~1.60× faster) | **1.150× latency** (15.0% slower) |
+| Decode with 32 launches per submit, three reps | 9/9 decode configs | **0.22× latency** (~4.5× faster) | **0.91–0.97× latency** (~3–9% lower) |
+
+Rep B's candidate-only one-off peaks were **27,734 GFLOP/s bf16**, **17,685
+GFLOP/s tf32**, and **6,888 GFLOP/s exact f32**. They are same-run context, not
+portable peak claims. All six GEMM comparisons breach the current hard 1.25×
+paired-spread ceiling; the worst shape spread is 3.473×. Attention rep C also
+breaches it, reaching 1.538× against torch and 1.785× against MLX. These gate
+failures are why the snapshots remain historical even when a median is large.
 
 Apple M5 Pro, via [`bench/paired_cross_runtime.py`](bench/paired_cross_runtime.py).
 The harness interleaves the tessl and comparison lanes **round by round** rather
@@ -215,9 +252,33 @@ than running each sweep once, because two single sweeps of the identical
 benchmark disagreed by 16–21% on the torch lane alone — more than most of the
 differences being reported. Every geomean below covers the **whole 8-shape
 ladder**; the run aborts rather than averaging over the shapes that happened to
-report. Artifact: [`bench/results/gemm_speed_ladder_m5pro.json`](bench/results/gemm_speed_ladder_m5pro.json).
+report. Artifacts:
+[`gemm_speed_ladder_m5pro.json`](bench/results/gemm_speed_ladder_m5pro.json)
+(the table below) and
+[`gemm_speed_ladder_m5pro_b.json`](bench/results/gemm_speed_ladder_m5pro_b.json),
+an independent repeat on 2026-09-03 at the same settings.
 
-*Geomean of per-shape medians, 5 alternating rounds × 30 iterations, 8 shapes:*
+> [!CAUTION]
+> These are historical schema-v1 artifacts, not publishable evidence for the
+> current tree. They contain no revision/dirty state, executable or metallib
+> hashes, host/runtime/power provenance, or outer-round values. Every one of
+> rep B's six comparisons has at least one shape beyond the new hard 1.25x
+> paired-spread ceiling (the worst is 3.47x), and its `peak_gflops` values are
+> independent one-off maxima. Preserve them as audit history; rerun the current
+> driver and require its `.attempt.json` status to be `published` before making
+> a current speed claim.
+
+**Historical observation:** the aggregate medians were similar on the repeat,
+all six comparisons reporting 8/8 shapes:
+f32 1.071 → 1.045, tf32 2.098 → 2.145, bf16 0.999 → 0.979 against torch; and
+0.979 → 0.999, 1.942 → 1.998, 2.670 → 2.631 against MLX. Every ratio moved by
+less than the round-to-round spread; the gate failures above make this
+descriptive history rather than current performance evidence.
+The *peaks* moved as expected and as warned below — bf16 26,702 → 27,734, tf32
+15,872 → 17,685, f32 6,492 → 6,888.
+
+*Rep A historical geomean of per-shape medians, 5 alternating rounds × 30
+iterations, 8 shapes:*
 
 | Precision Mode | vs. torch MPS | worst shape | best shape | vs. MLX |
 |---|---|---|---|---|
@@ -239,8 +300,9 @@ report. Artifact: [`bench/results/gemm_speed_ladder_m5pro.json`](bench/results/g
 > [!WARNING]
 > **The bf16 row is a correction.** This table previously claimed **1.11×
 > "(Outperforms MPS)"** for bf16. Re-measured over the full ladder it is
-> **1.00×** (5 rounds), and **1.03×** on an independent 9-round × 40-iteration
-> confirmation. tessl bf16 is at *parity* with torch MPS bf16, not ahead of it.
+> **1.00×** (5 rounds), **1.03×** on an independent 9-round × 40-iteration
+> confirmation, and **0.98×** on the 2026-09-03 repeat. tessl bf16 is at *parity*
+> with torch MPS bf16, not ahead of it.
 >
 > The structure matters more than the geomean. Per shape, tessl bf16 wins only
 > on the two smallest squares — 1.26× at 512³ and 1.34× at 1024³, both with
@@ -256,8 +318,8 @@ Reading the rest:
 - **tf32-relaxed's 2.10×** is the one large, robust win, and it reproduces the
   previously recorded 2.01× within round-to-round noise. It is *not* a
   like-for-like comparison — see the accuracy section directly below.
-- **f32 exact at 1.07×** also reproduces its prior figure, but the spread is
-  wide (0.90×–1.62×) and the win is concentrated at 512³; from 2048³ up it is
+- **f32 exact at 1.07×** was also close to its prior historical figure, but the
+  spread is wide (0.90×–1.62×) and the win is concentrated at 512³; from 2048³ up it is
   0.92×–1.06×, i.e. parity.
 - **The 2.67× over MLX bf16 says more about MLX than about tessl.** MLX's bf16
   matmul peaks at 6,850 GFLOP/s here against torch MPS's 26,104 — roughly 4×
@@ -278,8 +340,48 @@ Reading the rest:
 >   happens when they are.
 > - **Clock drift.** Single-run cross-runtime benchmarks fluctuate 15–20% on
 >   identical workloads under the Apple Silicon power governor. Always use a
->   paired, interleaved sweep — `paired_cross_runtime.py` for cross-runtime, or
->   `bench_gemm_coop_ab` / `bench_gemm_tnnt_tune` for kernel-vs-kernel A/B.
+>   paired, interleaved sweep — `bench/paired_cross_runtime.py` for cross-runtime
+>   GEMM, `bench/attn_paired.py` for attention. Both retain every outer-round
+>   child-reported median and run provenance (the child tools do not emit their
+>   inner per-iteration timings); summary arrays are consequently named
+>   `outer_round_values`, not raw iteration samples. They aggregate paired ratios
+>   by medians and refuse
+>   an artifact by default when any paired max/min ratio spread exceeds 1.10x;
+>   the evidence-mode cap itself is bounded at 1.25x. Evidence runs require an
+>   even outer-round count of at least 4 (default 6) for exact AB/BA balance,
+>   plus at least 3 timed samples inside each child median. `--out` is replaced
+>   atomically only after every gate passes; `<out>.attempt.json` marks the
+>   latest attempt `not_published` until then, so a preserved older result
+>   cannot be mistaken for the failed rerun.
+>   Inherited benchmark/runtime tuning prefixes are cleared before each child;
+>   the artifact records only explicit overrides and never serializes the full
+>   process environment (which may contain credentials). Publishable paths under
+>   the invoking user's home are normalized to `$HOME/...` while the real input
+>   files are hashed. The output parent directory must already exist; the driver
+>   never creates an implicit destination tree.
+>
+>   Thermal, power-source, and normalized load observations are provenance,
+>   not acceptance gates: `pmset` is macOS-specific and does not always expose
+>   a numeric thermal state, while load average is workload- and CPU-count-
+>   dependent and the benchmark contributes to it. The portable enforceable
+>   stability signal is the paired ratio-spread gate; the artifact states this
+>   policy explicitly rather than silently treating a missing probe as healthy.
+> - **Kernel-vs-kernel GEMM A/B: `bench_gemm_tnnt_tune`.** It interleaves — every
+>   arm is timed once per round in exact forward/reverse order pairs, and it reports the median of
+>   the *per-round ratios* plus their spread, not a ratio of two blocked medians.
+>   `BENCH_ROUNDS` must be even and at least 2 (default 4). When the baseline itself
+>   moves more than 10% across rounds the run fails and names the spread,
+>   because that is the state in which no number
+>   on the row means anything.
+>
+>   This bullet named `bench_gemm_coop_ab` until 2026-09-03, and that binary was
+>   never in the crate — no source, no `[[bin]]`, and
+>   `cargo build --bin bench_gemm_coop_ab` errors; only a stale 2026-08-30
+>   executable in `target/release/` kept the name looking live. The interleaving
+>   it was credited with did not exist anywhere in the Rust binaries, which both
+>   used the blocked protocol this note warns against. It exists now.
+>   [`tests/docs_name_real_tools.rs`](tests/docs_name_real_tools.rs) fails the
+>   suite if a doc ever again names a binary that is not there.
 
 ## Flash attention
 
@@ -288,12 +390,13 @@ lane at all**. [`bench_flash_attn`](src/bin/bench_flash_attn.rs) and
 [`bench/attn_paired.py`](bench/attn_paired.py) closed that over prefill and
 decode configurations at 4:1 GQA — and the measurement found the kernels were
 **11× slower than torch-MPS and 20.5× slower than MLX**, geomean, with a worst
-case of 271×. Two structural causes, one routing cause and four
-throughput causes are now fixed, in that order — each one findable only after
-the one before it had been.
+case of 271×. In the measured historical development sequence, two structural
+changes, one routing change, and four throughput changes followed in that
+order — each one findable only after the one before it had been.
 
-**Shipping path vs. the baselines, 5 alternating rounds x 20 iterations, over
-the same 10 configurations before and after. >1 means tessl is slower.**
+**Historical shipping-path snapshots vs. the baselines, 5 alternating rounds
+x 20 iterations over the same 10 configurations before and after. >1 means
+tessl was slower in that snapshot.**
 
 | | torch before | torch after | MLX before | MLX after |
 |---|---|---|---|---|
@@ -308,27 +411,38 @@ below](#the-decomposition-predicts-which-numbers-are-stable-and-it-is-right).
 Four configurations were added afterwards to probe things the original set could
 not see — two large-batch decodes (`B·H` = 1024 and 2048) for the routing rule,
 one with GQA switched off to separate issued K/V traffic from unique, and one at
-`Hkv = 1` to calibrate the measurement noise floor. Over all 14: **0.63–0.65x vs
-torch**, **1.18–1.26x vs MLX**. Both reps:
-[A](bench/results/attn_speed_routed_m5pro.json),
-[B](bench/results/attn_speed_routed_m5pro_b.json), against
-[before](bench/results/attn_speed_m5pro.json).
+`Hkv = 1` to calibrate the measurement noise floor. Over all 14: **0.62–0.65x vs
+torch**, **1.15–1.26x vs MLX**. Three reps:
+[A](bench/results/attn_speed_routed_m5pro.json) (0.645 / 1.256),
+[B](bench/results/attn_speed_routed_m5pro_b.json) (0.629 / 1.182),
+[C](bench/results/attn_speed_routed_m5pro_c.json) (0.624 / 1.150, 2026-09-03),
+against [before](bench/results/attn_speed_m5pro.json).
+
+> [!CAUTION]
+> Rep C is also a historical schema-v1 artifact: it records neither load nor
+> code/device provenance nor outer-round values. Both comparison lanes breach
+> the new hard 1.25x paired-spread ceiling (worst 1.54x vs torch and 1.78x vs
+> MLX). Its ratios remain useful as an audit clue, but do not establish current
+> performance; a current claim requires a newly `published` gated artifact.
 
 > [!IMPORTANT]
 > **These are the numbers from a machine that had been benchmarking for hours,
 > and they are the worse of the states measured.** An earlier run of the same
 > sweep on a cool machine gave prefill **0.91x**, decode **1.49x**, all-10
-> **1.17x** against MLX — so the full observed range across four runs is
-> 1.16–1.29x. The whole difference sits in the decode configs, whose
-> wall clock is 8–29% kernel and the rest host dispatch — see
+> **1.17x** against MLX — so the full observed range across five runs is
+> 1.15–1.29x, the low end being rep C above. The whole difference sits in the
+> decode configs, whose wall clock is 8–29% kernel and the rest host dispatch — see
 > [below](#the-decomposition-predicts-which-numbers-are-stable-and-it-is-right),
 > where that turns out to be a prediction the decomposition makes and passes.
-> The loaded numbers are published because picking the cooler run would be
-> choosing the flattering half of a measurement whose spread is understood.
+> The loaded numbers were retained in the historical record because picking
+> the cooler run would choose the flattering half of a measurement whose
+> spread was understood. “Retained” is not `status: "published"` under the
+> current evidence gate.
 
-**Prefill is ahead of MLX in both states**, and `swa128_prefill_4096` runs at
-half MLX's wall clock or better (37.3 ms against 82.9 loaded; 25.4 against 51.5
-cool). Decode's wall-clock gap is dispatch, decomposed next.
+**In those historical runs, prefill measured ahead of MLX in both states**, and
+`swa128_prefill_4096` measured at half MLX's wall clock or better (37.3 ms
+against 82.9 loaded; 25.4 against 51.5 cool). The observed decode wall-clock
+gap is decomposed next.
 
 #### Where the remaining gap sits — and how much of it is real
 
@@ -346,9 +460,9 @@ whole reason decode's wall clock behaves as it does. The KV-split path is two
 dispatches — partial then reduce — so at one launch per submit it pays **two**
 round trips where MLX's single-kernel decode pays one. The submit column below
 comes out at 339–470 us, i.e. ~170–235 us apiece, bracketing the one-submit cost
-the elementwise kernel shows in the same states. Decode is not slow here; it is charged twice
-for a protocol nobody uses in a real decode loop, and that charge is levered to
-whatever the host is doing.
+the elementwise kernel shows in the same states. In that historical
+decomposition, decode was charged twice for a protocol a real decode loop does
+not use, and that charge was levered to whatever the host was doing.
 
 `bench/attn_tune.py --knob batched` sweeps launches-per-submit to separate the
 two — 3 interleaved rounds, shipping routed path
@@ -400,10 +514,10 @@ Re-run with submits amortized, over the 9 decode configs, three repetitions
 | **vs torch-MPS** | 0.59–0.60x | **0.22x** — 4.5x faster |
 | **vs MLX** | 1.37–1.45x | **0.91–0.97x** |
 
-So most of the answer to "why is it slower" is **it isn't** — the measurement was
-dominated by dispatch cost, and with that removed the decode kernels are *ahead*
-of MLX overall and at every config but the D=512 pair. Per-config medians of the
-three reps: `swa128_decode_4k` **0.78x**, `swa128_decode_b64_1k` 0.84x,
+In those runs, most of the apparent slowdown came from dispatch cost. With that
+cost amortized, the historical decode snapshots measured *ahead* of MLX overall
+and at every config but the D=512 pair. Per-config medians of the three reps:
+`swa128_decode_4k` **0.78x**, `swa128_decode_b64_1k` 0.84x,
 `swa128_decode_b32_1k` 0.86x, `swa128_decode_b8_4k` 0.89x, `swa256_decode_4k`
 0.94x, `swa128_decode_1k` 0.99x, `global512_decode_4k_mqa` 1.02x.
 
@@ -411,13 +525,15 @@ three reps: `swa128_decode_4k` **0.78x**, `swa128_decode_b64_1k` 0.84x,
 > The MLX geomean spread across those three reps is **6.5%** (0.91 to 0.97), and
 > an earlier set of three on a cooler machine agreed to 0.3% (0.952–0.955). Both
 > are real; the wider one is what this hardware does after hours of continuous
-> benchmarking. The range is published rather than the tightest run, because
+> benchmarking. The wider range was recorded rather than the tightest run,
+> because
 > picking the tightest run is how a 0.3% claim gets made about a 6.5%
-> measurement.
+> measurement. “Recorded” does not mean currently publishable evidence.
 
-**The one gap left is `global512_decode_4k`, 1.13x kernel-only** (1.05/1.13/1.20
-across the three reps). What it is *not* is a GQA problem, and the control
-config settles that: `global512_decode_4k_mha` is the same shape with `Hkv = H`,
+**The one gap in those snapshots was `global512_decode_4k`, 1.13x
+kernel-only** (1.05/1.13/1.20 across the three reps). The historical control
+indicated it was *not* a GQA problem: `global512_decode_4k_mha` is the same
+shape with `Hkv = H`,
 so it issues the same bytes through the load path while reading four times as
 many unique ones, which makes it DRAM-bound by construction. It sits at
 **1.14x** — the same deficit, with the GQA re-read removed. So what is left is
@@ -439,11 +555,13 @@ layout — which is what the next section did, and measured, and undid.
 #### The KV layout, changed and measured and put back
 
 The obvious explanation for that residual was the cache layout. tessl's K/V are
-`[B, Tkv, Hkv, D]` — sequence-major, which is what the cache *writer* wants,
-since appending a token is one contiguous `Hkv*D` store. torch and MLX both take
-`[B, H, S, D]`, head-major, where one simdgroup walking the key axis issues a
-sequential stream instead of 2 KB blocks strided by `Hkv*D`. On a pure DRAM
-stream — the `Hkv = H` control — MLX is 1.14x ahead, and a strided walk is
+`[B, capacity, Hkv, D]` — sequence-major with a fixed per-batch capacity and
+only the first live `Tkv` positions visited. This is what the cache *writer*
+wants, since appending a token is one contiguous `Hkv*D` store. The fixed stride
+also means growing `Tkv` never moves a later batch's base address. torch and MLX
+both take `[B, H, S, D]`, head-major, where one simdgroup walking the key axis
+issues a sequential stream instead of 2 KB blocks strided by `Hkv*D`. On a pure
+DRAM stream — the `Hkv = H` control — MLX is 1.14x ahead, and a strided walk is
 exactly the kind of thing that produces that.
 
 So it was built. The KV-split kernel took explicit `(batch, head, position)`
@@ -695,7 +813,8 @@ opposite case and need it.
 **Lanes per key (`R`) and keys per chunk (`CH`), KV-split path.** When these
 were first swept, decode ran at **0.6% of ALU peak and 5% of bandwidth** — far
 off *both* roofs, latency bound, and the prefill `D/R = 16` rule only half
-applied. That is no longer where it sits. Measured on the current kernels:
+applied. In the historical schema-v1 snapshot, the then-current kernels
+measured:
 
 | config | GFLOP/s | % ALU peak | GB/s |
 |---|---|---|---|
@@ -704,9 +823,10 @@ applied. That is no longer where it sits. Measured on the current kernels:
 | `swa256_decode_4k` | 384 | 5.9% | 192 |
 | `global512_decode_4k` | 446 | 6.9% | 223 |
 
-Decode is now **bandwidth bound**, not latency bound, and under a tenth of the
-ALU roof. That is why the last few rounds of tuning stopped paying: the knobs
-move latency and occupancy, and the binding constraint had moved to memory.
+In that snapshot, decode measured **bandwidth bound**, not latency bound, and
+under a tenth of the ALU roof. That observation explained why the last tuning
+rounds stopped paying there: the knobs moved latency and occupancy after the
+measured binding constraint had moved to memory.
 
 **What that bandwidth is a fraction of took measuring, not assuming.** This file
 used to divide by "~400 GB/s", a figure never checked on this machine. Run
@@ -986,13 +1106,18 @@ Reading the three speed rows against these:
 > when a budget is breached it names whether tessl alone, the comparison runtime
 > alone, or every runtime exceeded it, because those call for opposite responses.
 >
-> [`bench/test_parity_harness.py`](bench/test_parity_harness.py) holds **94
-> assertions** against that whole class — adversarial dumps, grid-merge cases,
+> [`bench/test_parity_harness.py`](bench/test_parity_harness.py) holds adversarial
+> checks against that whole class — adversarial dumps, grid-merge cases,
 > budget verdicts, the attention drivers' coverage and batching guards, the
-> tuning knob table, and CLI/env contracts. Only the CLI sections need a GPU:
+> tuning knob table, and CLI/env contracts. `--pure` never launches the two
+> GPU-backed CLI sections; `--require-gpu` makes the unavailability of either
+> section a failing exit. Every mode emits a machine-readable
+> `HARNESS_SUMMARY`, and an optional skip is reported as `PASS WITH SKIPS`, never
+> as a complete pass:
 >
 > ```bash
-> python3 bench/test_parity_harness.py
+> python3 bench/test_parity_harness.py --pure
+> python3 bench/test_parity_harness.py --require-gpu
 > ```
 
 ---
@@ -1033,7 +1158,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Consuming Kernels from Downstream Crates
 
-Downstream crates building their own `default.metallib` can directly compile `tessl` shaders without copying source files. `tessl` exports `DEP_TESSL_KERNELS` via `links = "tessl"`.
+Downstream crates building their own metallib can directly compile `tessl`
+shaders without copying source files. Through `links = "tessl"`, the build
+script exports `DEP_TESSL_KERNELS` for the canonical sources and
+`DEP_TESSL_METALLIB` for the immutable compiled artifact in Tessl's `OUT_DIR`.
+It never writes a generated library into Tessl's source directory.
 
 In downstream `build.rs`:
 ```rust
@@ -1061,20 +1190,22 @@ rt.add_metallib(Path::new("/path/to/custom_overlay.metallib"))?;
 ## Verification & Hardening Suite
 
 ```bash
-# Run unit and integration tests (single-threaded for GPU context safety)
-cargo test --release --lib -- --test-threads=1
+# Run unit, integration, and doc tests (single-threaded for GPU context safety).
+# Do not add `--lib`: that would omit every integration-test binary under `tests/`.
+cargo test --release -- --test-threads=1
 
 # Validate static TileGeom definitions against compiled Metal kernel constants
 python3 scripts/audit_gemm_tiles.py
 
-# Run randomized adversarial shape fuzzing (with self-asserting kernel coverage)
+# Run randomized adversarial shape fuzzing (numeric correctness; the dispatch
+# coverage census is a separate `bench/kernel_coverage.py --check` command)
 # Quick fuzz (160 cases) runs as part of the ordinary suite:
 cargo test --release --lib -- --test-threads=1 --nocapture gemm_fuzz_quick
 
 # Deep soak (2500 cases), #[ignore]d so it stays out of the default run:
 cargo test --release --lib -- --ignored --test-threads=1 --nocapture gemm_fuzz_deep
 
-# Replay a specific failing seed:
+# Replay a specific failing seed (decimal or `0x`-prefixed u64):
 STRESS_SEED=0xdeadbeef cargo test --release --lib -- --test-threads=1 gemm_fuzz_quick
 ```
 
@@ -1094,7 +1225,10 @@ Cross-references every Rust `TileGeom` struct against the `constexpr int SM/SN` 
 
 ## Benchmarking & Tuning Binaries
 
-Tuning and A/B verification kernels (92 measurement variants) are excluded from the default metallib to keep release binaries lightweight (0.20 MB vs. 1.07 MB).
+Tuning and A/B verification kernels are excluded from the default metallib. Measured against the compiled libraries with `xcrun metal-nm` on 2026-09-03: the default metallib holds **147 entry points at 1.13 MB**, and `TESSL_GEMM_TUNE=1` adds **34** `mm_bf16_*` variants (28 macro instantiations in `kernels/tune/matmul_tensorops_tune.metal`) for **181 at 1.46 MB**.
+
+> [!WARNING]
+> This paragraph read "92 measurement variants" and "0.20 MB vs. 1.07 MB" until 2026-09-03. Both predate the promotion of the NN and attention kernels into this crate, which is what took the *default* library past the size the tuning build used to be. The counts above are `metal-nm` output, not a source scan — the same method the [coverage census](#benchmark-coverage-147147-measured) uses, and for the same reason: a scan for `^kernel void` cannot see macro-instantiated kernels.
 
 To build with tuning kernels enabled:
 ```bash
@@ -1103,9 +1237,8 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 
 | Binary | Description & Usage |
 |---|---|
-| `bench_gemm_tnnt_tune` | TN/NT tile sweep; the paired, round-interleaved A/B comparison lane. |
-| `bench_gemm_tile_tune` | Exhaustive tile geometry ($SM \times SN$) and $BK$ ladder benchmark. |
-| `bench_gemm_tnnt_tune` | Paired A/B tuning evaluation for TN/NT descriptor and accumulate kernels. |
+| `bench_gemm_tnnt_tune` | TN / NT / TN-accum kernel A/B against the production baseline, plus the NN grid-swizzle lane. **Counterbalanced**: an even `BENCH_ROUNDS` count (default 4) runs exact forward/reverse order pairs, reports the median of per-round ratios and their spread, and fails when baseline spread exceeds 10%. One output buffer per shape, shared by every candidate. |
+| `bench_gemm_tile_tune` | Exhaustive tile geometry ($SM \times SN$) and $BK$ ladder benchmark. Still blocked timing — use `bench_gemm_tnnt_tune` for any comparison you intend to quote. |
 | `bench_gemm_sweep` | Cross-runtime GEMM timing (`f32`, `tf32`, `bf16`), JSON out. `--dump-parity DIR` writes operands and every lane's result for the numeric scorer. |
 | `bench_flash_attn` | The attention kernels over 14 prefill/decode configs, timing the tiled baseline, the shipping routed path, and each fast kernel in one run. `--dump-parity DIR` writes Q/K/V and *every* implementation's output for the f64 scorer; it refuses to run under a tuning override. |
 | `probe_gemm_parity` | Bit-exact verification probe comparing TensorOps against reference SIMD implementations. |
@@ -1117,7 +1250,7 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 | `bench_gemm_variants` | TN / NT / accumulate / split-K / batched / epilogue / f16 GEMM lanes. |
 | `bench/attn_tune.py` | Sweeps the attention tuning knobs in interleaved rounds and reports the winner per config. |
 | `bench/kernel_coverage.py` | Measures which kernels the suite actually dispatches, via `TESSL_KERNEL_TRACE`. `--check` gates on 100%. |
-| `bench/test_parity_harness.py` | Adversarial tests for every harness. Only the CLI sections need a GPU. |
+| `bench/test_parity_harness.py` | Adversarial tests for every harness. Use `--pure` without GPU dispatch and `--require-gpu` when skipped GPU CLI contracts must fail the run. |
 
 ---
 
@@ -1127,17 +1260,18 @@ All runtime configuration parameters use the canonical `TESSL_*` prefix. Legacy 
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `TESSL_GEMM_TUNE` | `0` | Compiles extended 92-kernel A/B tuning suite into metallib (build-time). |
+| `TESSL_GEMM_TUNE` | `0` | Adds the 34-kernel A/B tuning set to the metallib (build-time). |
 | `TESSL_GEMM_ACCUM` | `0` | Enables native TensorOps `multiply_accumulate` for TN/NT accumulate paths. |
 | `TESSL_GEMM_ACCUM_DX` | `0` | Enables hardware accumulate path specifically for $dX$ NT GEMM. |
 | `TESSL_GEMM_INTERIOR` | `0` | Enables interior-offset tile optimizations for `f32` GEMM. |
-| `TESSL_HAZARD_BARRIERS` | `0` (barriers on) | **Unsafe, do not enable.** `1` *removes* the always-on Dispatch→Dispatch device barrier. The sense is the opposite of what this row said until 2026-08-31, and following the old wording to "enforce barriers" removed them. Enabling it requires the caller to place an explicit `Binder::barrier` at every RAW edge, and tessl's own ops do not: measured on an M5 Pro, `gemm_tn_accum_train` 64×64×128 under async encode produced wrong results in **300 of 300** repetitions with this set, and `stress_mapping_reentry_and_queued_copies` fails 3/3. |
+| `TESSL_HAZARD_BARRIERS` | `0` (barriers on) | `1` *removes* the always-on Dispatch→Dispatch device barrier after every dispatch (the sense is the opposite of what this row said until 2026-08-31). Packed multi-dispatch ops still place explicit `Binder::barrier` calls at their internal RAW edges, and since 2026-09-04 the runtime orders the edge between consecutive `with_binder` scopes on a shared encoder: a scope that ends with an unbarriered dispatch makes the next scope's first dispatch emit one barrier, and an explicit `Binder::barrier` clears that pending edge, so a caller that already barriers its own edges pays nothing extra. Before that, every cross-scope edge was unordered — measured on an M5 Pro, `gemm_tn_accum_train` 64×64×128 under async encode produced wrong results in **300 of 300** repetitions with this set. Off by default; enabling it trades the per-dispatch barrier for one per op. |
 | `TESSL_COARSE_BARRIERS` | inherits `TESSL_HAZARD_BARRIERS` | Replaces per-RAW barriers with coarse phase-level synchronization. |
 | `TESSL_MID_COMMIT=N` | `0` | Overlaps host command encoding with GPU execution every $N$ dispatches. |
 | `TESSL_DECODE_ICB` | `0` | Enables Indirect Command Buffer capture and execution path. |
 | `TESSL_ICB_FREEZE_BINDS` | `0` | Freezes argument table buffer bindings directly into ICB commands. |
 | `TESSL_ICB_RANGE_BATCH` | `0` | Coalesces contiguous ICB command ranges into single execution dispatches. |
-| `TESSL_SKIP_AOT` | `0` | Bypasses `build.rs` AOT shader compilation and reuses existing `default.metallib`. |
+| `TESSL_SKIP_AOT` | `0` | Bypasses AOT compilation only when `TESSL_PREBUILT_METALLIB` names an existing absolute path. No implicit crate-root artifact is accepted. |
+| `TESSL_PREBUILT_METALLIB` | unset | Explicit immutable metallib input for `TESSL_SKIP_AOT`; tracked by Cargo and embedded after canonicalization. |
 
 Benchmark-only variables, read by the sweep binaries rather than the runtime.
 All of them **fail loud** on a malformed or unknown value rather than falling
@@ -1177,7 +1311,7 @@ back to the default silently.
 
 - [`../../docs/gemm_architecture.md`](../../docs/gemm_architecture.md): Deep-dive into cooperative accumulator gates, $K$-reduction bandwidth analysis, and arithmetic proofs.
 - [`../../docs/metal4_mpp.md`](../../docs/metal4_mpp.md): Low-level Metal 4 and Metal Performance Primitives integration guidelines.
-- [`bench/results/bf16_tile_tune_FINDINGS.md`](bench/results/bf16_tile_tune_FINDINGS.md): Empirical tuning log documenting $BK$ ladder benchmarks, root causes, and landed M5 Pro speedups.
+- [`bench/results/bf16_tile_tune_FINDINGS.md`](bench/results/bf16_tile_tune_FINDINGS.md): Historical tuning log documenting the $BK$ ladder, root causes, and landed kernel-selection changes. Its timings predate the current evidence schema.
 
 ---
 
@@ -1200,6 +1334,12 @@ gemm_epilogue(&a, &b, &c, GemmBackend::TensorOps, Epilogue {
 
 Bias is per-column and broadcasts across rows through a **row-stride-0 tensor view**, so the same cooperative `load` that fetches `C_prev` fetches the bias with no separate indexing.
 
+> [!CAUTION]
+> The epilogue numbers below are a historical diagnostic from a host at load
+> average 52. They predate the current revision/hash/provenance and paired-spread
+> publication gates. They support the fusion design, but are not a current-tree
+> speed claim.
+
 | shape | `gemm` | fused | `gemm` + one pass over C | epilogue cost | vs one pass |
 |---|---:|---:|---:|---:|---:|
 | 512³ | 0.377 ms | 0.558 ms | 0.661 ms | 0.181 ms | **1.57× cheaper** |
@@ -1208,7 +1348,10 @@ Bias is per-column and broadcasts across rows through a **row-stride-0 tensor vi
 
 `cargo run --release --example epilogue_cost`. The comparison arm is `gemm` plus a *single* `add_inplace_f32` sweep — strictly less work than a real bias broadcast, and half the work of bias plus a separate activation. Fusing beats even that lower bound at every shape. All three arms are GPU-side in one interleaved run, so the machine's load average of 52 during measurement affects them alike.
 
-`Activation::GeluTanh` is the same clamped `precise::tanh` formulation as `nn::mlp_gelu_tanh`, deliberately copied rather than re-derived: at `-O2` MSL lowers plain `tanh` to `air.fast_tanh`, which returns NaN past roughly |10|, and a crate with two different GELUs would be a worse defect than a slow one.
+`Activation::GeluTanh` and `nn::mlp_gelu_tanh` both delegate to the clamped
+`precise::tanh` implementation in `kernels/gelu.h`: at `-O2` MSL lowers plain
+`tanh` to `air.fast_tanh`, which returns NaN past roughly |10|, so the two paths
+share one canonical numerical contract.
 
 It requires the cooperative-destination path — bf16 operands, or f32 with relaxed precision. The exact-f32 and simdgroup kernels write `C` straight from the matmul with no register accumulator, so there is nothing to fuse into; those are refused rather than silently falling back to separate dispatches, which would make the call quietly slower than the unfused code it replaced.
 
@@ -1216,16 +1359,20 @@ It requires the cooperative-destination path — bf16 operands, or f32 with rela
 
 ## 🧭 Known gaps
 
-Recorded rather than implied. All kernels are wired to a typed Rust API, the suite is warning-free, and there are no stubs; these are capabilities the crate does not have.
+Recorded rather than implied. Production kernel dispatches are wired to typed
+Rust APIs and the suite is warning-free; explicitly named replay scaffolding is
+kept separate from working paths.
 
-Four of the six original entries here have since shipped: the [fused epilogue](#-fused-gemm-epilogue), row-wise reductions (`nn::softmax_rows_f32`, `row_sum_f32`, `row_max_f32`), IEEE binary16 (`DType::F16` with casts and GEMM), and strided batched GEMM (`gemm_batched`). What remains is one upstream block, one deliberate choice, and two gaps this crate's own attention work opened or exposed.
+Four original gaps have since shipped: the [fused epilogue](#-fused-gemm-epilogue), row-wise reductions (`nn::softmax_rows_f32`, `row_sum_f32`, `row_max_f32`), IEEE binary16 (`DType::F16` with casts and GEMM), and strided batched GEMM (`gemm_batched`). Current gaps follow.
 
 | Gap | Why it matters | Why not yet |
 |---|---|---|
 | **Int4 TensorOps GEMM** | Half the weight bandwidth of int8. | TensorOps accepts `int4b_format` — the gap is the shader-side tensor constructor for a sub-byte element type, not the objc2 binding this table used to blame. `nn::gemm_i8_dequant` ships the int8 case. |
 | **No CPU fallback** | No Metal 4 device means nothing runs. | Deliberate: the crate is an Apple-silicon runtime, and a silent CPU path would make "GPU" benchmarks meaningless. |
+| **No generic/full 31B ICB graph replay** | The working DecodeIcb path covers mini and eligible E4B Hot layer graphs, not every model/session shape. | True command-buffer encode-once remains scaffolded in `cb_replay`; full 31B capture needs stable binds and eligibility proof for the complete graph. All ICB modes remain opt-in/default-off. |
 | **The fast attention paths have no ICB entry point** | `gemma-metal` — the one in-tree consumer — reaches only the *tiled* kernels, so it gets none of the row-parallel or KV-split work. | `flash_attn_swa_with_scalars` is the scalar-binder form an indirect command buffer needs, and it dispatches the tiled kernel; `flash_attn_rows` and `flash_attn_decode` have no `_with_scalars` variant. The KV-split path also allocates a partials scratch and issues two dispatches, neither of which fits a frozen-bind ICB without design. Not measured end-to-end for `gemma-metal`, so no speedup is claimed here — only that the faster kernels are unreachable from that call path. |
-| **D=512 decode is ~1.2x off MLX** | The one attention shape not at parity; everything else is level or ahead. | Characterised, not guessed: it is not GQA re-read (the `Hkv = H` control shows the same deficit) and not the cache layout (built, measured bit-identical, 5x under the noise floor — [see above](#the-kv-layout-changed-and-measured-and-put-back)). What is left is D=512 streaming efficiency; the `Hkv = H` control shows the same 1.14x on a pure DRAM stream. |
+| **bf16 GEMM writes an f32 C where torch and MLX write bf16** | Twice the output bytes on every store. Measured: torch MPS and MLX both return bf16 from a bf16 matmul; tessl's kernels are `bf16_f32` and the sweep allocates `alloc_tensor_f32(&[m, n])`. Across the four large ladder shapes the deficit tracks C-bytes-per-FLOP — 0.90x at `8192x3072x768` (50 MB of extra store) and 0.92x at `4096x4096x1024`, against 1.04x and 0.97x on the two that write least. n=4 with one inversion, so this is a *candidate* cause, not a settled one. | **Blocked at the API, and this was tried.** `cooperative_destination_tensor::store` is constrained `is_same_v<element_type, tensor::value_type>` — it does not convert, so an f32 accumulator cannot store to a bf16 tensor, and the compiler rejects it. The only route is a bf16 *destination cooperative tensor*, which would make `op.run` accumulate at bf16 and break the crate's f32-accumulate contract; whether MPP keeps an internal f32 accumulator in that case is not stated in `metal_cooperative_tensor` and was not assumed. Landing this needs that question answered first, then a numeric check against the f64 reference — not a kernel added on the guess. |
+| **Historical D=512 decode snapshot was ~1.2x off MLX** | It was the one attention shape not at parity in those runs. | The historical controls indicate it was not GQA re-read (`Hkv = H` showed the same deficit) or the cache layout (built, measured bit-identical, 5x under that run's noise floor — [see above](#the-kv-layout-changed-and-measured-and-put-back)). A current gated run is still required to quantify D=512 streaming efficiency. |
 
 The typed `nn` API covers 11 kernels in depth (RMSNorm, MLP gating, Q8 GEMV, KV stores) and the remaining promoted ones through shape-checked entry points; the MLX Q4 family is reached via `Q4MlxBank` rather than 15 separate signatures.
 
@@ -1238,6 +1385,9 @@ kernel is selected — and each bench binary prints its trace on exit, on every
 exit path including early returns and errors.
 
 ```bash
+cargo build --release --bins
+# Resolves the exact OUT_DIR metallib embedded in bench_gemm_sweep. An explicit
+# artifact can instead be supplied with --metallib /absolute/path/to/file.
 python3 bench/kernel_coverage.py --check   # non-zero if any kernel is unmeasured
 ```
 
@@ -1264,8 +1414,8 @@ dispatch parameter, so sweeping it costs no kernels at all.
 > - **The census was wrong.** A scan for `^kernel void` misses every kernel
 >   declared through the `NN_COOP_KERNEL` / `TN_NT_COOP_KERNEL` macro families —
 >   16 entry points, including every `_64x64_sg4` cooperative variant. The true
->   count was **84** at the time, confirmed against `xcrun metal-nm
->   default.metallib`; it is **147** now that the attention kernels are
+>   count was **84** at the time, confirmed against `xcrun metal-nm` on the
+>   compiled library; it is **147** now that the attention kernels are
 >   parameterized on their tuning constants.
 > - **Coverage was inferred, not measured.** Grepping a kernel's name out of the
 >   bench sources reported `matmul2d_tensorops_*` as untimed (it is reached

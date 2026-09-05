@@ -17,9 +17,10 @@
 //! Gemma-specific kernels stayed behind: Per-Layer Embeddings (`ple_lookup*`)
 //! and the persistent-interpreter prototype (`persistent_interp*`).
 //!
-//! Quantized `MTLTensor` hooks (WWDC26-330) live in `mtl_tensor`, behind the
-//! off-by-default `quant-prep` feature — prep only, the prefill entry point
-//! still returns an error.
+//! Quantized `MTLTensor` allocation and readiness hooks (WWDC26-330) live in
+//! `mtl_tensor`, behind the off-by-default `quant-prep` feature. The module is
+//! prep only: it reports that its host-side quantized prefill path is unwired
+//! instead of exposing a callable entry point that can only fail.
 //!
 //! # Unsafe code
 //!
@@ -69,11 +70,11 @@ pub use cb_replay::{
 };
 pub use decode_icb::{
     begin_decode_icb_capture, binder_encode_nop, decode_icb_capture_active, decode_icb_enabled,
-    icb_coarse_ranges_enabled, icb_freeze_binds_enabled, icb_pipelines_enabled,
-    icb_range_batch_enabled, pipeline_icb, set_binder_encode_nop, set_decode_icb,
-    set_icb_coarse_ranges, set_icb_freeze_binds, set_icb_pipelines, set_icb_range_batch,
-    take_decode_icb_capture, BinderEncodeNopGuard, DecodeIcb, DecodeIcbBind, DecodeIcbCapture,
-    DecodeIcbCommand,
+    end_decode_icb_capture, icb_coarse_ranges_enabled, icb_freeze_binds_enabled,
+    icb_pipelines_enabled, icb_range_batch_enabled, pipeline_icb, set_binder_encode_nop,
+    set_decode_icb, set_icb_coarse_ranges, set_icb_freeze_binds, set_icb_pipelines,
+    set_icb_range_batch, take_decode_icb_capture, BinderEncodeNopGuard, DecodeIcb, DecodeIcbBind,
+    DecodeIcbCapture, DecodeIcbCommand,
 };
 pub use gemm::{
     cast_f16_to_f32, cast_f32_to_f16, gemm, gemm_batched, gemm_epilogue, gemm_f32, Activation,

@@ -206,12 +206,13 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
         for i in 0..8 {
             let t = rt.bump_alloc_f32(&[64]).unwrap();
             assert!(
-                t.buffer.read_f32()[t.byte_offset / 4..][..64]
-                    .iter()
-                    .all(|&x| x == 0.0),
+                t.read_f32().unwrap().iter().all(|&x| x == 0.0),
                 "bump slice {i} was not zeroed"
             );
-            t.buffer.write_f32_prefix(&[i as f32 + 1.0]);
+            // Through the view, so the mark lands in this slice's own window;
+            // the buffer-level prefix write used here before put every mark at
+            // slab offset 0 and made the aliasing check below vacuous.
+            t.write_f32(&vec![i as f32 + 1.0; 64]).unwrap();
             views.push(t);
         }
 
@@ -226,18 +227,15 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
         // Resetting with views still outstanding must move to a fresh slab
         // rather than alias them; the previously handed-out windows keep their
         // contents.
-        let marks: Vec<f32> = views
-            .iter()
-            .map(|t| t.buffer.read_f32()[t.byte_offset / 4])
-            .collect();
-        rt.bump_reset();
+        let marks: Vec<f32> = views.iter().map(|t| t.read_f32().unwrap()[0]).collect();
+        rt.bump_reset().unwrap();
         let after_reset = rt.bump_alloc_f32(&[512]).unwrap();
         after_reset
-            .buffer
-            .write_f32_prefix(&vec![-1.0f32; after_reset.numel()]);
+            .write_f32(&vec![-1.0f32; after_reset.numel()])
+            .unwrap();
         for (i, t) in views.iter().enumerate() {
             assert_eq!(
-                t.buffer.read_f32()[t.byte_offset / 4],
+                t.read_f32().unwrap()[0],
                 marks[i],
                 "bump reset aliased a live view (slice {i})"
             );
@@ -249,6 +247,100 @@ fn bump_arena_hands_out_zeroed_slices_and_reports_exhaustion() {
             rt.ensure_bump(usize::MAX).unwrap_err(),
             "bump capacity overflow"
         );
+    });
+}
+
+/// Views hand out their own window, not the slab: reading or writing through
+/// the view reaches only its elements, and a wrong-length write is refused.
+#[test]
+fn bump_views_read_and_write_only_their_own_window() {
+    with_gpu(|rt| {
+        rt.ensure_bump(1 << 16).unwrap();
+        let a = rt.bump_alloc_f32(&[64]).unwrap();
+        let b = rt.bump_alloc_f32(&[64]).unwrap();
+        assert_ne!(a.byte_offset, b.byte_offset);
+        b.write_f32(&[1.0; 64]).unwrap();
+        assert!(
+            a.read_f32().unwrap().iter().all(|&x| x == 0.0),
+            "writing b landed on a's window"
+        );
+        assert!(b.read_f32().unwrap().iter().all(|&x| x == 1.0));
+        assert!(
+            b.write_f32(&[0.0; 63]).is_err(),
+            "a short write must be refused, not silently partial"
+        );
+        // The whole-slab accessor still exists for callers who want it; the
+        // view's window is where b's ones actually are.
+        assert_eq!(b.buffer.read_f32()[b.byte_offset / 4], 1.0);
+    });
+}
+
+/// `bump_reset` reports the conditions `bump_alloc_f32` reports, instead of
+/// panicking on them: a live host mapping makes the runtime busy.
+#[test]
+fn bump_reset_reports_a_busy_runtime_instead_of_panicking() {
+    with_gpu(|rt| {
+        rt.ensure_bump(4096).unwrap();
+        let t = rt.bump_alloc_f32(&[4]).unwrap();
+        let mapping = t.buffer.contents_f32();
+        let err = rt.bump_reset().unwrap_err();
+        assert!(err.contains("busy"), "{err}");
+        drop(mapping);
+        rt.bump_reset().unwrap();
+    });
+}
+
+/// Only an exhausted arena falls through to the pool. A poisoned runtime is
+/// an error, not a pool allocation that quietly bypasses the arena.
+#[test]
+fn alloc_temp_refuses_a_poisoned_runtime_instead_of_bypassing_the_bump_arena() {
+    with_gpu(|rt| {
+        rt.ensure_bump(1 << 16).unwrap();
+        rt.set_async_encode(true).unwrap();
+        assert!(rt.with_binder(|_| Err("injected".into())).is_err());
+        let err = rt.alloc_temp_f32(&[64]).map(|_| ()).unwrap_err();
+        assert!(err.contains("poisoned"), "{err}");
+    });
+}
+
+/// A load-then-write loop with nothing in flight pays no residency commit and
+/// no command-buffer round trip per tensor: host access only needs completed
+/// GPU work, and there is none.
+#[test]
+fn host_writes_with_no_gpu_work_pending_do_not_commit_residency() {
+    with_gpu(|rt| {
+        tessl::infer_trace::set_enabled(true);
+        tessl::infer_trace::reset_token_counters();
+        for i in 0..16 {
+            let t = rt.alloc_tensor_f32_hot(&[256]).unwrap();
+            t.buffer.write_f32(&vec![i as f32; 256]);
+            assert_eq!(t.buffer.read_f32()[255], i as f32);
+        }
+        let snap = tessl::infer_trace::snapshot();
+        tessl::infer_trace::set_enabled(false);
+        assert_eq!(
+            snap.residency_flushes, 0,
+            "a load-then-write loop with nothing in flight paid residency commits"
+        );
+        // The set is still made resident before the first dispatch uses it.
+        let a = rt.alloc_tensor_f32(&[64]).unwrap();
+        let b = rt.alloc_tensor_f32(&[64]).unwrap();
+        a.buffer.write_f32(&[2.0; 64]);
+        tessl::tensor::gpu_copy(&a, &b).unwrap();
+        rt.synchronize().unwrap();
+        assert!(b.buffer.read_f32().iter().all(|&x| x == 2.0));
+    });
+}
+
+/// The dispatch counter counts encode attempts in both modes, including a
+/// closure that fails: a failed op still reached the encoder.
+#[test]
+fn a_failed_encode_still_counts_as_a_dispatch_attempt() {
+    with_gpu(|rt| {
+        rt.set_async_encode(true).unwrap();
+        rt.take_dispatch_count();
+        assert!(rt.with_binder(|_| Err("injected".into())).is_err());
+        assert_eq!(rt.take_dispatch_count(), 1);
     });
 }
 

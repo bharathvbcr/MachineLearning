@@ -73,20 +73,20 @@ kernel void gemm_q4_mlx_simd(
     float acc[SIMD_ROWS][GEMM_MAX_M];
     for (uint r = 0u; r < SIMD_ROWS; ++r)
         for (uint m = 0u; m < GEMM_MAX_M; ++m) acc[r][m] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        const uint col = k0 + lane_col0;
-        if (col + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        const ulong col = k0 + lane_col0;
+        if (col + SIMD_VPT <= (ulong)cols) {
             float xt[GEMM_MAX_M][16];
             float xsum[GEMM_MAX_M];
             for (uint m = 0u; m < m_cap; ++m)
-                xsum[m] = load_x16_qdot(x + m * cols + col, xt[m]);
-            const uint g = col / group_size;
-            const uint byte_off = col >> 1;
+                xsum[m] = load_x16_qdot(x + (ulong)m * cols + col, xt[m]);
+            const ulong g = col / group_size;
+            const ulong byte_off = col >> 1;
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 const uint row = row0 + r;
                 if (row >= rows) break;
-                const bfloat2 sbv = sb[row * gpr + g];
-                device const uchar *wp = packed + row * row_bytes + byte_off;
+                const bfloat2 sbv = sb[(ulong)row * gpr + g];
+                device const uchar *wp = packed + (ulong)row * row_bytes + byte_off;
                 for (uint m = 0u; m < m_cap; ++m)
                     acc[r][m] += qdot16(wp, xt[m], float(sbv.x), float(sbv.y), xsum[m]);
             }
@@ -96,7 +96,7 @@ kernel void gemm_q4_mlx_simd(
         const uint row = row0 + r;
         for (uint m = 0u; m < m_cap; ++m) {
             const float sum = simd_sum(acc[r][m]);
-            if (lane == 0u && row < rows) y[m * rows + row] = sum;
+            if (lane == 0u && row < rows) y[(ulong)m * rows + row] = sum;
         }
     }
 }
@@ -127,20 +127,20 @@ kernel void gemm_q4_mlx_simd_add(
     float acc[SIMD_ROWS][GEMM_MAX_M];
     for (uint r = 0u; r < SIMD_ROWS; ++r)
         for (uint m = 0u; m < GEMM_MAX_M; ++m) acc[r][m] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        const uint col = k0 + lane_col0;
-        if (col + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        const ulong col = k0 + lane_col0;
+        if (col + SIMD_VPT <= (ulong)cols) {
             float xt[GEMM_MAX_M][16];
             float xsum[GEMM_MAX_M];
             for (uint m = 0u; m < m_cap; ++m)
-                xsum[m] = load_x16_qdot(x + m * cols + col, xt[m]);
-            const uint g = col / group_size;
-            const uint byte_off = col >> 1;
+                xsum[m] = load_x16_qdot(x + (ulong)m * cols + col, xt[m]);
+            const ulong g = col / group_size;
+            const ulong byte_off = col >> 1;
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 const uint row = row0 + r;
                 if (row >= rows) break;
-                const bfloat2 sbv = sb[row * gpr + g];
-                device const uchar *wp = packed + row * row_bytes + byte_off;
+                const bfloat2 sbv = sb[(ulong)row * gpr + g];
+                device const uchar *wp = packed + (ulong)row * row_bytes + byte_off;
                 for (uint m = 0u; m < m_cap; ++m)
                     acc[r][m] += qdot16(wp, xt[m], float(sbv.x), float(sbv.y), xsum[m]);
             }
@@ -151,7 +151,7 @@ kernel void gemm_q4_mlx_simd_add(
         for (uint m = 0u; m < m_cap; ++m) {
             const float sum = simd_sum(acc[r][m]);
             if (lane == 0u && row < rows)
-                y[m * rows + row] = sum + resid[m * rows + row];
+                y[(ulong)m * rows + row] = sum + resid[(ulong)m * rows + row];
         }
     }
 }
@@ -182,17 +182,18 @@ kernel void gemm_q4_mlx_simd_i4(
     float acc[SIMD_ROWS][GEMM_MAX_M];
     for (uint r = 0u; r < SIMD_ROWS; ++r)
         for (uint m = 0u; m < GEMM_MAX_M; ++m) acc[r][m] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        const uint col = k0 + lane_col0;
-        if (col + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        const ulong col = k0 + lane_col0;
+        if (col + SIMD_VPT <= (ulong)cols) {
             float xt[GEMM_MAX_M][16];
             float xsum[GEMM_MAX_M];
             for (uint m = 0u; m < m_cap; ++m)
-                xsum[m] = load_x16_qdot(x + m * cols + col, xt[m]);
-            const uint g = col / group_size;
-            const uint pack2 = col >> 4;
-            device const uchar *wp0 = packed + ((tile * packs_u2 + pack2) * SIMD_ROWS) * 8u;
-            const uint sb0 = (tile * gpr + g) * SIMD_ROWS;
+                xsum[m] = load_x16_qdot(x + (ulong)m * cols + col, xt[m]);
+            const ulong g = col / group_size;
+            const ulong pack2 = col >> 4;
+            device const uchar *wp0 = packed
+                + (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
+            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
                 const bfloat2 sbv = sb[sb0 + r];
@@ -205,7 +206,7 @@ kernel void gemm_q4_mlx_simd_i4(
         const uint row = row0 + r;
         for (uint m = 0u; m < m_cap; ++m) {
             const float sum = simd_sum(acc[r][m]);
-            if (lane == 0u && row < rows) y[m * rows + row] = sum;
+            if (lane == 0u && row < rows) y[(ulong)m * rows + row] = sum;
         }
     }
 }
@@ -237,17 +238,18 @@ kernel void gemm_q4_mlx_simd_add_i4(
     float acc[SIMD_ROWS][GEMM_MAX_M];
     for (uint r = 0u; r < SIMD_ROWS; ++r)
         for (uint m = 0u; m < GEMM_MAX_M; ++m) acc[r][m] = 0.0f;
-    for (uint k0 = 0u; k0 < cols; k0 += SIMD_BLOCK) {
-        const uint col = k0 + lane_col0;
-        if (col + SIMD_VPT <= cols) {
+    for (ulong k0 = 0ul; k0 < (ulong)cols; k0 += SIMD_BLOCK) {
+        const ulong col = k0 + lane_col0;
+        if (col + SIMD_VPT <= (ulong)cols) {
             float xt[GEMM_MAX_M][16];
             float xsum[GEMM_MAX_M];
             for (uint m = 0u; m < m_cap; ++m)
-                xsum[m] = load_x16_qdot(x + m * cols + col, xt[m]);
-            const uint g = col / group_size;
-            const uint pack2 = col >> 4;
-            device const uchar *wp0 = packed + ((tile * packs_u2 + pack2) * SIMD_ROWS) * 8u;
-            const uint sb0 = (tile * gpr + g) * SIMD_ROWS;
+                xsum[m] = load_x16_qdot(x + (ulong)m * cols + col, xt[m]);
+            const ulong g = col / group_size;
+            const ulong pack2 = col >> 4;
+            device const uchar *wp0 = packed
+                + (((ulong)tile * packs_u2 + pack2) * SIMD_ROWS) * 8ul;
+            const ulong sb0 = ((ulong)tile * gpr + g) * SIMD_ROWS;
             for (uint r = 0u; r < SIMD_ROWS; ++r) {
                 if (row0 + r >= rows) break;
                 const bfloat2 sbv = sb[sb0 + r];
@@ -261,7 +263,7 @@ kernel void gemm_q4_mlx_simd_add_i4(
         for (uint m = 0u; m < m_cap; ++m) {
             const float sum = simd_sum(acc[r][m]);
             if (lane == 0u && row < rows)
-                y[m * rows + row] = sum + resid[m * rows + row];
+                y[(ulong)m * rows + row] = sum + resid[(ulong)m * rows + row];
         }
     }
 }

@@ -244,3 +244,32 @@ fn bf16_gemm_beats_the_relaxed_bound_it_is_allowed() {
         assert_within_bound("bf16 f32-accumulate", &c.buffer.read_f32(), &expect, k, 0.0);
     });
 }
+
+/// A large K used to encode one split-K dispatch per 256 columns of K: 65536
+/// meant 256 partitions and 255 barriers for one 64×64 result, with no bound
+/// at all. The plan is capped, so the same GEMM is at most 32 partitions plus
+/// the zero pass, and stays correct at a K far past anything else here.
+#[test]
+fn tn_splitk_bounds_its_partition_count_at_large_k() {
+    with_gpu(|rt| {
+        let (m, n, k) = (64usize, 64usize, 65_536usize);
+        tessl::infer_trace::set_enabled(true);
+        tessl::infer_trace::reset_token_counters();
+        check_f32(rt, Layout::Tn, m, n, k);
+        let f32_snap = tessl::infer_trace::snapshot();
+
+        rt.set_precision(PrecisionMode::Bf16);
+        tessl::infer_trace::reset_token_counters();
+        check_bf16(rt, Layout::Tn, m, n, k);
+        let bf16_snap = tessl::infer_trace::snapshot();
+        tessl::infer_trace::set_enabled(false);
+
+        for (label, snap) in [("f32", f32_snap), ("bf16", bf16_snap)] {
+            assert!(
+                snap.dispatches <= 33,
+                "{label} split-K encoded {} dispatches for K = {k}; the plan must be bounded",
+                snap.dispatches
+            );
+        }
+    });
+}

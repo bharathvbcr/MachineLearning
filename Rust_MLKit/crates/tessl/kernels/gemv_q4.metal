@@ -8,12 +8,12 @@ constant uint GEMV_TG = 128u;
 
 inline float dequant_q4_nibble(
     device const uchar *packed,
-    uint idx,
+    ulong idx,
     float scale,
     float zero)
 {
     uchar byte = packed[idx / 2];
-    uchar nibble = (idx & 1u) == 0u ? (byte & 0x0fu) : ((byte >> 4) & 0x0fu);
+    uchar nibble = (idx & 1ul) == 0ul ? (byte & 0x0fu) : ((byte >> 4) & 0x0fu);
     int q = (int)(nibble << 28) >> 28;
     return scale * ((float)q - zero);
 }
@@ -38,7 +38,7 @@ kernel void gemv_q4(
     uint tptg [[threads_per_threadgroup]],
     threadgroup float *x_cache [[threadgroup(0)]])
 {
-    for (uint i = lid; i < cols; i += tptg) {
+    for (ulong i = lid; i < (ulong)cols; i += tptg) {
         x_cache[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -46,20 +46,20 @@ kernel void gemv_q4(
     if (gid >= rows) return;
     const uint row = gid;
     const uint groups_per_row = cols / group_size;
-    const uint row_base = row * cols;
-    const uint scale_base = row * groups_per_row;
-    const uint packed_row = row_base / 2u;
+    const ulong row_base = (ulong)row * cols;
+    const ulong scale_base = (ulong)row * groups_per_row;
+    const ulong packed_row = row_base / 2ul;
 
     float acc = 0.0f;
     for (uint g = 0u; g < groups_per_row; ++g) {
         const float scale = scales[scale_base + g];
         const float zero = zeros[scale_base + g];
         const uint xbase = g * group_size;
-        const uint pbase = packed_row + (g * group_size) / 2u;
+        const ulong pbase = packed_row + ((ulong)g * group_size) / 2ul;
         device const uint *pwords = (device const uint *)(packed + pbase);
-        uint i = 0u;
-        for (; i + 8u <= group_size; i += 8u) {
-            const uint w = pwords[i / 8u];
+        ulong i = 0ul;
+        for (; i + 8ul <= (ulong)group_size; i += 8ul) {
+            const uint w = pwords[i / 8ul];
             // Signed nibble: reinterpret low 4 bits as int4 via sign-extend.
             const float q0 = dequant_nibble_bits((uchar)(w & 0x0fu), scale, zero);
             const float q1 = dequant_nibble_bits((uchar)((w >> 4) & 0x0fu), scale, zero);
@@ -78,7 +78,7 @@ kernel void gemv_q4(
             acc += q6 * x_cache[xbase + i + 6u];
             acc += q7 * x_cache[xbase + i + 7u];
         }
-        for (; i < group_size; ++i) {
+        for (; i < (ulong)group_size; ++i) {
             acc += dequant_q4_nibble(packed, row_base + xbase + i, scale, zero)
                 * x_cache[xbase + i];
         }
@@ -103,13 +103,13 @@ kernel void gemv_q4_tiled(
     const uint row = tg;
     const uint groups_per_row = cols / group_size;
     float acc = 0.0f;
-    for (uint g = tid; g < groups_per_row; g += GEMV_TG) {
-        const uint gi = row * groups_per_row + g;
+    for (ulong g = tid; g < (ulong)groups_per_row; g += GEMV_TG) {
+        const ulong gi = (ulong)row * groups_per_row + g;
         const float scale = scales[gi];
         const float zero = zeros[gi];
-        const uint base = row * cols + g * group_size;
-        const uint xbase = g * group_size;
-        for (uint i = 0; i < group_size; ++i) {
+        const ulong base = (ulong)row * cols + g * group_size;
+        const ulong xbase = g * group_size;
+        for (ulong i = 0ul; i < (ulong)group_size; ++i) {
             acc += dequant_q4_nibble(packed, base + i, scale, zero) * x[xbase + i];
         }
     }

@@ -63,7 +63,7 @@ fn reference(
                     let xc = v.clamp(-20.0, 20.0);
                     let inner =
                         0.7978845608028654f64 * (xc as f64 + 0.044715 * (xc as f64).powi(3));
-                    (0.5 * xc as f64 * (1.0 + inner.clamp(-10.0, 10.0).tanh())) as f32
+                    (0.5 * v as f64 * (1.0 + inner.clamp(-10.0, 10.0).tanh())) as f32
                 }
                 Activation::Silu => v / (1.0 + (-v).exp()),
             };
@@ -82,9 +82,18 @@ fn tol(k: usize) -> f32 {
 }
 
 fn close(what: &str, got: &[f32], want: &[f32], tol: f32) {
+    assert!(
+        tol.is_finite() && tol >= 0.0,
+        "{what}: tolerance must be finite and non-negative, got {tol}"
+    );
+    assert_eq!(got.len(), want.len(), "{what}: length mismatch");
     let mut worst = 0.0f32;
     let mut at = 0usize;
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            g.is_finite() && w.is_finite(),
+            "{what}[{i}]: comparison requires finite values, got {g}, want {w}"
+        );
         let d = (g - w).abs();
         if d > worst {
             worst = d;
@@ -97,6 +106,21 @@ fn close(what: &str, got: &[f32], want: &[f32], tol: f32) {
         got[at],
         want[at]
     );
+}
+
+#[test]
+fn comparison_rejects_one_sided_nan_and_length_mismatch() {
+    for (name, got, want) in [
+        ("NaN result", vec![f32::NAN], vec![1.0]),
+        ("NaN reference", vec![1.0], vec![f32::NAN]),
+        ("short result", vec![1.0], vec![1.0, 2.0]),
+        ("long result", vec![1.0, 2.0], vec![1.0]),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| close(name, &got, &want, 0.0)).is_err(),
+            "{name} must be rejected rather than aggregated into a passing worst error"
+        );
+    }
 }
 
 const SHAPES: &[(usize, usize, usize)] = &[
@@ -158,6 +182,42 @@ fn fused_epilogue_matches_the_unfused_sequence() {
                 );
             }
         }
+    });
+}
+
+#[test]
+fn gelu_epilogue_above_twenty_approaches_the_unclamped_input() {
+    // GELU(x) approaches x for large positive x. The tanh polynomial's input
+    // may be clamped for stability, but clamping the outer 0.5*x factor turns
+    // every x > 20 into 20 and is observably wrong.
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(true);
+        let (m, n, k) = (128usize, 64usize, 64usize);
+        let input = 20.5f32;
+        let a = tensor(rt, &[m, k], &vec![1.0; m * k]);
+        // 0.3203125 is exact in binary; 64 equal products sum to 20.5.
+        let b = tensor(rt, &[k, n], &vec![0.3203125; k * n]);
+        let c = tensor(rt, &[m, n], &vec![0.0; m * n]);
+
+        gemm_epilogue(
+            &a,
+            &b,
+            &c,
+            GemmBackend::TensorOps,
+            Epilogue {
+                activation: Activation::GeluTanh,
+                ..Default::default()
+            },
+        )
+        .expect("GELU epilogue");
+        rt.synchronize().expect("synchronize");
+
+        close(
+            "GELU asymptotic identity above 20",
+            &c.buffer.read_f32()[..m * n],
+            &vec![input; m * n],
+            tol(k),
+        );
     });
 }
 
@@ -352,5 +412,29 @@ fn a_short_bias_is_refused() {
         )
         .expect_err("non-finite alpha");
         assert!(err.contains("finite"), "{err}");
+    });
+}
+
+#[test]
+fn a_bias_view_overlapping_the_output_is_refused() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(true);
+        let a = tensor(rt, &[1, 1], &[2.0]);
+        let b = tensor(rt, &[1, 1], &[3.0]);
+        let c_and_bias = tensor(rt, &[1, 1], &[4.0]);
+        let err = gemm_epilogue(
+            &a,
+            &b,
+            &c_and_bias,
+            GemmBackend::TensorOps,
+            Epilogue {
+                alpha: 1.0,
+                beta: 0.0,
+                bias: Some(&c_and_bias),
+                activation: Activation::None,
+            },
+        )
+        .expect_err("bias must not alias the output");
+        assert!(err.contains("bias overlaps output"), "{err}");
     });
 }

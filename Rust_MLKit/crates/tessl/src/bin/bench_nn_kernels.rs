@@ -24,6 +24,9 @@
 //! that silently wrote nothing would otherwise post the best number in the
 //! table.
 
+mod common;
+
+use common::{env_usize, median};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -42,16 +45,6 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
             (((s >> 32) as u32) as f64 / (u32::MAX as f64) * 2.0 - 1.0) as f32
         })
         .collect()
-}
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
 }
 
 fn buf(rt: &Arc<GpuRuntime>, data: &[f32]) -> GpuBuffer {
@@ -110,12 +103,12 @@ fn measure(
         solo.push(t0.elapsed().as_secs_f64() * 1e6);
     }
 
-    let b = median(batched);
+    let b = median(batched)?;
     Ok(Row {
         name: name.to_string(),
         shape: shape.to_string(),
         batched_us: b,
-        solo_us: median(solo),
+        solo_us: median(solo)?,
         gb_s: bytes / (b * 1e-6) / 1e9,
     })
 }
@@ -185,15 +178,9 @@ fn emit_kernel_trace() {
 }
 
 fn run() -> Result<(), String> {
+    let warmup = env_usize("BENCH_WARMUP", 10, 0)?;
+    let iters = env_usize("BENCH_ITERS", 50, 1)?;
     let rt = GpuRuntime::new()?;
-    let warmup: usize = std::env::var("BENCH_WARMUP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let iters: usize = std::env::var("BENCH_ITERS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
 
     println!("device: {}", rt.device_name());
     println!(
@@ -625,13 +612,14 @@ fn run() -> Result<(), String> {
         let (rows_n, dim) = (2048usize, 2048usize);
         let n = rows_n * dim;
         let xf = buf(&rt, &fill(n, 0x81));
+        let upf = buf(&rt, &fill(n, 0x82));
         let w = buf(&rt, &fill(dim, 0x82));
         let outf = out_buf(&rt, n);
-        let xbf = rt.alloc_buffer(n * 4)?;
-        xbf.write_bf16_bits(&vec![0x3f00u16; n * 2]);
-        let wbf = rt.alloc_buffer(dim * 4)?;
-        wbf.write_bf16_bits(&vec![0x3f80u16; dim * 2]);
-        let obf = rt.alloc_buffer(n * 4)?;
+        // These kernels take f32 inputs and write bf16. Keep the output at its
+        // exact half-width extent so the coverage benchmark cannot hide an
+        // overrun in an oversized allocation, and never reuse it as an input:
+        // doing so races the kernel's read and write streams.
+        let obf = rt.alloc_buffer(n * 2)?;
         let bytes_n = (n * 4 * 2) as f64;
 
         rows.push(measure(
@@ -641,7 +629,7 @@ fn run() -> Result<(), String> {
             bytes_n / 2.0,
             warmup,
             iters,
-            || nn::rms_norm_bf16(&rt, &xbf, &wbf, &obf, rows_n as u32, dim as u32, 1e-6),
+            || nn::rms_norm_bf16(&rt, &xf, &w, &obf, rows_n as u32, dim as u32, 1e-6),
         )?);
         // Residual add is in-place on `resid`, which is what makes it one pass.
         let resid = buf(&rt, &fill(n, 0x83));
@@ -672,7 +660,7 @@ fn run() -> Result<(), String> {
             bytes_n / 2.0,
             warmup,
             iters,
-            || nn::mlp_gelu_tanh_bf16(&rt, &xbf, &obf, &obf, n as u32),
+            || nn::mlp_gelu_tanh_bf16(&rt, &xf, &upf, &obf, n as u32),
         )?);
         rows.push(measure(
             &rt,
@@ -687,10 +675,11 @@ fn run() -> Result<(), String> {
         // --- KV cache stores. `dst_offset` is a device buffer because during
         // decode it changes every token and an ICB freezes its binds.
         let slot = 8192usize;
+        let cache_elems = slot * 64;
         let src_k = buf(&rt, &fill(slot, 0x84));
         let src_v = buf(&rt, &fill(slot, 0x85));
-        let dst_k = out_buf(&rt, slot * 64);
-        let dst_v = out_buf(&rt, slot * 64);
+        let dst_k = out_buf(&rt, cache_elems);
+        let dst_v = out_buf(&rt, cache_elems);
         let off = rt.alloc_buffer(4)?;
         off.write_u32(&[0]);
         let kv_bytes = (slot * 4 * 2) as f64;
@@ -701,7 +690,7 @@ fn run() -> Result<(), String> {
             kv_bytes,
             warmup,
             iters,
-            || nn::kv_store_timestep(&rt, &src_k, &dst_k, &off, slot as u32),
+            || nn::kv_store_timestep(&rt, &src_k, &dst_k, &off, slot as u32, cache_elems as u32),
         )?);
         rows.push(measure(
             &rt,
@@ -710,7 +699,18 @@ fn run() -> Result<(), String> {
             kv_bytes * 2.0,
             warmup,
             iters,
-            || nn::kv_store_timestep_pair(&rt, &src_k, &src_v, &dst_k, &dst_v, &off, slot as u32),
+            || {
+                nn::kv_store_timestep_pair(
+                    &rt,
+                    &src_k,
+                    &src_v,
+                    &dst_k,
+                    &dst_v,
+                    &off,
+                    slot as u32,
+                    cache_elems as u32,
+                )
+            },
         )?);
         let filled = rt.alloc_buffer(4)?;
         filled.write_u32(&[64]);
@@ -956,6 +956,7 @@ fn run() -> Result<(), String> {
                     dst_k: &dk,
                     dst_v: &dv,
                     dst_offset: &dofs,
+                    capacity: kvcap as u32,
                 }),
             ),
         ] {
@@ -982,7 +983,7 @@ fn run() -> Result<(), String> {
         );
     }
 
-    let floor = median(rows.iter().map(|r| r.solo_us).collect());
+    let floor = median(rows.iter().map(|r| r.solo_us).collect())?;
     println!(
         "\nMedian solo dispatch: {floor:.1} us. Every kernel whose batched time \
          is below that is\nentirely inside the submit-and-wait floor when issued \

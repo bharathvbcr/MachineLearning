@@ -317,7 +317,9 @@ fn mlp_gelu_tanh_stays_finite_where_fast_tanh_would_nan() {
             "mlp_gelu_tanh produced a non-finite value on |x| up to 64"
         );
 
-        // Match the kernel's clamp so this is a comparison, not a restatement.
+        // Clamp only the cubic argument. GELU itself is asymptotically the
+        // identity for large positive x; clamping the final multiplier turns
+        // every x > 20 into approximately 20 and is a silent activation clip.
         let want: Vec<f32> = gate
             .iter()
             .zip(&up)
@@ -327,7 +329,7 @@ fn mlp_gelu_tanh_stays_finite_where_fast_tanh_would_nan() {
                 // ordering bug behind matching rounding.
                 let xc = (*x as f64).clamp(-20.0, 20.0);
                 let inner = 0.7978845608028654 * (xc + 0.044715 * xc * xc * xc);
-                (0.5 * xc * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
+                (0.5 * (*x as f64) * (1.0 + inner.clamp(-10.0, 10.0).tanh()) * (*u as f64)) as f32
             })
             .collect();
         close("mlp_gelu_tanh", &got[..n], &want, 1e-4);
@@ -598,7 +600,7 @@ fn kv_store_timestep_writes_at_the_device_side_offset() {
         let off = rt.alloc_buffer(4).unwrap();
         off.write_u32(&[(2 * n) as u32]);
 
-        nn::kv_store_timestep(rt, &sb, &dst, &off, n as u32).unwrap();
+        nn::kv_store_timestep(rt, &sb, &dst, &off, n as u32, (4 * n) as u32).unwrap();
         rt.synchronize().unwrap();
 
         let got = dst.read_f32();

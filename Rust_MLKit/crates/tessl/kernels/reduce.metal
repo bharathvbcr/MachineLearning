@@ -35,7 +35,7 @@ kernel void softmax_rows_f32(
     device float* outr = out + (ulong)row * cols;
 
     float m = -INFINITY;
-    for (uint c = lid; c < cols; c += tptg) { m = fmax(m, xr[c]); }
+    for (ulong c = lid; c < (ulong)cols; c += tptg) { m = fmax(m, xr[c]); }
     scratch[lid] = m;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     REDUCE_TREE(scratch, tptg, lid, reduce_max)
@@ -43,7 +43,7 @@ kernel void softmax_rows_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float s = 0.0f;
-    for (uint c = lid; c < cols; c += tptg) { s += exp(xr[c] - row_max); }
+    for (ulong c = lid; c < (ulong)cols; c += tptg) { s += exp(xr[c] - row_max); }
     scratch[lid] = s;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     REDUCE_TREE(scratch, tptg, lid, reduce_add)
@@ -55,7 +55,7 @@ kernel void softmax_rows_f32(
     const bool degenerate = !(denom > 0.0f);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint c = lid; c < cols; c += tptg) {
+    for (ulong c = lid; c < (ulong)cols; c += tptg) {
         outr[c] = degenerate ? inv : exp(xr[c] - row_max) * inv;
     }
 }
@@ -72,7 +72,7 @@ kernel void row_sum_f32(
     threadgroup float scratch[REDUCE_MAX_TG];
     device const float* xr = x + (ulong)row * cols;
     float s = 0.0f;
-    for (uint c = lid; c < cols; c += tptg) { s += xr[c]; }
+    for (ulong c = lid; c < (ulong)cols; c += tptg) { s += xr[c]; }
     scratch[lid] = s;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     REDUCE_TREE(scratch, tptg, lid, reduce_add)
@@ -91,7 +91,7 @@ kernel void row_max_f32(
     threadgroup float scratch[REDUCE_MAX_TG];
     device const float* xr = x + (ulong)row * cols;
     float m = -INFINITY;
-    for (uint c = lid; c < cols; c += tptg) { m = fmax(m, xr[c]); }
+    for (ulong c = lid; c < (ulong)cols; c += tptg) { m = fmax(m, xr[c]); }
     scratch[lid] = m;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     REDUCE_TREE(scratch, tptg, lid, reduce_max)

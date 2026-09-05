@@ -155,6 +155,10 @@ pub fn env_usize(name: &str, default: usize, min: usize) -> Result<usize, String
         Err(std::env::VarError::NotPresent) => return Ok(default),
         Err(e) => return Err(format!("{name}: {e}")),
     };
+    parse_usize_env_value(name, &raw, min)
+}
+
+fn parse_usize_env_value(name: &str, raw: &str, min: usize) -> Result<usize, String> {
     let v: usize = raw
         .trim()
         .parse()
@@ -163,4 +167,37 @@ pub fn env_usize(name: &str, default: usize, min: usize) -> Result<usize, String
         return Err(format!("{name}={v} is below the minimum of {min}"));
     }
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{median, parse_usize_env_value};
+
+    #[test]
+    fn median_rejects_empty_and_non_finite_samples() {
+        assert!(median(Vec::new()).unwrap_err().contains("zero samples"));
+        assert!(median(vec![1.0, f64::NAN])
+            .unwrap_err()
+            .contains("non-finite"));
+        assert!(median(vec![f64::INFINITY])
+            .unwrap_err()
+            .contains("non-finite"));
+    }
+
+    #[test]
+    fn median_handles_odd_and_even_sample_counts() {
+        assert_eq!(median(vec![3.0, 1.0, 2.0]).unwrap(), 2.0);
+        assert_eq!(median(vec![4.0, 1.0, 3.0, 2.0]).unwrap(), 2.5);
+    }
+
+    #[test]
+    fn benchmark_count_parser_is_strict_and_bounded() {
+        assert_eq!(parse_usize_env_value("N", " 7 ", 1).unwrap(), 7);
+        assert!(parse_usize_env_value("N", "", 1).is_err());
+        assert!(parse_usize_env_value("N", "not-a-count", 1).is_err());
+        assert!(parse_usize_env_value("N", "-1", 1).is_err());
+        assert!(parse_usize_env_value("N", "0", 1)
+            .unwrap_err()
+            .contains("minimum"));
+    }
 }

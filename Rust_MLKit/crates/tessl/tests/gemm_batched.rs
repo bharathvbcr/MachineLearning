@@ -28,7 +28,14 @@ fn tensor(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tensor {
 fn every_batch_element_equals_a_single_gemm_bit_for_bit() {
     with_gpu(|rt| {
         rt.set_relaxed_precision(true);
-        for &(m, n, k, batch) in &[(128usize, 64usize, 64usize, 4usize), (96, 80, 128, 3)] {
+        // The third shape has N > 512, so `gemm` picks the 128x64 geometry the
+        // batched kernel is instantiated at; the first two run 64x64 on the
+        // single-matrix side and pin that the reduction order is tile-independent.
+        for &(m, n, k, batch) in &[
+            (128usize, 64usize, 64usize, 4usize),
+            (96, 80, 128, 3),
+            (64, 640, 96, 2),
+        ] {
             let a_h = random_f32(m * k * batch, 0xBA7 + k as u64);
             let b_h = random_f32(k * n * batch, 0xC4E + n as u64);
             let a = tensor(rt, &[batch * m, k], &a_h);
@@ -226,4 +233,70 @@ fn batched_refuses_paths_without_a_register_accumulator() {
         .expect_err("exact f32 has no batched kernel");
         assert!(err.contains("cooperative-destination"), "{err}");
     });
+}
+
+#[test]
+fn overlapping_output_batches_are_refused_before_encoding() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(true);
+        let a = tensor(rt, &[2, 1], &[2.0, 3.0]);
+        let b = tensor(rt, &[2, 1], &[5.0, 7.0]);
+        // One output element cannot hold two independently written batches.
+        // The old last-element extent check accepted stride C = 0 because both
+        // batches individually fit, then dispatched two threadgroups racing on
+        // this same element.
+        let c = tensor(rt, &[1, 1], &[0.0]);
+        let err = gemm_batched(
+            &a,
+            &b,
+            &c,
+            GemmBackend::TensorOps,
+            BatchedGemm {
+                m: 1,
+                n: 1,
+                k: 1,
+                batch: 2,
+                strides: BatchStrides { a: 1, b: 1, c: 0 },
+            },
+        )
+        .expect_err("output batches must not overlap");
+        assert!(err.contains("output batches overlap"), "{err}");
+    });
+}
+
+#[test]
+fn batched_output_must_not_alias_an_input() {
+    with_gpu(|rt| {
+        rt.set_relaxed_precision(true);
+        let storage = tensor(rt, &[1, 1], &[2.0]);
+        let b = tensor(rt, &[1, 1], &[5.0]);
+        let err = gemm_batched(
+            &storage,
+            &b,
+            &storage,
+            GemmBackend::TensorOps,
+            BatchedGemm {
+                m: 1,
+                n: 1,
+                k: 1,
+                batch: 1,
+                strides: BatchStrides::contiguous(1, 1, 1),
+            },
+        )
+        .expect_err("output must not alias an input");
+        assert!(err.contains("overlap"), "{err}");
+    });
+}
+
+#[test]
+fn stride_constructors_saturate_impossible_products_for_later_rejection() {
+    let contiguous = BatchStrides::contiguous(usize::MAX, 2, 3);
+    assert_eq!(contiguous.a, usize::MAX);
+    assert_eq!(contiguous.b, 6);
+    assert_eq!(contiguous.c, usize::MAX);
+
+    let shared = BatchStrides::shared_b(usize::MAX, 2, 3);
+    assert_eq!(shared.a, usize::MAX);
+    assert_eq!(shared.b, 0);
+    assert_eq!(shared.c, usize::MAX);
 }

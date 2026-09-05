@@ -671,7 +671,7 @@ fn main() -> Result<(), String> {
         // dynamics (~step 2100). Within-step async batching is unchanged.
         rt.synchronize()?;
         inputs.mark_synced();
-        rt.bump_reset();
+        rt.bump_reset()?;
         prof.finish();
 
         // The loss and global norm are four-byte device reductions already

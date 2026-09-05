@@ -159,6 +159,19 @@ fn rms_qkv_rope_matches_an_f64_reference() {
             // denominator would get wrong in the rotated half too.
             (2, 2, 1, 128, 64),
             (1, 8, 8, 32, 16),
+            // A half-row that is not a multiple of the 32-lane simdgroup, so
+            // the pair (p, p + D/2) lands on two different lane residues.
+            (2, 3, 1, 96, 96),
+            // Odd head dims: the last element pairs with nothing and must be
+            // normalized without being rotated; 130 makes D/2 itself odd.
+            (1, 2, 1, 7, 4),
+            (2, 2, 1, 130, 130),
+            // Gemma's global layers: a 256-wide head rotating only 64 lanes.
+            (1, 2, 2, 256, 64),
+            // A single element, nothing to rotate.
+            (1, 1, 1, 1, 0),
+            // Enough rows to span several threadgroups with a padded tail.
+            (5, 7, 3, 64, 64),
         ] {
             let dm = Dims {
                 t,
@@ -379,6 +392,7 @@ fn kv_store_variant_writes_the_rotated_k_and_v_into_the_cache() {
                 dst_k: &dst_k,
                 dst_v: &dst_v,
                 dst_offset: &off,
+                capacity: (kv_elems * 3) as u32,
             }),
             false,
         )
@@ -400,5 +414,170 @@ fn kv_store_variant_writes_the_rotated_k_and_v_into_the_cache() {
                 "cache {name}: wrote {touched} elements outside its slot"
             );
         }
+    });
+}
+
+/// `q_only` dispatches `T * Hq` threads, which the runtime rounds up to a
+/// multiple of the SIMD width. The kernel's grid guard is `T*Hq + 2*T*Hkv`,
+/// so the padding threads fall through into the K and V branches unless the
+/// kernel is also told `Hkv = 0` — and in q-only mode those branches are bound
+/// to the Q buffer, so they re-normalize and re-rotate Q rows that other
+/// threads own. 40 heads is not a multiple of 32, so 24 padding threads exist
+/// and the corruption is deterministic rather than a rare race.
+#[test]
+fn q_only_leaves_the_padding_threads_idle() {
+    with_gpu(|rt| {
+        for variant in [QkvRopeVariant::PosConst, QkvRopeVariant::PosBuffer] {
+            let dm = Dims {
+                t: 1,
+                hq: 40,
+                hkv: 8,
+                d: 64,
+                rotary: 64,
+                theta: 10_000.0,
+                eps: 1e-6,
+            };
+            let f = fixture(dm, 0x40);
+            let pos = 3usize;
+            let (qb, kb, vb) = f.upload(rt);
+            let (qwb, kwb, vwb) = (buf(rt, &f.qw), buf(rt, &f.kw), buf(rt, &f.vw));
+            let pb = u32_buf(rt, pos as u32);
+            let pos_buf = (variant == QkvRopeVariant::PosBuffer).then_some(&pb);
+
+            nn::rms_qkv_rope(
+                rt,
+                variant,
+                QkvBuffers {
+                    q: &qb,
+                    k: &kb,
+                    v: &vb,
+                    q_weight: &qwb,
+                    k_weight: &kwb,
+                    v_weight: &vwb,
+                },
+                f.dims(),
+                pos as u32,
+                pos_buf,
+                None,
+                true,
+            )
+            .unwrap();
+            rt.synchronize().unwrap();
+
+            let (wq, _, _) = reference(&f.q, &f.k, &f.v, &f.qw, &f.kw, &f.vw, dm, pos);
+            close(
+                &format!("q_only q {variant:?}"),
+                &qb.read_f32()[..wq.len()],
+                &wq,
+            );
+            // K and V are not part of a q-only pass and must come back untouched.
+            assert_eq!(
+                &kb.read_f32()[..f.k.len()],
+                &f.k[..],
+                "{variant:?}: k was written"
+            );
+            assert_eq!(
+                &vb.read_f32()[..f.v.len()],
+                &f.v[..],
+                "{variant:?}: v was written"
+            );
+        }
+    });
+}
+
+/// A head row's result depends on its contents and position only, never on
+/// where the row sits in the grid: the same row normalized alone (a decode
+/// step) and inside a long prefill must agree to the bit, or the KV cache
+/// would hold keys that differ from the queries later compared against them.
+/// This holds because every row is reduced by exactly one simdgroup with the
+/// same lane assignment, whatever threadgroup it lands in.
+#[test]
+fn a_row_is_normalized_identically_wherever_it_sits_in_the_grid() {
+    with_gpu(|rt| {
+        let dm = Dims {
+            t: 9,
+            hq: 5,
+            hkv: 3,
+            d: 128,
+            rotary: 64,
+            theta: 10_000.0,
+            eps: 1e-6,
+        };
+        let f = fixture(dm, 0x77);
+        let pos_offset = 11usize;
+        let (qb, kb, vb) = f.upload(rt);
+        let (qwb, kwb, vwb) = (buf(rt, &f.qw), buf(rt, &f.kw), buf(rt, &f.vw));
+        nn::rms_qkv_rope(
+            rt,
+            QkvRopeVariant::PosConst,
+            QkvBuffers {
+                q: &qb,
+                k: &kb,
+                v: &vb,
+                q_weight: &qwb,
+                k_weight: &kwb,
+                v_weight: &vwb,
+            },
+            f.dims(),
+            pos_offset as u32,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+        let (q_big, k_big, v_big) = (qb.read_f32(), kb.read_f32(), vb.read_f32());
+
+        // The same rows, each dispatched on its own at the position it had.
+        let (t, hq_i, hkv_i) = (6usize, 2usize, 1usize);
+        let q_row = t * dm.hq + hq_i;
+        let kv_row = t * dm.hkv + hkv_i;
+        let sq = buf(rt, &f.q[q_row * dm.d..(q_row + 1) * dm.d]);
+        let sk = buf(rt, &f.k[kv_row * dm.d..(kv_row + 1) * dm.d]);
+        let sv = buf(rt, &f.v[kv_row * dm.d..(kv_row + 1) * dm.d]);
+        nn::rms_qkv_rope(
+            rt,
+            QkvRopeVariant::PosConst,
+            QkvBuffers {
+                q: &sq,
+                k: &sk,
+                v: &sv,
+                q_weight: &qwb,
+                k_weight: &kwb,
+                v_weight: &vwb,
+            },
+            QkvRopeDims {
+                t: 1,
+                heads_q: 1,
+                heads_kv: 1,
+                head_dim: dm.d as u32,
+                rotary_dim: dm.rotary as u32,
+                theta: dm.theta,
+                eps: dm.eps,
+            },
+            (pos_offset + t) as u32,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        assert_eq!(
+            bits(&sq.read_f32()[..dm.d]),
+            bits(&q_big[q_row * dm.d..(q_row + 1) * dm.d]),
+            "q row differs with grid placement"
+        );
+        assert_eq!(
+            bits(&sk.read_f32()[..dm.d]),
+            bits(&k_big[kv_row * dm.d..(kv_row + 1) * dm.d]),
+            "k row differs with grid placement"
+        );
+        assert_eq!(
+            bits(&sv.read_f32()[..dm.d]),
+            bits(&v_big[kv_row * dm.d..(kv_row + 1) * dm.d]),
+            "v row differs with grid placement"
+        );
     });
 }

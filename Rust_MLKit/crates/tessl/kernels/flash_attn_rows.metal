@@ -1,4 +1,5 @@
 // Prefill FlashAttention: one simdgroup per query row.
+// K/V use [B,kv_capacity,Hkv,D]; Tkv is the live prefix and never a stride.
 //
 // The general FA-2 kernels tile BR query rows into a 32-thread threadgroup and
 // guard the inner loops with `row_valid = lid < BR`, so **8 lanes in 32 do the
@@ -69,6 +70,7 @@ kernel void NAME(                                                             \
     device const uint *q_pos_offset_ptr [[buffer(11)]],                       \
     device const uint *kv_pos_offset_ptr [[buffer(12)]],                      \
     constant uint &out_bf16 [[buffer(13)]],                                   \
+    constant uint &kv_capacity [[buffer(14)]],                                \
     uint2 tgpig [[threadgroup_position_in_grid]],                             \
     uint2 tpitg [[thread_position_in_threadgroup]])                           \
 {                                                                             \
@@ -87,51 +89,66 @@ kernel void NAME(                                                             \
     const uint sub = lane / (R);       /* which row inside the simdgroup */   \
     const uint dl = lane % (R);        /* which dim slice */                  \
                                                                               \
-    const uint Tkv = *Tkv_ptr;                                                \
+    /* Clamp mutable device state before it participates in any address. */   \
+    const uint Tkv = min(*Tkv_ptr, kv_capacity);                              \
     const uint bh = tgpig.y;                                                  \
     const uint h = bh % H;                                                    \
     const uint b = bh / H;                                                    \
-    const uint base_row = tgpig.x * RPT + sg * RPS;                           \
+    const ulong base_row = (ulong)tgpig.x * RPT + sg * RPS;                  \
     /* Uniform across the simdgroup: the butterfly below needs every lane of  \
        the simdgroup active, so a partially-out-of-range simdgroup keeps all  \
        its lanes and simply does not store. */                                \
-    if (base_row >= Tq) { return; }                                           \
-    const uint t_q = base_row + sub;                                          \
-    const bool row_live = t_q < Tq;                                           \
+    if (base_row >= (ulong)Tq) { return; }                                    \
+    const uint live_rows = min(RPS, (uint)((ulong)Tq - base_row));            \
+    const bool row_live = sub < live_rows;                                    \
+    const uint t_q = row_live ? (uint)(base_row + sub) : (uint)base_row;      \
                                                                               \
     const uint group = max(H / Hkv, 1u);                                      \
     const uint hkv = h / group;                                               \
-    const int q_off_i = (int)(*q_pos_offset_ptr);                             \
-    const int kv_off = (int)(*kv_pos_offset_ptr);                             \
-    const int q_abs = q_off_i + (int)t_q;                                     \
-    const int my_lo = ((window) == 0u) ? 0                                    \
-                                       : max(0, q_abs - (int)window + 1);     \
+    const ulong kv_pos_stride = (ulong)Hkv * (D);                             \
+    const ulong kv_head_base =                                                \
+        (ulong)b * kv_capacity * kv_pos_stride + (ulong)hkv * (D);            \
+    const ulong q_pos_stride = (ulong)H * (D);                                \
+    const ulong q_head_base =                                                 \
+        (ulong)b * Tq * q_pos_stride + (ulong)h * (D);                        \
+    const ulong q_off_i = (ulong)(*q_pos_offset_ptr);                         \
+    const ulong kv_off = (ulong)(*kv_pos_offset_ptr);                         \
+    const ulong q_abs = q_off_i + (ulong)t_q;                                 \
+    const ulong window_back = ((window) == 0u) ? 0ul                          \
+                                                : (ulong)window - 1ul;         \
+    const ulong my_lo = ((window) == 0u || q_abs < window_back)               \
+        ? 0ul                                                                 \
+        : q_abs - window_back;                                                 \
                                                                               \
     /* Union key range over the RPS rows this simdgroup owns, so every lane   \
        runs the same trip count and the butterfly is never divergent. Rows    \
        mask individually inside it. */                                        \
-    const int q_lo = q_off_i + (int)base_row;                                 \
-    const int q_hi = q_off_i + (int)min(base_row + RPS, Tq) - 1;              \
-    const int u_lo = ((window) == 0u) ? 0                                     \
-                                      : max(0, q_lo - (int)window + 1);       \
-    const int t_start_i = max(0, u_lo - kv_off);                              \
-    const int t_end_i = min((int)Tkv, q_hi - kv_off + 1);                     \
+    const ulong q_lo = q_off_i + base_row;                                    \
+    const ulong q_hi = q_off_i + base_row + live_rows - 1ul;                  \
+    const ulong u_lo = ((window) == 0u || q_lo < window_back)                 \
+        ? 0ul                                                                 \
+        : q_lo - window_back;                                                  \
+    const ulong t_start = (u_lo > kv_off)                                     \
+        ? min((ulong)Tkv, u_lo - kv_off)                                      \
+        : 0ul;                                                                \
+    const ulong causal_end = (q_hi >= kv_off) ? q_hi - kv_off + 1ul : 0ul;    \
+    const ulong t_end = min((ulong)Tkv, causal_end);                          \
                                                                               \
-    const uint o_off = ((b * Tq + t_q) * H + h) * (D);                        \
+    const ulong o_off = q_head_base + (ulong)t_q * q_pos_stride;             \
     float4 q_reg[DPV];                                                        \
     float4 acc[DPV];                                                          \
     for (uint j = 0; j < DPV; ++j) { acc[j] = float4(0.0f); }                 \
     float m_i = -INFINITY;                                                    \
     float l_i = 0.0f;                                                         \
                                                                               \
-    if (t_start_i < t_end_i) {                                                \
-        const uint q_base = ((b * Tq + t_q) * H + h) * (D);                   \
+    if (t_start < t_end) {                                                    \
+        const ulong q_base = o_off;                                           \
         device const float4 *Q4 = (device const float4 *)(Q + q_base);        \
         for (uint j = 0; j < DPV; ++j) {                                      \
             q_reg[j] = row_live ? Q4[dl + j * (R)] : float4(0.0f);            \
         }                                                                     \
-        for (uint t = (uint)t_start_i; t < (uint)t_end_i; ++t) {              \
-            const uint kv_base = ((b * Tkv + t) * Hkv + hkv) * (D);           \
+        for (uint t = (uint)t_start; t < (uint)t_end; ++t) {                  \
+            const ulong kv_base = kv_head_base + (ulong)t * kv_pos_stride;   \
             device const float4 *K4 = (device const float4 *)(K + kv_base);   \
             float4 dot4 = float4(0.0f);                                       \
             for (uint j = 0; j < DPV; ++j) {                                  \
@@ -144,7 +161,7 @@ kernel void NAME(                                                             \
             for (uint off = (R) / 2u; off > 0u; off >>= 1) {                  \
                 part += simd_shuffle_xor(part, off);                          \
             }                                                                 \
-            const int k_abs = kv_off + (int)t;                                \
+            const ulong k_abs = kv_off + (ulong)t;                            \
             float s = part * scale;                                           \
             if (!row_live || k_abs > q_abs || k_abs < my_lo) {                \
                 s = -INFINITY;                                                \
@@ -169,7 +186,7 @@ kernel void NAME(                                                             \
     if (out_bf16 != 0u) {                                                     \
         device bfloat *Ob = (device bfloat *)O;                               \
         for (uint j = 0; j < DPV; ++j) {                                      \
-            const uint d0 = o_off + 4u * (dl + j * (R));                      \
+            const ulong d0 = o_off + 4u * (dl + j * (R));                     \
             const float4 o4 = acc[j] * inv_l;                                 \
             Ob[d0 + 0u] = bfloat(o4.x);                                       \
             Ob[d0 + 1u] = bfloat(o4.y);                                       \

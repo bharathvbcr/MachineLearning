@@ -129,6 +129,35 @@ fn check(label: &str, got: &[f32], want: &[f32]) {
     }
 }
 
+#[track_caller]
+fn assert_same_finite_bits(label: &str, left: &[f32], right: &[f32]) {
+    assert_eq!(left.len(), right.len(), "{label}: length mismatch");
+    for (i, (x, y)) in left.iter().zip(right).enumerate() {
+        assert!(
+            x.is_finite() && y.is_finite(),
+            "{label}[{i}]: exact comparison requires finite values, got {x} and {y}"
+        );
+        assert_eq!(
+            x.to_bits(),
+            y.to_bits(),
+            "{label}[{i}]: exact outputs differ: {x} vs {y}"
+        );
+    }
+}
+
+#[test]
+fn exact_comparison_rejects_one_sided_nan_and_length_mismatch() {
+    assert!(
+        std::panic::catch_unwind(|| assert_same_finite_bits("NaN", &[f32::NAN], &[1.0])).is_err(),
+        "a one-sided NaN must not compare equal"
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_same_finite_bits("length", &[1.0, 2.0], &[1.0]))
+            .is_err(),
+        "a trailing output must not be ignored"
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_swa(
     rt: &Arc<GpuRuntime>,
@@ -612,6 +641,129 @@ fn rows_honours_position_offsets_and_masks_to_zero() {
     });
 }
 
+/// A zero live KV prefix is a valid empty-history state even when the backing
+/// K/V allocations have nonzero capacity. Every implementation must overwrite
+/// all live output rows with zeros rather than exposing bytes from a previous
+/// use of the output allocation.
+#[test]
+fn zero_live_kv_overwrites_every_tiled_and_routed_output() {
+    with_gpu(|rt| {
+        const B: usize = 2;
+        const TQ: usize = 9;
+        const H: usize = 4;
+        const HKV: usize = 2;
+        const KV_CAPACITY: usize = 3;
+
+        for d in [128usize, 256, 512] {
+            let n = B * TQ * H * d;
+            let q = buf(rt, &random_f32(n, 0x5a00 + d as u64));
+            let k = empty(rt, B * KV_CAPACITY * HKV * d);
+            let v = empty(rt, B * KV_CAPACITY * HKV * d);
+            let tiled = seeded(rt, n, UNWRITTEN);
+            let rows = seeded(rt, n, UNWRITTEN);
+            let tiled_bf16 = if d == 512 {
+                let output = rt
+                    .alloc_buffer(n * std::mem::size_of::<u16>())
+                    .expect("half-width bf16 output");
+                // Two nonzero bf16 1.0 values per word. A no-op kernel leaves
+                // this pattern visible; the empty-history contract writes 0.
+                output.write_u32(&vec![0x3f80_3f80; n / 2]);
+                Some(output)
+            } else {
+                None
+            };
+            let tkv = u32_buf(rt, 0);
+            let q_off = u32_buf(rt, 17);
+            let kv_off = u32_buf(rt, 41);
+            let dims = AttnDims {
+                batch: B as u32,
+                tq: TQ as u32,
+                heads: H as u32,
+                heads_kv: HKV as u32,
+                window: 0,
+                scale: 0.125,
+            };
+
+            assert_eq!(
+                nn::attn_kernel_for(dims.tq, KV_CAPACITY),
+                nn::AttnKernel::Rows,
+                "Tq > 1 must make the normal router select the rows path"
+            );
+            // Call that routed implementation explicitly so a benchmark's
+            // process-wide TESSL_ATTN_TILED override cannot change this test.
+            nn::flash_attn_rows(
+                rt, &q, &k, &v, &rows, &tkv, &q_off, &kv_off, dims, d as u32, false,
+            )
+            .unwrap();
+            match d {
+                128 => {
+                    nn::flash_attn_swa_tiled(
+                        rt,
+                        AttnHeadDim::D128,
+                        &q,
+                        &k,
+                        &v,
+                        &tiled,
+                        &tkv,
+                        &q_off,
+                        &kv_off,
+                        dims,
+                    )
+                    .unwrap();
+                }
+                256 => {
+                    nn::flash_attn_swa_tiled(
+                        rt,
+                        AttnHeadDim::D256,
+                        &q,
+                        &k,
+                        &v,
+                        &tiled,
+                        &tkv,
+                        &q_off,
+                        &kv_off,
+                        dims,
+                    )
+                    .unwrap();
+                }
+                512 => {
+                    nn::flash_attn_global_h512_tiled(
+                        rt, &q, &k, &v, &tiled, &tkv, &q_off, &kv_off, dims, false,
+                    )
+                    .unwrap();
+                    nn::flash_attn_global_h512_tiled(
+                        rt,
+                        &q,
+                        &k,
+                        &v,
+                        tiled_bf16.as_ref().expect("D=512 bf16 output"),
+                        &tkv,
+                        &q_off,
+                        &kv_off,
+                        dims,
+                        true,
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            rt.synchronize().unwrap();
+            let tiled = tiled.read_f32()[..n].to_vec();
+            let rows = rows.read_f32()[..n].to_vec();
+            let zeros = vec![0.0; n];
+            check(&format!("zero-live-KV tiled d={d}"), &tiled, &zeros);
+            check(&format!("zero-live-KV rows d={d}"), &rows, &zeros);
+            assert_same_finite_bits(&format!("zero-live-KV parity d={d}"), &tiled, &rows);
+            if let Some(output) = tiled_bf16 {
+                for (i, &bits) in output.read_u32()[..n / 2].iter().enumerate() {
+                    assert_eq!(bits, 0, "zero-live-KV tiled bf16 word {i} stayed {bits:#x}");
+                }
+            }
+        }
+    });
+}
+
 /// Adversarial inputs for both fast paths.
 ///
 /// The shipped configs all use `scale = 1/sqrt(D)` on unit-ish operands, which
@@ -840,6 +992,166 @@ fn decode_chunk_constant_matches_the_shader() {
         nn::DECODE_KV_CHUNK,
         "shader KV_CHUNK and nn::DECODE_KV_CHUNK disagree"
     );
+}
+
+/// Every entry point that consumes mutable device `Tkv` must clamp it to the
+/// host-derived K/V capacity before computing a pointer. These source contracts
+/// cover overflow boundaries that cannot be exercised by allocating a
+/// `u32::MAX`-row tensor in a unit test.
+#[test]
+fn every_attention_shader_binds_and_applies_the_fixed_kv_capacity() {
+    let host = include_str!("../src/nn.rs");
+    let h128 = include_str!("../kernels/flash_attn_swa_h128.metal");
+    let h256 = include_str!("../kernels/flash_attn_swa_h256.metal");
+    let h512 = include_str!("../kernels/flash_attn_global_h512.metal");
+    let rows = include_str!("../kernels/flash_attn_rows.metal");
+    let decode = include_str!("../kernels/flash_attn_decode.metal");
+
+    for (name, source, slot) in [
+        ("swa_h128", h128, 13),
+        ("swa_h256", h256, 14),
+        ("global_h512", h512, 13),
+        ("rows", rows, 14),
+    ] {
+        assert!(
+            source.contains(&format!("constant uint &kv_capacity [[buffer({slot})]]")),
+            "{name}: capacity ABI slot is missing"
+        );
+        assert!(
+            source.contains("min(*Tkv_ptr, kv_capacity)"),
+            "{name}: mutable Tkv is not clamped"
+        );
+        assert!(
+            source.contains("* kv_capacity * kv_pos_stride"),
+            "{name}: batch stride must use fixed capacity, not live Tkv"
+        );
+    }
+
+    assert!(
+        decode.contains("constant uint &kv_capacity [[buffer(13)]]"),
+        "decode partial capacity ABI slot is missing"
+    );
+    assert!(
+        decode.contains("constant uint &kv_capacity [[buffer(6)]]"),
+        "decode reduce capacity ABI slot is missing"
+    );
+    assert_eq!(
+        decode.matches("min(*Tkv_ptr, kv_capacity)").count(),
+        2,
+        "both decode passes must independently clamp the live value"
+    );
+    assert!(
+        decode.contains("* kv_capacity * kv_pos_stride"),
+        "decode K/V batch stride must be fixed across tokens"
+    );
+    assert_eq!(
+        host.matches("set_u32(bnd, kv_capacity, 13)").count(),
+        3,
+        "decode partial, tiled D=128, and tiled D=512 must bind capacity"
+    );
+    assert_eq!(
+        host.matches("set_u32(bnd, kv_capacity, 14)").count(),
+        2,
+        "row-parallel and tiled D=256 must bind capacity"
+    );
+    assert_eq!(
+        host.matches("set_u32(bnd, kv_capacity, 6)").count(),
+        1,
+        "decode reduce must bind the same capacity as its partial pass"
+    );
+
+    for (name, source) in [
+        ("swa_h128", h128),
+        ("swa_h256", h256),
+        ("global_h512", h512),
+        ("rows", rows),
+        ("decode", decode),
+    ] {
+        assert!(
+            source.contains("const ulong"),
+            "{name}: flattened addresses/positions must be widened"
+        );
+        assert!(
+            !source.contains("Tkv + BC - 1") && !source.contains("Tkv + (CH) - 1"),
+            "{name}: ceil division adds before dividing and wraps at u32::MAX"
+        );
+        assert!(
+            !source.contains("min(t_q0 + BR, Tq)") && !source.contains("min(base_row + RPS, Tq)"),
+            "{name}: padded last-row arithmetic adds before clamping"
+        );
+    }
+}
+
+/// Storage/alias validation is host-only: no pipeline lookup or dispatch is
+/// needed to prove the f32 in-place exception and reject unsafe writers.
+#[test]
+fn attention_storage_validation_rejects_unsafe_aliases_without_dispatch() {
+    with_gpu(|rt| {
+        let q = empty(rt, 128);
+        let k = empty(rt, 128);
+        let v = empty(rt, 128);
+        let o = empty(rt, 128);
+        let dims = AttnDims {
+            batch: 1,
+            tq: 1,
+            heads: 1,
+            heads_kv: 1,
+            window: 0,
+            scale: 1.0,
+        };
+
+        assert_eq!(
+            nn::validate_attn_storage(&dims, 128, &q, &k, &v, &o, false).unwrap(),
+            1
+        );
+        assert!(
+            nn::validate_attn_storage(&dims, 128, &q, &k, &v, &q, false).is_ok(),
+            "f32 Q/O in-place is safe after each kernel retains its query row"
+        );
+        assert!(
+            nn::validate_attn_storage(&dims, 128, &q, &k, &v, &q, true).is_err(),
+            "packed bf16 output aliases different f32 query rows"
+        );
+        assert!(
+            nn::validate_attn_storage(&dims, 128, &q, &k, &v, &k, false).is_err(),
+            "output must not race K readers"
+        );
+        assert!(
+            nn::validate_attn_storage(&dims, 128, &q, &k, &v, &v, false).is_err(),
+            "output must not race V readers"
+        );
+
+        let k_wider = empty(rt, 2 * 128);
+        let mismatch = nn::validate_attn_storage(&dims, 128, &q, &k_wider, &v, &o, false)
+            .expect_err("K/V with different fixed strides must be rejected");
+        assert!(
+            mismatch.contains("different fixed capacities"),
+            "{mismatch}"
+        );
+
+        let scalar_alias = nn::flash_attn_rows(rt, &q, &k, &v, &o, &o, &o, &o, dims, 128, false)
+            .expect_err("output/live-scalar alias must fail before pipeline dispatch");
+        assert!(scalar_alias.contains("output must not alias live"));
+
+        let no_work = AttnDims { tq: 0, ..dims };
+        assert!(
+            nn::validate_attn_storage(&no_work, 128, &q, &q, &q, &q, false).is_ok(),
+            "zero-work attention must remain a no-op even when placeholder buffers alias"
+        );
+
+        let k2 = empty(rt, 2 * 128);
+        let v2 = empty(rt, 2 * 128);
+        let tkv = u32_buf(rt, 1);
+        let zero = u32_buf(rt, 0);
+        let declared = nn::flash_attn_decode(
+            rt, &q, &k2, &v2, &o, &tkv, &zero, &zero, dims, 128, 1, false,
+        )
+        .expect_err("a caller-provided live length must not redefine the fixed batch stride");
+        assert!(
+            declared.contains("does not match the fixed K/V layout"),
+            "{declared}"
+        );
+    });
 }
 
 #[test]
@@ -1241,15 +1553,143 @@ fn every_single_query_dispatch_takes_the_kv_split() {
     assert_eq!(attn_kernel_for(0, 0), AttnKernel::Rows);
 }
 
+/// K/V are laid out as `[B, capacity, Hkv, D]`, not `[B, live_Tkv, Hkv, D]`.
+/// A growing device-side length must therefore change only the visited range;
+/// it must never move batch 1's base address into batch 0's reserved cache.
+#[test]
+fn kv_batch_stride_is_independent_of_live_tkv() {
+    with_gpu(|rt| {
+        const B: usize = 2;
+        const CAPACITY: usize = 3;
+        const LIVE: usize = 1;
+        const D: usize = 128;
+
+        let q = vec![0.0; B * D];
+        let k = vec![0.0; B * CAPACITY * D];
+        let mut v = vec![-99.0; B * CAPACITY * D];
+        v[..D].fill(2.0);
+        v[CAPACITY * D..(CAPACITY + 1) * D].fill(7.0);
+        let (qb, kb, vb) = (buf(rt, &q), buf(rt, &k), buf(rt, &v));
+        let tkv = u32_buf(rt, LIVE as u32);
+        let zero = u32_buf(rt, 0);
+        let dims = AttnDims {
+            batch: B as u32,
+            tq: 1,
+            heads: 1,
+            heads_kv: 1,
+            window: 1,
+            scale: 1.0,
+        };
+
+        let split = empty(rt, B * D);
+        nn::flash_attn_decode(
+            rt, &qb, &kb, &vb, &split, &tkv, &zero, &zero, dims, D as u32, CAPACITY, false,
+        )
+        .unwrap();
+
+        let rows = empty(rt, B * D);
+        nn::flash_attn_rows(
+            rt, &qb, &kb, &vb, &rows, &tkv, &zero, &zero, dims, D as u32, false,
+        )
+        .unwrap();
+
+        let tiled = empty(rt, B * D);
+        nn::flash_attn_swa_tiled(
+            rt,
+            AttnHeadDim::D128,
+            &qb,
+            &kb,
+            &vb,
+            &tiled,
+            &tkv,
+            &zero,
+            &zero,
+            dims,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+
+        let expected: Vec<f32> = std::iter::repeat_n(2.0, D)
+            .chain(std::iter::repeat_n(7.0, D))
+            .collect();
+        assert_same_finite_bits(
+            "split fixed-capacity batch stride",
+            &split.read_f32(),
+            &expected,
+        );
+        assert_same_finite_bits(
+            "rows fixed-capacity batch stride",
+            &rows.read_f32(),
+            &expected,
+        );
+        assert_same_finite_bits(
+            "tiled fixed-capacity batch stride",
+            &tiled.read_f32(),
+            &expected,
+        );
+    });
+}
+
+/// Position offsets are device `u32`s, but adding a query row can cross that
+/// boundary. The logical absolute position is widened, not wrapped back to
+/// zero; a key at `u32::MAX` therefore remains causal for the following row.
+/// The old uint addition returned zero for row 1 and incorrectly masked it.
+#[test]
+fn absolute_position_math_widens_before_adding_the_query_row() {
+    with_gpu(|rt| {
+        const TQ: usize = 2;
+        const D: usize = 128;
+        let q = buf(rt, &vec![0.0; TQ * D]);
+        let k = buf(rt, &vec![0.0; D]);
+        let v = buf(rt, &vec![3.0; D]);
+        let tkv = u32_buf(rt, 1);
+        let max_pos = u32_buf(rt, u32::MAX);
+        let dims = AttnDims {
+            batch: 1,
+            tq: TQ as u32,
+            heads: 1,
+            heads_kv: 1,
+            window: 2,
+            scale: 1.0,
+        };
+
+        let rows = empty(rt, TQ * D);
+        nn::flash_attn_rows(
+            rt, &q, &k, &v, &rows, &tkv, &max_pos, &max_pos, dims, D as u32, false,
+        )
+        .unwrap();
+
+        let tiled = empty(rt, TQ * D);
+        nn::flash_attn_swa_tiled(
+            rt,
+            AttnHeadDim::D128,
+            &q,
+            &k,
+            &v,
+            &tiled,
+            &tkv,
+            &max_pos,
+            &max_pos,
+            dims,
+        )
+        .unwrap();
+        rt.synchronize().unwrap();
+
+        let expected = vec![3.0; TQ * D];
+        assert_same_finite_bits("rows widened positions", &rows.read_f32(), &expected);
+        assert_same_finite_bits("tiled widened positions", &tiled.read_f32(), &expected);
+    });
+}
+
 /// The routed path and a direct KV-split dispatch must agree bit for bit.
 ///
-/// `route_attn` sizes the split grid from the K buffer's *capacity*, because
-/// the live `Tkv` is a device value it cannot read. A pooled allocator that
-/// hands back more bytes than were asked for therefore dispatches chunks past
-/// the live range, and the reduce pass folds their zeroed partials in. That is
-/// meant to be a no-op; this asserts it, because the parity dump showed the
-/// two paths' outputs differing by 2.2e-08 and only a bit-level comparison
-/// says whether that is a different reduction order or a real contribution.
+/// `route_attn` sizes the split grid from the fixed capacity jointly derived
+/// from K and V, because the live `Tkv` is a device value it cannot read. Grid
+/// chunks past the live range return before writing, while both passes derive
+/// the same live scratch stride and reduce only partials written this time.
+/// This asserts that contract bit for bit: the parity dump once showed a
+/// 2.2e-08 difference, and only exact comparison can distinguish a changed
+/// reduction order from a real contribution.
 #[test]
 fn the_routed_path_matches_a_direct_kv_split_dispatch() {
     with_gpu(|rt| {
@@ -1317,18 +1757,10 @@ fn the_routed_path_matches_a_direct_kv_split_dispatch() {
             rt.synchronize().unwrap();
 
             let (a, c) = (routed.read_f32(), direct.read_f32());
-            let mut worst = (0usize, 0.0f32);
-            for (i, (x, y)) in a[..b * h * d].iter().zip(&c[..b * h * d]).enumerate() {
-                let e = (x - y).abs();
-                if e > worst.1 {
-                    worst = (i, e);
-                }
-            }
-            assert_eq!(
-                worst.1, 0.0,
-                "b={b} tkv={tkv} h={h} d={d} window={window}: routed and direct \
-             KV-split disagree at element {} by {}",
-                worst.0, worst.1
+            assert_same_finite_bits(
+                &format!("b={b} tkv={tkv} h={h} d={d} window={window}: routed vs direct"),
+                &a[..b * h * d],
+                &c[..b * h * d],
             );
         }
     });

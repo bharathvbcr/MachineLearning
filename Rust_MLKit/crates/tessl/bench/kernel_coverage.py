@@ -14,8 +14,20 @@ is selected; each bench binary prints its trace on exit, on every exit path.
 
   python3 bench/kernel_coverage.py            # report
   python3 bench/kernel_coverage.py --check    # non-zero if anything is uncovered
+
+By default the compiled library is resolved from the absolute `OUT_DIR` path
+embedded in `target/release/bench_gemm_sweep`. Pass `--metallib PATH` to audit
+an explicit artifact. The build never writes a compatibility copy into the
+crate source tree.
 """
-import argparse, json, os, re, subprocess, sys
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CRATE = os.path.dirname(HERE)
@@ -94,7 +106,7 @@ def strip_macro_bodies(text):
     return "\n".join(out)
 
 
-def inventory(kdir=None, metallib=None):
+def inventory(kdir=None, metallib=None, require_metallib=False):
     """Every kernel entry point declared in the shipped kernel sources.
 
     `kdir` is a parameter so the guard below is testable: a macro family this
@@ -132,7 +144,7 @@ def inventory(kdir=None, metallib=None):
     # kept because it attributes each kernel to a file, but any disagreement
     # means the scan is wrong -- a macro form it cannot parse, or one whose
     # first argument is not the kernel name.
-    exported = metallib_symbols(metallib)
+    exported = metallib_symbols(metallib, required=require_metallib)
     if exported is not None:
         only_lib = sorted(exported - names)
         only_src = sorted(names - exported)
@@ -145,20 +157,48 @@ def inventory(kdir=None, metallib=None):
     return names, by_file
 
 
-def metallib_symbols(path=None):
+def metallib_symbols(path=None, required=False):
     """Exported kernel names from the built metallib, or None if unavailable.
 
     `None` and `set()` are deliberately different: a toolchain without
-    `metal-nm` must not read as a library with no kernels in it.
+    `metal-nm` must not read as a library with no kernels in it. Set `required`
+    for a coverage measurement: a cross-check that could not run is then a hard
+    failure rather than the same PASS as one that actually verified the binary.
     """
-    path = path or os.path.join(CRATE, "default.metallib")
+    if path is None:
+        # The runtime embeds build.rs's immutable OUT_DIR artifact. Resolving
+        # that exact path keeps the census tied to the binaries being measured
+        # and avoids relying on a stale, source-tree `default.metallib` copy.
+        binary = os.path.join(BIN, "bench_gemm_sweep")
+        if not os.path.isfile(binary):
+            if required:
+                raise SystemExit(
+                    f"benchmark binary missing at {binary}; run "
+                    "`cargo build --release --bins` before measuring kernel coverage")
+            return None
+        from benchmark_evidence import embedded_metallib_path
+        try:
+            path = embedded_metallib_path(binary)
+        except ValueError as exc:
+            if required:
+                raise SystemExit(f"cannot resolve the benchmark's embedded metallib: {exc}")
+            return None
     if not os.path.exists(path):
+        if required:
+            raise SystemExit(
+                f"compiled metallib missing at {path}; build the release binaries "
+                "before measuring kernel coverage")
         return None
     try:
         r = subprocess.run(["xcrun", "metal-nm", path], capture_output=True, text=True)
-    except OSError:
+    except OSError as exc:
+        if required:
+            raise SystemExit(f"could not execute xcrun metal-nm: {exc}")
         return None
     if r.returncode != 0:
+        if required:
+            detail = r.stderr.strip()[:400] or "no diagnostic"
+            raise SystemExit(f"metal-nm failed for {path}: {detail}")
         return None
     out = set()
     for line in r.stdout.splitlines():
@@ -166,6 +206,10 @@ def metallib_symbols(path=None):
         # `<addr> T <name>` marks an exported kernel entry point.
         if len(parts) == 3 and parts[1] == "T":
             out.add(parts[2])
+    if not out and required:
+        raise SystemExit(
+            f"metal-nm exported no kernel entry points from {path}; refusing to "
+            "treat an unreadable or empty library as verified")
     return out or None
 
 
@@ -205,13 +249,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true",
                     help="exit non-zero if any kernel is never dispatched")
+    ap.add_argument(
+        "--metallib",
+        help="explicit compiled metallib to inventory (default: path embedded in the release binary)",
+    )
     ap.add_argument("--out")
     args = ap.parse_args()
 
-    import tempfile, shutil
     tmp = tempfile.mkdtemp(prefix="kernel-coverage-")
     try:
-        names, by_file = inventory()
+        # A command-line coverage result is evidence about the shipped binary,
+        # not just a source grep. If the compiled-library census cannot run,
+        # stop before executing suites or printing a percentage.
+        names, by_file = inventory(metallib=args.metallib, require_metallib=True)
         traced, per_suite, failures = run_suites(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

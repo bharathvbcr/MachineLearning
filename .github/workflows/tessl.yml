@@ -5,10 +5,14 @@ on:
     branches: [main]
     paths:
       - 'Rust_MLKit/crates/tessl/**'
+      - 'Rust_MLKit/gemma-metal/**'
+      - 'Rust_MLKit/arch_02_value_resid/metal-native/**'
       - '.github/workflows/tessl.yml'
   pull_request:
     paths:
       - 'Rust_MLKit/crates/tessl/**'
+      - 'Rust_MLKit/gemma-metal/**'
+      - 'Rust_MLKit/arch_02_value_resid/metal-native/**'
       - '.github/workflows/tessl.yml'
   workflow_dispatch:
 
@@ -40,14 +44,15 @@ jobs:
   # knowing would be guessing at a red build.
   #
   # The probe step below answers it. Once a run shows a usable device, move
-  # `cargo test --release` into this job and keep `gpu` for measurement only.
+  # `cargo test --release -- --test-threads=1` into this job and keep `gpu` for
+  # measurement only.
   #
   # Meanwhile this job is far from empty: `build.rs` AOT-compiles
   # `kernels/*.metal` into a metallib, so a shader that stops compiling turns it
   # red — the most common way to break tessl without a Rust compiler error.
   # ---------------------------------------------------------------------------
   build:
-    name: build + lint (no GPU on hosted runners)
+    name: build + lint (hosted TensorOps tests pending)
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -76,6 +81,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy --all-targets --features quant-prep -- -D warnings
+      - name: Pure parity-harness regressions
+        run: python3 bench/test_parity_harness.py --pure
 
       - name: Probe the runner's Metal capabilities
         # Informational, never a gate. Reports whether this runner has a device
@@ -95,23 +102,53 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-      - name: docs.rs build (no Xcode, no Metal toolchain)
-        # docs.rs builds on x86_64 Linux where `xcrun` does not exist and the
-        # gitignored `default.metallib` is absent from the published .crate.
-        # `build.rs` detects DOCS_RS and skips the shader compile. Without this
-        # step the escape hatch rots silently and the first sign is a red build
-        # on docs.rs after a release, which cannot be fixed without a new one.
+      - name: Isolated docs.rs build-script path
+        # A separate target directory forces build.rs to execute with DOCS_RS=1
+        # instead of reusing the ordinary docs build above. docs.rs itself has
+        # no Metal toolchain and the published crate has no source-root
+        # metallib, so this escape hatch must stay independently buildable.
         run: cargo doc --no-deps --all-features
         env:
           DOCS_RS: "1"
+          CARGO_TARGET_DIR: target/docsrs-simulation
           RUSTDOCFLAGS: -D warnings
 
       - name: Build (AOT-compiles the metallib)
-        # TESSL_SKIP_AOT is NOT used here on purpose. It points the build at a
-        # crate-root `default.metallib`, which is a gitignored local artefact
-        # and therefore absent on a fresh checkout — the skip would produce a
-        # build that links a metallib that does not exist.
+        # TESSL_SKIP_AOT is deliberately absent: CI must compile the current
+        # sources, not trust an explicitly supplied prebuilt metallib.
         run: cargo build --release --all-targets
+
+      - name: Check the in-tree Gemma consumer
+        # gemma-metal exercises tessl's low-level decode/ICB ABI. A tessl build
+        # alone cannot catch a signature or feature-integration regression in
+        # that downstream crate.
+        working-directory: Rust_MLKit/gemma-metal
+        run: |
+          cargo check --all-targets
+          cargo check --no-default-features --all-targets
+
+      - name: Check the Arch02 training consumer
+        # This consumer compiles selected Tessl Metal sources into its own
+        # metallib. The downstream check catches symbol collisions and dtype
+        # contract drift that a Tessl-only build cannot observe.
+        working-directory: Rust_MLKit/arch_02_value_resid/metal-native
+        run: cargo check --locked --all-targets
+
+  # `rust-version = "1.82"` is a compatibility contract, not documentation.
+  # Build every Tessl target and optional feature with that exact compiler.
+  msrv:
+    name: MSRV 1.82 / all targets
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the Metal Toolchain component
+        run: xcodebuild -downloadComponent MetalToolchain
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: Rust_MLKit/crates/tessl
+      - run: cargo check --locked --all-targets
+      - run: cargo check --locked --all-features --all-targets
 
   # ---------------------------------------------------------------------------
   # The real suite. Needs an Apple silicon machine with a Metal device.
@@ -126,6 +163,10 @@ jobs:
     name: full suite on bare-metal Apple silicon
     if: ${{ vars.HAS_METAL_RUNNER == 'true' }}
     runs-on: [self-hosted, macOS, ARM64]
+    env:
+      MTL_SHADER_VALIDATION: "1"
+      MTL_SHADER_VALIDATION_REPORT_TO_STDERR: "1"
+      MTL_SHADER_VALIDATION_ABORT_ON_FAULT: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -133,9 +174,13 @@ jobs:
         with:
           workspaces: Rust_MLKit/crates/tessl
       - name: Test (release)
-        run: cargo test --release
+        run: cargo test --release -- --test-threads=1
       - name: Test with quant-prep
-        run: cargo test --release --features quant-prep
+        run: cargo test --release --features quant-prep -- --test-threads=1
+      - name: Fail-closed cross-runtime parity
+        run: python3 bench/test_parity_harness.py --require-gpu
+      - name: Require benchmark coverage for every shipped kernel
+        run: python3 bench/kernel_coverage.py --check
       - name: Run the README examples
         # The README's snippets are these files. Building them proves they
         # compile; running them proves the API still does what the prose says,
@@ -145,5 +190,6 @@ jobs:
           cargo run --release --example nn_layer
       - name: Deep GEMM fuzz
         # `gemm_fuzz_deep` is `#[ignore]`d so it stays out of the default run.
-        # A real GPU runner is the right place to actually pay for it.
-        run: cargo test --release -- --ignored gemm_fuzz_deep
+        # Select the library explicitly so Cargo does not launch 19 unrelated
+        # integration-test binaries whose ignored-test set is empty.
+        run: cargo test --release --lib -- --ignored --test-threads=1 gemm_fuzz_deep

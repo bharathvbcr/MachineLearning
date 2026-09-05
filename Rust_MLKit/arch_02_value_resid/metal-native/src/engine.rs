@@ -252,7 +252,7 @@ impl TrainingEngine {
             ));
         }
         self.inputs.mark_synced();
-        self.rt.bump_reset();
+        self.rt.bump_reset()?;
         let dispatches = self.rt.take_dispatch_count();
         self.data_cursor_tokens = self
             .data_cursor_tokens
@@ -279,7 +279,7 @@ impl TrainingEngine {
         self.rt.synchronize()?;
         let loss = out.read_loss(&self.rt)?;
         self.inputs.mark_synced();
-        self.rt.bump_reset();
+        self.rt.bump_reset()?;
         let _ = self.rt.take_dispatch_count();
         Ok(loss)
     }

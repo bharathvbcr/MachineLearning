@@ -32,7 +32,7 @@ inline float row_sum_squares(
     uint tptg)
 {
     float ss = 0.0f;
-    for (uint d = lid; d < dim; d += tptg) {
+    for (ulong d = lid; d < (ulong)dim; d += tptg) {
         float v = xin[d];
         ss += v * v;
     }
@@ -62,7 +62,7 @@ kernel void rms_norm_f32(
     // `eps` is what keeps an all-zero row finite: rsqrt(0) is inf, and the row
     // would leave here as inf or NaN without it.
     const float inv = rsqrt(row_sum_squares(xin, scratch, dim, lid, tptg) / (float)dim + eps);
-    for (uint d = lid; d < dim; d += tptg) {
+    for (ulong d = lid; d < (ulong)dim; d += tptg) {
         xout[d] = xin[d] * inv * weight[d];
     }
 }
@@ -85,7 +85,7 @@ kernel void rms_norm_bf16(
     device bfloat *xout = out + (ulong)row * dim;
 
     const float inv = rsqrt(row_sum_squares(xin, scratch, dim, lid, tptg) / (float)dim + eps);
-    for (uint d = lid; d < dim; d += tptg) {
+    for (ulong d = lid; d < (ulong)dim; d += tptg) {
         xout[d] = (bfloat)(xin[d] * inv * weight[d]);
     }
 }
@@ -112,11 +112,11 @@ kernel void rms_norm_residual_add_f32(
     const float inv = rsqrt(row_sum_squares(xin, scratch, dim, lid, tptg) / (float)dim + eps);
     const float s = layer_scale;
     if (s == 1.0f) {
-        for (uint d = lid; d < dim; d += tptg) {
+        for (ulong d = lid; d < (ulong)dim; d += tptg) {
             xout[d] += xin[d] * inv * weight[d];
         }
     } else {
-        for (uint d = lid; d < dim; d += tptg) {
+        for (ulong d = lid; d < (ulong)dim; d += tptg) {
             float h = xin[d] * inv * weight[d];
             xout[d] = s * (xout[d] + h);
         }

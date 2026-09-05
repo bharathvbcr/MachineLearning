@@ -13,8 +13,8 @@ use objc2::runtime::ProtocolObject;
 use objc2::AnyThread;
 use objc2_foundation::NSInteger;
 use objc2_metal::{
-    MTLBuffer, MTLDevice, MTLResourceID, MTLResourceOptions, MTLSizeAndAlign, MTLTensor,
-    MTLTensorDataType, MTLTensorDescriptor, MTLTensorExtents, MTLTensorUsage,
+    MTLAllocation, MTLBuffer, MTLDevice, MTLResourceID, MTLResourceOptions, MTLSizeAndAlign,
+    MTLTensor, MTLTensorDataType, MTLTensorDescriptor, MTLTensorExtents, MTLTensorUsage,
 };
 use std::sync::Arc;
 
@@ -62,9 +62,11 @@ impl QuantDType {
 
 /// Snapshot of TensorOps / NAX readiness for verify(M) / prefill planning.
 ///
-/// Int4 is **unbound** in objc2-metal 0.3 — verify(M) remains on hand simdgroup Q4
-/// GEMM (`gemm_q4_mlx_simd*`). DDTree stays parked until verify(M) flattens (it will
-/// not with current simdgroup Q4 alone).
+/// Verify(M) remains on hand-written simdgroup Q4 GEMM
+/// (`gemm_q4_mlx_simd*`) because tessl does not yet ship the shader-side
+/// sub-byte TensorOps constructor and wired host dispatch that raw-address Q4
+/// needs. The missing Int4 host descriptor binding in objc2-metal 0.3 is
+/// reported separately; it does not block that raw-address kernel design.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NaxVerifyReadiness {
     pub int8_tensorops_dtype: bool,
@@ -84,7 +86,7 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
         // `.is_ok()` off it. There is one fact here — quantized TensorOps
         // prefill GEMM does not exist — and it is stated once.
         quant_prefill_gemm_wired: QUANT_PREFILL_GEMM_WIRED,
-        note: "Int4 unbound in objc2-metal 0.3; verify(M) = hand simdgroup Q4; TensorOps Q4 not shipped",
+        note: "TensorOps Q4 is not shipped: raw-address kernels lack a shader-side sub-byte tensor constructor and wired host dispatch; the missing Int4 host descriptor binding is separate",
     }
 }
 
@@ -112,8 +114,20 @@ pub fn nax_verify_readiness() -> NaxVerifyReadiness {
 pub const QUANT_PREFILL_GEMM_WIRED: bool = false;
 
 /// Owned MTLTensor handle (device-allocated or buffer-backed).
+///
+/// The native handle is deliberately read-only through the safe API. Replacing
+/// it would detach the object from the storage, runtime, and residency policy
+/// recorded alongside it, so callers receive only a borrowed handle via
+/// [`Self::metal`].
+///
+/// ```compile_fail,E0616
+/// use tessl::mtl_tensor::GpuTensor;
+/// fn cannot_replace_the_native_handle(tensor: &mut GpuTensor) {
+///     let _replacement_slot = &mut tensor.tensor;
+/// }
+/// ```
 pub struct GpuTensor {
-    pub tensor: Retained<ProtocolObject<dyn MTLTensor>>,
+    tensor: Retained<ProtocolObject<dyn MTLTensor>>,
     pub dtype: MTLTensorDataType,
     pub dims: Vec<usize>,
     // Lifetime anchors, never read: the MTLTensor above borrows this storage,
@@ -125,15 +139,36 @@ pub struct GpuTensor {
     pub(crate) storage: Option<GpuBuffer>,
     #[allow(dead_code)]
     pub(crate) runtime: Arc<GpuRuntime>,
+    /// Device-created tensors own a distinct `MTLAllocation` and therefore a
+    /// distinct residency registration. Buffer-backed tensor views borrow the
+    /// registration held by `storage` and must not double-register it.
+    residency_registered: bool,
 }
 
 impl GpuTensor {
+    /// Borrow the native tensor without allowing its ownership metadata to be
+    /// separated from it.
+    pub fn metal(&self) -> &ProtocolObject<dyn MTLTensor> {
+        &self.tensor
+    }
+
     pub fn gpu_resource_id(&self) -> MTLResourceID {
         self.tensor.gpuResourceID()
     }
 
     pub fn data_type(&self) -> MTLTensorDataType {
         self.tensor.dataType()
+    }
+}
+
+impl Drop for GpuTensor {
+    fn drop(&mut self) {
+        if self.residency_registered {
+            // The runtime retains this allocation until every command that
+            // could reference it has completed, then removes it from the
+            // residency set without putting it into the buffer freelist.
+            self.runtime.schedule_tensor_retirement(self.tensor.clone());
+        }
     }
 }
 
@@ -146,6 +181,9 @@ impl GpuTensor {
 /// writes past the table (a large one segfaults outright), which is why this
 /// safe wrapper rejects it instead of passing it through.
 pub fn bind_mtl_tensor(bnd: &mut Binder<'_>, t: &GpuTensor, index: usize) -> Result<(), String> {
+    if !bnd.belongs_to_runtime(t.runtime.as_ref()) {
+        return Err("MTLTensor belongs to another runtime".into());
+    }
     if index >= ARGUMENT_TABLE_MAX_BUFFERS {
         return Err(format!(
             "MTLTensor bind index {index} out of range: argument table has \
@@ -153,15 +191,12 @@ pub fn bind_mtl_tensor(bnd: &mut Binder<'_>, t: &GpuTensor, index: usize) -> Res
             ARGUMENT_TABLE_MAX_BUFFERS - 1
         ));
     }
-    // SAFETY: `bind_resource_id` requires `index` to be within the argument
-    // table's buffer bind count; the check above establishes that against the
-    // same constant `runtime::try_init_metal4` builds the table with (the
-    // DecodeIcb tape table is built with the same width). The resource id is
-    // read from `t`, which owns its MTLTensor — and, for a buffer-backed
-    // tensor, the storage behind it — for at least as long as this call.
-    unsafe {
-        bnd.bind_resource_id(t.gpu_resource_id(), index);
-    }
+    // The Binder takes its own +1 retain on the MTLTensor object before writing
+    // the resource ID. Metal 4 command buffers use unretained resources, so the
+    // caller may drop `t` (including a buffer-backed view) as soon as this
+    // closure returns without invalidating the encoded ID. The anchor transfers
+    // to the allocator slot on submission and releases only after completion.
+    bnd.bind_mtl_tensor_resource(&t.tensor, index);
     Ok(())
 }
 
@@ -191,19 +226,23 @@ pub fn alloc_device_tensor(
         .device
         .newTensorWithDescriptor_error(&desc)
         .map_err(|e| format!("newTensorWithDescriptor: {e}"))?;
+    rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*tensor));
     Ok(GpuTensor {
         tensor,
         dtype: mtl_dtype,
         dims: dims.to_vec(),
         storage: None,
         runtime: Arc::clone(rt),
+        residency_registered: true,
     })
 }
 
 /// Wrap an existing shared buffer as an MTLTensor view (offset must satisfy align).
 ///
 /// # Safety
-/// `byte_offset` must match `tensorSizeAndAlignWithDescriptor` alignment for `dtype`.
+/// The caller must ensure no incompatible live tensor view aliases the requested
+/// buffer range. Alignment, bounds, size arithmetic, and runtime ownership are
+/// validated here before the Metal selector is called.
 pub unsafe fn tensor_from_buffer(
     rt: &Arc<GpuRuntime>,
     buf: &GpuBuffer,
@@ -211,15 +250,13 @@ pub unsafe fn tensor_from_buffer(
     dims: &[usize],
     dtype: QuantDType,
 ) -> Result<GpuTensor, String> {
+    if !buf.belongs_to(rt) {
+        return Err("MTLTensor buffer belongs to another runtime".into());
+    }
     let mtl_dtype = dtype.to_mtl()?;
     let desc = make_descriptor(dims, mtl_dtype, MTLTensorUsage::Compute)?;
     let align = rt.device.tensorSizeAndAlignWithDescriptor(&desc);
-    if byte_offset % align.align != 0 {
-        return Err(format!(
-            "tensor buffer offset {byte_offset} not aligned to {}",
-            align.align
-        ));
-    }
+    validate_tensor_buffer_range(buf.nbytes(), byte_offset, align.size, align.align)?;
     let tensor = buf
         .metal()
         .newTensorWithDescriptor_offset_error(&desc, byte_offset as _)
@@ -230,6 +267,7 @@ pub unsafe fn tensor_from_buffer(
         dims: dims.to_vec(),
         storage: Some(buf.clone()),
         runtime: Arc::clone(rt),
+        residency_registered: false,
     })
 }
 
@@ -241,6 +279,9 @@ fn make_descriptor(
     if dims.is_empty() || dims.len() > 16 {
         return Err(format!("MTLTensor rank {} out of range 1..=16", dims.len()));
     }
+    if let Some(&extent) = dims.iter().find(|&&d| d > NSInteger::MAX as usize) {
+        return Err(format!("MTLTensor extent {extent} does not fit NSInteger"));
+    }
     let desc = MTLTensorDescriptor::new();
     let extents = extents_from_dims(dims)?;
     desc.setDimensions(&extents);
@@ -248,6 +289,31 @@ fn make_descriptor(
     desc.setUsage(usage);
     desc.setResourceOptions(MTLResourceOptions::StorageModeShared);
     Ok(desc)
+}
+
+fn validate_tensor_buffer_range(
+    buffer_bytes: usize,
+    byte_offset: usize,
+    tensor_bytes: usize,
+    alignment: usize,
+) -> Result<(), String> {
+    if alignment == 0 {
+        return Err("MTLTensor reported zero buffer alignment".into());
+    }
+    if byte_offset % alignment != 0 {
+        return Err(format!(
+            "tensor buffer offset {byte_offset} not aligned to {alignment}"
+        ));
+    }
+    if byte_offset
+        .checked_add(tensor_bytes)
+        .is_none_or(|end| end > buffer_bytes)
+    {
+        return Err(format!(
+            "tensor buffer range offset={byte_offset} size={tensor_bytes} exceeds {buffer_bytes} bytes"
+        ));
+    }
+    Ok(())
 }
 
 fn extents_from_dims(dims: &[usize]) -> Result<Retained<MTLTensorExtents>, String> {
@@ -280,13 +346,14 @@ mod tests {
     }
 
     #[test]
-    fn nax_verify_readiness_int4_unbound() {
+    fn nax_verify_readiness_names_the_actual_q4_gap() {
         let r = nax_verify_readiness();
         assert!(r.int8_tensorops_dtype);
         assert!(!r.int4_tensorops_dtype);
         assert!(!r.fp8_e8m0_tensorops_dtype);
         assert!(!r.quant_prefill_gemm_wired);
-        assert!(r.note.contains("Int4 unbound"));
+        assert!(r.note.contains("shader-side sub-byte tensor constructor"));
+        assert!(r.note.contains("host descriptor binding is separate"));
     }
 
     /// The argument table has 31 buffer slots, so 30 is the last valid index
@@ -316,6 +383,50 @@ mod tests {
         huge.expect_err("usize::MAX must never reach setResource:atBufferIndex:");
     }
 
+    #[test]
+    fn bind_mtl_tensor_rejects_foreign_runtime_before_mutation() {
+        let owner = GpuRuntime::new().expect("owner runtime");
+        let encoder = GpuRuntime::new().expect("encoder runtime");
+        let foreign =
+            alloc_device_tensor(&owner, &[16, 16], QuantDType::Int8).expect("foreign tensor");
+        let local =
+            alloc_device_tensor(&encoder, &[16, 16], QuantDType::Int8).expect("local tensor");
+
+        let mut outcome = None;
+        encoder
+            .with_binder(|bnd| {
+                let rejected = bind_mtl_tensor(bnd, &foreign, 0);
+                // A rejected foreign resource must not poison or partially
+                // mutate the binder. A valid local bind in the same slot and
+                // scope must still succeed.
+                let local_after_rejection = bind_mtl_tensor(bnd, &local, 0);
+                outcome = Some((rejected, local_after_rejection));
+                Ok(())
+            })
+            .expect("binder remains usable after a rejected foreign tensor");
+        let (foreign_result, local_result) = outcome.expect("binder body ran");
+        let err = foreign_result.expect_err("foreign runtime must be rejected");
+        assert!(err.contains("another runtime"), "unexpected error: {err}");
+        local_result.expect("local tensor must still bind");
+    }
+
+    #[test]
+    fn device_tensor_residency_retires_after_completed_work() {
+        let rt = GpuRuntime::new().expect("runtime");
+        let baseline = *rt.metal4.residency_count.lock().unwrap();
+        for _ in 0..32 {
+            drop(alloc_device_tensor(&rt, &[16, 16], QuantDType::Int8).expect("device tensor"));
+        }
+        assert_eq!(
+            *rt.metal4.residency_count.lock().unwrap(),
+            baseline + 32,
+            "final drop must retain residency until the completion drain"
+        );
+
+        rt.synchronize().expect("completed-work drain");
+        assert_eq!(*rt.metal4.residency_count.lock().unwrap(), baseline);
+    }
+
     /// Descriptor construction only (no device call). Full
     /// `tensorSizeAndAlign` / `newTensor` A/B is Phase 2 — objc2 bindings can
     /// SIGSEGV on some SDK/runtime combos when probing unsupported layouts.
@@ -325,5 +436,26 @@ mod tests {
             .expect("descriptor");
         assert_eq!(desc.dataType(), MTLTensorDataType::Int8);
         assert_eq!(desc.dimensions().rank(), 2);
+    }
+
+    #[test]
+    fn descriptor_rejects_extent_that_does_not_fit_nsinteger() {
+        let err = make_descriptor(
+            &[usize::MAX],
+            MTLTensorDataType::Int8,
+            MTLTensorUsage::Compute,
+        )
+        .map(|_| ())
+        .expect_err("usize::MAX would narrow to a negative NSInteger extent");
+        assert!(err.contains("NSInteger"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn tensor_buffer_range_checks_overflow_alignment_and_capacity() {
+        validate_tensor_buffer_range(64, 16, 32, 16).expect("valid range");
+        assert!(validate_tensor_buffer_range(64, 1, 32, 16).is_err());
+        assert!(validate_tensor_buffer_range(64, 0, 65, 16).is_err());
+        assert!(validate_tensor_buffer_range(usize::MAX, usize::MAX - 7, 16, 1).is_err());
+        assert!(validate_tensor_buffer_range(64, 0, 1, 0).is_err());
     }
 }

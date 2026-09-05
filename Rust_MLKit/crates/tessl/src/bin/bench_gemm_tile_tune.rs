@@ -9,6 +9,9 @@
 // sweeping. Bundling them would add a struct that every call site unpacks.
 #![allow(clippy::too_many_arguments)]
 
+mod common;
+
+use common::{env_usize, median};
 use objc2_metal::MTLComputePipelineState;
 use std::time::Instant;
 use tessl::gemm::{cast_f32_to_bf16, gemm, GemmBackend};
@@ -135,16 +138,6 @@ fn fill(n: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    }
-}
-
 fn run_variant(
     rt: &std::sync::Arc<GpuRuntime>,
     v: &Variant,
@@ -173,9 +166,9 @@ fn run_variant(
             bnd.barrier();
         }
         bnd.set_pipeline(&p);
-        bnd.bind_buf(a.buffer.metal(), a.byte_offset, 0);
-        bnd.bind_buf(b.buffer.metal(), b.byte_offset, 1);
-        bnd.bind_buf(c.buffer.metal(), c.byte_offset, 2);
+        bnd.bind_tensor(a, 0);
+        bnd.bind_tensor(b, 1);
+        bnd.bind_tensor(c, 2);
         bnd.bind_u32(m as u32, 3);
         bnd.bind_u32(n as u32, 4);
         bnd.bind_u32(k as u32, 5);
@@ -186,15 +179,9 @@ fn run_variant(
 }
 
 fn main() -> Result<(), String> {
+    let warmup = env_usize("BENCH_WARMUP", 10, 0)?;
+    let iters = env_usize("BENCH_ITERS", 30, 1)?;
     let rt = GpuRuntime::new()?;
-    let warmup: usize = std::env::var("BENCH_WARMUP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
-    let iters: usize = std::env::var("BENCH_ITERS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
 
     println!(
         "{:<32}{:>12}{:>14}{:>16}",
@@ -244,7 +231,7 @@ fn main() -> Result<(), String> {
                 rt.synchronize()?;
                 s.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
-            median(s)
+            median(s)?
         };
         println!(
             "\n{label}  M={m} N={n} K={k}   production {prod:.3} ms  {:.0} GFLOP/s",
@@ -285,7 +272,7 @@ fn main() -> Result<(), String> {
                 rt.synchronize()?;
                 s.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
-            let med = median(s);
+            let med = median(s)?;
             println!(
                 "  {:<32}{:>10.3}{:>12.0}{:>8.2}×{:>12.2e}",
                 v.kernel,
@@ -304,7 +291,7 @@ fn main() -> Result<(), String> {
                 rt.synchronize()?;
                 s.push(t0.elapsed().as_secs_f64() * 1000.0);
             }
-            median(s)
+            median(s)?
         };
         println!(
             "  production re-measured after: {prod_after:.3} ms ({:.0} GFLOP/s) \

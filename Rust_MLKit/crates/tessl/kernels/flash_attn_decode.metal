@@ -1,4 +1,5 @@
 // FlashDecoding: single-query attention, split over the KV sequence.
+// K/V use [B,kv_capacity,Hkv,D]; Tkv is the live prefix and never a stride.
 //
 // The general FA-2 kernels tile over query rows: the grid is
 // `ceil(Tq/BR) x B*H` and only `lid < BR` lanes are row-valid. At Tq=1 that is
@@ -39,10 +40,10 @@ constant uint KV_CHUNK = 256;
 /// Partial pass: one simdgroup, one (batch, head, kv-chunk).
 ///
 /// `Tkv` lives on the device, so the host cannot size the grid to the live
-/// chunk count and dispatches for the K buffer's capacity instead. Chunks past
-/// `Tkv` return immediately; the scratch they would have written is zeroed by
-/// the host so the reduce pass cannot read a stale partial from a previous
-/// dispatch and treat it as this one's.
+/// chunk count and dispatches for the requested, jointly-backed K/V capacity
+/// instead. Both passes clamp `Tkv` to that same bound before deriving an
+/// address. Chunks past the clamped value return immediately, and the reduce
+/// pass visits exactly the chunks the partial pass wrote.
 #define DECODE_PARTIAL_KERNEL(NAME, D, CH, R)                                 \
 kernel void NAME(                                                             \
     device const float *Q [[buffer(0)]],                                      \
@@ -57,6 +58,7 @@ kernel void NAME(                                                             \
     constant float &scale [[buffer(10)]],                                     \
     device const uint *q_pos_offset_ptr [[buffer(11)]],                       \
     device const uint *kv_pos_offset_ptr [[buffer(12)]],                      \
+    constant uint &kv_capacity [[buffer(13)]],                                \
     uint2 tgpig [[threadgroup_position_in_grid]],                             \
     uint2 tpitg [[thread_position_in_threadgroup]],                           \
     uint2 tptg [[threads_per_threadgroup]])                                   \
@@ -100,7 +102,8 @@ kernel void NAME(                                                             \
     const uint lane = tpitg.x % SIMD_W;                                       \
     const uint grp = lane / (R);       /* which key-group */                  \
     const uint dl = lane % (R);        /* which dim slice */                  \
-    const uint Tkv = *Tkv_ptr;                                                \
+    /* Clamp mutable device state before it participates in any address. */   \
+    const uint Tkv = min(*Tkv_ptr, kv_capacity);                              \
     const uint chunk = tgpig.x;                                               \
     /* grid.y enumerates (batch, head-block); a block is the `sgs` consecutive \
        query heads one threadgroup covers. `sgs == H/Hkv` puts exactly the     \
@@ -114,19 +117,25 @@ kernel void NAME(                                                             \
     const uint hb = tgpig.y % blocks;                                         \
     const uint h = hb * sgs + sg;                                             \
     if (h >= H) { return; }                                                   \
-    const uint bh = b * H + h;                                                \
+    const ulong bh = (ulong)b * H + h;                                        \
     const uint t_k0 = chunk * (CH);                                           \
     if (t_k0 >= Tkv) { return; }                                              \
     const uint n_k = min((uint)(CH), Tkv - t_k0);                             \
     const uint group = max(H / Hkv, 1u);                                      \
     const uint hkv = h / group;                                               \
+    const ulong kv_pos_stride = (ulong)Hkv * (D);                             \
+    const ulong kv_head_base =                                                \
+        (ulong)b * kv_capacity * kv_pos_stride + (ulong)hkv * (D);            \
                                                                               \
-    const int q_abs = (int)(*q_pos_offset_ptr);                               \
-    const uint kv_pos_offset = *kv_pos_offset_ptr;                            \
-    const int k_lo = (window == 0u) ? 0 : max(0, q_abs - (int)window + 1);    \
+    const ulong q_abs = (ulong)(*q_pos_offset_ptr);                           \
+    const ulong kv_pos_offset = (ulong)(*kv_pos_offset_ptr);                  \
+    const ulong window_back = (window == 0u) ? 0ul : (ulong)window - 1ul;     \
+    const ulong k_lo = (window == 0u || q_abs < window_back)                  \
+        ? 0ul                                                                 \
+        : q_abs - window_back;                                                 \
                                                                               \
     /* Tq == 1, so the single query row is index 0. */                        \
-    const uint q_off = (b * H + h) * (D);                                     \
+    const ulong q_off = bh * (D);                                             \
     device const float4 *Q4 = (device const float4 *)(Q + q_off);             \
     float4 q_reg[DPV];                                                        \
     for (uint j = 0; j < DPV; ++j) { q_reg[j] = Q4[dl + j * (R)]; }           \
@@ -146,11 +155,16 @@ kernel void NAME(                                                             \
        Restoring this is a regression fix -- the `continue` the pre-R kernel   \
        had did the same job, and dropping it to keep the butterfly uniform    \
        cost 2x on `swa128_decode_b8_4k` before the sweep caught it. */        \
-    const int kv_off_i = (int)kv_pos_offset;                                  \
-    const int lo_i = max((int)t_k0, k_lo - kv_off_i);                         \
-    const int hi_i = min((int)(t_k0 + n_k), q_abs - kv_off_i + 1);            \
+    const ulong local_lo = (k_lo > kv_pos_offset) ? k_lo - kv_pos_offset      \
+                                                   : 0ul;                      \
+    const ulong local_hi = (q_abs >= kv_pos_offset)                           \
+        ? q_abs - kv_pos_offset + 1ul                                         \
+        : 0ul;                                                                \
+    const ulong lo_i = max((ulong)t_k0, local_lo);                            \
+    const ulong hi_i = min((ulong)t_k0 + n_k, local_hi);                      \
     const uint stride0 = (D) + 2u;                                            \
-    const uint base0 = (bh * ((Tkv + (CH) - 1u) / (CH)) + chunk) * stride0;   \
+    const uint n_chunks = Tkv / (CH) + ((Tkv % (CH)) != 0u ? 1u : 0u);        \
+    const ulong base0 = (bh * n_chunks + chunk) * stride0;                    \
     if (lo_i >= hi_i) {                                                       \
         /* Chunk fully masked. Uniform across the simdgroup, so returning     \
            here cannot strand a butterfly mid-flight. */                      \
@@ -173,7 +187,7 @@ kernel void NAME(                                                             \
         const uint t = it * KPG + grp;                                        \
         const uint tt = min(t, live - 1u);                                    \
         const uint key = (uint)lo_i + tt;                                     \
-        const uint kv_base = ((b * Tkv + key) * Hkv + hkv) * (D);             \
+        const ulong kv_base = kv_head_base + (ulong)key * kv_pos_stride;      \
         device const float4 *K4 = (device const float4 *)(K + kv_base);       \
         float4 dot4 = float4(0.0f);                                           \
         for (uint j = 0; j < DPV; ++j) {                                      \
@@ -228,7 +242,7 @@ kernel void NAME(                                                             \
        alone writes. The layout stays canonical [m, l, acc[D]] whatever R is, \
        which is why the reduce pass needs no R of its own. */                 \
     if (grp != 0u) { return; }                                                \
-    const uint base = base0;                                                  \
+    const ulong base = base0;                                                 \
     if (lane == 0u) { partials[base] = m_all; partials[base + 1u] = l_all; }  \
     for (uint j = 0; j < DPV; ++j) {                                          \
         const uint d0 = 4u * (dl + j * (R));                                  \
@@ -249,6 +263,7 @@ kernel void NAME(                                                             \
     device const uint *Tkv_ptr [[buffer(3)]],                                 \
     constant uint &H [[buffer(4)]],                                           \
     constant uint &out_bf16 [[buffer(5)]],                                    \
+    constant uint &kv_capacity [[buffer(6)]],                                 \
     uint2 tgpig [[threadgroup_position_in_grid]],                             \
     uint2 tpitg [[thread_position_in_threadgroup]],                           \
     uint2 tptg [[threads_per_threadgroup]])                                   \
@@ -267,13 +282,14 @@ kernel void NAME(                                                             \
        so the recompute is cache-resident and the register cost is gone. */   \
     const uint lid = tpitg.x;                                                 \
     const uint width = max(tptg.x, 1u);                                       \
-    const uint Tkv = *Tkv_ptr;                                                \
+    /* Match the partial pass's independently bounded scratch layout. */      \
+    const uint Tkv = min(*Tkv_ptr, kv_capacity);                              \
     const uint bh = tgpig.y;                                                  \
     const uint h = bh % H;                                                    \
     const uint b = bh / H;                                                    \
-    const uint n_chunks = (Tkv + (CH) - 1u) / (CH);                            \
+    const uint n_chunks = Tkv / (CH) + ((Tkv % (CH)) != 0u ? 1u : 0u);        \
     const uint stride = D + 2u;                                              \
-    const uint chunk0 = bh * n_chunks;                                        \
+    const ulong chunk0 = (ulong)bh * n_chunks;                                \
                                                                               \
     float m_all = -INFINITY;                                                  \
     for (uint c = 0; c < n_chunks; ++c) {                                     \
@@ -291,13 +307,13 @@ kernel void NAME(                                                             \
         }                                                                     \
     }                                                                         \
     const float inv_l = (l_all > 0.0f) ? (1.0f / l_all) : 0.0f;               \
-    const uint o_off = (b * H + h) * D;                                       \
+    const ulong o_off = (ulong)bh * D;                                        \
     device bfloat *Ob = (device bfloat *)O;                                   \
     for (uint d = lid; d < (D); d += width) {                                 \
         float a = 0.0f;                                                       \
         if (m_all != -INFINITY) {                                             \
             for (uint c = 0; c < n_chunks; ++c) {                             \
-                const uint base = (chunk0 + c) * stride;                      \
+                const ulong base = (chunk0 + c) * stride;                     \
                 const float m_c = partials[base];                             \
                 if (m_c == -INFINITY) { continue; }                           \
                 a += partials[base + 2u + d] * exp(m_c - m_all);              \

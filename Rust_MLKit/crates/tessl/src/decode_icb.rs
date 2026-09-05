@@ -25,6 +25,7 @@
 //! open. Opt-in; default OFF.
 
 use std::sync::atomic::{AtomicI8, Ordering};
+use std::sync::Weak;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -85,8 +86,23 @@ pub enum DecodeIcbBind {
 }
 
 #[inline]
+fn checked_buf_gpu_addr(buf: &GpuBuffer, byte_offset: usize) -> Result<u64, String> {
+    if byte_offset >= buf.nbytes() {
+        return Err(format!(
+            "buffer binding offset {byte_offset} is outside {} logical bytes",
+            buf.nbytes()
+        ));
+    }
+    let offset = u64::try_from(byte_offset)
+        .map_err(|_| "buffer binding offset does not fit a GPU address".to_string())?;
+    buf.metal()
+        .gpuAddress()
+        .checked_add(offset)
+        .ok_or_else(|| "buffer GPU address overflow".to_string())
+}
+
 fn buf_gpu_addr(buf: &GpuBuffer, byte_offset: usize) -> u64 {
-    buf.metal().gpuAddress().wrapping_add(byte_offset as u64)
+    checked_buf_gpu_addr(buf, byte_offset).expect("internally validated DecodeIcb buffer bind")
 }
 
 /// One frozen compute dispatch (pipeline + grid + bind recipe).
@@ -96,7 +112,10 @@ pub struct DecodeIcbCommand {
     pub threadgroups: MTLSize,
     pub threads_per_tg: MTLSize,
     pub binds: Vec<DecodeIcbBind>,
-    pub tg_mem: Option<(usize, usize)>,
+    /// Dynamic threadgroup-memory slots for this dispatch. Each index occurs
+    /// at most once; the aggregate is validated with the pipeline's static
+    /// allocation before any ICB or encoder API sees it.
+    pub tg_mem: Vec<(usize, usize)>,
     /// Owned Hot buffers for [`DecodeIcbBind::Immediate`] (keep residency).
     pub owned_immediates: Vec<GpuBuffer>,
     /// Insert a Dispatch→Dispatch Device barrier after this cmd on replay.
@@ -110,11 +129,12 @@ pub struct DecodeIcbCommand {
     /// [`crate::dispatch::Binder::bind_buf`] and `bind_resource_id` take a raw
     /// `MTLBuffer` / `MTLResourceID` with no owning `GpuBuffer`, so there is
     /// nothing for [`DecodeIcbBind::Buf`] to hold — and holding it is what pins
-    /// the operand's `Arc`. Every GEMM binds A, B and C through `bind_buf`, so
-    /// a captured GEMM recorded only its scalar immediates: replay would rebind
-    /// no operands at all, and the unrecorded buffers were pinned by nothing,
-    /// free to be recycled and handed to a new tensor while the tape still
-    /// logically referenced them.
+    /// the operand's `Arc`. Any command that uses these raw bind forms without
+    /// separately recording its owning resource would otherwise capture only
+    /// its scalar immediates: replay would rebind no corresponding operand, and
+    /// an unrecorded buffer could be recycled while the tape still logically
+    /// referenced it. Standard GEMM operands use the recordable tensor bind
+    /// path; this guard remains for lower-level/custom commands.
     ///
     /// Recording the count turns that from a silent wrong answer into a refusal
     /// — see the check in [`DecodeIcb::from_commands_ex`].
@@ -316,10 +336,20 @@ pub fn icb_coarse_ranges_enabled() -> bool {
     icb_range_batch_enabled()
 }
 
-/// Fingerprint of Buf `(index, gpu_addr)` pairs for prebuilt-table dedup.
-fn buf_bind_fingerprint(binds: &[DecodeIcbBind]) -> u64 {
-    // FNV-1a 64 — stable, cheap, good enough for capture-time table sharing.
-    let mut slots: Vec<(u16, u64)> = Vec::with_capacity(binds.len());
+/// Canonical Buf `(index, gpu_addr)` pairs for prebuilt-table dedup.
+///
+/// Immediate binds are deliberately absent: they are materialized into the
+/// adopted table on every execute. Command validation rejects duplicate and
+/// out-of-range indices before this key is built.
+type BufBindKey = Vec<(u16, u64)>;
+
+fn canonicalize_buf_bind_key(mut slots: BufBindKey) -> BufBindKey {
+    slots.sort_unstable();
+    slots
+}
+
+fn canonical_buf_bind_key(binds: &[DecodeIcbBind]) -> BufBindKey {
+    let mut slots = Vec::with_capacity(binds.len());
     for b in binds {
         if let DecodeIcbBind::Buf {
             index, gpu_addr, ..
@@ -330,9 +360,16 @@ fn buf_bind_fingerprint(binds: &[DecodeIcbBind]) -> u64 {
             }
         }
     }
-    slots.sort_unstable_by_key(|s| s.0);
+    canonicalize_buf_bind_key(slots)
+}
+
+/// Stable FNV-1a prefilter for canonical bind keys.
+///
+/// A fingerprint match is never sufficient for reuse: the dedup seam also
+/// compares the complete canonical key via [`same_prebuilt_bind_set`].
+fn buf_bind_fingerprint(key: &BufBindKey) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
-    for &(idx, addr) in &slots {
+    for &(idx, addr) in key {
         h ^= idx as u64;
         h = h.wrapping_mul(0x100000001b3);
         h ^= addr;
@@ -341,15 +378,34 @@ fn buf_bind_fingerprint(binds: &[DecodeIcbBind]) -> u64 {
     h
 }
 
+#[inline]
+fn same_prebuilt_bind_set(
+    stored_fingerprint: u64,
+    stored_key: &BufBindKey,
+    fingerprint: u64,
+    key: &BufBindKey,
+) -> bool {
+    stored_fingerprint == fingerprint && stored_key == key
+}
+
 /// Multi-command decode ICB (inheritBuffers + arg-table execute, or freeze-binds).
 pub struct DecodeIcb {
     icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
+    /// Weak to avoid an ICB -> runtime -> retirement-queue cycle. Drop upgrades
+    /// it only long enough to defer residency removal until GPU completion.
+    runtime: Weak<GpuRuntime>,
+    residency_registered: bool,
+    /// Identity of the runtime that owns the ICB, residency set and argument
+    /// table. Holding the table keeps pointer identity unambiguous even if that
+    /// runtime is later dropped and another one is allocated.
+    runtime_table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
     commands: Vec<DecodeIcbCommand>,
     /// Per-command MTL4 argument tables with Buf addresses frozen at capture
     /// (A2 residual: execute switches tables instead of re-`setAddress`).
     /// Empty when [`Self::freeze_binds`] is true.
     prebuilt_tables: Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>,
-    /// Unique prebuilt tables after fingerprint dedup (≤ `prebuilt_tables.len()`).
+    /// Unique prebuilt tables after fingerprint + structural bind-key dedup
+    /// (≤ `prebuilt_tables.len()`).
     unique_prebuilt_tables: usize,
     /// Classic `setKernelBuffer` freeze (`inheritBuffers=false`); execute skips
     /// argument-table traffic.
@@ -392,6 +448,12 @@ pub struct DecodeIcb {
 /// actually built (commands with identical binds share one).
 type PrebuiltTables = (Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>, usize);
 
+struct UniquePrebuiltTable {
+    fingerprint: u64,
+    bind_key: BufBindKey,
+    table: Retained<ProtocolObject<dyn MTL4ArgumentTable>>,
+}
+
 /// Per-command encode switches. Two adjacent `bool` parameters swap silently at
 /// a call site; named fields do not.
 #[derive(Clone, Copy)]
@@ -416,65 +478,27 @@ impl DecodeIcb {
         if commands.is_empty() {
             return Err("DecodeIcb: empty command list".into());
         }
-        // Reject bind indices the argument table cannot hold.
-        //
-        // The prebuilt and freeze paths filter `index < ARG_TABLE_SLOTS` and
-        // silently drop anything above, while `Binder::bind_addr` correctly
-        // errors on the same index — so a tape could be built with `index: 40`,
-        // return `Ok`, and replay with that operand simply absent. Worse,
-        // `buf_bind_fingerprint` applies the same filter, so two commands
-        // differing *only* in an out-of-range bind hash identically and share
-        // one prebuilt argument table.
-        //
-        // Unlike the incomplete-bind check below, this is not scoped to
-        // freeze-binds: an index past the table is invalid in every mode.
-        for (i, cmd) in commands.iter().enumerate() {
-            for b in &cmd.binds {
-                let index = match b {
-                    DecodeIcbBind::Buf { index, .. } | DecodeIcbBind::Immediate { index, .. } => {
-                        *index
-                    }
-                };
-                if index >= ARG_TABLE_SLOTS {
-                    return Err(format!(
-                        "DecodeIcb: command {i} binds index {index}, but the argument table \
-                         has {ARG_TABLE_SLOTS} slots. Encoding would drop it silently."
-                    ));
-                }
-            }
-        }
-        // Refuse a freeze-binds tape that is missing operands.
-        //
-        // Scope matters here, and getting it wrong disables a shipping feature.
-        // Under the default path the ICB is built with `setInheritBuffers(true)`
-        // and picks up the *live* argument table at execute time, so binds that
-        // never reached the tape are supplied by the encoder anyway and the
-        // caller's own handles keep the buffers alive. Refusing there breaks
-        // gemma-metal's layer-graph replay for a hazard it does not have —
-        // measured: six of its tests fail.
-        //
-        // Under `freeze_binds` the descriptor sets `setInheritBuffers(false)`
-        // and each command's binds are written into the ICB with
-        // `setKernelBuffer`. There the tape *is* the source of truth: a bind
-        // that was never recorded leaves that slot unwritten on every replay,
-        // and pins no `Arc`, so the buffer it referred to can be recycled into
-        // an unrelated tensor while the tape still logically points at it. Both
-        // failures are silent, which is why this refuses instead of warning.
-        if freeze_binds {
-            if let Some((i, cmd)) = commands
-                .iter()
-                .enumerate()
-                .find(|(_, c)| c.incomplete_binds > 0)
-            {
-                return Err(format!(
-                    "DecodeIcb freeze_binds: command {i} has {} bind(s) that could not be \
-                     recorded (bound through bind_buf / bind_resource_id, which carry no \
-                     owning GpuBuffer). Freeze-binds writes the tape's binds into the ICB, \
-                     so those slots would stay unwritten on every replay and pin nothing \
-                     against recycling. Bind through bind_tensor or bind_gpu_buf.",
-                    cmd.incomplete_binds
-                ));
-            }
+        Self::validate_commands(rt, &commands)?;
+        // Every replay mode reconstructs command operands exclusively from
+        // the recorded bind list. `inheritBuffers` controls how an ICB command
+        // sees the encoder's argument table; it does not re-run the original
+        // bind callback. A raw bind omitted from the tape would therefore use
+        // whichever address happens to remain in that shared table (or no
+        // address at all), and the tape owns nothing that prevents its resource
+        // from being recycled. Prebuilt tables make the missing slot explicit,
+        // while the sticky-table path merely makes the same bug stateful.
+        if let Some((i, cmd)) = commands
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.incomplete_binds > 0)
+        {
+            return Err(format!(
+                "DecodeIcb: command {i} has {} bind(s) that could not be recorded \
+                 (bound through bind_buf / bind_resource_id, which carry no owning \
+                 GpuBuffer). Replay would leave those slots missing or stale and pin \
+                 nothing against recycling. Bind through bind_tensor or bind_gpu_buf.",
+                cmd.incomplete_binds
+            ));
         }
 
         let mut commands = commands;
@@ -508,8 +532,6 @@ impl DecodeIcb {
         }
         .ok_or_else(|| "newIndirectCommandBuffer failed (DecodeIcb)".to_string())?;
 
-        rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*icb));
-
         // Keep Immediate binds as snapshotted bytes (non-freeze). Re-pack via
         // `bind_bytes` at execute. Prefer `IcbScalarPool` Buf binds for
         // per-token scalars.
@@ -524,6 +546,9 @@ impl DecodeIcb {
         };
         let mut this = Self {
             icb,
+            runtime: rt.weak_handle(),
+            residency_registered: false,
+            runtime_table: rt.metal4.argument_table.table.clone(),
             commands,
             prebuilt_tables,
             unique_prebuilt_tables,
@@ -546,7 +571,120 @@ impl DecodeIcb {
             barriers_elided: 0,
         };
         this.encode_cpu()?;
+        // Registration is deliberately last. Every earlier operation can fail,
+        // and registering before it meant a constructor error dropped the sole
+        // ICB handle while the residency set kept the allocation forever.
+        rt.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(&*this.icb));
+        this.residency_registered = true;
         Ok(this)
+    }
+
+    /// Validate every caller-controlled field before any Objective-C ICB API
+    /// sees it. Captures produced through [`crate::dispatch::Binder`] already
+    /// satisfy these invariants; the public command structs deliberately remain
+    /// inspectable, so direct constructors need the same checks.
+    fn validate_commands(rt: &GpuRuntime, commands: &[DecodeIcbCommand]) -> Result<(), String> {
+        for (i, cmd) in commands.iter().enumerate() {
+            let pipeline_device = cmd.pipeline.device();
+            if !std::ptr::eq(&*pipeline_device, &*rt.device) {
+                return Err(format!(
+                    "DecodeIcb: command {i} pipeline belongs to another Metal device"
+                ));
+            }
+            crate::dispatch::validate_dispatch_geometry(
+                cmd.threadgroups,
+                cmd.threads_per_tg,
+                Some(cmd.pipeline.maxTotalThreadsPerThreadgroup()),
+            )
+            .map_err(|e| format!("DecodeIcb: command {i} {e}"))?;
+
+            let mut tg_slots = [false; ARG_TABLE_SLOTS];
+            let mut dynamic_tg_memory = 0usize;
+            for &(index, length) in &cmd.tg_mem {
+                if index >= ARG_TABLE_SLOTS {
+                    return Err(format!(
+                        "DecodeIcb: command {i} threadgroup-memory index {index} is outside \
+                         the {ARG_TABLE_SLOTS}-slot table"
+                    ));
+                }
+                if std::mem::replace(&mut tg_slots[index], true) {
+                    return Err(format!(
+                        "DecodeIcb: command {i} configures threadgroup-memory index {index} more than once"
+                    ));
+                }
+                if length % 16 != 0 {
+                    return Err(format!(
+                        "DecodeIcb: command {i} threadgroup-memory length {length} is not 16-byte aligned"
+                    ));
+                }
+                dynamic_tg_memory = dynamic_tg_memory.checked_add(length).ok_or_else(|| {
+                    format!("DecodeIcb: command {i} dynamic threadgroup-memory size overflow")
+                })?;
+            }
+            let total = cmd
+                .pipeline
+                .staticThreadgroupMemoryLength()
+                .checked_add(dynamic_tg_memory)
+                .ok_or_else(|| {
+                    format!("DecodeIcb: command {i} threadgroup-memory size overflow")
+                })?;
+            if total > rt.max_threadgroup_memory() {
+                return Err(format!(
+                    "DecodeIcb: command {i} threadgroup memory {total} exceeds device limit {}",
+                    rt.max_threadgroup_memory()
+                ));
+            }
+
+            let mut occupied = [false; ARG_TABLE_SLOTS];
+            for b in &cmd.binds {
+                let index = match b {
+                    DecodeIcbBind::Buf { index, .. } | DecodeIcbBind::Immediate { index, .. } => {
+                        *index
+                    }
+                };
+                if index >= ARG_TABLE_SLOTS {
+                    return Err(format!(
+                        "DecodeIcb: command {i} binds index {index}, but the argument table \
+                         has {ARG_TABLE_SLOTS} slots. Encoding would drop it silently."
+                    ));
+                }
+                if std::mem::replace(&mut occupied[index], true) {
+                    return Err(format!(
+                        "DecodeIcb: command {i} binds argument-table index {index} more than once"
+                    ));
+                }
+                match b {
+                    DecodeIcbBind::Buf {
+                        buf,
+                        byte_offset,
+                        gpu_addr,
+                        ..
+                    } => {
+                        if !buf.belongs_to(rt) {
+                            return Err(format!(
+                                "DecodeIcb: command {i} buffer at index {index} belongs to \
+                                 another runtime"
+                            ));
+                        }
+                        let expected = checked_buf_gpu_addr(buf, *byte_offset)
+                            .map_err(|e| format!("DecodeIcb: command {i} index {index}: {e}"))?;
+                        if *gpu_addr != expected {
+                            return Err(format!(
+                                "DecodeIcb: command {i} index {index} cached GPU address is stale \
+                                 or inconsistent"
+                            ));
+                        }
+                    }
+                    DecodeIcbBind::Immediate { bytes, .. } if bytes.is_empty() => {
+                        return Err(format!(
+                            "DecodeIcb: command {i} index {index} has an empty immediate"
+                        ));
+                    }
+                    DecodeIcbBind::Immediate { .. } => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Stable buffer identity (base GPU address) for interference analysis.
@@ -555,40 +693,25 @@ impl DecodeIcb {
         buf.metal().gpuAddress()
     }
 
-    /// Formerly: buffers at or below this size were *assumed* read-only and
-    /// excluded from the disjointness test, on the grounds that tiny Hot
-    /// allocations are softcap scalars and lone u32 dims.
+    /// Complete buffer-allocation set for a command. Immediate → `None`.
     ///
-    /// That is an assumption about what a size is usually used for, not a
-    /// property of the buffer, and the failure it permits is silent. A genuine
-    /// read-after-write through a 16-byte buffer — a token id, a reduction
-    /// scalar — had its barrier elided, and so did a RAW through a shared
-    /// activation buffer that happened to be bound by most commands. Both
-    /// produce wrong output with nothing to notice it.
-    ///
-    /// Retained only so this comment has somewhere to live. Nothing reads it.
-    #[allow(dead_code)]
-    const READONLY_MAX_NBYTES: usize = 64;
-
-    /// Large-Buf ids for a cmd, minus ambient read-only. Immediate → `None`.
-    fn cmd_buf_set(cmd: &DecodeIcbCommand, ambient: &[u64]) -> Option<Vec<u64>> {
+    /// Earlier code guessed that buffers at or below 64 bytes, and buffers
+    /// bound by most commands, were read-only scalar arenas. Size/frequency is
+    /// not a mutability contract: the heuristic silently elided genuine RAW
+    /// edges through token ids, reduction scalars, and shared activations.
+    /// Until capture records read/write intent explicitly, every bound buffer
+    /// must remain a possible dependency.
+    fn cmd_buf_set(cmd: &DecodeIcbCommand) -> Option<Vec<u64>> {
         let mut ids = Vec::with_capacity(cmd.binds.len());
         for b in &cmd.binds {
             match b {
                 DecodeIcbBind::Immediate { .. } => return None,
                 DecodeIcbBind::Buf { buf, .. } => {
-                    // Every bound buffer counts. Excluding small ones, or ones
-                    // bound by most commands, elided real RAW barriers — see
-                    // `READONLY_MAX_NBYTES`. Without knowing which binds are
-                    // *written*, a shared buffer must be treated as a possible
-                    // dependency.
-                    //
                     // This is strictly more conservative than what shipped, so
                     // fewer barriers are elided and the throughput this feature
                     // was added for needs re-measuring on a real model. Getting
                     // it back properly means tracking writes at bind time, not
                     // guessing from size.
-                    let _ = ambient;
                     ids.push(Self::buf_id(buf));
                 }
             }
@@ -598,54 +721,24 @@ impl DecodeIcb {
         Some(ids)
     }
 
-    /// Buffers bound by ≥ half of cmds (IcbScalarPool u32/f32 arenas, etc.) —
-    /// host-updated between tokens, read-only during a single tape execute.
-    fn ambient_readonly_bufs(commands: &[DecodeIcbCommand]) -> Vec<u64> {
-        let n = commands.len().max(1);
-        let mut freq: Vec<(u64, usize)> = Vec::new();
-        for cmd in commands {
-            let mut seen = Vec::new();
-            for b in &cmd.binds {
-                if let DecodeIcbBind::Buf { buf, .. } = b {
-                    if buf.nbytes() <= Self::READONLY_MAX_NBYTES {
-                        continue;
-                    }
-                    let id = Self::buf_id(buf);
-                    if seen.contains(&id) {
-                        continue;
-                    }
-                    seen.push(id);
-                    if let Some(e) = freq.iter_mut().find(|(k, _)| *k == id) {
-                        e.1 += 1;
-                    } else {
-                        freq.push((id, 1));
-                    }
-                }
-            }
-        }
-        // ≥80% of cmds and at least 8 hits — avoids marking short-tape RAW
-        // buffers (e.g. b in a→b / b→e) as ambient while still catching
-        // IcbScalarPool arenas on mini/E4B graphs.
-        freq.into_iter()
-            .filter(|(_, c)| *c >= 8 && *c * 5 >= n * 4)
-            .map(|(id, _)| id)
-            .collect()
-    }
-
     /// Elide `barrier_after` when the next cmd's Buf set is disjoint from every
     /// Buf touched in the open span. Returns elided count.
     pub fn elide_non_interfering_barriers(commands: &mut [DecodeIcbCommand]) -> u64 {
         if commands.len() < 2 {
             return 0;
         }
-        let ambient = Self::ambient_readonly_bufs(commands);
         let mut elided = 0u64;
         let mut span: Vec<u64> = Vec::new();
+        let mut span_unknown = false;
         for i in 0..commands.len() {
-            match Self::cmd_buf_set(&commands[i], &ambient) {
+            match Self::cmd_buf_set(&commands[i]) {
                 None => {
-                    span.clear();
-                    continue;
+                    // An immediate prevents complete dependency analysis for
+                    // the whole open span. Forgetting earlier buffers here can
+                    // make a later barrier look disjoint and reorder a consumer
+                    // ahead of an unresolved producer. Carry the uncertainty to
+                    // the next barrier, which must terminate the span.
+                    span_unknown = true;
                 }
                 Some(ids) => {
                     for id in ids {
@@ -660,14 +753,17 @@ impl DecodeIcb {
             }
             if i + 1 >= commands.len() {
                 span.clear();
+                span_unknown = false;
                 continue;
             }
-            let keep = match Self::cmd_buf_set(&commands[i + 1], &ambient) {
-                None => true,
-                Some(next) => span.iter().any(|w| next.iter().any(|n| n == w)),
-            };
+            let keep = span_unknown
+                || match Self::cmd_buf_set(&commands[i + 1]) {
+                    None => true,
+                    Some(next) => span.iter().any(|w| next.iter().any(|n| n == w)),
+                };
             if keep {
                 span.clear();
+                span_unknown = false;
             } else {
                 commands[i].barrier_after = false;
                 elided = elided.saturating_add(1);
@@ -698,6 +794,12 @@ impl DecodeIcb {
                     // `copy_nonoverlapping` adds over `copy`.
                     unsafe {
                         let dst = buf.metal().contents().as_ptr() as *mut u8;
+                        // Binder immediates reserve at least four bytes and
+                        // zero-fill that complete slot. Freeze materialization
+                        // must preserve the same ABI for a 1-3 byte immediate,
+                        // rather than expose whatever a fresh allocation held
+                        // in the unread padding.
+                        std::ptr::write_bytes(dst, 0, buf.nbytes());
                         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
                     }
                     let gpu_addr = buf_gpu_addr(&buf, 0);
@@ -716,18 +818,23 @@ impl DecodeIcb {
         Ok(())
     }
 
-    /// Freeze Buf `gpu_addr`s into MTL4 argument tables; dedup by fingerprint
-    /// so sticky adopt can skip redundant `setArgumentTable` switches.
+    /// Freeze Buf `gpu_addr`s into MTL4 argument tables. The fingerprint is
+    /// only a lookup prefilter; reuse also requires an equal canonical bind key
+    /// so a hash collision cannot alias two commands' operands.
     fn build_prebuilt_tables(
         rt: &GpuRuntime,
         commands: &[DecodeIcbCommand],
     ) -> Result<PrebuiltTables, String> {
-        let mut unique: Vec<(u64, Retained<ProtocolObject<dyn MTL4ArgumentTable>>)> = Vec::new();
+        let mut unique: Vec<UniquePrebuiltTable> = Vec::new();
         let mut tables = Vec::with_capacity(commands.len());
         for cmd in commands {
-            let fp = buf_bind_fingerprint(&cmd.binds);
-            if let Some((_, t)) = unique.iter().find(|(f, _)| *f == fp) {
-                tables.push(t.clone());
+            let key = canonical_buf_bind_key(&cmd.binds);
+            let fp = buf_bind_fingerprint(&key);
+            if let Some(entry) = unique
+                .iter()
+                .find(|entry| same_prebuilt_bind_set(entry.fingerprint, &entry.bind_key, fp, &key))
+            {
+                tables.push(entry.table.clone());
                 continue;
             }
             let desc = MTL4ArgumentTableDescriptor::new();
@@ -748,7 +855,11 @@ impl DecodeIcb {
                     }
                 }
             }
-            unique.push((fp, table.clone()));
+            unique.push(UniquePrebuiltTable {
+                fingerprint: fp,
+                bind_key: key,
+                table: table.clone(),
+            });
             tables.push(table);
         }
         Ok((tables, unique.len()))
@@ -815,13 +926,19 @@ impl DecodeIcb {
         if n == 0 {
             return Err("DecodeIcb::mini_copy_chain: n > 0".into());
         }
+        let n_u32 = u32::try_from(n).map_err(|_| {
+            "DecodeIcb::mini_copy_chain: n exceeds 32-bit kernel indexing".to_string()
+        })?;
+        let nbytes = n
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| "DecodeIcb::mini_copy_chain: byte size overflow".to_string())?;
         // Hot/shared staging: classic setKernelBuffer freeze is flaky with
         // Private-only allocs on some SDK paths; Hot matches layer-graph residency.
-        let a = rt.alloc_buffer_hot(n * 4)?;
-        let b = rt.alloc_buffer_hot(n * 4)?;
-        let c = rt.alloc_buffer_hot(n * 4)?;
+        let a = rt.alloc_buffer_hot(nbytes)?;
+        let b = rt.alloc_buffer_hot(nbytes)?;
+        let c = rt.alloc_buffer_hot(nbytes)?;
         let n_buf = rt.alloc_buffer_hot(4)?;
-        n_buf.write_u32(&[n as u32]);
+        n_buf.write_u32(&[n_u32]);
         // SAFETY: `a`, `b` and `c` were each allocated at `n * 4` bytes just
         // above and are not yet shared with anything, so these writes are
         // unaliased and in bounds. They are Hot (shared-storage) buffers, so
@@ -834,8 +951,8 @@ impl DecodeIcb {
             }
             let zb = b.metal().contents().as_ptr() as *mut u8;
             let zc = c.metal().contents().as_ptr() as *mut u8;
-            std::ptr::write_bytes(zb, 0, n * 4);
-            std::ptr::write_bytes(zc, 0, n * 4);
+            std::ptr::write_bytes(zb, 0, nbytes);
+            std::ptr::write_bytes(zc, 0, nbytes);
         }
         let pipe = pipeline_icb(rt, "copy_f32")?;
         let tpt = pipe.threadExecutionWidth().min(n).max(1);
@@ -854,7 +971,7 @@ impl DecodeIcb {
                 threadgroups: tg,
                 threads_per_tg: tptg,
                 binds: vec![buf(0, &a), buf(1, &b), buf(2, &n_buf)],
-                tg_mem: None,
+                tg_mem: Vec::new(),
                 owned_immediates: Vec::new(),
                 // a→b must drain before b→c (no live always-on during tape execute).
                 barrier_after: true,
@@ -866,7 +983,7 @@ impl DecodeIcb {
                 threadgroups: tg,
                 threads_per_tg: tptg,
                 binds: vec![buf(0, &b), buf(1, &c), buf(2, &n_buf)],
-                tg_mem: None,
+                tg_mem: Vec::new(),
                 owned_immediates: Vec::new(),
                 barrier_after: false,
                 incomplete_binds: 0,
@@ -916,7 +1033,7 @@ impl DecodeIcb {
                 }
                 // GEMV / fused kernels need TG mem on the ICB cmd itself when
                 // inheritBuffers=false (encoder setThreadgroupMemory is ignored).
-                if let Some((tg_idx, len)) = cmd.tg_mem {
+                for &(tg_idx, len) in &cmd.tg_mem {
                     unsafe {
                         icmd.setThreadgroupMemoryLength_atIndex(len, tg_idx);
                     }
@@ -992,7 +1109,7 @@ impl DecodeIcb {
         self.freeze_binds
     }
 
-    /// Unique prebuilt argument tables after fingerprint dedup.
+    /// Unique prebuilt argument tables after fingerprint-prefiltered structural dedup.
     pub fn unique_prebuilt_table_count(&self) -> usize {
         self.unique_prebuilt_tables
     }
@@ -1060,6 +1177,9 @@ impl DecodeIcb {
     pub fn execute(&mut self, rt: &GpuRuntime) -> Result<(), String> {
         if !self.encoded {
             return Err("DecodeIcb: encode before execute".into());
+        }
+        if !std::ptr::eq(&*self.runtime_table, &*rt.metal4.argument_table.table) {
+            return Err("DecodeIcb: execute runtime differs from capture runtime".into());
         }
         // Under binder-encode-nop every `with_binder` body is skipped, so this
         // whole call is a no-op: no dispatch is encoded and the destination
@@ -1336,7 +1456,7 @@ impl DecodeIcb {
                     }
                 }
             }
-            if let Some((tg_idx, len)) = cmd.tg_mem {
+            for &(tg_idx, len) in &cmd.tg_mem {
                 bnd.set_threadgroup_memory(tg_idx, len);
             }
             if use_icb_exec && cmd.pipeline.supportIndirectCommandBuffers() {
@@ -1352,6 +1472,26 @@ impl DecodeIcb {
             bnd.barrier();
         }
         (icb_calls, icb_cmds)
+    }
+}
+
+impl Drop for DecodeIcb {
+    fn drop(&mut self) {
+        if !self.residency_registered {
+            return;
+        }
+        if let Some(rt) = self.runtime.upgrade() {
+            // MTL4 command buffers do not retain resource references. Keep the
+            // per-command argument tables and pipelines beside the ICB until
+            // the same completed-work drain that removes its residency entry.
+            let argument_tables = std::mem::take(&mut self.prebuilt_tables);
+            let pipelines = self
+                .commands
+                .iter()
+                .map(|command| command.pipeline.clone())
+                .collect();
+            rt.schedule_icb_retirement(self.icb.clone(), argument_tables, pipelines);
+        }
     }
 }
 
@@ -1410,7 +1550,7 @@ pub struct DecodeIcbCapture {
     pub commands: Vec<DecodeIcbCommand>,
     current_pipeline: Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     current_binds: Vec<DecodeIcbBind>,
-    current_tg_mem: Option<(usize, usize)>,
+    current_tg_mem: Vec<(usize, usize)>,
     /// Binds seen since the last `note_pipeline` that could not be recorded.
     unrecordable_binds: usize,
     /// How many times `begin_decode_icb_capture` was called while this capture
@@ -1422,21 +1562,25 @@ impl DecodeIcbCapture {
     pub fn note_pipeline(&mut self, p: Retained<ProtocolObject<dyn MTLComputePipelineState>>) {
         self.current_pipeline = Some(p);
         self.current_binds.clear();
-        self.current_tg_mem = None;
+        self.current_tg_mem.clear();
         self.unrecordable_binds = 0;
     }
 
     /// Note a bind that reached the encoder but carries no owning `GpuBuffer`.
     pub fn note_unrecordable_bind(&mut self) {
-        self.unrecordable_binds += 1;
+        self.unrecordable_binds = self.unrecordable_binds.saturating_add(1);
     }
 
     pub fn note_bind(&mut self, index: usize, buf: &GpuBuffer, byte_offset: usize) {
+        let Ok(gpu_addr) = checked_buf_gpu_addr(buf, byte_offset) else {
+            self.unrecordable_binds = self.unrecordable_binds.saturating_add(1);
+            return;
+        };
         let bind = DecodeIcbBind::Buf {
             index,
             buf: buf.clone(),
             byte_offset,
-            gpu_addr: buf_gpu_addr(buf, byte_offset),
+            gpu_addr,
         };
         if let Some(slot) = self.current_binds.iter_mut().find(|b| match b {
             DecodeIcbBind::Buf { index: i, .. } | DecodeIcbBind::Immediate { index: i, .. } => {
@@ -1466,7 +1610,15 @@ impl DecodeIcbCapture {
     }
 
     pub fn note_tg_mem(&mut self, index: usize, length: usize) {
-        self.current_tg_mem = Some((index, length));
+        if let Some((_, slot_length)) = self
+            .current_tg_mem
+            .iter_mut()
+            .find(|(slot_index, _)| *slot_index == index)
+        {
+            *slot_length = length;
+        } else {
+            self.current_tg_mem.push((index, length));
+        }
     }
 
     pub fn note_dispatch(&mut self, threadgroups: MTLSize, threads_per_tg: MTLSize) {
@@ -1490,7 +1642,7 @@ impl DecodeIcbCapture {
             threadgroups,
             threads_per_tg,
             binds: self.current_binds.clone(),
-            tg_mem: self.current_tg_mem,
+            tg_mem: self.current_tg_mem.clone(),
             owned_immediates: Vec::new(),
             barrier_after: false,
             incomplete_binds: self.unrecordable_binds,
@@ -1626,18 +1778,24 @@ pub fn icb_pipelines_enabled() -> bool {
     on
 }
 
-/// When set, [`crate::runtime::GpuRuntime::with_binder`] is a no-op (no Metal encode).
-///
-/// Used on the DecodeIcb replay path: re-run the Rust layer loop so `IcbScalarPool`
-/// / KV host metadata stay in sync, then [`DecodeIcb::execute`] does GPU work.
-static BINDER_ENCODE_NOP: AtomicI8 = AtomicI8::new(0);
+// When set, `GpuRuntime::with_binder` is a no-op (no Metal encode).
+//
+// Used on the DecodeIcb replay path: re-run the Rust layer loop so
+// `IcbScalarPool` / KV host metadata stay in sync, then `DecodeIcb::execute`
+// does GPU work. This is scoped execution state, not process configuration:
+// making it global lets one model's replay silently suppress unrelated
+// encoding on another thread/runtime. Capture state is already thread-local
+// for the same reason.
+thread_local! {
+    static BINDER_ENCODE_NOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub fn set_binder_encode_nop(on: bool) {
-    BINDER_ENCODE_NOP.store(if on { 1 } else { 0 }, Ordering::Relaxed);
+    BINDER_ENCODE_NOP.with(|flag| flag.set(on));
 }
 
 pub fn binder_encode_nop() -> bool {
-    BINDER_ENCODE_NOP.load(Ordering::Relaxed) == 1
+    BINDER_ENCODE_NOP.with(std::cell::Cell::get)
 }
 
 /// RAII: enable binder encode nop; restore off on drop.
@@ -1672,7 +1830,8 @@ impl Drop for BinderEncodeNopGuard {
 /// visible to every other test mid-flight.
 #[cfg(test)]
 pub(crate) struct IcbFlagsTestGuard {
-    saved: [i8; 6],
+    saved: [i8; 5],
+    saved_binder_encode_nop: bool,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
@@ -1690,8 +1849,8 @@ impl IcbFlagsTestGuard {
                 ICB_RANGE_BATCH.load(Ordering::Relaxed),
                 ICB_COARSE_RANGES.load(Ordering::Relaxed),
                 ICB_PIPELINES.load(Ordering::Relaxed),
-                BINDER_ENCODE_NOP.load(Ordering::Relaxed),
             ],
+            saved_binder_encode_nop: binder_encode_nop(),
             _lock: lock,
         }
     }
@@ -1705,13 +1864,110 @@ impl Drop for IcbFlagsTestGuard {
         ICB_RANGE_BATCH.store(self.saved[2], Ordering::Relaxed);
         ICB_COARSE_RANGES.store(self.saved[3], Ordering::Relaxed);
         ICB_PIPELINES.store(self.saved[4], Ordering::Relaxed);
-        BINDER_ENCODE_NOP.store(self.saved[5], Ordering::Relaxed);
+        set_binder_encode_nop(self.saved_binder_encode_nop);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn residency_count(rt: &GpuRuntime) -> usize {
+        *rt.metal4.residency_count.lock().unwrap()
+    }
+
+    fn single_buffer_command(
+        pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        buf: &GpuBuffer,
+    ) -> DecodeIcbCommand {
+        DecodeIcbCommand {
+            pipeline,
+            threadgroups: mtl_size(1, 1, 1),
+            threads_per_tg: mtl_size(1, 1, 1),
+            binds: vec![DecodeIcbBind::Buf {
+                index: 0,
+                buf: buf.clone(),
+                byte_offset: 0,
+                gpu_addr: buf_gpu_addr(buf, 0),
+            }],
+            tg_mem: Vec::new(),
+            owned_immediates: Vec::new(),
+            barrier_after: false,
+            incomplete_binds: 0,
+        }
+    }
+
+    #[test]
+    fn repeated_decode_icb_create_drop_balances_residency_after_completion() {
+        let _flags = IcbFlagsTestGuard::lock();
+        set_icb_pipelines(false);
+        let rt = GpuRuntime::new().expect("runtime");
+        let buf = rt.alloc_buffer_hot(16).expect("buffer");
+        let pipeline = rt.pipeline("copy_f32").expect("pipeline");
+        let baseline = residency_count(&rt);
+
+        for _ in 0..16 {
+            let cmd = single_buffer_command(pipeline.clone(), &buf);
+            drop(DecodeIcb::from_commands_ex(&rt, vec![cmd], false).expect("decode ICB"));
+        }
+        assert_eq!(residency_count(&rt), baseline + 16);
+
+        rt.synchronize().expect("completed-work retirement");
+        assert_eq!(residency_count(&rt), baseline);
+    }
+
+    #[test]
+    fn failed_decode_icb_construction_does_not_register_the_icb() {
+        let _flags = IcbFlagsTestGuard::lock();
+        set_icb_pipelines(false);
+        let rt = GpuRuntime::new().expect("runtime");
+        let buf = rt.alloc_buffer_hot(16).expect("buffer");
+        let pipeline = rt.pipeline("copy_f32").expect("non-ICB pipeline");
+        assert!(!pipeline.supportIndirectCommandBuffers());
+        let baseline = residency_count(&rt);
+
+        let cmd = single_buffer_command(pipeline, &buf);
+        let err = DecodeIcb::from_commands_ex(&rt, vec![cmd], true)
+            .map(|_| ())
+            .expect_err("freeze-binds must reject a non-ICB pipeline");
+        assert!(err.contains("not all pipelines"), "unexpected error: {err}");
+        assert_eq!(
+            residency_count(&rt),
+            baseline,
+            "a constructor failure must not leave a registered ICB behind"
+        );
+    }
+
+    #[test]
+    fn prebuilt_dedup_rejects_a_forced_fingerprint_collision() {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let collide_at_zero = |index: u16| {
+            // After hashing `index`, choose the address equal to that
+            // intermediate state. The next xor becomes zero, so every such
+            // one-bind key deterministically finishes at fingerprint zero.
+            let address = (FNV_OFFSET ^ u64::from(index)).wrapping_mul(FNV_PRIME);
+            canonicalize_buf_bind_key(vec![(index, address)])
+        };
+        let first = collide_at_zero(1);
+        let different = collide_at_zero(7);
+        let first_fingerprint = buf_bind_fingerprint(&first);
+        let different_fingerprint = buf_bind_fingerprint(&different);
+
+        assert_ne!(first, different);
+        assert_eq!(first_fingerprint, 0);
+        assert_eq!(different_fingerprint, first_fingerprint);
+        assert!(same_prebuilt_bind_set(
+            first_fingerprint,
+            &first,
+            first_fingerprint,
+            &first,
+        ));
+        assert!(
+            !same_prebuilt_bind_set(first_fingerprint, &first, different_fingerprint, &different,),
+            "equal fingerprints must not alias structurally different buffer binds"
+        );
+    }
 
     #[test]
     fn decode_icb_flag_default_off() {
@@ -1721,6 +1977,107 @@ mod tests {
         set_decode_icb(true);
         assert!(decode_icb_enabled());
         set_decode_icb(false);
+    }
+
+    #[test]
+    fn mini_copy_chain_rejects_host_overflow_before_allocation() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("runtime");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            DecodeIcb::mini_copy_chain(&rt, usize::MAX).map(|_| ())
+        }));
+        let err = outcome
+            .expect("invalid public input must return Err, not panic")
+            .expect_err("usize::MAX cannot fit copy_f32's uint count");
+        assert!(err.contains("32-bit"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn capture_preserves_every_dynamic_threadgroup_memory_slot() {
+        let mut capture = DecodeIcbCapture::default();
+        capture.note_tg_mem(0, 16);
+        capture.note_tg_mem(1, 32);
+        capture.note_tg_mem(0, 48);
+        assert_eq!(capture.current_tg_mem, vec![(0, 48), (1, 32)]);
+    }
+
+    #[test]
+    fn command_metadata_is_validated_before_native_icb_encoding() {
+        let _flags = IcbFlagsTestGuard::lock();
+        let rt = GpuRuntime::new().expect("runtime");
+        let buf = rt.alloc_buffer_hot(16).expect("buffer");
+        let pipeline = pipeline_icb(&rt, "copy_f32").expect("pipeline");
+        let valid = DecodeIcbCommand {
+            pipeline,
+            threadgroups: mtl_size(1, 1, 1),
+            threads_per_tg: mtl_size(1, 1, 1),
+            binds: vec![DecodeIcbBind::Buf {
+                index: 0,
+                buf: buf.clone(),
+                byte_offset: 0,
+                gpu_addr: buf_gpu_addr(&buf, 0),
+            }],
+            tg_mem: Vec::new(),
+            owned_immediates: Vec::new(),
+            barrier_after: false,
+            incomplete_binds: 0,
+        };
+        DecodeIcb::validate_commands(&rt, std::slice::from_ref(&valid)).expect("valid command");
+
+        let mut zero_grid = valid.clone();
+        zero_grid.threadgroups.width = 0;
+        assert!(DecodeIcb::validate_commands(&rt, &[zero_grid]).is_err());
+
+        let mut too_many_threads = valid.clone();
+        too_many_threads.threads_per_tg.width =
+            too_many_threads.pipeline.maxTotalThreadsPerThreadgroup() + 1;
+        assert!(DecodeIcb::validate_commands(&rt, &[too_many_threads]).is_err());
+
+        let mut bad_offset = valid.clone();
+        let DecodeIcbBind::Buf { byte_offset, .. } = &mut bad_offset.binds[0] else {
+            unreachable!()
+        };
+        *byte_offset = buf.nbytes();
+        assert!(DecodeIcb::validate_commands(&rt, &[bad_offset]).is_err());
+
+        let mut stale_address = valid.clone();
+        let DecodeIcbBind::Buf { gpu_addr, .. } = &mut stale_address.binds[0] else {
+            unreachable!()
+        };
+        *gpu_addr = gpu_addr.wrapping_add(4);
+        assert!(DecodeIcb::validate_commands(&rt, &[stale_address]).is_err());
+
+        let mut duplicate = valid.clone();
+        duplicate.binds.push(duplicate.binds[0].clone());
+        assert!(DecodeIcb::validate_commands(&rt, &[duplicate]).is_err());
+
+        let mut empty_immediate = valid.clone();
+        empty_immediate.binds.push(DecodeIcbBind::Immediate {
+            index: 1,
+            bytes: Vec::new(),
+        });
+        assert!(DecodeIcb::validate_commands(&rt, &[empty_immediate]).is_err());
+
+        let mut unaligned_tg_memory = valid.clone();
+        unaligned_tg_memory.tg_mem = vec![(0, 15)];
+        assert!(DecodeIcb::validate_commands(&rt, &[unaligned_tg_memory]).is_err());
+
+        let mut duplicate_tg_slot = valid.clone();
+        duplicate_tg_slot.tg_mem = vec![(0, 16), (0, 32)];
+        assert!(DecodeIcb::validate_commands(&rt, &[duplicate_tg_slot]).is_err());
+
+        let available = rt
+            .max_threadgroup_memory()
+            .checked_sub(valid.pipeline.staticThreadgroupMemoryLength())
+            .expect("copy pipeline static memory fits device");
+        let each = (available / 2 + 31) & !15;
+        let mut aggregate_tg_memory = valid.clone();
+        aggregate_tg_memory.tg_mem = vec![(0, each), (1, each)];
+        assert!(DecodeIcb::validate_commands(&rt, &[aggregate_tg_memory]).is_err());
+
+        let mut too_much_tg_memory = valid;
+        too_much_tg_memory.tg_mem = vec![(0, rt.max_threadgroup_memory() + 16)];
+        assert!(DecodeIcb::validate_commands(&rt, &[too_much_tg_memory]).is_err());
     }
 
     #[test]
@@ -1835,7 +2192,7 @@ mod tests {
             threadgroups: tg,
             threads_per_tg: tptg,
             binds: vec![buf(0, &src), buf(1, dst), buf(2, &n_buf)],
-            tg_mem: None,
+            tg_mem: Vec::new(),
             owned_immediates: Vec::new(),
             barrier_after,
             incomplete_binds: 0,
@@ -1919,7 +2276,7 @@ mod tests {
             threadgroups: tg,
             threads_per_tg: tptg,
             binds: vec![buf(0, src), buf(1, dst), buf(2, nbuf)],
-            tg_mem: None,
+            tg_mem: Vec::new(),
             owned_immediates: Vec::new(),
             barrier_after: bar,
             incomplete_binds: 0,
@@ -1937,6 +2294,38 @@ mod tests {
         assert!(!probe[0].barrier_after, "first barrier elided");
         assert!(probe[1].barrier_after, "RAW b→e barrier kept");
         assert!(probe[2].barrier_after);
+
+        // An unknown command inside an open span must not erase dependencies
+        // accumulated before it. Against the old `span.clear()` behavior, the
+        // barrier after c→d was incorrectly elided because only c/d remained
+        // visible when the following command touched a again.
+        let mut unknown_span = vec![
+            mk(&a, &b, &n_ab, false),
+            DecodeIcbCommand {
+                pipeline: pipe.clone(),
+                threadgroups: tg,
+                threads_per_tg: tptg,
+                binds: vec![DecodeIcbBind::Immediate {
+                    index: 0,
+                    bytes: 1u32.to_ne_bytes().to_vec(),
+                }],
+                tg_mem: Vec::new(),
+                owned_immediates: Vec::new(),
+                barrier_after: false,
+                incomplete_binds: 0,
+            },
+            mk(&c, &d, &n_cd, true),
+            mk(&a, &e, &n_be, true),
+        ];
+        let unknown_elided = DecodeIcb::elide_non_interfering_barriers(&mut unknown_span);
+        assert_eq!(
+            unknown_elided, 0,
+            "an unknown open span cannot be coarsened"
+        );
+        assert!(
+            unknown_span[2].barrier_after,
+            "the next barrier must close the unknown span before a can be reused"
+        );
 
         set_icb_range_batch(true);
         set_icb_coarse_ranges(true);
@@ -2119,6 +2508,37 @@ mod tests {
         assert!(!binder_encode_nop(), "the outer drop restores the original");
     }
 
+    /// Replay suppression belongs to one host thread. A process-global switch
+    /// made an unrelated model/runtime on another thread skip all of its
+    /// `with_binder` bodies and return apparent success with stale outputs.
+    #[test]
+    fn binder_encode_nop_does_not_cross_thread_boundaries() {
+        let _flags = IcbFlagsTestGuard::lock();
+        set_binder_encode_nop(false);
+        let outer = BinderEncodeNopGuard::enter();
+        assert!(binder_encode_nop());
+
+        std::thread::spawn(|| {
+            assert!(
+                !binder_encode_nop(),
+                "another thread inherited replay suppression"
+            );
+            let local = BinderEncodeNopGuard::enter();
+            assert!(binder_encode_nop());
+            drop(local);
+            assert!(!binder_encode_nop());
+        })
+        .join()
+        .expect("thread-local replay-state probe");
+
+        assert!(
+            binder_encode_nop(),
+            "another thread changed the original thread's guard"
+        );
+        drop(outer);
+        assert!(!binder_encode_nop());
+    }
+
     /// A bind the argument table cannot hold must be refused, not dropped.
     ///
     /// The prebuilt and freeze encode paths filter `index < ARG_TABLE_SLOTS`
@@ -2148,7 +2568,7 @@ mod tests {
                     byte_offset: 0,
                     gpu_addr: buf_gpu_addr(&a, 0),
                 }],
-                tg_mem: None,
+                tg_mem: Vec::new(),
                 owned_immediates: Vec::new(),
                 barrier_after: false,
                 incomplete_binds: 0,
@@ -2191,10 +2611,16 @@ mod tests {
 
         assert_eq!(cap.commands[0].incomplete_binds, 1);
 
-        // Inherit mode is fine: the live argument table supplies the bind.
-        DecodeIcb::from_commands_ex(&rt, cap.commands.clone(), false)
+        // `inheritBuffers` does not re-run the original binding callback. The
+        // default replay path would therefore read a stale or missing argument
+        // table slot just as freeze-binds would.
+        let inherit_err = DecodeIcb::from_commands_ex(&rt, cap.commands.clone(), false)
             .map(|_| ())
-            .expect("inherit-buffers replay does not depend on the tape's binds");
+            .expect_err("inherit replay must reject a missing operand");
+        assert!(
+            inherit_err.contains("missing or stale"),
+            "the error must name the replay hazard, got: {inherit_err}"
+        );
 
         // Freeze-binds writes the tape's binds into the ICB, so a missing one
         // is an unwritten slot on every replay.
@@ -2202,7 +2628,7 @@ mod tests {
             .map(|_| ())
             .expect_err("a freeze-binds tape missing operands must not build");
         assert!(
-            err.contains("could not be recorded"),
+            err.contains("could not be recorded") && err.contains("missing or stale"),
             "the error must name the cause, got: {err}"
         );
     }

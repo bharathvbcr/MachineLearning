@@ -35,12 +35,17 @@ impl DType {
     }
 }
 
-/// Checked storage size shared by allocation, views, and kernel validation.
-pub(crate) fn checked_nbytes(shape: &[usize], dtype: DType) -> Result<usize, String> {
-    let n = shape
+/// Checked element count shared by public inspection and storage validation.
+fn checked_numel(shape: &[usize]) -> Result<usize, String> {
+    shape
         .iter()
         .try_fold(1usize, |n, &d| n.checked_mul(d))
-        .ok_or_else(|| "tensor element count overflow".to_string())?;
+        .ok_or_else(|| "tensor element count overflow".to_string())
+}
+
+/// Checked storage size shared by allocation, views, and kernel validation.
+pub(crate) fn checked_nbytes(shape: &[usize], dtype: DType) -> Result<usize, String> {
+    let n = checked_numel(shape)?;
     n.checked_mul(dtype.size_of())
         .filter(|&bytes| bytes <= isize::MAX as usize)
         .ok_or_else(|| "tensor byte size overflow".to_string())
@@ -56,18 +61,19 @@ pub(crate) struct PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        // Bump views share the slab. Cold/Bump storage retires only after the
-        // last owner drops and GPU work completes; Hot storage stays resident.
-        if self.kind == BufferKind::Hot {
-            return;
-        }
         let Some(rt) = self.runtime.upgrade() else {
             return;
         };
-        // Keep the MTLBuffer alive until after CB completion via pending queue.
+        // Keep the MTLBuffer alive until after CB completion via the runtime's
+        // pending queues. Cold/Bump storage is reusable and enters the
+        // freelist; Hot storage is not reusable, but still must be removed from
+        // residency once its final logical owner disappears. A live Hot handle
+        // is unchanged: this only runs for the last Arc.
         let buffer = self.buffer.clone();
-        let nbytes = self.nbytes;
-        rt.schedule_cold_recycle(buffer, nbytes);
+        match self.kind {
+            BufferKind::Hot => rt.schedule_hot_retirement(buffer),
+            BufferKind::Cold | BufferKind::Bump => rt.schedule_cold_recycle(buffer, self.nbytes),
+        }
     }
 }
 
@@ -125,6 +131,30 @@ impl<T> std::ops::DerefMut for HostMapping<'_, T> {
 }
 
 impl GpuBuffer {
+    /// Whether this allocation was created by `runtime`.
+    ///
+    /// Raw-buffer kernel entry points do not carry a [`Tensor`]'s runtime
+    /// metadata, so they use this identity check before opening an encoder.
+    /// The bind layer repeats the check as defense in depth, but rejecting at
+    /// the public boundary keeps a foreign buffer from poisoning an in-flight
+    /// command batch before the late binder error is observed.
+    pub(crate) fn belongs_to(&self, runtime: &GpuRuntime) -> bool {
+        // A liveness load plus a pointer compare: `upgrade()` answered the same
+        // question with a CAS loop and a matching release on every bind.
+        std::sync::Weak::strong_count(&self.inner.runtime) > 0
+            && std::ptr::eq(std::sync::Weak::as_ptr(&self.inner.runtime), runtime)
+    }
+
+    /// Whether two handles name the same Metal allocation.
+    ///
+    /// `GpuBuffer` has no subrange metadata, so sharing the allocation means
+    /// their complete logical regions overlap. Kernels that do not explicitly
+    /// support in-place operation use this before encoding to avoid host-safe
+    /// aliases becoming unordered device reads and writes.
+    pub(crate) fn aliases(&self, other: &GpuBuffer) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     fn map_host<T>(&self) -> Result<HostMapping<'_, T>, String> {
         if self.nbytes() % std::mem::size_of::<T>() != 0
             || self.metal().contents().as_ptr() as usize % std::mem::align_of::<T>() != 0
@@ -157,8 +187,8 @@ impl GpuBuffer {
     ///
     /// Callers choose a [`BufferKind`] at allocation time; this reads it back,
     /// which matters when a buffer is handed around and the recycling
-    /// behaviour on drop (Cold recycles, Hot stays resident, Bump does not)
-    /// affects what the holder may do with it.
+    /// behaviour on final drop (Cold/Bump recycle, Hot retires without entering
+    /// the freelist) affects what the holder may do with it.
     pub fn kind(&self) -> BufferKind {
         self.inner.kind
     }
@@ -311,12 +341,74 @@ impl std::fmt::Debug for Tensor {
 }
 
 impl Tensor {
-    pub fn numel(&self) -> usize {
-        self.shape.iter().product()
+    /// Read this view's logical elements from unified memory.
+    ///
+    /// Honours `byte_offset`: a bump sub-allocation sees only its own window,
+    /// not the whole slab its `buffer` names. Fails for a non-f32 view, a
+    /// view that does not fit its buffer, or a runtime that is busy or
+    /// poisoned.
+    pub fn read_f32(&self) -> Result<Vec<f32>, String> {
+        let (start, len) = self.f32_window()?;
+        let mapping = self.buffer.try_contents_f32()?;
+        Ok(mapping[start..start + len].to_vec())
     }
 
+    /// Write this view's logical elements; `data` must be exactly `numel`
+    /// long. Honours `byte_offset` the way [`Self::read_f32`] does.
+    pub fn write_f32(&self, data: &[f32]) -> Result<(), String> {
+        let (start, len) = self.f32_window()?;
+        if data.len() != len {
+            return Err(format!(
+                "write_f32: {} elements for a view of {len}",
+                data.len()
+            ));
+        }
+        let mut mapping = self.buffer.try_contents_f32()?;
+        mapping[start..start + len].copy_from_slice(data);
+        Ok(())
+    }
+
+    /// `(first element, element count)` of this view inside its buffer.
+    fn f32_window(&self) -> Result<(usize, usize), String> {
+        if self.dtype != DType::F32 {
+            return Err(format!("tensor is {:?}, not f32", self.dtype));
+        }
+        self.validate()?;
+        Ok((self.byte_offset / DType::F32.size_of(), self.try_numel()?))
+    }
+
+    /// Fallible logical element count for caller-controlled tensor metadata.
+    ///
+    /// `shape` remains public for compatibility and can therefore be mutated
+    /// after construction. Result-returning boundaries should use this method
+    /// (or the crate's internal `validate` boundary) rather than allow an overflowing product to
+    /// wrap in release builds.
+    pub fn try_numel(&self) -> Result<usize, String> {
+        checked_numel(&self.shape)
+    }
+
+    /// Logical element count.
+    ///
+    /// This retains the original return type for source compatibility. Invalid
+    /// public metadata now fails explicitly instead of wrapping silently; code
+    /// that accepts untrusted or mutated shapes should call [`Self::try_numel`].
+    pub fn numel(&self) -> usize {
+        self.try_numel()
+            .expect("Tensor::numel: tensor element count overflow")
+    }
+
+    /// Fallible logical byte count, including dtype width and Rust allocation
+    /// limits.
+    pub fn try_nbytes_logical(&self) -> Result<usize, String> {
+        checked_nbytes(&self.shape, self.dtype)
+    }
+
+    /// Logical byte count with the original infallible API shape.
+    ///
+    /// Prefer [`Self::try_nbytes_logical`] when metadata is caller-controlled.
     pub fn nbytes_logical(&self) -> usize {
-        self.numel() * self.dtype.size_of()
+        self.try_nbytes_logical()
+            .expect("Tensor::nbytes_logical: tensor byte size overflow")
     }
 
     pub fn runtime(&self) -> &Arc<GpuRuntime> {
@@ -382,12 +474,12 @@ impl Tensor {
         {
             return Err("tensor view is misaligned or out of bounds".into());
         }
-        if !self
-            .buffer
-            .inner
-            .runtime
-            .ptr_eq(&Arc::downgrade(&self.runtime))
-        {
+        // Pointer identity without touching the refcounts: `Arc::downgrade`
+        // was two atomic read-modify-writes per bind for a comparison.
+        if !std::ptr::eq(
+            std::sync::Weak::as_ptr(&self.buffer.inner.runtime),
+            Arc::as_ptr(&self.runtime),
+        ) {
             return Err("tensor buffer belongs to a different runtime".into());
         }
         Ok(())
@@ -577,6 +669,34 @@ mod contract_tests {
     }
 
     #[test]
+    fn public_numel_exposes_a_fallible_overflow_boundary() {
+        let rt = GpuRuntime::new().unwrap();
+        let mut tensor = rt.alloc_tensor_f32(&[1]).unwrap();
+        tensor.shape = vec![usize::MAX, 2];
+
+        assert_eq!(
+            tensor.try_numel().unwrap_err(),
+            "tensor element count overflow"
+        );
+
+        tensor.shape = vec![usize::MAX];
+        assert_eq!(tensor.try_numel().unwrap(), usize::MAX);
+        assert_eq!(
+            tensor.try_nbytes_logical().unwrap_err(),
+            "tensor byte size overflow"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Tensor::numel: tensor element count overflow")]
+    fn public_numel_compatibility_wrapper_fails_loudly_on_overflow() {
+        let rt = GpuRuntime::new().unwrap();
+        let mut tensor = rt.alloc_tensor_f32(&[1]).unwrap();
+        tensor.shape = vec![usize::MAX, 2];
+        let _ = tensor.numel();
+    }
+
+    #[test]
     #[should_panic(expected = "view")]
     fn view_rejects_offset_overflow() {
         let rt = GpuRuntime::new().unwrap();
@@ -628,7 +748,7 @@ mod audit_tests {
             let view = rt.bump_alloc_f32(&[64]).unwrap();
             view.buffer.write_f32(&[i as f32; 64]);
             retained.push(view);
-            rt.bump_reset();
+            rt.bump_reset().unwrap();
             let pressure = rt.alloc_tensor_f32(&[64]).unwrap();
             pressure.buffer.write_f32(&[-999.0; 64]);
             drop(pressure);
@@ -639,7 +759,7 @@ mod audit_tests {
         }
         drop(retained);
         rt.synchronize().unwrap();
-        rt.bump_reset();
+        rt.bump_reset().unwrap();
         assert!(rt.bump_alloc_f32(&[64]).is_ok());
     }
 
@@ -707,12 +827,11 @@ mod audit_tests {
         rt.ensure_bump(256).unwrap();
         let a = rt.bump_alloc_f32(&[64]).unwrap();
         a.buffer.write_f32(&[7.0; 64]);
-        // Reset must either reject outstanding views, or move to a fresh slab.
-        let reset = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.bump_reset()));
-        if reset.is_ok() {
-            let b = rt.bump_alloc_f32(&[64]).unwrap();
-            b.buffer.write_f32(&[3.0; 64]);
-            assert!(a.buffer.read_f32().iter().all(|&x| x == 7.0));
-        }
+        // Reset with an outstanding view moves to a fresh slab; it is an
+        // ordinary success, not a rejection and not a panic.
+        rt.bump_reset().unwrap();
+        let b = rt.bump_alloc_f32(&[64]).unwrap();
+        b.buffer.write_f32(&[3.0; 64]);
+        assert!(a.buffer.read_f32().iter().all(|&x| x == 7.0));
     }
 }
