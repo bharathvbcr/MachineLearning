@@ -91,6 +91,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from nanolab.config import build_config  # noqa: E402
+from nanolab.vram import (  # noqa: E402
+    VRAM_HEADROOM, device_total_vram_gib,
+    job_vram_gib as _job_vram_gib, safe_workers as _safe_workers)
 from nanolab.crossover_replicate import (  # noqa: E402
     SEEDS, TOKEN_BUDGET, LOCKED20_TOKEN_BUDGET, SUITE14_TOKEN_BUDGET,
     all_crossover_tokens, mean_ci, scale_to_token_budget,
@@ -970,23 +973,14 @@ def detect_gpus() -> int:
         return 0
 
 
-def device_total_vram_gib() -> float:
-    """Total VRAM on device 0, or 0.0 when there is no CUDA device."""
-    try:
-        r = subprocess.run(
-            [sys.executable, "-c",
-             "import torch;print(torch.cuda.get_device_properties(0).total_memory "
-             "if torch.cuda.is_available() else 0)"],
-            capture_output=True, text=True, timeout=180, cwd=str(ROOT))
-        return int(r.stdout.strip() or 0) / 1024 ** 3
-    except (subprocess.SubprocessError, ValueError):
-        return 0.0
-
-
+# device_total_vram_gib, the measured table and the sizing model now live in
+# nanolab/vram.py, because `crossover_replicate launch` needed the same guard and
+# a second copy beside this one is how the two drift. This file keeps only the
+# job-dict adapter.
 def job_vram_gib(job: dict) -> float:
     o = job["overrides"]
-    return JOB_VRAM_GIB.get((o["mixer"], o["d_model"], o["batch_size"]),
-                            JOB_VRAM_DEFAULT_GIB)
+    gib, _measured = _job_vram_gib(o["mixer"], o["d_model"], o["batch_size"])
+    return gib
 
 
 def vram_safe_workers(jobs: list[dict], total_gib: float) -> tuple[int, float]:
@@ -998,7 +992,7 @@ def vram_safe_workers(jobs: list[dict], total_gib: float) -> tuple[int, float]:
     if not jobs or total_gib <= 0:
         return 0, 0.0
     per = max(job_vram_gib(j) for j in jobs)
-    return max(1, int(total_gib * VRAM_HEADROOM / per)), per
+    return _safe_workers(per, total_gib), per
 
 
 def device_name() -> str:
@@ -1951,10 +1945,11 @@ REFERENCE_CORPUS_TOKENS = 497_500_000
 # The two arms differ enough to matter, and sizing a worker count on the cheaper one
 # is how this went wrong: 4 workers chosen against attention's 17 GiB put four
 # minGRU jobs on the card at 95.5 of 97.9 GiB, 97.6% full.
-JOB_VRAM_GIB = {("attention", 768, 32): 17.0, ("mingru", 768, 32): 23.3}
-JOB_VRAM_DEFAULT_GIB = 23.3     # the worst measured cell, so an unknown shape is
-                                # sized pessimistically rather than optimistically
-VRAM_HEADROOM = 0.85            # refuse a plan that would fill more than this
+# The table, the scaling and the headroom moved to nanolab/vram.py. The old
+# JOB_VRAM_DEFAULT_GIB constant is gone on purpose: it returned 23.3 GiB -- the
+# worst cell measured AT d_model 768 -- for any unmeasured shape, and called that
+# pessimistic. At d_model 1536 it is optimistic by 3x, which is how an unmeasured
+# shape came to be handed a number indistinguishable from a measurement.
 SETUP_HOURS = 1.0        # billed while the box boots, clones and tokenizes
 # Extrapolation factors, stated so they can be argued with. Both are applied to a
 # MEASURED rate and both are labelled `extrapolated` in the output.

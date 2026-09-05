@@ -36,7 +36,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import build_config, parse_layer_mixers
+from .vram import check_plan, device_total_vram_gib
+from .config import Config, build_config, parse_layer_mixers
 from .train import train
 
 
@@ -1503,6 +1504,33 @@ def cmd_run(args) -> None:
     print(f"{job['id']} best_val={val:.4f}")
 
 
+def _job_shape(job: dict) -> tuple[str, int, int]:
+    """(mixer, d_model, batch_size) for the VRAM guard, honouring arm overrides.
+
+    An arm's overrides are where the ladder's widths live, so reading d_model off
+    the base config would size every ladder cell as though it were 768 -- which
+    is the sizing mistake this guard exists to prevent, one layer up.
+    """
+    over = dict(job.get("overrides") or {})
+    arm = next((a for a in ARMS if a.name == job.get("arm")), None)
+    if arm is not None:
+        over.update(dict(arm.overrides))
+    base = Config()
+    return (str(over.get("mixer", arm.mixer if arm else base.mixer)),
+            int(over.get("d_model", base.d_model)),
+            int(over.get("batch_size", cluster_batch())))
+
+
+def _queue_failures(queue: Path) -> list[tuple[str, str]]:
+    """[(job id, detail)] for every job the queue records as failed."""
+    try:
+        state = json.loads(Path(queue).read_text())
+    except (OSError, ValueError):
+        return []
+    return [(j.get("id", "?"), str(j.get("detail", "")))
+            for j in state.get("jobs", []) if j.get("status") == "failed"]
+
+
 def cmd_launch(args) -> None:
     if cluster_batch() >= 64 and args.workers > 1:
         print(f"CROSSOVER_BATCH={cluster_batch()} needs ~80GB/job; "
@@ -1534,6 +1562,19 @@ def cmd_launch(args) -> None:
     if args.seed is not None:
         jobs = [j for j in jobs if j["seed"] == args.seed]
     init_queue(queue, jobs, out_root)
+    # VRAM guard. gpu_bundle has refused an over-subscribed plan since it was
+    # written; this runner never did, and on 2026-09-05 two minGRU jobs at
+    # d_model 1536 OOMed two-to-a-device. The stage script then read an argmin
+    # off the four survivors -- one of them an edge -- and spent ten 50M-token
+    # jobs on it. Refusing costs a worker slot; not refusing cost a board.
+    if not getattr(args, "ignore_vram", False):
+        shapes = sorted({(_job_shape(j)) for j in jobs})
+        # --workers is per GPU (the launcher prints "workers/gpu"), so the
+        # budget is one device's memory, not the box's.
+        total = device_total_vram_gib()
+        ok, msg = check_plan(shapes, args.workers, total)
+        if not ok:
+            raise SystemExit(msg)
     if getattr(args, "unhold", False):
         fh, state = _lock_load(queue)
         n = 0
@@ -1610,6 +1651,19 @@ def cmd_launch(args) -> None:
     rc = 0
     for p in workers:
         rc = max(rc, p.wait())
+    # A worker that ran every job it was given and marked two of them `failed`
+    # exits 0, so `launch` used to report success for a partly-empty board. Every
+    # stage script in scripts/ keys its next step on this exit code, and one of
+    # them chose a learning rate from the survivors of exactly that. A check that
+    # could not run must not report what a check that ran and passed reports.
+    failed = _queue_failures(queue)
+    if failed:
+        print(f"\n{len(failed)} job(s) FAILED -- this board is incomplete:")
+        for jid, detail in failed[:10]:
+            print(f"  {jid}: {detail[:100]}")
+        if len(failed) > 10:
+            print(f"  ... and {len(failed) - 10} more")
+        rc = max(rc, 1)
     raise SystemExit(rc)
 
 
@@ -2657,6 +2711,10 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument("--arm", default=None, choices=[a.name for a in ARMS])
     launch.add_argument("--seed", type=int, default=None)
     launch.add_argument("--detach", action="store_true")
+    launch.add_argument("--ignore-vram", action="store_true",
+                        help="skip the VRAM guard (the per-shape figure is "
+                             "measured at d_model 768 and scaled elsewhere; "
+                             "override it if the scaling is wrong for yours)")
     launch.add_argument("--unhold", action="store_true",
                         help="release held jobs back to pending")
     worker = sub.add_parser("worker", parents=[common])

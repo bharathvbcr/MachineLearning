@@ -4197,6 +4197,97 @@ def a_one_expert_moe_is_the_dense_ffn_at_init():
 
 
 @test
+def vram_sizing_agrees_with_every_tenancy_this_repo_has_actually_observed():
+    """The guard is only worth having if it reproduces what the box did.
+
+    Three observations, all on a 94.5 GiB GH200 at batch 32 / ctx 512:
+      minGRU d_model  768, two to a device -- ran (every 50M board)
+      minGRU d_model 1152, two to a device -- ran (E21 phase 2, 30/30)
+      minGRU d_model 1536, two to a device -- CUDA OOM (E27 probe, 2 jobs lost)
+
+    The pre-fix sizing returned a flat 23.3 GiB for any unmeasured shape, so it
+    admitted the third. A parameter-ratio scaling refuses the second. Only the
+    split model -- optimizer state by parameter count, activations by
+    d_model x batch x ctx -- gets all three right.
+    """
+    from .vram import check_plan
+    GH200 = 94.5
+    for d, workers, want_ok, what in ((768, 2, True, "ran"),
+                                      (1152, 2, True, "ran"),
+                                      (1536, 2, False, "OOMed"),
+                                      (1536, 1, True, "fits alone")):
+        ok, _ = check_plan([("mingru", d, 32)], workers, GH200)
+        assert ok is want_ok, (
+            f"d_model {d} at {workers} worker(s) really {what}, guard says "
+            f"{'allow' if ok else 'refuse'}")
+
+
+@test
+def an_unmeasured_vram_shape_is_never_reported_as_a_measured_one():
+    """`JOB_VRAM_DEFAULT_GIB = 23.3` was documented as sizing an unknown shape
+    "pessimistically". It was the worst cell measured AT d_model 768, so at 1536
+    it was optimistic by 3x -- a check that could not run returning what a check
+    that ran and passed returns. The flag is the fix; this asserts it exists and
+    that the two paths do not collide."""
+    from .vram import job_vram_gib, MEASURED_JOB_VRAM_GIB
+    g768, measured = job_vram_gib("mingru", 768, 32)
+    assert measured and g768 == MEASURED_JOB_VRAM_GIB[("mingru", 768, 32)]
+    g1536, measured = job_vram_gib("mingru", 1536, 32)
+    assert not measured, "d_model 1536 has never been measured; must not claim it"
+    assert g1536 > g768 * 2, (
+        f"a 3.4x larger model sized at {g1536:.1f} GiB against {g768:.1f} -- "
+        "this is the flat-default bug returning")
+
+
+@test
+def a_launch_that_leaves_failed_jobs_does_not_report_success():
+    """Workers that run every job and mark two `failed` exit 0, so `launch` used
+    to report success for a partly-empty board -- and a stage script keyed on
+    that exit code chose a learning rate from the survivors of exactly that.
+    """
+    import json
+    import tempfile
+    from pathlib import Path
+    from .crossover_replicate import _queue_failures
+    with tempfile.TemporaryDirectory() as td:
+        q = Path(td) / "queue.json"
+        q.write_text(json.dumps({"jobs": [
+            {"id": "a", "status": "done"},
+            {"id": "b", "status": "failed", "detail": "OutOfMemoryError: CUDA"},
+            {"id": "c", "status": "failed", "detail": "OutOfMemoryError: CUDA"},
+        ]}))
+        bad = _queue_failures(q)
+        assert len(bad) == 2, bad
+        assert bad[0][0] == "b" and "OutOfMemory" in bad[0][1]
+        q.write_text(json.dumps({"jobs": [{"id": "a", "status": "done"}]}))
+        assert _queue_failures(q) == []
+
+
+@test
+def the_vram_guard_reads_width_from_the_arm_not_the_base_config():
+    """The ladder's widths live in arm overrides. Sizing off the base config
+    would call every ladder cell 768 -- the same class of mistake one layer up
+    from the one the guard exists to catch."""
+    import os
+    from .crossover_replicate import _job_shape, expand_grid
+    old = os.environ.get("CROSSOVER_ARMS")
+    os.environ["CROSSOVER_ARMS"] = "attention,w1536_mingru_lr40"
+    try:
+        shapes = {_job_shape(j) for j in expand_grid()}
+    finally:
+        if old is None:
+            os.environ.pop("CROSSOVER_ARMS", None)
+        else:
+            os.environ["CROSSOVER_ARMS"] = old
+    # Batch comes from the cluster env and is not what this test is about.
+    by_mixer = {m: d for m, d, _b in shapes}
+    assert by_mixer.get("mingru") == 1536, (
+        f"arm override width lost; got {sorted(shapes)}")
+    assert by_mixer.get("attention") == 768, (
+        f"base-config arm should stay at 768; got {sorted(shapes)}")
+
+
+@test
 def an_evaluated_moe_loss_is_pure_cross_entropy():
     """E19 was a units bug, not a model bug. `Model.forward` folded the Switch
     load-balancing aux into the loss it returned, and `train.evaluate` reports
