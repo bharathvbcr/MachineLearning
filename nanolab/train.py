@@ -72,6 +72,59 @@ def evaluate(model, batcher, cfg, ctx, optimizers=None):
     return val
 
 
+def copy_probe_batch(cfg, generator, span: int = 32):
+    """One repeated-span batch for the copy probe (E34).
+
+    Uniform random tokens of length ``block_size`` with one ``span``-token stretch
+    at ``p1`` (first half) copied to ``p2`` (second half). Targets follow the
+    trainer's convention -- ``y[t]`` is the token at ``t+1`` -- and are ``-1``
+    (the loss functions' ignore index) everywhere except the positions that
+    predict the 2nd..``span``-th token of the second copy: those are the only
+    positions a model can get right by copying, and the first copied token is
+    excluded because nothing announces where the copy begins. Built on the CPU
+    from a fixed generator so every arm, seed and evaluation sees the same
+    probe sequences.
+    """
+    B, T = cfg.batch_size, cfg.block_size
+    span = max(2, min(span, T // 4))
+    x = torch.randint(0, cfg.vocab_size, (B, T), generator=generator)
+    p1 = torch.randint(0, T // 2 - span + 1, (B,), generator=generator)
+    p2 = torch.randint(T // 2, T - span + 1, (B,), generator=generator)
+    ar = torch.arange(span)
+    rows = torch.arange(B)[:, None]
+    x[rows, p2[:, None] + ar] = x[rows, p1[:, None] + ar]
+    y = torch.full((B, T), -1, dtype=torch.long)
+    tgt = p2[:, None] + ar[1:]                       # copied tokens after the first
+    y[rows, tgt - 1] = x[rows, tgt]
+    return x, y
+
+
+def copy_probe_loss(model, cfg, ctx, n_batches: int = 4, span: int = 32,
+                    seed: int = 0xC0DE) -> float:
+    """Mean CE on the second occurrence of a repeated span (E34's `copy_loss`).
+
+    Eval mode (no MoE balancing term, see Model.forward), no gradients, four
+    batches: a few forward passes per evaluation and nothing else changes, so a
+    run with ``copy_probe`` on trains bit-identically to one without.
+    """
+    device = next(model.parameters()).device
+    g = torch.Generator().manual_seed(seed)
+    was_training = model.training
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for _ in range(n_batches):
+            x, y = copy_probe_batch(cfg, g, span)
+            with ctx:
+                _, loss = model(x.to(device), y.to(device))
+            losses.append(loss.item())
+    if was_training:
+        model.train()
+    val = sum(losses) / len(losses)
+    require_finite(-1, copy_loss=val)
+    return float(val)
+
+
 def train(cfg, overfit: int = 0, batchers=None):
     """``batchers`` injects a (train, val) pair instead of reading a corpus.
 
@@ -247,6 +300,11 @@ def train(cfg, overfit: int = 0, batchers=None):
                 schedule.observe(val)          # ReduceLROnPlateau
             if cfg.tokenizer == "char":        # char models: bits-per-char (§3)
                 extra["bpc"] = val / math.log(2)
+            if cfg.copy_probe:
+                # E34: does the attention/minGRU crossing coincide with the
+                # token at which in-context copying appears? Logged beside
+                # val_loss, never added to it.
+                extra["copy_loss"] = copy_probe_loss(model, cfg, autocast)
             if cfg.ffn == "moe":
                 # not added to val_loss -- logged so the router's balance is a
                 # measured quantity rather than an assumption. At perfect

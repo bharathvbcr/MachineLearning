@@ -442,6 +442,76 @@ RATIO_ARMS = ("hybrid_mingru11_attn1", "hybrid_mingru_periodic",
               "hybrid_mingru10_attn2")
 
 
+# 2026-09-05: the September program's arms, one board each. Every one is a new
+# arm NAME carrying its own override, so pre-fix runs keep their identity and
+# `lock_recipe` records which rule / weighting / width a job used. See
+# docs/architecture-review-2026-09-04/LAMBDA_HANDOFF_2026-09-05.md section 5.
+_PUB = (("gdn_rule", "published"),)
+_RAW = (("moe_router_weight", "raw"),)
+_X1 = (("mingru_expand", 1),)
+_W384 = (("d_model", 384), ("n_head", 6), ("head_dim", 64))
+ARMS = ARMS + (
+    # E28: is the hard-recall failure the operator variant? Same block, the
+    # published decayed-read rule (arXiv:2412.06464 eq. 8) instead of the repo's.
+    Arm("gdn_pub", "gdn", note="Gated DeltaNet on the PUBLISHED rule (decay before correction)",
+        overrides=_PUB),
+    Arm("hybrid_gdn_periodic_pub", "gdn",
+        "gdn*3,attention,gdn*3,attention,gdn*3,attention",
+        "hybrid_gdn_periodic on the published rule", overrides=_PUB),
+    # E29: E19's board with a router that can learn to route. Under `renorm` the
+    # top-1 weight is exactly 1 and the gate has no task gradient; `raw` is the
+    # Switch weighting. moe_e1k1_raw is the control and must match `attention`.
+    Arm("moe_e1k1_raw", "attention", note="control: 1 expert through the MoE path, raw router weight",
+        overrides=(("ffn", "moe"), ("moe_experts", 1), ("moe_top_k", 1)) + _RAW),
+    Arm("moe_e4k1_raw", "attention", note="4 experts, top-1, raw router weight (task gradient reaches the gate)",
+        overrides=(("ffn", "moe"), ("moe_experts", 4), ("moe_top_k", 1)) + _RAW),
+    Arm("moe_e8k1_raw", "attention", note="8 experts, top-1, raw router weight",
+        overrides=(("ffn", "moe"), ("moe_experts", 8), ("moe_top_k", 1)) + _RAW),
+    # E30b: the no-regret hybrid at parameter parity. Expansion 2 makes a minGRU
+    # layer ~6d^2 against attention's 4d^2, so hybrid_mingru8_attn4 is 19% heavier
+    # than attention; expansion 1 removes that.
+    Arm("mingru_x1", "mingru", note="minGRU at expansion 1", overrides=_X1),
+    Arm("hybrid_mingru8_attn4_x1", "mingru", "mingru*8,attention*4",
+        "8+4 at expansion 1: parameter parity with attention", overrides=_X1),
+    Arm("hybrid_mingru_periodic_x1", "mingru",
+        "mingru*3,attention,mingru*3,attention,mingru*3,attention",
+        "9+3 periodic at expansion 1", overrides=_X1),
+    # E31: the tied/untied x value-residual 2x2. `attention` is the (tied, VR) cell.
+    # Untying adds vocab*d = 38,633,472 parameters at width 768; report it.
+    Arm("attention_untied", "attention", note="tie_embeddings off",
+        overrides=(("tie_embeddings", False),)),
+    Arm("attention_novr", "attention", note="value residual off",
+        overrides=(("value_residual", False),)),
+    Arm("attention_untied_novr", "attention", note="tie_embeddings off, value residual off",
+        overrides=(("tie_embeddings", False), ("value_residual", False))),
+    # E33: depth for width at ~21M non-embedding parameters (attn3 is 21.3M,
+    # 12L x 384 is 21.2M). head_dim stays 64, so 544 is unreachable; these
+    # two bracket it: 6L x 512 = 18.9M, 6L x 576 = 23.9M.
+    Arm("attn6_w512", "attention", note="6 layers x 512: 18.9M non-embedding",
+        overrides=(("n_layer", 6), ("d_model", 512), ("n_head", 8), ("head_dim", 64))),
+    Arm("attn6_w576", "attention", note="6 layers x 576: 23.9M non-embedding",
+        overrides=(("n_layer", 6), ("d_model", 576), ("n_head", 9), ("head_dim", 64))),
+    # E35: the token ladder's hybrid arm at width 384. The ladder measured
+    # attention's optimum at 8x base LR and minGRU's at 4x; the hybrid has no
+    # measured optimum, so it runs at both.
+    Arm("w384_hybrid_mingru8_attn4_lr40", "mingru", "mingru*8,attention*4",
+        "8+4 at d_model 384, LR x4",
+        overrides=_W384 + (("lr", _LADDER_BASE_LR * 4.0), ("matrix_lr", _LADDER_BASE_MATRIX_LR * 4.0))),
+    Arm("w384_hybrid_mingru8_attn4_lr80", "mingru", "mingru*8,attention*4",
+        "8+4 at d_model 384, LR x8",
+        overrides=_W384 + (("lr", _LADDER_BASE_LR * 8.0), ("matrix_lr", _LADDER_BASE_MATRIX_LR * 8.0))),
+)
+# One name per board so a launcher cannot list a subset (the RATIO_ARMS rule).
+GDN_RULE_ARMS = ("gdn", "gdn_pub", "hybrid_gdn_periodic", "hybrid_gdn_periodic_pub")
+MOE_RAW_ARMS = ("attention", "moe_e1k1_raw", "moe_e4k1_raw", "moe_e8k1_raw")
+PARITY_ARMS = ("attention", "hybrid_mingru8_attn4_x1", "hybrid_mingru_periodic_x1")
+TIE_ARMS = ("attention", "attention_untied", "attention_novr", "attention_untied_novr")
+SHAPE_ARMS = ("attention", "attn6_w512", "attn6_w576", "w384_attention_lr10")
+COPY_ARMS = ("attention", "mingru", "hybrid_mingru8_attn4")
+W384X_ARMS = ("w384_attention_lr80", "w384_mingru_lr40",
+              "w384_hybrid_mingru8_attn4_lr40", "w384_hybrid_mingru8_attn4_lr80")
+
+
 def scale_to_token_budget(batch_size: int, block_size: int = 512,
                           grad_accum: int = 1,
                           token_budget: int = TOKEN_BUDGET,
@@ -760,6 +830,13 @@ def budget_by_arm() -> dict[str, int]:
     return {k: int(v) for k, v in json.loads(raw).items()}
 
 
+def cluster_copy_probe() -> bool:
+    """E34: log the repeated-span copy loss at every eval. Recorded in the
+    recipe (a launch that turns it on in a directory that ran without it is a
+    different recipe) even though it changes nothing about training."""
+    return os.environ.get("CROSSOVER_COPY_PROBE", "").strip() in ("1", "true", "yes")
+
+
 def cluster_block() -> int:
     """Context length. 512 is every committed suite; E9 varies it.
 
@@ -824,6 +901,7 @@ def current_recipe() -> dict:
         "arm_overrides": selected_arm_overrides(),
         "swa_chunk": cluster_swa_chunk(),
         "eval_iters": cluster_eval_iters(),
+        "copy_probe": cluster_copy_probe(),
         "token_budget": cluster_token_budget(),
         "lr_horizon": cluster_lr_horizon(),
         "arms": [a.name for a in selected_arms()],
@@ -1141,6 +1219,7 @@ def job_config(job: dict, out_root: Path, smoke: bool = False):
         eval_train=False,
         swa_chunk=cluster_swa_chunk(),
         eval_iters=cluster_eval_iters(),
+        copy_probe=cluster_copy_probe(),
         compile=False,
         mem_fraction=0.0,
     )

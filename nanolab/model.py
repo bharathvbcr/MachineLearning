@@ -81,6 +81,7 @@ class MoE(nn.Module):
         self.n_exp = cfg.moe_experts
         self.k = cfg.moe_top_k
         self.gate = nn.Linear(cfg.d_model, self.n_exp, bias=False)
+        self.router_weight = cfg.moe_router_weight
         self.experts = nn.ModuleList([SwiGLU(cfg) for _ in range(self.n_exp)])
         self.aux = None                 # load-balancing loss, set each forward
 
@@ -89,7 +90,14 @@ class MoE(nn.Module):
         xf = x.reshape(-1, d)                                # (N, d)
         probs = F.softmax(self.gate(xf), dim=-1)            # (N, E)
         weights, idx = torch.topk(probs, self.k, dim=-1)    # (N, k)
-        weights = weights / weights.sum(-1, keepdim=True)
+        if self.router_weight == "renorm":
+            # Renormalising the selected probabilities makes the top-1 weight
+            # identically 1, so the task loss has NO gradient path into the
+            # gate: a k=1 router trains on the balancing loss alone (found
+            # 2026-09-04; every committed moe_e*k1 run is like this). Kept as
+            # the default so those runs stay reproducible; `raw` is the
+            # Switch-style weighting that keeps the gradient.
+            weights = weights / weights.sum(-1, keepdim=True)
         out = torch.zeros_like(xf)
         for e in range(self.n_exp):
             sel_mask, slot = (idx == e).max(dim=-1)          # token routed to e?
