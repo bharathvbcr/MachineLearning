@@ -4,6 +4,16 @@ This lab notebook records methods, variants, failures, results, reproduction pat
 
 Copy [`_TEMPLATE.md`](_TEMPLATE.md) for new suites. Status values: `done` / `partial` / `planned` / `blocked`.
 
+## Research reviews and proposed protocols
+
+- [Architecture review — 2026-09-04](../docs/architecture-review-2026-09-04/README.md):
+  broad evidence inventory, paired hybrid learning-curve analysis, comparator issues,
+  and corrections to capacity/circuit claims. Includes historical supplied memos.
+- [Binding, direction, and retention protocol](../docs/architecture-review-2026-09-04/MEMORY_UPDATE_PROTOCOL.md):
+  proposed mechanism experiments, constrained-update oracles, and independently checked
+  mathematical special cases. This review is not an additional completed training suite
+  and does not change the suite counts above.
+
 ## Headline findings
 
 - On a 3070 Ti (one seed, bs8) attention overtook minGRU between **6.6M and 7.4M tokens**. On GH200 bs32 n=5 the same pair flips at **~1.05M** then **~12.4M** (independent 20M prefix recovered 12.34M). GH200 bs8 n=5 has **no flip by 7.38M**. Short rankings lie; the token of the flip is recipe-dependent.

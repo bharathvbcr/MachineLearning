@@ -1,0 +1,31 @@
+Review scope: local archived result analysis, source inspection, primary-literature search.
+No training, cloud jobs, source fixes, commits, or publication were performed.
+
+Executed: python3 paper/derive_figures.py --check
+Exit status: 0
+OK: all 60 derived figures appear in PAPER_2026-08_Recipe_Dependent_Rankings.md.
+COVERAGE: 61 of 706 figures stated in the manuscript are derived here or documented (9%). 645 come from artifacts this script does not read (lab notes and the Metal tracks); see manuscript section 10 for their provenance.
+OK: research/d7-lr-retune.json and research/champion-run.json match the ledger
+
+Executed in BINN: python3 scripts/aws/analyse_wave26.py
+Exit status: 2
+cells indexed : 0
+cells voided  : 0
+probed cells  : 0
+NOTHING TO ANALYSE: no wave-26 cell was found under /Users/bharath/Code/research/BINN/results/shd_attention_campaign_v2. This is not a verdict.
+Wave 26's numerical findings in the review are report-backed, not independently rederived.
+
+recompute.py parses archived metrics and emits hashes, per-run records, final-CE boards and recall cells.
+It deliberately omits runs lacking explicit final_val from final-CE boards.
+It does not interpret a queue's running flag as proof that a remote process is currently alive.
+It records one historical nonfinite metric in an archived failed funnel attempt rather than treating it as a successful finite observation.
+
+router_gradient_probe.py is a fresh CPU gradient experiment on the existing MoE module.
+It checks that task gradients reach the experts and the top-2 router, while the top-1 router loses its task gradient and still receives an auxiliary gradient.
+It is not a rerun of the full training campaign and does not establish the size of the training-quality effect.
+
+gdn_rule_probe.py compared the actual chunked operator to the published Gated DeltaNet update (arXiv:2412.06464, Table 1).
+At alpha=beta=0.5 with two unit query/key/value inputs and zero initial state:
+repository outputs [0.5, 0.5]; published rule outputs [0.5, 0.625].
+Controls alpha=1 and beta=0 agree. All probe assertions passed.
+This establishes operator non-equivalence, not its effect on training or recall.

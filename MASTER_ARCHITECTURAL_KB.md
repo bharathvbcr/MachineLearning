@@ -4,6 +4,15 @@
 **Purpose:** Durable source for later distillation (talks, READMEs, decision memos, resumes). Prefer citing the evidence paths below over narrative docs when numbers disagree.  
 **Scope:** Training (parameter-golf, nanolab, arch_02 metal-native) + inference (gemma-metal) on Apple M5 Pro / CUDA ablation hosts.
 
+> **September 4 research review:** the [consolidated assessment](docs/architecture-review-2026-09-04/README.md)
+> adds paired hybrid curves and qualifies several architectural interpretations below.
+> MQAR success does not identify an induction-head circuit; the implemented GDN differs
+> from the published recurrence; top-1 MoE routing needs a task-gradient check; and
+> blocked scalar memory writes do not establish exhausted capacity. The
+> [memory-update protocol](docs/architecture-review-2026-09-04/MEMORY_UPDATE_PROTOCOL.md)
+> separates binding, direction selection, retention checking, and resource accounting.
+> These are dated findings and proposed experiments, not a newly validated architecture.
+
 ---
 
 ## How to read this document

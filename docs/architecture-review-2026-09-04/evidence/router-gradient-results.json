@@ -1,0 +1,14 @@
+[
+  {
+    "top_k": 1,
+    "task_router_grad_norm": 5.153423168346536e-18,
+    "task_expert_grad_norm_sum": 1.3347988958817472,
+    "aux_router_grad_norm": 0.08525910464484089
+  },
+  {
+    "top_k": 2,
+    "task_router_grad_norm": 0.048801122314385756,
+    "task_expert_grad_norm_sum": 1.0708264115778803,
+    "aux_router_grad_norm": 0.08525910464484089
+  }
+]

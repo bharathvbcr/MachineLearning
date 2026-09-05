@@ -1,0 +1,14 @@
+{
+  "status": "passed",
+  "scalar_random_checks": 10000,
+  "scalar_max_ceiling_overshoot": 7.105427357601002e-15,
+  "scalar_max_bisection_step_difference": 3.3306690738754696e-16,
+  "projection_random_checks": 1000,
+  "projection_shape": [6, 12],
+  "projection_witness_rank": 8,
+  "max_witness_prediction_change": 7.34506314277461e-16,
+  "max_closed_form_objective_difference": 3.552713678800501e-15,
+  "max_norm_budget_excess": 1.7763568394002505e-15,
+  "boundary_checks": "zero residual, zero projected key, zero budget, invalid constraints, repair, and blocked-but-representable example",
+  "scope": "Independent fixtures; not a replay of the reported 124/200 trajectory or evidence of trained-model quality."
+}

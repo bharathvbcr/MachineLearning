@@ -1,0 +1,41 @@
+[
+  {
+    "alpha": 0.5,
+    "beta": 0.5,
+    "repository_chunked_outputs": [
+      0.5,
+      0.5
+    ],
+    "published_decayed_read_outputs": [
+      0.5,
+      0.625
+    ],
+    "max_difference": 0.125
+  },
+  {
+    "alpha": 1.0,
+    "beta": 0.5,
+    "repository_chunked_outputs": [
+      0.5,
+      0.75
+    ],
+    "published_decayed_read_outputs": [
+      0.5,
+      0.75
+    ],
+    "max_difference": 0.0
+  },
+  {
+    "alpha": 0.5,
+    "beta": 0.0,
+    "repository_chunked_outputs": [
+      0.0,
+      0.0
+    ],
+    "published_decayed_read_outputs": [
+      0.0,
+      0.0
+    ],
+    "max_difference": 0.0
+  }
+]

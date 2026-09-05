@@ -1,0 +1,27 @@
+[
+  {
+    "file": "inputs/01-hybrid-memo.md",
+    "original_sha256": "7566e746491a9f45620fd5e51bbe4474211232615c7564943deb02d169320dc3",
+    "preservation": "Original UTF-8 content unchanged after the provenance header."
+  },
+  {
+    "file": "inputs/02-retention-memo.md",
+    "original_sha256": "6aea1f44e369a93efb737822dd8668bee59701d50657cb6001143d496ff3067a",
+    "preservation": "Original UTF-8 content unchanged after the provenance header."
+  },
+  {
+    "file": "inputs/03-direction-revision.md",
+    "original_sha256": "b2416b88ebc9f2047c378d0e33563b073a0b8b06aaeeeafa82b351da03dc0a16",
+    "preservation": "Original UTF-8 content unchanged after the provenance header."
+  },
+  {
+    "file": "inputs/04-efficiency-reconciliation-memo.md",
+    "original_sha256": "394347b049868b8f67132d495ddd9f0d80c7df069e546beec6275ad65323ba16",
+    "preservation": "Original UTF-8 content unchanged after the provenance header."
+  },
+  {
+    "file": "EVIDENCE_REVIEW.md",
+    "original_sha256": "bb91a6298b8ca8d81c9d5cca70cae11c90da2048201a91bbd90a198a86a75d72",
+    "preservation": "Imported review with portable links, dated status notice, and explicit supersession of the drift-as-damage interpretation. Later the same day: a dated supersession note was added to the wall-clock (shared depth at nominal equal time) row and its stage-1 cell; the imported text itself was not rewritten."
+  }
+]

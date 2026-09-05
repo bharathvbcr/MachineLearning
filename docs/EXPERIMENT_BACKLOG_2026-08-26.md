@@ -1,5 +1,13 @@
 # Experiment backlog — 2026-08-26
 
+> **Research-priority update, 2026-09-04:** the
+> [architecture review](architecture-review-2026-09-04/README.md) consolidates the
+> newer evidence and critiques. Its [memory-update protocol](architecture-review-2026-09-04/MEMORY_UPDATE_PROTOCOL.md)
+> proposes comparator checks, oracle binding, update-direction versus retention
+> experiments, equal-storage controls, and a token-and-tuning ladder. These are
+> proposals, not queued/completed E-series jobs or approved spending. Existing
+> run history below retains its own dates and evidence boundaries.
+
 Prioritized follow-ups to `PAPER_2026-08_Recipe_Dependent_Rankings.md`, recorded after a
 gap review of the hybrid-mixer evidence. Two buckets, deliberately separate:
 
