@@ -1,0 +1,51 @@
+{
+  "arm": "hybrid_mingru8_attn4",
+  "batch": 32,
+  "block": 512,
+  "seconds": 45.0,
+  "rows": {
+    "1": {
+      "ok": true,
+      "n": 1,
+      "agg_tok_s": 110120.79503087536,
+      "per_job_tok_s": 110120.79503087536,
+      "sum_peak_gb": 19.041357824,
+      "sum_reserved_gb": 19.688062976,
+      "spread": 1.0
+    },
+    "2": {
+      "ok": true,
+      "n": 2,
+      "agg_tok_s": 122649.61616904623,
+      "per_job_tok_s": 61324.808084523116,
+      "sum_peak_gb": 38.082715648,
+      "sum_reserved_gb": 39.376125952,
+      "spread": 1.0000693873147632
+    },
+    "3": {
+      "ok": true,
+      "n": 3,
+      "agg_tok_s": 123837.56224455382,
+      "per_job_tok_s": 41279.18741485127,
+      "sum_peak_gb": 57.12407347199999,
+      "sum_reserved_gb": 59.06418892800001,
+      "spread": 1.0278476834879646
+    },
+    "4": {
+      "ok": true,
+      "n": 4,
+      "agg_tok_s": 123641.38864095467,
+      "per_job_tok_s": 30910.347160238667,
+      "sum_peak_gb": 76.165431296,
+      "sum_reserved_gb": 78.752251904,
+      "spread": 1.011770273031943
+    },
+    "6": {
+      "ok": false,
+      "failed": 6,
+      "n": 6
+    }
+  },
+  "best_tenancy": 3,
+  "speedup_vs_t1": 1.1245610986538246
+}

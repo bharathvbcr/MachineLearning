@@ -1,0 +1,46 @@
+{
+  "arm": "w384_attention_lr80",
+  "batch": 32,
+  "block": 512,
+  "seconds": 45.0,
+  "rows": {
+    "1": {
+      "ok": true,
+      "n": 1,
+      "agg_tok_s": 235630.73781178275,
+      "per_job_tok_s": 235630.73781178275,
+      "sum_peak_gb": 7.501791744,
+      "sum_reserved_gb": 7.732199424,
+      "spread": 1.0
+    },
+    "2": {
+      "ok": true,
+      "n": 2,
+      "agg_tok_s": 214867.65329205425,
+      "per_job_tok_s": 107433.82664602713,
+      "sum_peak_gb": 15.003583488,
+      "sum_reserved_gb": 15.464398848,
+      "spread": 1.0023438379108882
+    },
+    "3": {
+      "ok": true,
+      "n": 3,
+      "agg_tok_s": 214024.62637028476,
+      "per_job_tok_s": 71341.54212342825,
+      "sum_peak_gb": 22.505375232,
+      "sum_reserved_gb": 23.196598272,
+      "spread": 1.0072395056719083
+    },
+    "4": {
+      "ok": true,
+      "n": 4,
+      "agg_tok_s": 214463.65903544216,
+      "per_job_tok_s": 53615.91475886054,
+      "sum_peak_gb": 30.007166976,
+      "sum_reserved_gb": 30.928797696,
+      "spread": 1.0072959307424623
+    }
+  },
+  "best_tenancy": 1,
+  "speedup_vs_t1": 1.0
+}

@@ -1,0 +1,55 @@
+{
+  "arm": "attention",
+  "batch": 32,
+  "block": 512,
+  "seconds": 45.0,
+  "rows": {
+    "1": {
+      "ok": true,
+      "n": 1,
+      "agg_tok_s": 129649.13859726995,
+      "per_job_tok_s": 129649.13859726995,
+      "sum_peak_gb": 14.44453888,
+      "sum_reserved_gb": 15.091105792,
+      "spread": 1.0
+    },
+    "2": {
+      "ok": true,
+      "n": 2,
+      "agg_tok_s": 142537.27091101225,
+      "per_job_tok_s": 71268.63545550613,
+      "sum_peak_gb": 28.88907776,
+      "sum_reserved_gb": 30.182211584,
+      "spread": 1.0102131922305386
+    },
+    "3": {
+      "ok": true,
+      "n": 3,
+      "agg_tok_s": 144521.78361543716,
+      "per_job_tok_s": 48173.92787181239,
+      "sum_peak_gb": 43.33361664,
+      "sum_reserved_gb": 45.273317376,
+      "spread": 1.0687022245380005
+    },
+    "4": {
+      "ok": true,
+      "n": 4,
+      "agg_tok_s": 144524.9526965637,
+      "per_job_tok_s": 36131.238174140926,
+      "sum_peak_gb": 57.77815552,
+      "sum_reserved_gb": 60.364423168,
+      "spread": 1.009828465300693
+    },
+    "6": {
+      "ok": true,
+      "n": 6,
+      "agg_tok_s": 142835.9092544866,
+      "per_job_tok_s": 23805.98487574777,
+      "sum_peak_gb": 86.66723327999999,
+      "sum_reserved_gb": 90.54663475200002,
+      "spread": 1.002443294883256
+    }
+  },
+  "best_tenancy": 4,
+  "speedup_vs_t1": 1.1147390122313316
+}

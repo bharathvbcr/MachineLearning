@@ -1,0 +1,46 @@
+{
+  "arm": "moe_e8k1_raw",
+  "batch": 32,
+  "block": 512,
+  "seconds": 45.0,
+  "rows": {
+    "1": {
+      "ok": true,
+      "n": 1,
+      "agg_tok_s": 50911.91294089733,
+      "per_job_tok_s": 50911.91294089733,
+      "sum_peak_gb": 19.155598848,
+      "sum_reserved_gb": 25.820135424,
+      "spread": 1.0
+    },
+    "2": {
+      "ok": true,
+      "n": 2,
+      "agg_tok_s": 63656.70746894959,
+      "per_job_tok_s": 31828.353734474797,
+      "sum_peak_gb": 38.293740032,
+      "sum_reserved_gb": 51.62139648,
+      "spread": 1.0013860022656376
+    },
+    "3": {
+      "ok": true,
+      "n": 3,
+      "agg_tok_s": 66708.16431983656,
+      "per_job_tok_s": 22236.054773278855,
+      "sum_peak_gb": 57.43972454399999,
+      "sum_reserved_gb": 77.431046144,
+      "spread": 1.0005850076614051
+    },
+    "4": {
+      "ok": true,
+      "n": 4,
+      "agg_tok_s": 67592.00952790365,
+      "per_job_tok_s": 16898.00238197591,
+      "sum_peak_gb": 76.611640832,
+      "sum_reserved_gb": 97.46513920000001,
+      "spread": 1.0050164061847686
+    }
+  },
+  "best_tenancy": 4,
+  "speedup_vs_t1": 1.3276265931388185
+}

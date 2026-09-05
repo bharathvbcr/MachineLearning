@@ -1,0 +1,82 @@
+{
+  "attention": {
+    "arm": "attention",
+    "eager": {
+      "ms_per_step": 144.18160120646158,
+      "tok_s": 113634.47113157557,
+      "peak_gb": 14.451224064
+    },
+    "compile_s": 30.79181957244873,
+    "max_abs_logit_diff": null,
+    "compiled": {
+      "ms_per_step": 74.15793736775717,
+      "tok_s": 220933.86873410444,
+      "peak_gb": 11.911804928
+    },
+    "speedup": 1.9442504244886094
+  },
+  "mingru": {
+    "arm": "mingru",
+    "eager": {
+      "ms_per_step": 178.40523719787598,
+      "tok_s": 91835.86904361943,
+      "peak_gb": 21.351236096
+    },
+    "compile_s": 28.852254152297974,
+    "max_abs_logit_diff": null,
+    "compiled": {
+      "ms_per_step": 91.20155970255533,
+      "tok_s": 179646.05049995592,
+      "peak_gb": 14.602981376
+    },
+    "speedup": 1.9561643219669338
+  },
+  "hybrid_mingru8_attn4": {
+    "arm": "hybrid_mingru8_attn4",
+    "eager": {
+      "ms_per_step": 166.95558230082193,
+      "tok_s": 98133.88551740171,
+      "peak_gb": 19.047649792
+    },
+    "compile_s": 28.948329210281372,
+    "max_abs_logit_diff": null,
+    "compiled": {
+      "ms_per_step": 166.95214907328287,
+      "tok_s": 98135.90355646347,
+      "peak_gb": 19.041620992
+    },
+    "speedup": 1.0000205641410316
+  },
+  "gdn": {
+    "arm": "gdn",
+    "eager": {
+      "ms_per_step": 629.5528252919514,
+      "tok_s": 26024.82165400817,
+      "peak_gb": 26.21602048
+    },
+    "compile_s": 0.7193081378936768,
+    "max_abs_logit_diff": null,
+    "compiled": {
+      "ms_per_step": 651.1512279510498,
+      "tok_s": 25161.589653381816,
+      "peak_gb": 26.193419264
+    },
+    "speedup": 0.9668304354933628
+  },
+  "moe_e8k1": {
+    "arm": "moe_e8k1",
+    "eager": {
+      "ms_per_step": 292.9454962412516,
+      "tok_s": 55928.49253605579,
+      "peak_gb": 19.691600896
+    },
+    "compile_s": 0.2880830764770508,
+    "max_abs_logit_diff": null,
+    "compiled": {
+      "ms_per_step": 270.9802786509196,
+      "tok_s": 60461.96454431315,
+      "peak_gb": 19.697308672
+    },
+    "speedup": 1.0810583622530991
+  }
+}
