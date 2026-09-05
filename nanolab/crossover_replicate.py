@@ -375,7 +375,13 @@ MOE_ARMS = ("attention", "moe_e1k1", "moe_e4k1", "moe_e8k1")
 #
 # head_dim is pinned at 64 so width moves through n_head alone; changing both
 # would confound width with head geometry.
-LADDER_WIDTHS = (384, 768, 1152)
+# 1536 added 2026-09-05. Phase 2 found the attention-vs-minGRU ranking stable
+# over 384..1152 with a flat margin (0.147 / 0.159 / 0.152), which is a claim
+# about a 3x span. A fourth width takes it to 4x and tests the ladder's OTHER
+# finding at a new point: attention peaked at 8x base LR and minGRU at 4x at
+# every width so far, and an invariant that holds at three widths and breaks at
+# the fourth is worth knowing before the span is quoted.
+LADDER_WIDTHS = (384, 768, 1152, 1536)
 # 0.5/1.0/2.0 was the first sweep and it was entirely on the wrong side: at
 # 10M tokens ALL SIX cells picked 2.0, the top edge, with loss monotone
 # decreasing in LR (e.g. w768 attention 5.4948 / 5.3608 / 5.2701). An argmin at

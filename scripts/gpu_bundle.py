@@ -226,6 +226,20 @@ PROXY_SEEDS = SEEDS[:5]
 # so this covers most of the way there without assuming the two parametrizations
 # share an optimum -- muP also rescales the init and the logits, so they need not.
 BASIN_MULTS = (0.25, 0.5, 2.0, 4.0, 8.0, 16.0, 32.0)
+# The factor-2 grid resolves the muP LR rule only to +/-2x, and that is exactly
+# the question left open. optim.py applies matrix_lr / width_mult -- the ADAM muP
+# rule -- to the MUON group, and the measured target-width optima say it is
+# systematically wrong: off 4x on attention and 2x on minGRU, the SAME direction
+# on both arms. Muon with NO width divisor is off 1.333x / 0.667x, straddling
+# 1.0, i.e. unbiased -- but only within the grid.
+#
+# Muon orthogonalizes its update, so the update scale is already independent of
+# the gradient magnitude and the Adam-derived 1/width scaling has no reason to
+# apply. These three multipliers interleave with 2x/4x/8x to give a factor-1.5
+# grid over 1.5x..8x, which is where both arms' optima sit, and resolve whether
+# the truth is the no-divisor prediction (3x for attention, 3x for minGRU) or
+# something else. 3 mults x 3 seeds x 2 arms = 18 jobs.
+BASIN_FINE_MULTS = (1.5, 3.0, 6.0)
 
 # The SP target-width sweep. PAPER 8.1 names the inherited global 6e-4/0.025, never
 # re-tuned at these recipes, as the largest uncontrolled factor in the paper, and
@@ -300,6 +314,7 @@ SUITE_DOC = {
     "e1_sp_sched6": "SP on the 6M cosine -- the control row 3's test needs",
     "e1_sp_bs8_tuned": "SP at batch 8 at SP's OWN target-width optimum -- asks whether row 4 is about muP or just about a better LR",
     "e1_sp_bs8_perarm": "e1_sp_bs8_tuned with minGRU at its OTHER candidate LR -- robustness of a section-withdrawing claim to an unresolved argmin",
+    "e1_mup_basin_fine_spattn": "factor-1.5 refinement of the spattn basin -- resolves the Muon muP width rule",
     "e1_sp_basin": "s24 SP matrix-LR sweep at the TARGET width, 5 seeds -- prices the inherited LR",
     "e1_sp_sched20": "SP at the s23 recipe (20M cosine) -- readout rows 2 and 3",
     "e1_mup_sched20": "muP at the s23 recipe (20M cosine) -- readout rows 2 and 3",
@@ -318,7 +333,7 @@ MUP_TRANSFER_SUITES = ("e1_mup", "e1_mup_basin", "e1_mup_tuned",
                        "e1_mup_sched20", "e1_mup_bs8", "e1_mup_spattn",
                        "e1_mup_sched20_spattn", "e1_mup_bs8_spattn",
                        "e1_mup_basin_spattn", "e1_mup_tuned_spattn",
-                       "e1_mup_sched6_spattn")
+                       "e1_mup_sched6_spattn", "e1_mup_basin_fine_spattn")
 # Suites that run muP at its MEASURED target-width optimum rather than at the
 # transferred value, and so wait on the basin as well as on the proxy.
 MUP_ANCHOR_SUITES = ("e1_mup_tuned", "e1_mup_sched20", "e1_mup_bs8",
@@ -525,6 +540,13 @@ def build_matrix(sp_cells: str = "rerun", transfer: dict | None = None,
         for mult in BASIN_MULTS:
             for seed in BASIN_SEEDS:
                 jobs.append(_mup_job("e1_mup_basin_spattn", arm, seed, S24,
+                                     transfer, mult=mult, tag=f"x{mult:g}",
+                                     extra_cfg=dict(mup_sqrt_attn_scale=True)))
+
+    for arm in ARMS:
+        for mult in BASIN_FINE_MULTS:
+            for seed in BASIN_SEEDS:
+                jobs.append(_mup_job("e1_mup_basin_fine_spattn", arm, seed, S24,
                                      transfer, mult=mult, tag=f"x{mult:g}",
                                      extra_cfg=dict(mup_sqrt_attn_scale=True)))
 
