@@ -1984,6 +1984,53 @@ def verify_wallclock_fails_closed_when_no_run_records_a_duration():
 
 
 @test
+def verify_wallclock_reads_the_last_run_not_the_mean_of_a_restarted_file():
+    """A restarted directory holds two runs. Report the one that survived.
+
+    ``metrics.jsonl`` is opened "a" (nanolab/utils.py), so resetting a job to
+    pending and relaunching into the same directory concatenates runs rather
+    than replacing them. Reachable through the repair path: `claim_job` only
+    claims `pending`, but a manual status reset makes a completed run claimable
+    again and its `done` record stays on disk.
+
+    Averaging the two reports a duration no run had -- here 635s for a run that
+    took 800s and was exactly on target, which sends the reader hunting a 20%
+    wall-clock miss that does not exist. The docstring always said "terminal
+    metrics record"; this pins the implementation to it.
+    """
+    import json
+    from .crossover_replicate import verify_wallclock
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        d = root / "cxwc_attention_s1337"
+        d.mkdir(parents=True)
+        (d / "config.json").write_text(json.dumps(
+            {"batch_size": 32, "block_size": 512, "mixer": "attention"}),
+            encoding="utf-8")
+        (d / "metrics.jsonl").write_text("\n".join([
+            # the crashed-then-repaired first attempt, 1.7x too fast
+            json.dumps({"event": "start", "params": 1}),
+            json.dumps({"event": "done", "best_val": 4.9, "final_val": 4.9,
+                        "tokens": 1000, "elapsed_s": 470.0}),
+            # the rerun that actually stands
+            json.dumps({"event": "start", "params": 1}),
+            json.dumps({"event": "done", "best_val": 4.0, "final_val": 4.0,
+                        "tokens": 1000, "elapsed_s": 800.0}),
+        ]) + "\n", encoding="utf-8")
+
+        v = verify_wallclock(root, 800.0)
+        assert v["arms"]["attention"] == 800.0, (
+            f"reported {v['arms']['attention']}, which is the mean of two runs "
+            f"and the duration of neither")
+        assert v["ok"] is True, v["reason"]
+        # One directory contributed one number, whatever the file holds.
+        assert v["n"]["attention"] == 1, v["n"]
+        # And the restart is surfaced, not swallowed: one recipe per directory
+        # is a repo rule, and a file holding two finished runs broke it.
+        assert "cxwc_attention_s1337" in v["restarted"], v["restarted"]
+
+
+@test
 def wallclock_budgets_refuse_to_size_without_a_tenancy():
     from .crossover_replicate import wallclock_budgets
     try:

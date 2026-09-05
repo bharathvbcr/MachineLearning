@@ -712,12 +712,21 @@ def verify_wallclock(out_root: Path, target_s: float,
                      tolerance: float = WALLCLOCK_TOLERANCE) -> dict:
     """Did the runs actually train for the same wall clock? Measured, not assumed.
 
-    Reads ``elapsed_s`` out of each run's terminal metrics record. Returns the
-    per-arm means, the observed spread, and an ``ok`` flag. The first wall-clock
-    suite missed by 1.70x and still emitted a board that looked publishable;
-    nothing in the code objected, which is why this exists.
+    Reads ``elapsed_s`` out of each run's terminal metrics record -- the *last*
+    one in the file, since ``metrics.jsonl`` is opened "a" and a directory that
+    was reset to pending and relaunched holds every attempt end to end. Returns
+    the per-arm means, the observed spread, and an ``ok`` flag. The first
+    wall-clock suite missed by 1.70x and still emitted a board that looked
+    publishable; nothing in the code objected, which is why this exists.
+
+    One number per directory, not per ``done`` record. Meaning both records of a
+    restarted run reported a duration no run had (470s and 800s reading as
+    635s), which points the reader at a wall-clock miss that never happened.
+    ``restarted`` names the directories that held more than one finished run, so
+    the count can be reconciled against the seeds that were meant to be there.
     """
     per: dict[str, list[float]] = {}
+    restarted: list[str] = []
     for mp in sorted(Path(out_root).glob("*/metrics.jsonl")):
         arm = None
         cfgp = mp.with_name("config.json")
@@ -728,17 +737,24 @@ def verify_wallclock(out_root: Path, target_s: float,
                 arm = None
         name = mp.parent.name
         arm = name.split("_s")[0].split("_", 1)[-1] or arm
+        finished: list[float] = []
         for line in mp.read_text(encoding="utf-8").splitlines():
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if rec.get("event") == "done" and rec.get("elapsed_s"):
-                per.setdefault(arm, []).append(float(rec["elapsed_s"]))
+                finished.append(float(rec["elapsed_s"]))
+        if not finished:
+            continue
+        if len(finished) > 1:
+            restarted.append(name)
+        per.setdefault(arm, []).append(finished[-1])
     rows = {a: statistics.mean(v) for a, v in per.items() if v}
     if not rows:
         return {"ok": False, "reason": "no elapsed_s in any run record",
-                "arms": {}, "target_s": target_s, "spread": None}
+                "arms": {}, "target_s": target_s, "spread": None,
+                "restarted": restarted}
     worst = max(abs(v - target_s) / target_s for v in rows.values())
     return {
         "ok": worst <= tolerance,
@@ -749,6 +765,7 @@ def verify_wallclock(out_root: Path, target_s: float,
         "target_s": target_s,
         "spread": max(rows.values()) / min(rows.values()),
         "n": {a: len(v) for a, v in per.items() if v},
+        "restarted": restarted,
     }
 
 
