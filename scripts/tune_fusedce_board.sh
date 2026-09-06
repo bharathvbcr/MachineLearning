@@ -22,7 +22,13 @@ wait_for_idle() {
   local quiet=0
   echo "waiting for the GPU to go idle ($(date -u +%FT%TZ))"
   for _ in $(seq 1 150); do
-    if pgrep -f "crossover_replicate (launch|worker)|mqar_suite" >/dev/null 2>&1; then
+    # nvidia-smi, NOT pgrep. `pgrep -f` matches whole command lines, so any
+    # shell whose argv CONTAINS this pattern matches it -- the `bash -c` that
+    # writes a chain script via heredoc, and every status check typed with the
+    # same string. That held one stage off an idle card for 48 min on
+    # 2026-09-06. The compute-app list answers the question actually being
+    # asked: is anything using the device.
+    if [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)" ]; then
       quiet=0
     else
       quiet=$((quiet+1))
