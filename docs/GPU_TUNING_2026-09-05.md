@@ -143,7 +143,7 @@ For scale, two runs of the *same* configuration land 0.0014 nats apart (below),
 so compile moves the reported number by about 1.6x the nondeterminism that is
 already there, and roughly 8x less than the effects the boards measure.
 
-#### 1b. Compiling makes `fused_ce` a cost rather than a saving — 3.02x stacked
+#### 1b. Compiling makes `fused_ce` a cost rather than a saving (step loop)
 
 `crossover50m` sets `fused_ce=True`, and the comment above it dates the choice:
 the measured throughput peak *"on the 3070 Ti (8 GB)"*, where 16 chunks
@@ -163,8 +163,9 @@ The 2x2, attention at bs32/ctx512, one fwd+bwd on fixed weights:
 
 Unfused is the memory-hungry option only while eager (+11.2 GB). Compiled, it
 costs **+1.9 GB** over fused and still lands *under* today's fused-eager
-footprint. So the recommended cell is both 3.02x faster and slightly lighter
-than the current one; there is no trade to make.
+footprint, so the recommended cell is faster *and* slightly lighter than the
+current one. Read 3.02x as the step-loop ceiling: section 1c runs it on a board
+and gets 1.14x for the `fused_ce` half, for about 2.2x stacked.
 
 Two independent checks that this is real. The compile column here is **1.94x**
 (113.6K -> 220.5K), the same number the five-seed end-to-end board produced
@@ -192,11 +193,37 @@ def cluster_fused_ce() -> bool:
     return raw in ("1", "true", "yes")
 ```
 
-Caveat, stated plainly: the 342.6K cell is a **microbenchmark**, not a board.
-Its compile half is corroborated by the end-to-end run above and its eager half
-by appendix F, but `unfused x compiled` has not itself been run through the
-suite for five seeds. Treat 3.02x as **measured on the step loop, inferred for
-the board** until a board confirms it.
+#### 1c. The board says 1.14x, not 1.55x — and the numerics cost is real
+
+That caveat was worth writing, because the board did not confirm it. Five seeds,
+20M tokens, compile ON in both cells, `fused_ce` the only variable:
+
+| seed | fused `final_val` | unfused | diff | fused s | unfused s | speed-up |
+|---|---:|---:|---:|---:|---:|---:|
+| 42 | 4.7506 | 4.7554 | +0.0048 | 84 | 74 | 1.14x |
+| 100 | 4.7813 | 4.7901 | +0.0088 | 84 | 74 | 1.14x |
+| 777 | 4.7748 | 4.7739 | -0.0009 | 85 | 75 | 1.14x |
+| 1337 | 4.7812 | 4.7802 | -0.0010 | 107 | 118 | 0.91x |
+| 2026 | 4.7481 | 4.7451 | -0.0030 | 84 | 74 | 1.14x |
+
+**Throughput: 1.14x steady state, not 1.55x.** Four seeds agree to three digits;
+s1337 is the one paying Inductor's cold compile and runs 0.91x. Whole-board wall
+clock is 461 s against 434 s = 1.06x, because that cold compile is paid once
+either way. The step loop over-promised by 36%: it timed training steps only,
+and a real run also does 61 evaluations, data loading and checkpointing, none of
+which the CE path speeds up.
+
+**And it is not numerically free.** Mean absolute `final_val` difference is
+**0.0037** (max 0.0088) — *above* the 0.0014/0.0031 rerun floor, and above
+compile's own 0.0023/0.0040. The single-forward comparison in 1b (9.9e-7
+relative) istrue but irrelevant at board scale: like compile, the per-step
+difference compounds over 20M tokens.
+
+So the honest stack is **1.94x from compile, then 1.14x from unfusing** — about
+**2.2x**, not the 3.02x this section first claimed. Unfusing is still worth
+taking: 14% for +1.9 GB, at a numerics cost in the same category as compile's.
+But it is a recipe change to adopt board-wide, not a free win, and recording
+`fused_ce` turns out to matter more than it looked.
 
 ### 2. Tenancy's sign is predicted by the arm's MFU
 
