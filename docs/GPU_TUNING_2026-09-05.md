@@ -128,12 +128,14 @@ This is a numerics change: Inductor fuses and re-associates. `compile` is now a
 recorded recipe field (`CROSSOVER_COMPILE`, default off), so a compiled run
 cannot pool with an eager one by accident.
 
-**Measured end to end**, five seeds x 20M tokens through the real suite runner,
-eager against compiled:
+**Measured end to end**, five seeds x 20M tokens through the real suite runner
+(`_tune/cmp_eager` and `_tune/cmp_on`), eager against compiled. Note this board
+runs **`mingru`**, not attention — an earlier version of this table labelled it
+attention and quoted 961 s -> 495 s, which no board in `_tune/` produces:
 
 | | eager | compiled |
 |---|---:|---:|
-| wall clock, 5 jobs | 961 s | **495 s** (1.94x) |
+| wall clock, 5 jobs | 1197 s | **597 s** (2.01x) |
 | in-run rate | 131.1K tok/s | **289K tok/s** |
 | MFU | 10.6% | **23.3%** |
 | `final_val` vs eager, mean over seeds | — | **0.0023 nats** (max 0.0040) |
@@ -167,12 +169,12 @@ footprint, so the recommended cell is faster *and* slightly lighter than the
 current one. Read 3.02x as the step-loop ceiling: section 1c runs it on a board
 and gets 1.14x for the `fused_ce` half, for about 2.2x stacked.
 
-Two independent checks that this is real. The compile column here is **1.94x**
-(113.6K -> 220.5K), the same number the five-seed end-to-end board produced
-(961 s -> 495 s) — a microbenchmark reproducing the board result is the evidence
-that the unfused column transfers too. And the eager column is **1.29x**
-(113.6K -> 146.4K), which reproduces the standalone fused-CE sweep in appendix F
-(113.1K -> 145.6K).
+Two independent checks that this is real. The eager column is **1.29x** (113.6K -> 146.4K), which
+reproduces the standalone fused-CE sweep in appendix F (113.1K -> 145.6K). For
+compile, the only board that exists is `mingru`'s, and there the step loop
+(1.96x) does agree with the board (2.01x) — but see 1c, where the same reasoning
+applied to `fused_ce` fails. There is **no attention compile board**; attention's
+1.94x is step-loop only.
 
 Numerically it is the cheapest change on this page: unfused differs from fused
 by **9.9e-7 relative** on attention and **2.2e-5** on the 8+4 hybrid — at a loss
