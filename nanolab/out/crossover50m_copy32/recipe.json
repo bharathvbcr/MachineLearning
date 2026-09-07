@@ -7,19 +7,16 @@
   "arm_overrides": null,
   "swa_chunk": -1,
   "eval_iters": 20,
-  "copy_probe": false,
+  "copy_probe": true,
   "token_budget": 50000000,
   "lr_horizon": null,
   "arms": [
-    "hybrid_mingru11_attn1",
-    "hybrid_mingru_periodic",
-    "hybrid_mingru_bookend",
-    "hybrid_mingru8_attn4",
-    "hybrid_mingru10_attn2",
-    "attention"
+    "attention",
+    "mingru",
+    "hybrid_mingru8_attn4"
   ],
-  "prefix": "cx32p",
+  "prefix": "cx32copy",
   "device": "NVIDIA GH200 480GB",
-  "compile": false,
+  "compile": true,
   "fused_ce": true
 }

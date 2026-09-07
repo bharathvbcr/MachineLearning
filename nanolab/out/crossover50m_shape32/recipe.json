@@ -1,0 +1,43 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "workers": 3,
+  "gpus": 1,
+  "budget_by_arm": null,
+  "arm_overrides": {
+    "attn6_w512": {
+      "n_layer": 6,
+      "d_model": 512,
+      "n_head": 8,
+      "head_dim": 64
+    },
+    "attn6_w576": {
+      "n_layer": 6,
+      "d_model": 576,
+      "n_head": 9,
+      "head_dim": 64
+    },
+    "w384_attention_lr10": {
+      "d_model": 384,
+      "n_head": 6,
+      "head_dim": 64,
+      "lr": 0.0006,
+      "matrix_lr": 0.025
+    }
+  },
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "copy_probe": false,
+  "token_budget": 50000000,
+  "lr_horizon": null,
+  "arms": [
+    "attention",
+    "attn6_w512",
+    "attn6_w576",
+    "w384_attention_lr10"
+  ],
+  "prefix": "cx32shape",
+  "device": "NVIDIA GH200 480GB",
+  "compile": true,
+  "fused_ce": true
+}

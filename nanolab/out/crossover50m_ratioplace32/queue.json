@@ -324,6 +324,71 @@
       "started": 1788034512.8424976,
       "finished": 1788035185.6499617,
       "detail": "best_val=4.210355"
+    },
+    {
+      "id": "cx32p_attention_s1337",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "capacity baseline",
+      "status": "done",
+      "worker": 1,
+      "started": 1788801627.415045,
+      "finished": 1788803115.4588892,
+      "detail": "best_val=4.209552"
+    },
+    {
+      "id": "cx32p_attention_s42",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "capacity baseline",
+      "status": "done",
+      "worker": 0,
+      "started": 1788801627.4588003,
+      "finished": 1788803122.9460435,
+      "detail": "best_val=4.207465"
+    },
+    {
+      "id": "cx32p_attention_s100",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "capacity baseline",
+      "status": "done",
+      "worker": 2,
+      "started": 1788801627.5018651,
+      "finished": 1788803121.705964,
+      "detail": "best_val=4.190934"
+    },
+    {
+      "id": "cx32p_attention_s2026",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 2026,
+      "note": "capacity baseline",
+      "status": "done",
+      "worker": 1,
+      "started": 1788803115.4681177,
+      "finished": 1788804107.306381,
+      "detail": "best_val=4.204173"
+    },
+    {
+      "id": "cx32p_attention_s777",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 777,
+      "note": "capacity baseline",
+      "status": "done",
+      "worker": 2,
+      "started": 1788803121.903165,
+      "finished": 1788804110.9166605,
+      "detail": "best_val=4.203135"
     }
   ]
 }
