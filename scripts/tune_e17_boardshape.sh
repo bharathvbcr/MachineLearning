@@ -19,6 +19,9 @@ export PATH="$HOME/.local/bin:$PATH"
 LOG=nanolab/out/_program.log
 
 echo "e17_boardshape waiting for tune_program ($(date -u +%FT%TZ))"
+if [ "${FOLLOWUP_NOWAIT:-0}" = "1" ]; then
+  echo "  (driver already waited)"
+else
 deadline=$(( $(date +%s) + 20*3600 ))
 while ! grep -q "^tune_program exit=" "$LOG" 2>/dev/null; do
   [ "$(date +%s)" -gt "$deadline" ] && { echo "gave up waiting at $(date -u +%FT%TZ)"; exit 1; }
@@ -33,6 +36,7 @@ while true; do
   fi
   sleep 20
 done
+fi
 echo "e17_boardshape start $(date -u +%FT%TZ)  ninja=$(command -v ninja || echo MISSING)"
 
 rc=0
