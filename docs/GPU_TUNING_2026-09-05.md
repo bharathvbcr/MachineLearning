@@ -718,3 +718,35 @@ Two trained arms at seed 1337 (`cx32loop_attention_s1337` vs `cx32loop_attn6_s13
 | 10 | 0.0233 | 0.0022 | 50% |
 | 20 | 0.0165 | 0.0015 | 100% |
 | 40 | 0.0116 | 0.0011 | 200% |
+
+---
+
+## Archive
+
+Run metadata for **982 runs** across 102 suites is at
+`s3://mlsystemslab-artifacts-511192439661/results/nanolab-out/` (3481 objects,
+111.9 MB), with a `manifest.json` listing every run's `done` record so the
+archive can be checked without downloading it. Every table in this report and in
+`docs/SWA_BOARD_2026-08-31.md` recomputes from that metadata alone.
+
+**Weights are NOT archived, and the manifest says so explicitly.** They exist
+only on the rented box and die with it:
+
+| | files | size |
+|---|---:|---:|
+| `ckpt.pt` (resume state) | 378 | 523.6 GB |
+| `best.pt` | 453 | 272.9 GB |
+| `final.pt` | 453 | 272.9 GB |
+
+The box has the AWS CLI but **no credentials**, so weights would have to
+double-hop through a laptop. To archive them, run `aws configure` on the box
+yourself and then `scripts/archive_to_s3.sh` there — it excludes `ckpt.pt` by
+default, which is the right call: 523.6 GB of resume state for runs that have
+already finished. Set `SUITES` to cover this sprint's directories, which the
+script's default list does not:
+
+```bash
+S3=s3://mlsystemslab-artifacts-511192439661/checkpoints \
+SUITES="crossover_ladder1536 crossover_ladder1536_mingru crossover50m_swa32 crossover50m_swa2k" \
+bash scripts/archive_to_s3.sh
+```
