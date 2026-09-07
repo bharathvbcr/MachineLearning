@@ -116,18 +116,47 @@ def gdn_chunked_matches_sequential():
     # the chunk-parallel GDN kernel must match the O(T) sequential reference in
     # both output and the gradient flowing back to the input — including a
     # block_size NOT divisible by the chunk size (exercises the tail padding).
-    for T, chunk in ((32, 8), (30, 8)):
-        m, cfg = _toy_model(mixer="gdn", block_size=T, mixer_chunk=chunk)
-        gdn = m.blocks[0].mixer
-        torch.manual_seed(3)
-        x = torch.randn(2, T, cfg.d_model, requires_grad=True)
-        xs = x.detach().clone().requires_grad_()
-        y_chunk, _ = gdn(x)
-        y_seq, _ = gdn._sequential(xs)
-        assert (y_chunk - y_seq).abs().max() < 1e-4, f"GDN chunked!=seq output (T={T})"
-        y_chunk.square().sum().backward()
-        y_seq.square().sum().backward()
-        assert (x.grad - xs.grad).abs().max() < 1e-4, f"GDN chunked!=seq grad (T={T})"
+    # Both rules: the repo's undecayed-read variant and the published
+    # decayed-read rule. The reference implements whichever rule the config
+    # names, so a kernel that silently ran the other one would fail here.
+    for rule in ("repo", "published"):
+        for T, chunk in ((32, 8), (30, 8)):
+            m, cfg = _toy_model(mixer="gdn", block_size=T, mixer_chunk=chunk, gdn_rule=rule)
+            gdn = m.blocks[0].mixer
+            torch.manual_seed(3)
+            x = torch.randn(2, T, cfg.d_model, requires_grad=True)
+            xs = x.detach().clone().requires_grad_()
+            y_chunk, _ = gdn(x)
+            y_seq, _ = gdn._sequential(xs)
+            assert (y_chunk - y_seq).abs().max() < 1e-4, f"GDN chunked!=seq output (T={T}, {rule})"
+            y_chunk.square().sum().backward()
+            y_seq.square().sum().backward()
+            assert (x.grad - xs.grad).abs().max() < 1e-4, f"GDN chunked!=seq grad (T={T}, {rule})"
+
+
+@test
+def gdn_rules_differ_as_documented():
+    # Two unit tokens, zero state, alpha = beta = 0.5: the repo rule returns
+    # [0.5, 0.5] and the published rule [0.5, 0.625]; at alpha = 1 or beta = 0
+    # the rules coincide. This is the probe that found the difference
+    # (docs/architecture-review-2026-09-04/evidence/gdn_rule_probe.py) and it
+    # pins the meaning of `gdn_rule` to the two update equations.
+    from .mixers import gdn_chunked
+    D = 4
+    q = torch.zeros(1, 1, 2, D); k = torch.zeros(1, 1, 2, D); v = torch.zeros(1, 1, 2, D)
+    q[..., 0] = k[..., 0] = v[..., 0] = 1.0
+    def run(rule, a, b):
+        al = torch.full((1, 1, 2), a); be = torch.full((1, 1, 2), b)
+        return gdn_chunked(q, k, v, al, be, chunk=32, rule=rule)[0, 0, :, 0].tolist()
+    close = lambda got, want: all(abs(g - w) < 1e-6 for g, w in zip(got, want))
+    assert close(run("repo", 0.5, 0.5), [0.5, 0.5]), run("repo", 0.5, 0.5)
+    assert close(run("published", 0.5, 0.5), [0.5, 0.625]), run("published", 0.5, 0.5)
+    for a, b in ((1.0, 0.5), (0.5, 0.0)):
+        assert close(run("repo", a, b), run("published", a, b)), (a, b)
+    # alpha=0.3, beta=0.9: the repo transition along the stored key is a-b = -0.6
+    # (sign flip), the published one a(1-b) = +0.03.
+    assert close(run("repo", 0.3, 0.9), [0.9, 0.9 * (0.3 - 0.9) + 0.9]), run("repo", 0.3, 0.9)
+    assert close(run("published", 0.3, 0.9), [0.9, 0.9 * 0.3 * 0.1 + 0.9]), run("published", 0.3, 0.9)
 
 
 @test
@@ -637,6 +666,108 @@ def moe_router_gets_gradient():
     g = m.blocks[0].ffn.gate.weight.grad
     assert g is not None and g.norm() > 0, "MoE gate received no gradient"
     assert m.blocks[0].ffn.aux is not None, "MoE aux loss not set"
+
+
+@test
+def moe_top1_router_task_gradient():
+    # Under `renorm` the top-1 weight is exactly 1, so the task loss cannot reach
+    # the gate; under `raw` (Switch) it can. Measured in eval mode so the
+    # balancing loss is not added (Model.forward gates it on self.training), and
+    # with zero_init_proj off: zero-initialised experts give a zero task gradient
+    # to ANY router at step 0, which would make the raw case look broken.
+    norms = {}
+    for weighting in ("renorm", "raw"):
+        m, cfg = _toy_model(ffn="moe", moe_experts=4, moe_top_k=1,
+                            moe_router_weight=weighting, zero_init_proj=False)
+        m.eval()
+        x, y = _batch(cfg)
+        _, loss = m(x, y)
+        loss.backward()
+        g = m.blocks[0].ffn.gate.weight.grad
+        norms[weighting] = 0.0 if g is None else g.norm().item()
+    assert norms["renorm"] < 1e-9, f"renorm top-1 gate got a task gradient: {norms}"
+    assert norms["raw"] > 1e-6, f"raw top-1 gate got no task gradient: {norms}"
+
+
+@test
+def mingru_expand_sets_hidden_width():
+    for expand in (1, 2):
+        m, cfg = _toy_model(mixer="mingru", mingru_expand=expand)
+        mixer = m.blocks[0].mixer
+        assert mixer.to_h.out_features == expand * cfg.d_model, (expand, mixer.to_h.out_features)
+        x, y = _batch(cfg)
+        _, loss = m(x, y)
+        loss.backward()
+        assert torch.isfinite(loss)
+    # near-parity: expansion 1 takes a minGRU layer from ~6d^2 to ~3d^2 plus its
+    # value-residual projections (2 d*kv), so the 8+4 hybrid lands a few percent
+    # ABOVE attention rather than 19% above (measured at the board shape:
+    # 147.2M -> 128.4M against 123.7M). Exact parity would need the VR
+    # projections removed, which is a different arm.
+    def n_params(**kw):
+        return _toy_model(n_layer=12, **kw)[0].n_params
+    attn = n_params(mixer="attention")
+    x2 = n_params(mixer="mingru", layer_mixers="mingru*8,attention*4", mingru_expand=2)
+    x1 = n_params(mixer="mingru", layer_mixers="mingru*8,attention*4", mingru_expand=1)
+    assert x2 > x1, (x2, x1)
+    assert x1 < x2 - 0.5 * (x2 - attn), (x2, attn, x1)   # removes more than half the excess
+
+
+@test
+def september_program_arms_build():
+    # Every arm the 2026-09-05 handoff launches must build at its own overrides
+    # (width, layers, rule, weighting, tying) -- a name that fails to build on
+    # the box is a billed refusal.
+    from .crossover_replicate import (ARMS, GDN_RULE_ARMS, MOE_RAW_ARMS, PARITY_ARMS,
+                                      TIE_ARMS, SHAPE_ARMS, COPY_ARMS, W384X_ARMS)
+    by = {a.name: a for a in ARMS}
+    want = set(GDN_RULE_ARMS + MOE_RAW_ARMS + PARITY_ARMS + TIE_ARMS + SHAPE_ARMS
+               + COPY_ARMS + W384X_ARMS)
+    missing = sorted(n for n in want if n not in by)
+    assert not missing, f"unregistered arms: {missing}"
+    for name in sorted(want):
+        arm = by[name]
+        over = dict(arm.overrides)
+        kw = dict(mixer=arm.mixer, layer_mixers=arm.layer_mixers, n_layer=12)
+        kw.update(over)
+        if "d_model" not in over:                 # keep the toy width unless the arm sets one
+            kw.update(d_model=64, n_head=4, head_dim=16)
+        cfg = _cfg(**kw)
+        m = build_model(cfg)
+        assert m.n_params > 0, name
+        if "gdn_rule" in over:
+            assert m.blocks[0].mixer.rule == over["gdn_rule"], name
+        if "moe_router_weight" in over:
+            assert m.blocks[0].ffn.router_weight == over["moe_router_weight"], name
+        if "tie_embeddings" in over:
+            assert (m.lm_head.weight is m.tok_emb.weight) == over["tie_embeddings"], name
+
+
+@test
+def copy_probe_targets_are_the_second_copy():
+    from contextlib import nullcontext
+    from .train import copy_probe_batch, copy_probe_loss
+    cfg = _cfg(block_size=128, batch_size=4)
+    g = torch.Generator().manual_seed(1)
+    x, y = copy_probe_batch(cfg, g, span=16)
+    valid = y != -1
+    assert int(valid.sum()) == 4 * 15, int(valid.sum())          # (span - 1) per row
+    # every valid target is the next token, and it sits inside a copied span
+    rows, cols = valid.nonzero(as_tuple=True)
+    assert torch.equal(y[rows, cols], x[rows, cols + 1])
+    for r in range(4):
+        c = cols[rows == r]
+        assert int(c.min()) >= 64 - 1 and int(c.max()) <= 127, c   # second half only
+        first_copy = x[r, c.min() - 1 - 0 : c.max() + 1]           # placeholder to keep shapes honest
+        assert first_copy.numel() == 16
+    # the same generator seed reproduces the same probe (every arm sees one probe)
+    x2, y2 = copy_probe_batch(cfg, torch.Generator().manual_seed(1), span=16)
+    assert torch.equal(x, x2) and torch.equal(y, y2)
+    m, cfg = _toy_model(block_size=128, batch_size=4)
+    m.train()
+    val = copy_probe_loss(m, cfg, nullcontext(), n_batches=2, span=16)
+    assert math.isfinite(val) and val > 0, val
+    assert m.training, "copy probe must restore train mode"
 
 
 @test
@@ -1981,53 +2112,6 @@ def verify_wallclock_fails_closed_when_no_run_records_a_duration():
             '{"event": "done", "best_val": 4.0}\n', encoding="utf-8")
         v = verify_wallclock(root, 691.0)
         assert v["ok"] is False, "unmeasured must never read the same as verified"
-
-
-@test
-def verify_wallclock_reads_the_last_run_not_the_mean_of_a_restarted_file():
-    """A restarted directory holds two runs. Report the one that survived.
-
-    ``metrics.jsonl`` is opened "a" (nanolab/utils.py), so resetting a job to
-    pending and relaunching into the same directory concatenates runs rather
-    than replacing them. Reachable through the repair path: `claim_job` only
-    claims `pending`, but a manual status reset makes a completed run claimable
-    again and its `done` record stays on disk.
-
-    Averaging the two reports a duration no run had -- here 635s for a run that
-    took 800s and was exactly on target, which sends the reader hunting a 20%
-    wall-clock miss that does not exist. The docstring always said "terminal
-    metrics record"; this pins the implementation to it.
-    """
-    import json
-    from .crossover_replicate import verify_wallclock
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        d = root / "cxwc_attention_s1337"
-        d.mkdir(parents=True)
-        (d / "config.json").write_text(json.dumps(
-            {"batch_size": 32, "block_size": 512, "mixer": "attention"}),
-            encoding="utf-8")
-        (d / "metrics.jsonl").write_text("\n".join([
-            # the crashed-then-repaired first attempt, 1.7x too fast
-            json.dumps({"event": "start", "params": 1}),
-            json.dumps({"event": "done", "best_val": 4.9, "final_val": 4.9,
-                        "tokens": 1000, "elapsed_s": 470.0}),
-            # the rerun that actually stands
-            json.dumps({"event": "start", "params": 1}),
-            json.dumps({"event": "done", "best_val": 4.0, "final_val": 4.0,
-                        "tokens": 1000, "elapsed_s": 800.0}),
-        ]) + "\n", encoding="utf-8")
-
-        v = verify_wallclock(root, 800.0)
-        assert v["arms"]["attention"] == 800.0, (
-            f"reported {v['arms']['attention']}, which is the mean of two runs "
-            f"and the duration of neither")
-        assert v["ok"] is True, v["reason"]
-        # One directory contributed one number, whatever the file holds.
-        assert v["n"]["attention"] == 1, v["n"]
-        # And the restart is surfaced, not swallowed: one recipe per directory
-        # is a repo rule, and a file holding two finished runs broke it.
-        assert "cxwc_attention_s1337" in v["restarted"], v["restarted"]
 
 
 @test
@@ -4244,6 +4328,97 @@ def a_one_expert_moe_is_the_dense_ffn_at_init():
 
 
 @test
+def vram_sizing_agrees_with_every_tenancy_this_repo_has_actually_observed():
+    """The guard is only worth having if it reproduces what the box did.
+
+    Three observations, all on a 94.5 GiB GH200 at batch 32 / ctx 512:
+      minGRU d_model  768, two to a device -- ran (every 50M board)
+      minGRU d_model 1152, two to a device -- ran (E21 phase 2, 30/30)
+      minGRU d_model 1536, two to a device -- CUDA OOM (E27 probe, 2 jobs lost)
+
+    The pre-fix sizing returned a flat 23.3 GiB for any unmeasured shape, so it
+    admitted the third. A parameter-ratio scaling refuses the second. Only the
+    split model -- optimizer state by parameter count, activations by
+    d_model x batch x ctx -- gets all three right.
+    """
+    from .vram import check_plan
+    GH200 = 94.5
+    for d, workers, want_ok, what in ((768, 2, True, "ran"),
+                                      (1152, 2, True, "ran"),
+                                      (1536, 2, False, "OOMed"),
+                                      (1536, 1, True, "fits alone")):
+        ok, _ = check_plan([("mingru", d, 32)], workers, GH200)
+        assert ok is want_ok, (
+            f"d_model {d} at {workers} worker(s) really {what}, guard says "
+            f"{'allow' if ok else 'refuse'}")
+
+
+@test
+def an_unmeasured_vram_shape_is_never_reported_as_a_measured_one():
+    """`JOB_VRAM_DEFAULT_GIB = 23.3` was documented as sizing an unknown shape
+    "pessimistically". It was the worst cell measured AT d_model 768, so at 1536
+    it was optimistic by 3x -- a check that could not run returning what a check
+    that ran and passed returns. The flag is the fix; this asserts it exists and
+    that the two paths do not collide."""
+    from .vram import job_vram_gib, MEASURED_JOB_VRAM_GIB
+    g768, measured = job_vram_gib("mingru", 768, 32)
+    assert measured and g768 == MEASURED_JOB_VRAM_GIB[("mingru", 768, 32)]
+    g1536, measured = job_vram_gib("mingru", 1536, 32)
+    assert not measured, "d_model 1536 has never been measured; must not claim it"
+    assert g1536 > g768 * 2, (
+        f"a 3.4x larger model sized at {g1536:.1f} GiB against {g768:.1f} -- "
+        "this is the flat-default bug returning")
+
+
+@test
+def a_launch_that_leaves_failed_jobs_does_not_report_success():
+    """Workers that run every job and mark two `failed` exit 0, so `launch` used
+    to report success for a partly-empty board -- and a stage script keyed on
+    that exit code chose a learning rate from the survivors of exactly that.
+    """
+    import json
+    import tempfile
+    from pathlib import Path
+    from .crossover_replicate import _queue_failures
+    with tempfile.TemporaryDirectory() as td:
+        q = Path(td) / "queue.json"
+        q.write_text(json.dumps({"jobs": [
+            {"id": "a", "status": "done"},
+            {"id": "b", "status": "failed", "detail": "OutOfMemoryError: CUDA"},
+            {"id": "c", "status": "failed", "detail": "OutOfMemoryError: CUDA"},
+        ]}))
+        bad = _queue_failures(q)
+        assert len(bad) == 2, bad
+        assert bad[0][0] == "b" and "OutOfMemory" in bad[0][1]
+        q.write_text(json.dumps({"jobs": [{"id": "a", "status": "done"}]}))
+        assert _queue_failures(q) == []
+
+
+@test
+def the_vram_guard_reads_width_from_the_arm_not_the_base_config():
+    """The ladder's widths live in arm overrides. Sizing off the base config
+    would call every ladder cell 768 -- the same class of mistake one layer up
+    from the one the guard exists to catch."""
+    import os
+    from .crossover_replicate import _job_shape, expand_grid
+    old = os.environ.get("CROSSOVER_ARMS")
+    os.environ["CROSSOVER_ARMS"] = "attention,w1536_mingru_lr40"
+    try:
+        shapes = {_job_shape(j) for j in expand_grid()}
+    finally:
+        if old is None:
+            os.environ.pop("CROSSOVER_ARMS", None)
+        else:
+            os.environ["CROSSOVER_ARMS"] = old
+    # Batch comes from the cluster env and is not what this test is about.
+    by_mixer = {m: d for m, d, _b in shapes}
+    assert by_mixer.get("mingru") == 1536, (
+        f"arm override width lost; got {sorted(shapes)}")
+    assert by_mixer.get("attention") == 768, (
+        f"base-config arm should stay at 768; got {sorted(shapes)}")
+
+
+@test
 def an_evaluated_moe_loss_is_pure_cross_entropy():
     """E19 was a units bug, not a model bug. `Model.forward` folded the Switch
     load-balancing aux into the loss it returned, and `train.evaluate` reports
@@ -4350,6 +4525,53 @@ def e21_ladder_varies_width_alone_and_can_be_read_at_each_width():
     assert widths[-1] / widths[0] >= 2.5, (
         f"ladder spans only {widths[-1]/widths[0]:.1f}x in width; too narrow to "
         "say anything about scale")
+
+
+@test
+def verify_wallclock_reads_the_last_run_not_the_mean_of_a_restarted_file():
+    """A restarted directory holds two runs. Report the one that survived.
+
+    ``metrics.jsonl`` is opened "a" (nanolab/utils.py), so resetting a job to
+    pending and relaunching into the same directory concatenates runs rather
+    than replacing them. Reachable through the repair path: `claim_job` only
+    claims `pending`, but a manual status reset makes a completed run claimable
+    again and its `done` record stays on disk.
+
+    Averaging the two reports a duration no run had -- here 635s for a run that
+    took 800s and was exactly on target, which sends the reader hunting a 20%
+    wall-clock miss that does not exist. The docstring always said "terminal
+    metrics record"; this pins the implementation to it.
+    """
+    import json
+    from .crossover_replicate import verify_wallclock
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        d = root / "cxwc_attention_s1337"
+        d.mkdir(parents=True)
+        (d / "config.json").write_text(json.dumps(
+            {"batch_size": 32, "block_size": 512, "mixer": "attention"}),
+            encoding="utf-8")
+        (d / "metrics.jsonl").write_text("\n".join([
+            # the crashed-then-repaired first attempt, 1.7x too fast
+            json.dumps({"event": "start", "params": 1}),
+            json.dumps({"event": "done", "best_val": 4.9, "final_val": 4.9,
+                        "tokens": 1000, "elapsed_s": 470.0}),
+            # the rerun that actually stands
+            json.dumps({"event": "start", "params": 1}),
+            json.dumps({"event": "done", "best_val": 4.0, "final_val": 4.0,
+                        "tokens": 1000, "elapsed_s": 800.0}),
+        ]) + "\n", encoding="utf-8")
+
+        v = verify_wallclock(root, 800.0)
+        assert v["arms"]["attention"] == 800.0, (
+            f"reported {v['arms']['attention']}, which is the mean of two runs "
+            f"and the duration of neither")
+        assert v["ok"] is True, v["reason"]
+        # One directory contributed one number, whatever the file holds.
+        assert v["n"]["attention"] == 1, v["n"]
+        # And the restart is surfaced, not swallowed: one recipe per directory
+        # is a repo rule, and a file holding two finished runs broke it.
+        assert "cxwc_attention_s1337" in v["restarted"], v["restarted"]
 
 
 def main():

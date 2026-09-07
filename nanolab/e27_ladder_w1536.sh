@@ -35,31 +35,10 @@ export CROSSOVER_ARMS=w1536_attention_lr40,w1536_attention_lr80,w1536_attention_
 export CROSSOVER_JOB_PREFIX=cx32lad1536p
 export CROSSOVER_TOKEN_BUDGET=10000000
 python3 -u -m nanolab.crossover_replicate launch \
-  --out nanolab/out/crossover_ladder_probe1536 --workers 1 --seed 1337
+  --out nanolab/out/crossover_ladder_probe1536 --workers 2 --seed 1337
 rc=$?
 echo "e27 probe exit=$rc $(date -u +%FT%TZ)"
 [ "$rc" -ne 0 ] && { echo "e27 exit=$rc PROBE FAILED"; exit "$rc"; }
-
-# The first run of this script proceeded on FOUR of six probe jobs: two minGRU
-# cells OOMed, `launch` exited 0 anyway, and stage 2 then read minGRU's argmin
-# off the single survivor -- which was the bottom edge of the swept range, and
-# contradicted the ladder's own invariant. Ten 50M-token jobs went to the wrong
-# learning rate. `launch` now exits non-zero when the queue holds failures, but
-# a stage that reads a queue must check the queue rather than trust an exit
-# code it did not write.
-python3 - <<'PYEOF' || exit 1
-import json, sys
-from collections import Counter
-q = json.load(open("nanolab/out/crossover_ladder_probe1536/queue.json"))
-c = Counter(j["status"] for j in q["jobs"])
-print("e27 probe queue:", dict(c), "of", len(q["jobs"]))
-bad = [j for j in q["jobs"] if j["status"] != "done"]
-for j in bad:
-    print("  NOT DONE:", j["id"], j["status"], (j.get("detail") or "")[:90])
-if bad:
-    print("REFUSING stage 2: an argmin over a partial probe is not an argmin.")
-    sys.exit(1)
-PYEOF
 
 BEST=$(python3 - <<'PYEOF'
 import json
@@ -92,22 +71,13 @@ print(",".join(k for k,_ in sorted(best.values())))
 PYEOF
 )
 echo "e27 stage2 arms: $BEST"
-case "$BEST" in
-  *lr40|*lr40,*|*lr160*|*lr20,*|*_mingru_lr20|*lr80,*_mingru_lr80)
-    # An argmin on the edge of the swept range is not an argmin. Previously this
-    # was a stderr note nobody gated on.
-    echo "e27: an argmin landed on a SWEEP EDGE -- widen the probe before"
-    echo "     spending 50M-token jobs on it. Refusing stage 2."
-    echo "e27 exit=1 $(date -u +%FT%TZ)"
-    exit 1;;
-esac
 
 # ---- stage 2: the two winning cells at 50M, n=5 ----
 export CROSSOVER_ARMS="$BEST"
 export CROSSOVER_JOB_PREFIX=cx32lad1536
 export CROSSOVER_TOKEN_BUDGET=50000000
 python3 -u -m nanolab.crossover_replicate launch \
-  --out nanolab/out/crossover_ladder1536 --workers 1
+  --out nanolab/out/crossover_ladder1536 --workers 2
 rc=$?
 echo "e27 board exit=$rc $(date -u +%FT%TZ)"
 

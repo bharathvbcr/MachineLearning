@@ -74,6 +74,12 @@ class Config:
     moe_experts: int = 8         # number of FFN experts
     moe_top_k: int = 2           # experts active per token
     moe_aux_weight: float = 0.01 # load-balancing auxiliary-loss weight
+    # How the selected experts' outputs are weighted. `renorm` divides the top-k
+    # probabilities by their sum, so at top-1 the weight is exactly 1 and the
+    # router receives NO task gradient (only the balancing loss trains it) --
+    # every committed moe_e*k1 run used this. `raw` multiplies by the raw softmax
+    # probability (Switch Transformer), which keeps the task gradient at top-1.
+    moe_router_weight: str = "renorm"  # renorm | raw
     # MLA (§2.1, DeepSeek): low-rank KV compression + decoupled RoPE.
     kv_lora_rank: int = 0        # 0 -> d_model//4 ; KV latent dim
     q_lora_rank: int = 0         # 0 -> d_model//2 ; Q latent dim (0-len disables)
@@ -134,6 +140,16 @@ class Config:
     # recurrent-mixer knobs (mamba2 / gdn):
     d_state: int = 64
     mixer_chunk: int = 64
+    # Gated delta rule variant. `repo`: S <- a*S + b*(v - S k) k^T, the correction
+    # read from the UNDECAYED state -- what every committed GDN run trained on.
+    # `published`: S <- a*S + b*(v - a*S k) k^T, arXiv:2412.06464 eq. 8. With unit
+    # keys the old association's own-key transition is a-b (sign can flip when
+    # b > a) against a(1-b). Found 2026-09-04; see docs/architecture-review-2026-09-04.
+    gdn_rule: str = "repo"       # repo | published
+    # minGRU hidden width = mingru_expand * d_model. 2 is every committed run and
+    # makes a minGRU layer ~6d^2 against attention's 4d^2 (the 8+4 hybrid is 19%
+    # heavier than attention); 1 is the parameter-parity arm.
+    mingru_expand: int = 2
 
     # ---- optimizer (guide §4) ----
     optimizer: str = "muon_ns5_adamw"  # see OPTIMIZERS
@@ -185,6 +201,10 @@ class Config:
     lr_max_steps: int = 0  # if >0, schedule decays over this many steps instead of max_steps
     eval_interval: int = 250
     eval_iters: int = 100
+    # Log a repeated-span copy loss at every eval (CE on the second occurrence of
+    # a random 32-token span inside a random-token sequence; same probe batches
+    # for every arm and every eval). Training is untouched; the recipe records it.
+    copy_probe: bool = False
     # --- MQAR (E8): the recall metric axis. See nanolab/mqar.py. ---
     # Sequence length is 2*(pairs+queries), so block_size is derived from these
     # rather than chosen: MQARBatcher refuses a block_size the task cannot fill.
@@ -259,6 +279,11 @@ class Config:
         assert self.optimizer in OPTIMIZERS, f"optimizer must be one of {OPTIMIZERS}"
         assert self.schedule in SCHEDULES, f"schedule must be one of {SCHEDULES}"
         assert self.diffusion_mode in DIFFUSION_MODES, f"diffusion_mode must be one of {DIFFUSION_MODES}"
+        assert self.gdn_rule in ("repo", "published"), (
+            f"gdn_rule must be repo|published, got {self.gdn_rule!r}")
+        assert self.moe_router_weight in ("renorm", "raw"), (
+            f"moe_router_weight must be renorm|raw, got {self.moe_router_weight!r}")
+        assert self.mingru_expand >= 1, f"mingru_expand must be >= 1, got {self.mingru_expand}"
         parse_layer_mixers(self)  # fail closed on bad hybrid specs
 
     # -- convenience --------------------------------------------------------

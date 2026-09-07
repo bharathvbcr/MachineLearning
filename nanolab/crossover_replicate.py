@@ -36,7 +36,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import build_config, parse_layer_mixers
+from .vram import check_plan, device_total_vram_gib
+from .config import Config, build_config, parse_layer_mixers
 from .train import train
 
 
@@ -441,6 +442,76 @@ RATIO_ARMS = ("hybrid_mingru11_attn1", "hybrid_mingru_periodic",
               "hybrid_mingru10_attn2")
 
 
+# 2026-09-05: the September program's arms, one board each. Every one is a new
+# arm NAME carrying its own override, so pre-fix runs keep their identity and
+# `lock_recipe` records which rule / weighting / width a job used. See
+# docs/architecture-review-2026-09-04/LAMBDA_HANDOFF_2026-09-05.md section 5.
+_PUB = (("gdn_rule", "published"),)
+_RAW = (("moe_router_weight", "raw"),)
+_X1 = (("mingru_expand", 1),)
+_W384 = (("d_model", 384), ("n_head", 6), ("head_dim", 64))
+ARMS = ARMS + (
+    # E28: is the hard-recall failure the operator variant? Same block, the
+    # published decayed-read rule (arXiv:2412.06464 eq. 8) instead of the repo's.
+    Arm("gdn_pub", "gdn", note="Gated DeltaNet on the PUBLISHED rule (decay before correction)",
+        overrides=_PUB),
+    Arm("hybrid_gdn_periodic_pub", "gdn",
+        "gdn*3,attention,gdn*3,attention,gdn*3,attention",
+        "hybrid_gdn_periodic on the published rule", overrides=_PUB),
+    # E29: E19's board with a router that can learn to route. Under `renorm` the
+    # top-1 weight is exactly 1 and the gate has no task gradient; `raw` is the
+    # Switch weighting. moe_e1k1_raw is the control and must match `attention`.
+    Arm("moe_e1k1_raw", "attention", note="control: 1 expert through the MoE path, raw router weight",
+        overrides=(("ffn", "moe"), ("moe_experts", 1), ("moe_top_k", 1)) + _RAW),
+    Arm("moe_e4k1_raw", "attention", note="4 experts, top-1, raw router weight (task gradient reaches the gate)",
+        overrides=(("ffn", "moe"), ("moe_experts", 4), ("moe_top_k", 1)) + _RAW),
+    Arm("moe_e8k1_raw", "attention", note="8 experts, top-1, raw router weight",
+        overrides=(("ffn", "moe"), ("moe_experts", 8), ("moe_top_k", 1)) + _RAW),
+    # E30b: the no-regret hybrid at parameter parity. Expansion 2 makes a minGRU
+    # layer ~6d^2 against attention's 4d^2, so hybrid_mingru8_attn4 is 19% heavier
+    # than attention; expansion 1 removes that.
+    Arm("mingru_x1", "mingru", note="minGRU at expansion 1", overrides=_X1),
+    Arm("hybrid_mingru8_attn4_x1", "mingru", "mingru*8,attention*4",
+        "8+4 at expansion 1: parameter parity with attention", overrides=_X1),
+    Arm("hybrid_mingru_periodic_x1", "mingru",
+        "mingru*3,attention,mingru*3,attention,mingru*3,attention",
+        "9+3 periodic at expansion 1", overrides=_X1),
+    # E31: the tied/untied x value-residual 2x2. `attention` is the (tied, VR) cell.
+    # Untying adds vocab*d = 38,633,472 parameters at width 768; report it.
+    Arm("attention_untied", "attention", note="tie_embeddings off",
+        overrides=(("tie_embeddings", False),)),
+    Arm("attention_novr", "attention", note="value residual off",
+        overrides=(("value_residual", False),)),
+    Arm("attention_untied_novr", "attention", note="tie_embeddings off, value residual off",
+        overrides=(("tie_embeddings", False), ("value_residual", False))),
+    # E33: depth for width at ~21M non-embedding parameters (attn3 is 21.3M,
+    # 12L x 384 is 21.2M). head_dim stays 64, so 544 is unreachable; these
+    # two bracket it: 6L x 512 = 18.9M, 6L x 576 = 23.9M.
+    Arm("attn6_w512", "attention", note="6 layers x 512: 18.9M non-embedding",
+        overrides=(("n_layer", 6), ("d_model", 512), ("n_head", 8), ("head_dim", 64))),
+    Arm("attn6_w576", "attention", note="6 layers x 576: 23.9M non-embedding",
+        overrides=(("n_layer", 6), ("d_model", 576), ("n_head", 9), ("head_dim", 64))),
+    # E35: the token ladder's hybrid arm at width 384. The ladder measured
+    # attention's optimum at 8x base LR and minGRU's at 4x; the hybrid has no
+    # measured optimum, so it runs at both.
+    Arm("w384_hybrid_mingru8_attn4_lr40", "mingru", "mingru*8,attention*4",
+        "8+4 at d_model 384, LR x4",
+        overrides=_W384 + (("lr", _LADDER_BASE_LR * 4.0), ("matrix_lr", _LADDER_BASE_MATRIX_LR * 4.0))),
+    Arm("w384_hybrid_mingru8_attn4_lr80", "mingru", "mingru*8,attention*4",
+        "8+4 at d_model 384, LR x8",
+        overrides=_W384 + (("lr", _LADDER_BASE_LR * 8.0), ("matrix_lr", _LADDER_BASE_MATRIX_LR * 8.0))),
+)
+# One name per board so a launcher cannot list a subset (the RATIO_ARMS rule).
+GDN_RULE_ARMS = ("gdn", "gdn_pub", "hybrid_gdn_periodic", "hybrid_gdn_periodic_pub")
+MOE_RAW_ARMS = ("attention", "moe_e1k1_raw", "moe_e4k1_raw", "moe_e8k1_raw")
+PARITY_ARMS = ("attention", "hybrid_mingru8_attn4_x1", "hybrid_mingru_periodic_x1")
+TIE_ARMS = ("attention", "attention_untied", "attention_novr", "attention_untied_novr")
+SHAPE_ARMS = ("attention", "attn6_w512", "attn6_w576", "w384_attention_lr10")
+COPY_ARMS = ("attention", "mingru", "hybrid_mingru8_attn4")
+W384X_ARMS = ("w384_attention_lr80", "w384_mingru_lr40",
+              "w384_hybrid_mingru8_attn4_lr40", "w384_hybrid_mingru8_attn4_lr80")
+
+
 def scale_to_token_budget(batch_size: int, block_size: int = 512,
                           grad_accum: int = 1,
                           token_budget: int = TOKEN_BUDGET,
@@ -776,6 +847,58 @@ def budget_by_arm() -> dict[str, int]:
     return {k: int(v) for k, v in json.loads(raw).items()}
 
 
+def cluster_compile() -> bool:
+    """torch.compile for the suite's jobs. Default OFF, as every committed run.
+
+    Recorded in the recipe, so a compiled run can never pool with an eager one:
+    Inductor fuses and re-associates, which moves the loss in the last places,
+    and two runs whose curves differ for that reason must not share a directory.
+    Measured 2026-09-05 on the GH200: 1.94x on attention, 1.96x on minGRU. The
+    `compile=False` this replaces was hardcoded when Inductor stalled on aarch64;
+    on torch 2.7.0 it compiles in ~30 s.
+    """
+    return os.environ.get("CROSSOVER_COMPILE", "").strip() in ("1", "true", "yes")
+
+
+def cluster_fused_ce() -> bool:
+    """The chunked cross-entropy. Default ON, as every committed run.
+
+    `crossover50m` sets fused_ce=True, and the comment above it dates the
+    choice: the measured throughput peak "on the 3070 Ti (8 GB)", where chunks
+    16 "frees the VRAM ... that lets bs32 fit". VRAM is not the binding
+    constraint on a 94.5 GiB card, and the setting stopped being free the
+    moment compile became available: Inductor fuses the CE reduction itself, so
+    the hand-written chunking blocks the fusion it exists to provide.
+
+    Measured 2026-09-05 on the GH200, attention, bs32/ctx512, one fwd+bwd:
+
+        fused/16 eager     113.6K tok/s   15.2 GB   <- what the suite runs
+        fused/16 compiled  220.5K tok/s   12.6 GB
+        unfused  eager     146.4K tok/s   26.4 GB
+        unfused  compiled  342.6K tok/s   14.5 GB   <- 3.02x, and lighter
+
+    Unfused is the memory-hungry option only while eager. Compiled it costs
+    +1.9 GB over fused and still undercuts today's fused-eager footprint.
+
+    Recorded in the recipe for the same reason `compile` is: it moves the loss
+    in the last places (9.9e-7 relative on attention, 2.2e-5 on the 8+4 hybrid,
+    both far under the 0.0031 nat rerun floor) and two runs that differ on it
+    must not pool. fused_ce_chunks 16 and 4 are bit-identical, so the chunk
+    count is not a second knob.
+    """
+    raw = os.environ.get("CROSSOVER_FUSED_CE", "").strip().lower()
+    if not raw:
+        return True
+    return raw in ("1", "true", "yes")
+
+
+def cluster_copy_probe() -> bool:
+    """E34: log the repeated-span copy loss at every eval. Recorded in the
+    recipe (a launch that turns it on in a directory that ran without it is a
+    different recipe) even though it changes nothing about training."""
+    return os.environ.get("CROSSOVER_COPY_PROBE", "").strip() in ("1", "true", "yes")
+
+
 def cluster_block() -> int:
     """Context length. 512 is every committed suite; E9 varies it.
 
@@ -840,6 +963,7 @@ def current_recipe() -> dict:
         "arm_overrides": selected_arm_overrides(),
         "swa_chunk": cluster_swa_chunk(),
         "eval_iters": cluster_eval_iters(),
+        "copy_probe": cluster_copy_probe(),
         "token_budget": cluster_token_budget(),
         "lr_horizon": cluster_lr_horizon(),
         "arms": [a.name for a in selected_arms()],
@@ -849,7 +973,11 @@ def current_recipe() -> dict:
         # mixed a GH200 suite and an H100 suite in one directory without a word --
         # in a repo whose paper is about rankings moving with the recipe.
         "device": live_device_name() or None,
-        "compile": False,
+        "compile": cluster_compile(),
+        # Changes throughput 1.55x at equal memory once compiled, and the loss
+        # in the last places. Unrecorded, it would let a fused run pool with an
+        # unfused one -- the confound `compile` is recorded to prevent.
+        "fused_ce": cluster_fused_ce(),
     }
 
 
@@ -1157,7 +1285,9 @@ def job_config(job: dict, out_root: Path, smoke: bool = False):
         eval_train=False,
         swa_chunk=cluster_swa_chunk(),
         eval_iters=cluster_eval_iters(),
-        compile=False,
+        copy_probe=cluster_copy_probe(),
+        compile=cluster_compile(),
+        fused_ce=cluster_fused_ce(),
         mem_fraction=0.0,
     )
     # Applied last: an arm's own knobs (e.g. the SWA window) are what makes it
@@ -1520,6 +1650,33 @@ def cmd_run(args) -> None:
     print(f"{job['id']} best_val={val:.4f}")
 
 
+def _job_shape(job: dict) -> tuple[str, int, int]:
+    """(mixer, d_model, batch_size) for the VRAM guard, honouring arm overrides.
+
+    An arm's overrides are where the ladder's widths live, so reading d_model off
+    the base config would size every ladder cell as though it were 768 -- which
+    is the sizing mistake this guard exists to prevent, one layer up.
+    """
+    over = dict(job.get("overrides") or {})
+    arm = next((a for a in ARMS if a.name == job.get("arm")), None)
+    if arm is not None:
+        over.update(dict(arm.overrides))
+    base = Config()
+    return (str(over.get("mixer", arm.mixer if arm else base.mixer)),
+            int(over.get("d_model", base.d_model)),
+            int(over.get("batch_size", cluster_batch())))
+
+
+def _queue_failures(queue: Path) -> list[tuple[str, str]]:
+    """[(job id, detail)] for every job the queue records as failed."""
+    try:
+        state = json.loads(Path(queue).read_text())
+    except (OSError, ValueError):
+        return []
+    return [(j.get("id", "?"), str(j.get("detail", "")))
+            for j in state.get("jobs", []) if j.get("status") == "failed"]
+
+
 def cmd_launch(args) -> None:
     if cluster_batch() >= 64 and args.workers > 1:
         print(f"CROSSOVER_BATCH={cluster_batch()} needs ~80GB/job; "
@@ -1551,6 +1708,19 @@ def cmd_launch(args) -> None:
     if args.seed is not None:
         jobs = [j for j in jobs if j["seed"] == args.seed]
     init_queue(queue, jobs, out_root)
+    # VRAM guard. gpu_bundle has refused an over-subscribed plan since it was
+    # written; this runner never did, and on 2026-09-05 two minGRU jobs at
+    # d_model 1536 OOMed two-to-a-device. The stage script then read an argmin
+    # off the four survivors -- one of them an edge -- and spent ten 50M-token
+    # jobs on it. Refusing costs a worker slot; not refusing cost a board.
+    if not getattr(args, "ignore_vram", False):
+        shapes = sorted({(_job_shape(j)) for j in jobs})
+        # --workers is per GPU (the launcher prints "workers/gpu"), so the
+        # budget is one device's memory, not the box's.
+        total = device_total_vram_gib()
+        ok, msg = check_plan(shapes, args.workers, total)
+        if not ok:
+            raise SystemExit(msg)
     if getattr(args, "unhold", False):
         fh, state = _lock_load(queue)
         n = 0
@@ -1627,6 +1797,19 @@ def cmd_launch(args) -> None:
     rc = 0
     for p in workers:
         rc = max(rc, p.wait())
+    # A worker that ran every job it was given and marked two of them `failed`
+    # exits 0, so `launch` used to report success for a partly-empty board. Every
+    # stage script in scripts/ keys its next step on this exit code, and one of
+    # them chose a learning rate from the survivors of exactly that. A check that
+    # could not run must not report what a check that ran and passed reports.
+    failed = _queue_failures(queue)
+    if failed:
+        print(f"\n{len(failed)} job(s) FAILED -- this board is incomplete:")
+        for jid, detail in failed[:10]:
+            print(f"  {jid}: {detail[:100]}")
+        if len(failed) > 10:
+            print(f"  ... and {len(failed) - 10} more")
+        rc = max(rc, 1)
     raise SystemExit(rc)
 
 
@@ -2674,6 +2857,10 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument("--arm", default=None, choices=[a.name for a in ARMS])
     launch.add_argument("--seed", type=int, default=None)
     launch.add_argument("--detach", action="store_true")
+    launch.add_argument("--ignore-vram", action="store_true",
+                        help="skip the VRAM guard (the per-shape figure is "
+                             "measured at d_model 768 and scaled elsewhere; "
+                             "override it if the scaling is wrong for yours)")
     launch.add_argument("--unhold", action="store_true",
                         help="release held jobs back to pending")
     worker = sub.add_parser("worker", parents=[common])

@@ -483,7 +483,7 @@ class MinGRU(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         d = cfg.d_model
-        self.expand = 2
+        self.expand = cfg.mingru_expand
         hid = self.expand * d
         self.to_z = nn.Linear(d, hid, bias=False)
         self.to_h = nn.Linear(d, hid, bias=False)
@@ -681,7 +681,7 @@ class Mamba2(nn.Module):
 # graph — backward only stores the N=T/chunk small (D,D) state carries. Ported and
 # adapted from the repo's verified parameter-golf/verify_gdn_wy.py (matches the
 # sequential reference to <1e-9 in fp64; see the regression test).
-def gdn_chunked(q, k, v, alpha, beta, chunk=32):
+def gdn_chunked(q, k, v, alpha, beta, chunk=32, rule="repo"):
     """Chunk-parallel gated delta rule via the WY / UT-transform (guide §7).
 
     q,k,v: [B,H,L,D]; alpha,beta: [B,H,L]. The O(T) recurrence
@@ -695,7 +695,15 @@ def gdn_chunked(q, k, v, alpha, beta, chunk=32):
     decay-weighted matmuls. Only the chunk carry S_in stays sequential. Pure
     autograd (no manual backward); fp32 to match — verified exact vs the O(T)
     reference (`_sequential`, test `gdn_chunked_matches_sequential`). This is the
-    fully-vectorised analogue of `ssd_chunk_parallel` for the delta rule."""
+    fully-vectorised analogue of `ssd_chunk_parallel` for the delta rule.
+
+    ``rule`` selects which state the correction reads. ``repo`` (above, and every
+    committed run): e_t = v_t - S_{t-1} k_t. ``published`` (arXiv:2412.06464 eq. 8):
+    e_t = v_t - a_t S_{t-1} k_t, i.e. the decay is applied before the correction.
+    Unrolling the published rule inside a chunk replaces A_{t-1} with A_t in both
+    the triangular system and the carry term -- M[t,j] = b_t (A_t/A_j)(k_t.k_j) and
+    R_t = b_t v_t - b_t A_t (S_in k_t) -- and changes nothing else; the regression
+    test checks both rules against ``_sequential``."""
     with torch.autocast(device_type=k.device.type, enabled=False):
         q, k, v = q.float(), k.float(), v.float()
         # log(alpha) in the WY kernel: sigmoid gates can be 0 after a large
@@ -719,7 +727,12 @@ def gdn_chunked(q, k, v, alpha, beta, chunk=32):
         # Exponentiate only the triangular part we use. The full CxC ratio
         # A_{t-1}/A_j is >>1 for j>t and overflowed to inf; autograd then NaN'd
         # even though .tril() hid those entries in the forward.
-        logM = (cum_prev[..., :, None] - cum[..., None, :]).tril(-1)
+        if rule not in ("repo", "published"):
+            raise ValueError(f"gdn rule must be repo|published, got {rule!r}")
+        # The cumulative decay the correction term sees: A_{t-1} under the repo
+        # rule, A_t = a_t A_{t-1} under the published one.
+        cum_corr = cum if rule == "published" else cum_prev
+        logM = (cum_corr[..., :, None] - cum[..., None, :]).tril(-1)
         decM = torch.exp(logM.clamp(max=0.0))
         M = (bc[..., :, None] * decM * (kc @ kc.transpose(-1, -2))).tril(-1)
         eye = torch.eye(C, device=k.device, dtype=k.dtype).expand(B, H, N, C, C)
@@ -728,7 +741,7 @@ def gdn_chunked(q, k, v, alpha, beta, chunk=32):
         decY = torch.exp(logY.clamp(max=0.0))                 # A_t/A_j
         Wy = (decY * (qc @ kc.transpose(-1, -2))).tril(0)     # output weights
         A_t = torch.exp(cum)[..., None]                       # (B,H,N,C,1)
-        A_prev = torch.exp(cum_prev)
+        A_corr = torch.exp(cum_corr)
         dec_jC = torch.exp((cum[..., -1:] - cum).clamp(max=0.0))[..., None]  # A_C/A_j
         A_C = torch.exp(cum[..., -1])[..., None, None]        # (B,H,N,1,1)
 
@@ -737,7 +750,7 @@ def gdn_chunked(q, k, v, alpha, beta, chunk=32):
         for m in range(N):
             km, vm, qm = kc[:, :, m], vc[:, :, m], qc[:, :, m]          # (B,H,C,D)
             sk = torch.einsum("bhde,bhce->bhcd", S, km)                 # S k_t
-            R = bc[:, :, m][..., None] * vm - (bc[:, :, m] * A_prev[:, :, m])[..., None] * sk
+            R = bc[:, :, m][..., None] * vm - (bc[:, :, m] * A_corr[:, :, m])[..., None] * sk
             u = torch.einsum("bhtj,bhjd->bhtd", Tinv[:, :, m], R)       # u = (I+M)^-1 R
             sq = torch.einsum("bhde,bhce->bhcd", S, qm)                 # S q_t
             y = A_t[:, :, m] * sq + torch.einsum("bhtj,bhjd->bhtd", Wy[:, :, m], u)
@@ -751,10 +764,13 @@ class GatedDeltaNet(nn.Module):
     """Gated delta rule, computed by the chunk-parallel kernel above (the original
     O(T) sequential recurrence is kept as ``_sequential`` for the regression test).
 
-    State update per step (FP32):
-        S <- alpha * S + beta * k (v - S^T k)^T   (delta correction)
+    State update per step (FP32), ``cfg.gdn_rule``:
+        repo:      S <- alpha * S + beta * k (v - S^T k)^T          (undecayed read)
+        published: S <- alpha * S + beta * k (v - alpha * S^T k)^T  (arXiv:2412.06464 eq. 8)
         y  = S^T q
-    Verified against this exact recurrence by the repo's verify_gdn.py (1e-4).
+    Every committed GDN run used `repo`; it is NOT the published operator (the
+    own-key transition of a stored association is alpha-beta rather than
+    alpha(1-beta)). Verified against `_sequential` for both rules in nanolab.tests.
     """
 
     def __init__(self, cfg):
@@ -772,6 +788,7 @@ class GatedDeltaNet(nn.Module):
         # chunk size for the parallel scan; smaller = less intra-chunk work but
         # more sequential carries. 32 is a good default at head_dim ~64.
         self.chunk = min(cfg.mixer_chunk, cfg.block_size) or 32
+        self.rule = cfg.gdn_rule
 
     def _project(self, x):
         """Shared input projection -> (q, k, v, alpha, beta) in [B,H,T,P]/[B,H,T]."""
@@ -792,7 +809,7 @@ class GatedDeltaNet(nn.Module):
     def forward(self, x, *args, **kwargs):
         B, T, D = x.shape
         q, k, v, alpha, beta = self._project(x)
-        y = gdn_chunked(q, k, v, alpha, beta, self.chunk)   # [B,H,T,P]
+        y = gdn_chunked(q, k, v, alpha, beta, self.chunk, rule=self.rule)   # [B,H,T,P]
         y = y.transpose(1, 2).reshape(B, T, D).to(x.dtype)
         return self.out_proj(self.out_norm(y)), None
 
@@ -811,6 +828,8 @@ class GatedDeltaNet(nn.Module):
             at = alpha[:, t].unsqueeze(-1).unsqueeze(-1)
             bt = beta[:, t].unsqueeze(-1)
             pred = torch.einsum("bhpn,bhp->bhn", S, kt)
+            if self.rule == "published":
+                pred = alpha[:, t].unsqueeze(-1) * pred      # read the DECAYED state
             delta = (vt - pred) * bt
             S = at * S + torch.einsum("bhp,bhn->bhpn", kt, delta)
             ys.append(torch.einsum("bhpn,bhp->bhn", S, q[:, t]))
