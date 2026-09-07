@@ -1,0 +1,22 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "workers": 3,
+  "gpus": 1,
+  "budget_by_arm": null,
+  "arm_overrides": null,
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "copy_probe": true,
+  "token_budget": 2000000,
+  "lr_horizon": null,
+  "arms": [
+    "attention",
+    "mingru",
+    "hybrid_mingru8_attn4"
+  ],
+  "prefix": "smke34",
+  "device": "NVIDIA GH200 480GB",
+  "compile": true,
+  "fused_ce": true
+}

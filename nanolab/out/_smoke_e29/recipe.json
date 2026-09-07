@@ -1,0 +1,42 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "workers": 3,
+  "gpus": 1,
+  "budget_by_arm": null,
+  "arm_overrides": {
+    "moe_e1k1_raw": {
+      "ffn": "moe",
+      "moe_experts": 1,
+      "moe_top_k": 1,
+      "moe_router_weight": "raw"
+    },
+    "moe_e4k1_raw": {
+      "ffn": "moe",
+      "moe_experts": 4,
+      "moe_top_k": 1,
+      "moe_router_weight": "raw"
+    },
+    "moe_e8k1_raw": {
+      "ffn": "moe",
+      "moe_experts": 8,
+      "moe_top_k": 1,
+      "moe_router_weight": "raw"
+    }
+  },
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "copy_probe": false,
+  "token_budget": 2000000,
+  "lr_horizon": null,
+  "arms": [
+    "attention",
+    "moe_e1k1_raw",
+    "moe_e4k1_raw",
+    "moe_e8k1_raw"
+  ],
+  "prefix": "smke29",
+  "device": "NVIDIA GH200 480GB",
+  "compile": true,
+  "fused_ce": true
+}

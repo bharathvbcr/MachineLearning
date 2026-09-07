@@ -1,0 +1,56 @@
+{
+  "jobs": [
+    {
+      "id": "smke29_attention_s1337",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "capacity baseline",
+      "status": "done",
+      "worker": 0,
+      "started": 1788785029.0920866,
+      "finished": 1788785073.002489,
+      "detail": "best_val=6.405057"
+    },
+    {
+      "id": "smke29_moe_e1k1_raw_s1337",
+      "arm": "moe_e1k1_raw",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "control: 1 expert through the MoE path, raw router weight",
+      "status": "done",
+      "worker": 2,
+      "started": 1788785029.0970988,
+      "finished": 1788785055.3478389,
+      "detail": "best_val=6.402792"
+    },
+    {
+      "id": "smke29_moe_e4k1_raw_s1337",
+      "arm": "moe_e4k1_raw",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "4 experts, top-1, raw router weight (task gradient reaches the gate)",
+      "status": "done",
+      "worker": 1,
+      "started": 1788785029.1272998,
+      "finished": 1788785081.707504,
+      "detail": "best_val=6.423190"
+    },
+    {
+      "id": "smke29_moe_e8k1_raw_s1337",
+      "arm": "moe_e8k1_raw",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "8 experts, top-1, raw router weight",
+      "status": "done",
+      "worker": 2,
+      "started": 1788785055.5416796,
+      "finished": 1788785113.8744545,
+      "detail": "best_val=6.427613"
+    }
+  ]
+}

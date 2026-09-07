@@ -1,0 +1,20 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "workers": 3,
+  "gpus": 1,
+  "budget_by_arm": null,
+  "arm_overrides": null,
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "copy_probe": false,
+  "token_budget": 5000000,
+  "lr_horizon": null,
+  "arms": [
+    "attention",
+    "hybrid_mingru8_attn4"
+  ],
+  "prefix": "valm3",
+  "device": "NVIDIA GH200 480GB",
+  "compile": false
+}

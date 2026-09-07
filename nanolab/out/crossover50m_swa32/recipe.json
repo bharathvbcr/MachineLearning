@@ -28,6 +28,7 @@
   },
   "swa_chunk": -1,
   "eval_iters": 20,
+  "copy_probe": false,
   "token_budget": 50000000,
   "lr_horizon": null,
   "arms": [
@@ -41,5 +42,6 @@
   ],
   "prefix": "cx32swa",
   "device": "NVIDIA GH200 480GB",
-  "compile": false
+  "compile": false,
+  "fused_ce": true
 }

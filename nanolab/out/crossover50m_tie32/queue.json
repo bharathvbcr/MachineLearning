@@ -1,0 +1,190 @@
+{
+  "jobs": [
+    {
+      "id": "cx32tie_attention_s1337",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "capacity baseline",
+      "status": "running",
+      "worker": 2,
+      "started": 1788785600.8550034
+    },
+    {
+      "id": "cx32tie_attention_s42",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "capacity baseline",
+      "status": "running",
+      "worker": 1,
+      "started": 1788785600.865962
+    },
+    {
+      "id": "cx32tie_attention_s100",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "capacity baseline",
+      "status": "running",
+      "worker": 0,
+      "started": 1788785600.884278
+    },
+    {
+      "id": "cx32tie_attention_s2026",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 2026,
+      "note": "capacity baseline",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_s777",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 777,
+      "note": "capacity baseline",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_untied_s1337",
+      "arm": "attention_untied",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "tie_embeddings off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_untied_s42",
+      "arm": "attention_untied",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "tie_embeddings off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_untied_s100",
+      "arm": "attention_untied",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "tie_embeddings off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_untied_s2026",
+      "arm": "attention_untied",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 2026,
+      "note": "tie_embeddings off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_untied_s777",
+      "arm": "attention_untied",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 777,
+      "note": "tie_embeddings off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_novr_s1337",
+      "arm": "attention_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "value residual off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_novr_s42",
+      "arm": "attention_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "value residual off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_novr_s100",
+      "arm": "attention_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "value residual off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_novr_s2026",
+      "arm": "attention_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 2026,
+      "note": "value residual off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_novr_s777",
+      "arm": "attention_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 777,
+      "note": "value residual off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_untied_novr_s1337",
+      "arm": "attention_untied_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "tie_embeddings off, value residual off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_untied_novr_s42",
+      "arm": "attention_untied_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "tie_embeddings off, value residual off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_untied_novr_s100",
+      "arm": "attention_untied_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "tie_embeddings off, value residual off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_untied_novr_s2026",
+      "arm": "attention_untied_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 2026,
+      "note": "tie_embeddings off, value residual off",
+      "status": "pending"
+    },
+    {
+      "id": "cx32tie_attention_untied_novr_s777",
+      "arm": "attention_untied_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 777,
+      "note": "tie_embeddings off, value residual off",
+      "status": "pending"
+    }
+  ]
+}

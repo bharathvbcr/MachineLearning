@@ -1,0 +1,27 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "workers": 1,
+  "gpus": 1,
+  "budget_by_arm": null,
+  "arm_overrides": {
+    "w1536_mingru_lr40": {
+      "d_model": 1536,
+      "n_head": 24,
+      "head_dim": 64,
+      "lr": 0.0024,
+      "matrix_lr": 0.1
+    }
+  },
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "copy_probe": false,
+  "token_budget": 50000000,
+  "lr_horizon": null,
+  "arms": [
+    "w1536_mingru_lr40"
+  ],
+  "prefix": "cx32lad1536m",
+  "device": "NVIDIA GH200 480GB",
+  "compile": false
+}

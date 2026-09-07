@@ -1,0 +1,34 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "workers": 3,
+  "gpus": 1,
+  "budget_by_arm": null,
+  "arm_overrides": {
+    "attention_untied": {
+      "tie_embeddings": false
+    },
+    "attention_novr": {
+      "value_residual": false
+    },
+    "attention_untied_novr": {
+      "tie_embeddings": false,
+      "value_residual": false
+    }
+  },
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "copy_probe": false,
+  "token_budget": 50000000,
+  "lr_horizon": null,
+  "arms": [
+    "attention",
+    "attention_untied",
+    "attention_novr",
+    "attention_untied_novr"
+  ],
+  "prefix": "cx32tie",
+  "device": "NVIDIA GH200 480GB",
+  "compile": true,
+  "fused_ce": true
+}

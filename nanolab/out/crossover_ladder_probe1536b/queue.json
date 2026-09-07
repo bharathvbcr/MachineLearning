@@ -1,0 +1,30 @@
+{
+  "jobs": [
+    {
+      "id": "cx32lad1536pb_w1536_mingru_lr40_s1337",
+      "arm": "w1536_mingru_lr40",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x4.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1788619766.577059,
+      "finished": 1788620030.823088,
+      "detail": "best_val=4.953442"
+    },
+    {
+      "id": "cx32lad1536pb_w1536_mingru_lr80_s1337",
+      "arm": "w1536_mingru_lr80",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x8.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1788620031.9119868,
+      "finished": 1788620295.0645056,
+      "detail": "best_val=5.012637"
+    }
+  ]
+}

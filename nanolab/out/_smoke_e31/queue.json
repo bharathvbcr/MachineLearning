@@ -1,0 +1,43 @@
+{
+  "jobs": [
+    {
+      "id": "smke31_attention_untied_s1337",
+      "arm": "attention_untied",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "tie_embeddings off",
+      "status": "done",
+      "worker": 0,
+      "started": 1788785170.8096828,
+      "finished": 1788785247.0663536,
+      "detail": "best_val=6.397838"
+    },
+    {
+      "id": "smke31_attention_novr_s1337",
+      "arm": "attention_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "value residual off",
+      "status": "done",
+      "worker": 1,
+      "started": 1788785170.8191137,
+      "finished": 1788785245.3111742,
+      "detail": "best_val=6.403123"
+    },
+    {
+      "id": "smke31_attention_untied_novr_s1337",
+      "arm": "attention_untied_novr",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "tie_embeddings off, value residual off",
+      "status": "done",
+      "worker": 2,
+      "started": 1788785170.829907,
+      "finished": 1788785241.711477,
+      "detail": "best_val=6.384424"
+    }
+  ]
+}

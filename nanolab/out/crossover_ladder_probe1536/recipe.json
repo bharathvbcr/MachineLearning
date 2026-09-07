@@ -1,0 +1,66 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "workers": 2,
+  "gpus": 1,
+  "budget_by_arm": null,
+  "arm_overrides": {
+    "w1536_attention_lr40": {
+      "d_model": 1536,
+      "n_head": 24,
+      "head_dim": 64,
+      "lr": 0.0024,
+      "matrix_lr": 0.1
+    },
+    "w1536_attention_lr80": {
+      "d_model": 1536,
+      "n_head": 24,
+      "head_dim": 64,
+      "lr": 0.0048,
+      "matrix_lr": 0.2
+    },
+    "w1536_attention_lr160": {
+      "d_model": 1536,
+      "n_head": 24,
+      "head_dim": 64,
+      "lr": 0.0096,
+      "matrix_lr": 0.4
+    },
+    "w1536_mingru_lr20": {
+      "d_model": 1536,
+      "n_head": 24,
+      "head_dim": 64,
+      "lr": 0.0012,
+      "matrix_lr": 0.05
+    },
+    "w1536_mingru_lr40": {
+      "d_model": 1536,
+      "n_head": 24,
+      "head_dim": 64,
+      "lr": 0.0024,
+      "matrix_lr": 0.1
+    },
+    "w1536_mingru_lr80": {
+      "d_model": 1536,
+      "n_head": 24,
+      "head_dim": 64,
+      "lr": 0.0048,
+      "matrix_lr": 0.2
+    }
+  },
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "token_budget": 10000000,
+  "lr_horizon": null,
+  "arms": [
+    "w1536_attention_lr40",
+    "w1536_attention_lr80",
+    "w1536_attention_lr160",
+    "w1536_mingru_lr20",
+    "w1536_mingru_lr40",
+    "w1536_mingru_lr80"
+  ],
+  "prefix": "cx32lad1536p",
+  "device": "NVIDIA GH200 480GB",
+  "compile": false
+}

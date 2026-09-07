@@ -1,0 +1,43 @@
+{
+  "jobs": [
+    {
+      "id": "smke33_attn6_w512_s1337",
+      "arm": "attn6_w512",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "6 layers x 512: 18.9M non-embedding",
+      "status": "done",
+      "worker": 1,
+      "started": 1788785255.1233323,
+      "finished": 1788785298.4561303,
+      "detail": "best_val=6.515524"
+    },
+    {
+      "id": "smke33_attn6_w576_s1337",
+      "arm": "attn6_w576",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "6 layers x 576: 23.9M non-embedding",
+      "status": "done",
+      "worker": 2,
+      "started": 1788785255.136113,
+      "finished": 1788785299.9914863,
+      "detail": "best_val=6.488799"
+    },
+    {
+      "id": "smke33_w384_attention_lr10_s1337",
+      "arm": "w384_attention_lr10",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 384, LR x1.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1788785255.1790283,
+      "finished": 1788785320.1942108,
+      "detail": "best_val=6.602870"
+    }
+  ]
+}
