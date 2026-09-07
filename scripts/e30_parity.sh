@@ -15,10 +15,20 @@
 # parity; otherwise the margin was parameters.
 source "$(dirname "$0")/_stage_common.sh"
 stage_wait; stage_start e30
+# (a) EAGER, and not by preference. crossover50m_ratioplace32 holds 25 runs
+# whose recipe records compile:false, and the whole point of adding `attention`
+# to that directory is that it becomes a WITHIN-suite comparison. Compiling the
+# new arm would make it a different recipe -- `lock_recipe` refuses it outright,
+# which is the correct answer, not an obstacle to route around. 5 jobs at ~2x
+# the wall clock is the price of the comparison being valid.
+export CROSSOVER_COMPILE=0
 export CROSSOVER_ARMS=hybrid_mingru11_attn1,hybrid_mingru_periodic,hybrid_mingru_bookend,hybrid_mingru8_attn4,hybrid_mingru10_attn2,attention
 export CROSSOVER_JOB_PREFIX=cx32p
 python3 -u -m nanolab.crossover_replicate launch --out nanolab/out/crossover50m_ratioplace32 --workers 3
 rc_a=$?; echo "e30a launch exit=$rc_a $(date -u +%FT%TZ)"
+# (b) is a NEW directory, so it is free to take the 2x. Its `attention` control
+# is rebuilt inside it either way, so nothing here pools with (a).
+export CROSSOVER_COMPILE=1
 export CROSSOVER_ARMS=attention,hybrid_mingru8_attn4_x1,hybrid_mingru_periodic_x1
 export CROSSOVER_JOB_PREFIX=cx32par
 python3 -u -m nanolab.crossover_replicate launch --out nanolab/out/crossover50m_parity32 --workers 3
