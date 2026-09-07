@@ -14,6 +14,8 @@ non-zero on any failure (so it works in CI or a bare shell).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import pathlib
 import sys
 import tempfile
@@ -57,6 +59,31 @@ class Skip(Exception):
 def test(fn):
     _RESULTS.append(fn)
     return fn
+
+
+@contextlib.contextmanager
+def _env_vars(**kw):
+    """Set env vars for the block, restore exactly what was there before.
+
+    The cluster_* accessors read os.environ at call time, so a test that wants a
+    specific recipe has to set one. Restoring matters more than usual here: the
+    suite shares one process, and a leaked CROSSOVER_* changes what every later
+    test measures.
+    """
+    prev = {k: os.environ.get(k) for k in kw}
+    try:
+        for k, v in kw.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = str(v)
+        yield
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _cfg(**kw):
@@ -4572,6 +4599,75 @@ def verify_wallclock_reads_the_last_run_not_the_mean_of_a_restarted_file():
         # And the restart is surfaced, not swallowed: one recipe per directory
         # is a repo rule, and a file holding two finished runs broke it.
         assert "cxwc_attention_s1337" in v["restarted"], v["restarted"]
+
+
+@test
+def an_unrecorded_recipe_field_is_not_a_free_one():
+    """A field missing from a recipe means "ran at its default", not "no value".
+
+    `lock_recipe` backfills a field the on-disk recipe never recorded, on the
+    reasoning that it was added after the suite ran and so cannot conflict. True
+    of a field that only describes a run; false of one that changes it.
+
+    crossover50m_ratioplace32 is the live case. Its recipe.json was written
+    before `fused_ce` was a field, and E30 adds `attention` to that directory on
+    purpose, so the hybrids become a within-suite comparison. Launch that with
+    the CE unfused and the old behaviour accepted it and stamped
+    `fused_ce: false` on a directory whose 25 runs were fused -- worth 0.0037
+    nats, above the 0.0031 rerun floor, against a pre-registered +-0.005.
+
+    Both directions are pinned here, because a check that refuses the growth E30
+    needs would be worse than no check: it would be routed around.
+    """
+    import json
+    from .crossover_replicate import lock_recipe, LEGACY_RECIPE_DEFAULTS
+
+    on_disk = {
+        "batch_size": 32, "block_size": 512, "workers": 3, "budget_by_arm": None,
+        "eval_iters": 20, "token_budget": 50000000, "lr_horizon": None,
+        "arms": ["hybrid_mingru8_attn4", "hybrid_mingru10_attn2"],
+        "prefix": "cx32p", "compile": False,
+    }
+    assert "fused_ce" not in on_disk, "the point of the fixture"
+    env = dict(CROSSOVER_ARMS="hybrid_mingru8_attn4,hybrid_mingru10_attn2,attention",
+               CROSSOVER_JOB_PREFIX="cx32p", CROSSOVER_BATCH="32",
+               CROSSOVER_BLOCK="512", CROSSOVER_WORKERS="3",
+               CROSSOVER_EVAL_ITERS="20", CROSSOVER_TOKEN_BUDGET="50000000")
+
+    def attempt(**extra):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recipe.json").write_text(json.dumps(on_disk), encoding="utf-8")
+            with _env_vars(**{**env, **extra}):
+                return lock_recipe(root)
+
+    # Refuses the unfused launch, and says which field.
+    try:
+        merged = attempt(CROSSOVER_FUSED_CE="0")
+    except SystemExit as e:
+        assert "fused_ce" in str(e), e
+    else:
+        raise AssertionError(
+            f"accepted an unfused launch into a fused directory, stamping "
+            f"fused_ce={merged.get('fused_ce')!r} on 25 runs that were fused")
+
+    # Accepts the launch that matches what those runs actually did, and still
+    # grows the arm list -- which is the whole reason E30 reuses the directory.
+    merged = attempt(CROSSOVER_FUSED_CE="1")
+    assert merged["fused_ce"] is True, merged
+    assert "attention" in merged["arms"], merged["arms"]
+    assert len(merged["arms"]) == 3, merged["arms"]
+
+    # And every legacy default is the value its accessor's docstring claims.
+    from .crossover_replicate import (cluster_compile, cluster_fused_ce,
+                                      cluster_copy_probe)
+    with _env_vars(CROSSOVER_COMPILE="", CROSSOVER_FUSED_CE="",
+                  CROSSOVER_COPY_PROBE=""):
+        live = {"compile": cluster_compile(), "fused_ce": cluster_fused_ce(),
+                "copy_probe": cluster_copy_probe()}
+    assert live == LEGACY_RECIPE_DEFAULTS, (
+        f"a legacy default drifted from the accessor's default: {live} vs "
+        f"{LEGACY_RECIPE_DEFAULTS}")
 
 
 def main():

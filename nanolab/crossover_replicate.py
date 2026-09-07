@@ -981,6 +981,32 @@ def current_recipe() -> dict:
     }
 
 
+# What a recipe field was worth on the runs that predate it.
+#
+# `lock_recipe` treats a field missing from an on-disk recipe as "added after
+# this suite ran", and backfills it from the launch in hand. That is right for a
+# field that only DESCRIBES a run, and wrong for one that CHANGES it: the runs
+# on disk did not have no value for `fused_ce`, they had the value it had when
+# they ran. Backfilling the other one stamps the directory with a recipe none of
+# its runs used, and pools the two.
+#
+# It is a live confound, not a hypothetical: crossover50m_ratioplace32 holds 25
+# runs under a recipe written before `fused_ce` existed, and E30 adds `attention`
+# to that very directory on purpose. Unfusing is worth 0.0037 nats -- measured,
+# above the 0.0031 rerun floor -- against a pre-registered +-0.005.
+#
+# Only fields whose legacy value this repo can actually state are listed. Each
+# is asserted by its accessor's docstring ("as every committed run"); a field
+# whose past this repo cannot reconstruct does not belong here, because a WRONG
+# legacy default would refuse good directories and teach the next reader to
+# route around the check.
+LEGACY_RECIPE_DEFAULTS: dict[str, object] = {
+    "compile": False,     # cluster_compile: hardcoded off until 2026-09-05
+    "fused_ce": True,     # cluster_fused_ce: crossover50m has set it since the 3070 Ti
+    "copy_probe": False,  # cluster_copy_probe: E34 is the first board to log it
+}
+
+
 def lock_recipe(out_root: Path) -> dict:
     """Refuse to mix two training recipes in one out dir."""
     rec = current_recipe()
@@ -993,6 +1019,13 @@ def lock_recipe(out_root: Path) -> dict:
         # shared field still refuses, which is the point of the lock.
         conflicts = {k: (old[k], rec[k]) for k in old.keys() & rec.keys()
                      if old[k] != rec[k]}
+        # A field the old recipe never recorded still had a value on those runs.
+        # Where this repo knows what it was, compare against it rather than
+        # waving the field through -- see LEGACY_RECIPE_DEFAULTS.
+        conflicts.update({
+            k: (f"unrecorded, ran as {v!r}", rec[k])
+            for k, v in LEGACY_RECIPE_DEFAULTS.items()
+            if k not in old and k in rec and rec[k] != v})
         # Adding an arm is not mixing recipes. Every field that decides how a
         # job trains -- batch, budget, lr_horizon, eval_iters, block, device --
         # is compared as before; `arms` alone is allowed to GROW, because a new
