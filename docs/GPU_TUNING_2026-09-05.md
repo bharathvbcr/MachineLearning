@@ -721,6 +721,34 @@ Two trained arms at seed 1337 (`cx32loop_attention_s1337` vs `cx32loop_attn6_s13
 
 ---
 
+## What the tuning actually bought, measured on a real board
+
+Everything above is probe work. The first board run under the tuned recipe is
+E31 (`crossover50m_tie32`, 20 jobs, 50M tokens, tenancy 3, compile on), and it
+gives the number the probes were trying to predict:
+
+| | per job | mean rate |
+|---|---:|---:|
+| 50M-token job, compiled, tenancy 3 | **630 s** | **79.3K tok/s** |
+| the same jobs' step-loop rate | — | 90.0K tok/s |
+
+The step-loop rate over-reads the thing that matters by **13%**, on the same
+runs, at the same moment. That is the third time this sprint a step-loop probe
+came in optimistic, and it is worth stating as a rule rather than an anecdote:
+**a step-loop probe is an upper bound on a board, not an estimate of one.**
+
+The reason is not subtle once you count it. `eval_iters=20`, 61 evaluations per
+run, batch 32, ctx 512 is 20M tokens of forward pass **per run** — at the 20M
+budget, as much compute as the training it is measuring. Wall-clock rates sit
+below step-loop rates because a run is not only its step loop.
+
+**Do not price the compile factor by scaling the old eager figure.** The 844 s /
+20M measurement was taken at a different budget, where those fixed costs
+amortise differently. E30 phase (a) runs eager at *exactly* this shape, budget
+and tenancy — because `crossover50m_ratioplace32`'s recipe records
+`compile: false` and the comparison has to stay within-suite — so the program
+produces a directly measured eager control for free. Use that.
+
 ## Archive
 
 Run metadata for **982 runs** across 102 suites is at
@@ -729,24 +757,49 @@ Run metadata for **982 runs** across 102 suites is at
 archive can be checked without downloading it. Every table in this report and in
 `docs/SWA_BOARD_2026-08-31.md` recomputes from that metadata alone.
 
-**Weights are NOT archived, and the manifest says so explicitly.** They exist
-only on the rented box and die with it:
+**Weights ARE archived, as a stated subset** (2026-09-07). 49 objects, 25.8 GB,
+at `checkpoints/<suite>/<run>/final.pt`, indexed by
+`checkpoints/manifest-september-2026.json`.
 
-| | files | size |
-|---|---:|---:|
-| `ckpt.pt` (resume state) | 378 | 523.6 GB |
-| `best.pt` | 453 | 272.9 GB |
-| `final.pt` | 453 | 272.9 GB |
+Selection rule: **one `final.pt` per (suite, arm), lowest seed present**, across
+the nine suites that back a claim. Not `best.pt` — repo rule 7 reads `final_val`
+and never `best_val`, so archiving a checkpoint selected by the statistic the
+repo refuses to quote would be archiving the wrong file. Not `ckpt.pt` — that is
+optimizer moments and RNG state for runs that have already **finished**, which is
+both the largest thing on the box and the least useful.
 
-The box has the AWS CLI but **no credentials**, so weights would have to
-double-hop through a laptop. To archive them, run `aws configure` on the box
-yourself and then `scripts/archive_to_s3.sh` there — it excludes `ckpt.pt` by
-default, which is the right call: 523.6 GB of resume state for runs that have
-already finished. Set `SUITES` to cover this sprint's directories, which the
-script's default list does not:
+| | files | size | archived |
+|---|---:|---:|---|
+| `ckpt.pt` (resume state) | 378 | 523.6 GB | no |
+| `best.pt` | 453 | 272.9 GB | no |
+| `final.pt`, all seeds | 453 | 272.9 GB | no |
+| `final.pt`, one per (suite, arm), 9 suites | **49** | **25.8 GB** | **yes** |
 
-```bash
-S3=s3://mlsystemslab-artifacts-511192439661/checkpoints \
-SUITES="crossover_ladder1536 crossover_ladder1536_mingru crossover50m_swa32 crossover50m_swa2k" \
-bash scripts/archive_to_s3.sh
-```
+The exclusions are recorded in the manifest with reasons, not just omitted. The
+two that are judgement rather than arithmetic:
+
+- **`crossover50m_moe32`, `_moe32b`, `_moe32c` (59.4 GB) — superseded.** Every
+  `moe_e*k1` run in them renormalises the top-1 router weight to exactly 1, so
+  the gate never saw a task gradient. E29 is the rerun that fixes it. Keeping
+  the weights of a board whose conclusion is being retested invites someone to
+  load them.
+- **The other four seeds of every kept arm (96.8 GB).** The seed spread is the
+  point of five seeds, and it lives in `metrics.jsonl` — archived whole, and
+  tracked in git. A second copy of the same architecture at a different seed
+  adds nothing you can read off the weights that the metrics do not already say.
+
+**How they got there, given the box has no AWS credentials and should not.**
+`scripts/archive_to_s3.sh` states the rule this repo works under — *"aws
+configure # you do this; I never handle keys"* — and the box is rented hardware
+that gets destroyed. So the bytes went **direct from the box to S3** under
+12-hour presigned PUT URLs generated on the laptop (`scratchpad/presign.py`,
+pure-python SigV4; `scripts/upload_weights_presigned.sh` on the box). A
+presigned URL is scoped to one key and one verb and expires; no credential was
+installed on the box, and 25.8 GB did not travel twice to pass through a laptop.
+The URL list was mode 600 and shredded after use.
+
+**Verify by size, not by exit status.** The uploader reported one failure that
+had not happened: `curl` reports the 100-continue code after a retry, so a
+successful retried PUT reads as `100`. All 49 objects were re-checked
+byte-for-byte against their on-box sizes afterwards, and that check — not the
+log — is what establishes the archive is complete.
