@@ -39,7 +39,13 @@ fi
 for PAIRS in 4 8; do
   echo "--- E28 cell: pairs=$PAIRS steps=3000 batch=256 workers=4 $(date -u +%FT%TZ) ---"
   s=$(date +%s)
-  python3 -u -m nanolab.mqar_suite --out nanolab/out/mqar_e8 --device cuda \
+  # One directory per cell. Both cells previously wrote to nanolab/out/mqar_e8,
+  # which put two `pairs` recipes in one place AND appended into a results file
+  # that already held earlier MQAR work under the same arm names. Nothing was
+  # lost -- runs.jsonl is append-only and the run name carries pairs/batch/steps
+  # and the lr rule -- but `pairs` is not a field on the record, so separating
+  # the cells afterwards means parsing run names. Separate them up front.
+  python3 -u -m nanolab.mqar_suite --out "nanolab/out/mqar_e28_p$PAIRS" --device cuda \
     --arms "$ARMS" --pairs "$PAIRS" --steps 3000 --batch 256 \
     --seeds 15 --lr-rule sqrt --workers 4 --gpus 1 2>&1 | tail -25
   echo "e28 cell pairs=$PAIRS elapsed=$(( $(date +%s) - s ))s $(date -u +%FT%TZ)"

@@ -13,6 +13,15 @@ arms and markers), the sign count, and the mean-curve crossing tokens.
 No GPU. Reads ``metrics.jsonl`` + ``config.json`` only; refuses a pair whose
 recipes differ on anything but the arm (batch, block, eval_iters, token budget),
 because a cross-recipe pairing is exactly the error PAPER section 4 is about.
+
+"The arm" includes the fields the REGISTRY declares for it. An arm registered
+with an ``lr`` override is "that shape at that learning rate" -- the LR is what
+distinguishes it from its siblings, not drift between two runs meant to match --
+so a difference on a field either arm declares is waved through and named in the
+header. A difference on a field NEITHER arm declares still refuses, which is the
+accidental mismatch this guard exists to catch. Without this, a board run at each
+arm's own measured optimum cannot be read at all: the comparison it exists to
+make is the one the guard rejects.
 Cross-SUITE pairing at one recipe is allowed and labelled: it is valid at this
 recipe only because fresh attention arms reproduced suite 22's per seed within
 +-0.001 (E18, E19b), and the label says so.
@@ -31,11 +40,29 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from nanolab.crossover_replicate import _arm_from_run_dir  # noqa: E402
+from nanolab.crossover_replicate import ARMS, _arm_from_run_dir  # noqa: E402
 
 T4 = {"95%": 2.776445, "99%": 4.604095, "99.9%": 8.610302}   # two-sided, 4 dof
 RECIPE_KEYS = ("batch_size", "block_size", "eval_iters", "max_steps", "lr_max_steps",
                "lr", "matrix_lr", "warmup_steps", "schedule", "optimizer")
+
+
+def declared_keys(*arm_names: str) -> set[str]:
+    """Config keys the registry sets as part of these arms' identity.
+
+    Read from ``ARMS``, the canonical owner, rather than from the run configs --
+    a config cannot say whether a value was chosen for the arm or drifted into
+    it, and that distinction is the whole point of the guard. An arm the registry
+    does not know contributes nothing, so an unregistered name cannot widen the
+    exemption.
+    """
+    spec = {a.name: a for a in ARMS}
+    out: set[str] = set()
+    for name in arm_names:
+        arm = spec.get(name)
+        if arm is not None:
+            out |= {k for k, _ in (arm.overrides or ())}
+    return out
 
 
 def load_arm(suite: str, arm: str) -> dict:
@@ -62,6 +89,21 @@ def load_arm(suite: str, arm: str) -> dict:
             elif r.get("event") == "done":
                 final = r.get("final_val")
         if curve:
+            # The token axis is what every marker and crossing in this file is
+            # read against, and before D1 a resumed run restarted `tokens` at 0
+            # while `step` carried on -- so the axis went backwards mid-curve and
+            # `at()` interpolated across the fold without complaining. That is
+            # how a crossing analysis once found no crossing at all. Refuse the
+            # run rather than return a curve that looks fine and is not: a check
+            # that cannot run must not report what a passing check reports.
+            fold = next((i for i in range(1, len(curve))
+                         if curve[i][0] <= curve[i - 1][0]), None)
+            if fold is not None:
+                raise SystemExit(
+                    f"REFUSING {d.name}: its token axis goes backwards at eval "
+                    f"{fold} ({curve[fold - 1][0]} -> {curve[fold][0]}). This is "
+                    "a pre-D1 resumed run; re-read it keyed on `step`, or rerun "
+                    "it on the fixed harness.")
             rec = {k: cfg.get(k) for k in RECIPE_KEYS}
             # Older suites recorded lr_max_steps=0 (= "decay over max_steps");
             # newer ones record the number itself. Same schedule, one spelling.
@@ -114,12 +156,23 @@ def main() -> None:
         if len(seeds) < 2:
             print(f"{spec}: fewer than 2 shared seeds with {a.ref}; nothing to pair")
             continue
+        declared = declared_keys(arm, ref_arm)
+        by_design: set[str] = set()
         for s in seeds:
             if cur[s]["recipe"] != ref[s]["recipe"]:
-                bad = {k: (cur[s]["recipe"][k], ref[s]["recipe"][k]) for k in RECIPE_KEYS
-                       if cur[s]["recipe"][k] != ref[s]["recipe"][k]}
-                raise SystemExit(f"REFUSING to pair {spec} with {a.ref}: recipes differ on {bad}")
+                differ = {k for k in RECIPE_KEYS
+                          if cur[s]["recipe"][k] != ref[s]["recipe"][k]}
+                by_design |= differ & declared
+                bad = {k: (cur[s]["recipe"][k], ref[s]["recipe"][k])
+                       for k in differ - declared}
+                if bad:
+                    raise SystemExit(
+                        f"REFUSING to pair {spec} with {a.ref}: recipes differ on {bad}")
         tag = "within-suite" if suite == ref_suite else "CROSS-SUITE (valid at this recipe only)"
+        if by_design:
+            # Named, never silent: a reader must not have to check the registry to
+            # learn that the two arms were trained at different learning rates.
+            tag += ", arms differ BY DESIGN on " + ", ".join(sorted(by_design))
         print(f"\n== {spec} minus {a.ref}   seeds {seeds}   {tag}")
         last = max(t for t, _ in cur[seeds[0]]["curve"])
         rows = [(f"{float(x)/1e6:.2f}M", float(x)) for x in a.markers.split(",")] + [("last eval", last)]

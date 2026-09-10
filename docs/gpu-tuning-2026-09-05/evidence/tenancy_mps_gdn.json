@@ -1,0 +1,37 @@
+{
+  "arm": "gdn",
+  "batch": 32,
+  "block": 512,
+  "seconds": 45.0,
+  "rows": {
+    "1": {
+      "ok": true,
+      "n": 1,
+      "agg_tok_s": 29871.343528224923,
+      "per_job_tok_s": 29871.343528224923,
+      "sum_peak_gb": 25.614482432,
+      "sum_reserved_gb": 26.789019648,
+      "spread": 1.0
+    },
+    "2": {
+      "ok": true,
+      "n": 2,
+      "agg_tok_s": 51798.01350753056,
+      "per_job_tok_s": 25899.00675376528,
+      "sum_peak_gb": 51.228964864,
+      "sum_reserved_gb": 53.578039296,
+      "spread": 1.0130225922343765
+    },
+    "3": {
+      "ok": true,
+      "n": 3,
+      "agg_tok_s": 57434.80419869696,
+      "per_job_tok_s": 19144.934732898986,
+      "sum_peak_gb": 76.843447296,
+      "sum_reserved_gb": 80.36705894400001,
+      "spread": 1.1202317535523838
+    }
+  },
+  "best_tenancy": 3,
+  "speedup_vs_t1": 1.9227392348264414
+}

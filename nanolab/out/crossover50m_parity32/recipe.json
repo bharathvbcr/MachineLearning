@@ -1,0 +1,29 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "workers": 3,
+  "gpus": 1,
+  "budget_by_arm": null,
+  "arm_overrides": {
+    "hybrid_mingru8_attn4_x1": {
+      "mingru_expand": 1
+    },
+    "hybrid_mingru_periodic_x1": {
+      "mingru_expand": 1
+    }
+  },
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "copy_probe": false,
+  "token_budget": 50000000,
+  "lr_horizon": null,
+  "arms": [
+    "attention",
+    "hybrid_mingru8_attn4_x1",
+    "hybrid_mingru_periodic_x1"
+  ],
+  "prefix": "cx32par",
+  "device": "NVIDIA GH200 480GB",
+  "compile": true,
+  "fused_ce": true
+}

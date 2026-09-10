@@ -1,0 +1,56 @@
+{
+  "jobs": [
+    {
+      "id": "smke35_w384_attention_lr80_s1337",
+      "arm": "w384_attention_lr80",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 384, LR x8.0",
+      "status": "done",
+      "worker": 2,
+      "started": 1788785327.7697704,
+      "finished": 1788785358.7215319,
+      "detail": "best_val=6.482023"
+    },
+    {
+      "id": "smke35_w384_mingru_lr40_s1337",
+      "arm": "w384_mingru_lr40",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 384, LR x4.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1788785327.792524,
+      "finished": 1788785390.4864311,
+      "detail": "best_val=6.126893"
+    },
+    {
+      "id": "smke35_w384_hybrid_mingru8_attn4_lr40_s1337",
+      "arm": "w384_hybrid_mingru8_attn4_lr40",
+      "mixer": "mingru",
+      "layer_mixers": "mingru*8,attention*4",
+      "seed": 1337,
+      "note": "8+4 at d_model 384, LR x4",
+      "status": "done",
+      "worker": 1,
+      "started": 1788785327.7973533,
+      "finished": 1788785398.9296026,
+      "detail": "best_val=6.093246"
+    },
+    {
+      "id": "smke35_w384_hybrid_mingru8_attn4_lr80_s1337",
+      "arm": "w384_hybrid_mingru8_attn4_lr80",
+      "mixer": "mingru",
+      "layer_mixers": "mingru*8,attention*4",
+      "seed": 1337,
+      "note": "8+4 at d_model 384, LR x8",
+      "status": "done",
+      "worker": 2,
+      "started": 1788785358.8558757,
+      "finished": 1788785400.6941006,
+      "detail": "best_val=6.034128"
+    }
+  ]
+}

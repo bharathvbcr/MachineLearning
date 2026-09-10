@@ -1,0 +1,60 @@
+--- /tmp/cr_backup.py	2026-09-05 16:47:33.392020115 +0000
++++ nanolab/crossover_replicate.py	2026-09-05 16:47:33.406020276 +0000
+@@ -843,6 +843,38 @@
+     return os.environ.get("CROSSOVER_COMPILE", "").strip() in ("1", "true", "yes")
+ 
+ 
++def cluster_fused_ce() -> bool:
++    """The chunked cross-entropy. Default ON, as every committed run.
++
++    `crossover50m` sets fused_ce=True, and the comment above it dates the
++    choice: the measured throughput peak "on the 3070 Ti (8 GB)", where chunks
++    16 "frees the VRAM ... that lets bs32 fit". VRAM is not the binding
++    constraint on a 94.5 GiB card, and the setting stopped being free the
++    moment compile became available: Inductor fuses the CE reduction itself, so
++    the hand-written chunking blocks the fusion it exists to provide.
++
++    Measured 2026-09-05 on the GH200, attention, bs32/ctx512, one fwd+bwd:
++
++        fused/16 eager     113.6K tok/s   15.2 GB   <- what the suite runs
++        fused/16 compiled  220.5K tok/s   12.6 GB
++        unfused  eager     146.4K tok/s   26.4 GB
++        unfused  compiled  342.6K tok/s   14.5 GB   <- 3.02x, and lighter
++
++    Unfused is the memory-hungry option only while eager. Compiled it costs
++    +1.9 GB over fused and still undercuts today's fused-eager footprint.
++
++    Recorded in the recipe for the same reason `compile` is: it moves the loss
++    in the last places (9.9e-7 relative on attention, 2.2e-5 on the 8+4 hybrid,
++    both far under the 0.0031 nat rerun floor) and two runs that differ on it
++    must not pool. fused_ce_chunks 16 and 4 are bit-identical, so the chunk
++    count is not a second knob.
++    """
++    raw = os.environ.get("CROSSOVER_FUSED_CE", "").strip().lower()
++    if not raw:
++        return True
++    return raw in ("1", "true", "yes")
++
++
+ def cluster_copy_probe() -> bool:
+     """E34: log the repeated-span copy loss at every eval. Recorded in the
+     recipe (a launch that turns it on in a directory that ran without it is a
+@@ -925,6 +957,10 @@
+         # in a repo whose paper is about rankings moving with the recipe.
+         "device": live_device_name() or None,
+         "compile": cluster_compile(),
++        # Changes throughput 1.55x at equal memory once compiled, and the loss
++        # in the last places. Unrecorded, it would let a fused run pool with an
++        # unfused one -- the confound `compile` is recorded to prevent.
++        "fused_ce": cluster_fused_ce(),
+     }
+ 
+ 
+@@ -1234,6 +1270,7 @@
+         eval_iters=cluster_eval_iters(),
+         copy_probe=cluster_copy_probe(),
+         compile=cluster_compile(),
++        fused_ce=cluster_fused_ce(),
+         mem_fraction=0.0,
+     )
+     # Applied last: an arm's own knobs (e.g. the SWA window) are what makes it

@@ -1,0 +1,151 @@
+{
+  "datapath": {
+    "n_tokens": 497500000,
+    "corpus_gib": 1.8533319234848022,
+    "free_needed_gib": 9.266659617424011,
+    "free_now_gib": 93.81805419921875,
+    "total_gib": 94.5,
+    "path_when_empty": "gpu_resident",
+    "free_after_hold_gib": 7.41180419921875,
+    "should_gpu_resident_after_hold": false,
+    "path_when_squeezed": "memmap",
+    "same_first_batch": false,
+    "first_row_gpu": [
+      247,
+      82,
+      2057,
+      12,
+      44708,
+      1410,
+      290,
+      262
+    ],
+    "first_row_memmap": [
+      393,
+      7734,
+      416,
+      4737,
+      257,
+      1545,
+      11,
+      1641
+    ],
+    "VERDICT": "HAZARD: same seed, different tokens -- the sampler that runs depends on free VRAM at construction"
+  },
+  "gdnchunk": {
+    "speed": {
+      "16": {
+        "tok_s": 14508.079107888214,
+        "ms_per_step": 1129.3018102645874,
+        "peak_mem_gb": 25.577115136,
+        "fwd_ms": 382.9806304931641,
+        "bwd_ms": 721.5950378417969
+      },
+      "32": {
+        "tok_s": 26878.920779644835,
+        "ms_per_step": 609.548282623291,
+        "peak_mem_gb": 25.601744384,
+        "fwd_ms": 228.0060592651367,
+        "bwd_ms": 365.1304046630859
+      },
+      "64": {
+        "tok_s": 46267.943346653425,
+        "ms_per_step": 354.11126613616943,
+        "peak_mem_gb": 27.861937664,
+        "fwd_ms": 148.92261199951173,
+        "bwd_ms": 192.26449432373047
+      },
+      "128": {
+        "tok_s": 53174.63313595686,
+        "ms_per_step": 308.11684131622314,
+        "peak_mem_gb": 33.314123264,
+        "fwd_ms": 115.58068313598633,
+        "bwd_ms": 180.9960479736328
+      },
+      "256": {
+        "tok_s": 44312.07541363948,
+        "ms_per_step": 369.74120140075684,
+        "peak_mem_gb": 44.63659776,
+        "fwd_ms": 147.01683959960937,
+        "bwd_ms": 211.74972076416014
+      }
+    },
+    "agreement": {
+      "16": {
+        "chunk_attr": 16,
+        "max_abs_vs_sequential": 0.0,
+        "rel_rms_vs_sequential": NaN
+      },
+      "32": {
+        "chunk_attr": 32,
+        "max_abs_vs_sequential": 0.0,
+        "rel_rms_vs_sequential": NaN
+      },
+      "64": {
+        "chunk_attr": 64,
+        "max_abs_vs_sequential": 0.0,
+        "rel_rms_vs_sequential": NaN
+      },
+      "128": {
+        "chunk_attr": 128,
+        "max_abs_vs_sequential": 0.0,
+        "rel_rms_vs_sequential": NaN
+      },
+      "256": {
+        "chunk_attr": 256,
+        "max_abs_vs_sequential": 0.0,
+        "rel_rms_vs_sequential": NaN
+      }
+    }
+  },
+  "evalsync": {
+    "as_written": {
+      "ms": 297.91259765625,
+      "val": 15.3496732711792
+    },
+    "deferred": {
+      "ms": 297.15267817179364,
+      "val": 15.347732543945312
+    },
+    "identical": false,
+    "speedup": 1.0025573368180012,
+    "saved_s_per_50M_run": 0.046355088551838036
+  },
+  "moereal": {
+    "attention": {
+      "ms_per_step": 143.51526896158853,
+      "tok_s": 114162.06873698668,
+      "peak_gb": 16.4348672
+    },
+    "moe_e1k1": {
+      "ms_per_step": 156.62039120992026,
+      "tok_s": 104609.62249826283,
+      "peak_gb": 17.044850688
+    },
+    "moe_e1k1_raw": {
+      "ms_per_step": 156.3735644022624,
+      "tok_s": 104774.74285777014,
+      "peak_gb": 17.043277824
+    },
+    "moe_e4k1": {
+      "ms_per_step": 298.3635902404785,
+      "tok_s": 54912.86650222514,
+      "peak_gb": 18.853878272
+    },
+    "moe_e4k1_raw": {
+      "ms_per_step": 267.0053164164225,
+      "tok_s": 61362.07405865826,
+      "peak_gb": 18.864654848
+    },
+    "moe_e8k1": {
+      "ms_per_step": 426.72859827677405,
+      "tok_s": 38394.426964028826,
+      "peak_gb": 21.150861824
+    },
+    "moe_e8k1_raw": {
+      "ms_per_step": 370.7703113555908,
+      "tok_s": 44189.082831626096,
+      "peak_gb": 21.147131904
+    }
+  }
+}

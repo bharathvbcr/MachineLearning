@@ -7,9 +7,11 @@
       "layer_mixers": "",
       "seed": 1337,
       "note": "E21 ladder: d_model 1536, LR x8.0",
-      "status": "running",
+      "status": "done",
       "worker": 1,
-      "started": 1788587286.462116
+      "started": 1788644240.8630774,
+      "finished": 1788645291.040598,
+      "detail": "best_val=4.449502"
     },
     {
       "id": "cx32lad1536_w1536_attention_lr80_s42",
@@ -18,9 +20,11 @@
       "layer_mixers": "",
       "seed": 42,
       "note": "E21 ladder: d_model 1536, LR x8.0",
-      "status": "running",
+      "status": "done",
       "worker": 0,
-      "started": 1788587286.490245
+      "started": 1788644240.8911874,
+      "finished": 1788645296.5258155,
+      "detail": "best_val=4.414424"
     },
     {
       "id": "cx32lad1536_w1536_attention_lr80_s100",
@@ -29,7 +33,11 @@
       "layer_mixers": "",
       "seed": 100,
       "note": "E21 ladder: d_model 1536, LR x8.0",
-      "status": "pending"
+      "status": "done",
+      "worker": 1,
+      "started": 1788645291.0618968,
+      "finished": 1788647317.7200732,
+      "detail": "best_val=4.406881"
     },
     {
       "id": "cx32lad1536_w1536_attention_lr80_s2026",
@@ -38,7 +46,11 @@
       "layer_mixers": "",
       "seed": 2026,
       "note": "E21 ladder: d_model 1536, LR x8.0",
-      "status": "pending"
+      "status": "done",
+      "worker": 0,
+      "started": 1788645297.1444876,
+      "finished": 1788647327.0844214,
+      "detail": "best_val=4.419106"
     },
     {
       "id": "cx32lad1536_w1536_attention_lr80_s777",
@@ -47,7 +59,11 @@
       "layer_mixers": "",
       "seed": 777,
       "note": "E21 ladder: d_model 1536, LR x8.0",
-      "status": "pending"
+      "status": "done",
+      "worker": 1,
+      "started": 1788618321.1993825,
+      "finished": 1788619703.8548884,
+      "detail": "best_val=4.415069"
     },
     {
       "id": "cx32lad1536_w1536_mingru_lr20_s1337",
@@ -56,7 +72,7 @@
       "layer_mixers": "",
       "seed": 1337,
       "note": "E21 ladder: d_model 1536, LR x2.0",
-      "status": "pending"
+      "status": "held"
     },
     {
       "id": "cx32lad1536_w1536_mingru_lr20_s42",
@@ -65,7 +81,7 @@
       "layer_mixers": "",
       "seed": 42,
       "note": "E21 ladder: d_model 1536, LR x2.0",
-      "status": "pending"
+      "status": "held"
     },
     {
       "id": "cx32lad1536_w1536_mingru_lr20_s100",
@@ -74,7 +90,7 @@
       "layer_mixers": "",
       "seed": 100,
       "note": "E21 ladder: d_model 1536, LR x2.0",
-      "status": "pending"
+      "status": "held"
     },
     {
       "id": "cx32lad1536_w1536_mingru_lr20_s2026",
@@ -83,7 +99,7 @@
       "layer_mixers": "",
       "seed": 2026,
       "note": "E21 ladder: d_model 1536, LR x2.0",
-      "status": "pending"
+      "status": "held"
     },
     {
       "id": "cx32lad1536_w1536_mingru_lr20_s777",
@@ -92,6 +108,51 @@
       "layer_mixers": "",
       "seed": 777,
       "note": "E21 ladder: d_model 1536, LR x2.0",
+      "status": "held"
+    },
+    {
+      "id": "cx32lad1536_w1536_attention_lr05_s1337",
+      "arm": "w1536_attention_lr05",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x0.5",
+      "status": "pending"
+    },
+    {
+      "id": "cx32lad1536_w1536_attention_lr05_s42",
+      "arm": "w1536_attention_lr05",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "E21 ladder: d_model 1536, LR x0.5",
+      "status": "pending"
+    },
+    {
+      "id": "cx32lad1536_w1536_attention_lr05_s100",
+      "arm": "w1536_attention_lr05",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "E21 ladder: d_model 1536, LR x0.5",
+      "status": "pending"
+    },
+    {
+      "id": "cx32lad1536_w1536_attention_lr05_s2026",
+      "arm": "w1536_attention_lr05",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 2026,
+      "note": "E21 ladder: d_model 1536, LR x0.5",
+      "status": "pending"
+    },
+    {
+      "id": "cx32lad1536_w1536_attention_lr05_s777",
+      "arm": "w1536_attention_lr05",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 777,
+      "note": "E21 ladder: d_model 1536, LR x0.5",
       "status": "pending"
     }
   ]

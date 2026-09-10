@@ -1,0 +1,46 @@
+{
+  "arm": "w384_mingru_lr40",
+  "batch": 32,
+  "block": 512,
+  "seconds": 45.0,
+  "rows": {
+    "1": {
+      "ok": true,
+      "n": 1,
+      "agg_tok_s": 176889.831418172,
+      "per_job_tok_s": 176889.831418172,
+      "sum_peak_gb": 10.88033536,
+      "sum_reserved_gb": 11.542724608,
+      "spread": 1.0
+    },
+    "2": {
+      "ok": true,
+      "n": 2,
+      "agg_tok_s": 161837.62124272395,
+      "per_job_tok_s": 80918.81062136198,
+      "sum_peak_gb": 21.76067072,
+      "sum_reserved_gb": 23.085449216,
+      "spread": 1.000720661079528
+    },
+    "3": {
+      "ok": true,
+      "n": 3,
+      "agg_tok_s": 162715.39814919292,
+      "per_job_tok_s": 54238.466049730974,
+      "sum_peak_gb": 32.64100608,
+      "sum_reserved_gb": 34.628173824,
+      "spread": 1.00610900240887
+    },
+    "4": {
+      "ok": true,
+      "n": 4,
+      "agg_tok_s": 162587.16270147573,
+      "per_job_tok_s": 40646.79067536893,
+      "sum_peak_gb": 43.52134144,
+      "sum_reserved_gb": 46.170898432,
+      "spread": 1.0082118460812348
+    }
+  },
+  "best_tenancy": 1,
+  "speedup_vs_t1": 1.0
+}

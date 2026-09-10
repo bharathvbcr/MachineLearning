@@ -5,7 +5,8 @@
 # Pre-registered: rate inside attention's Wilson interval at every cell ->
 # no-regret on both metrics.
 source "$(dirname "$0")/_stage_common.sh"
-stage_wait; stage_start e32
+stage_wait || stage_refused e32
+stage_start e32
 rc_any=0
 for STEPS in 3000 9000; do for PAIRS in 4 8; do
   python3 -u -m nanolab.mqar_suite --out nanolab/out/mqar_e8 --device cuda \

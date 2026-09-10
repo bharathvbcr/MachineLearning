@@ -3,6 +3,71 @@
 Written 2026-09-04. Closes the `EXPERIMENT_BACKLOG_2026-08-26.md` scale-ladder
 item, which had been parked as "blocked on the µP decision" since it was filed.
 
+> **STATUS 2026-09-09 — phase 1's headline is horizon-local, and phase 2 inherited
+> it.** This doc's "attention peaks at 8× base at every width; minGRU peaks at 4× at
+> every width" is a **10M-token** result and does not survive at 50M. The 50M grid has
+> now been run to an interior minimum in every cell (G8a/G8b/G8d, 0.25x-8x):
+>
+> | width | attention | minGRU | best `lr` | width x lr |
+> |---|---|---|---|---|
+> | 384 | **2x** | **2x** | 0.0012 | 0.4608 |
+> | 768 | **1x** | **1x** | 0.0006 | 0.4608 |
+> | 1152 | **0.667x** | **0.667x** [dagger] | 0.0004 | **0.4608** |
+> | 1536 | **0.5x** | **0.5x** | 0.0003 | 0.4608 |
+>
+>
+> **Every argmin now carries n=3, and none of them moved (G11b, 2026-09-10).** That was
+> the pre-registered test: *any argmin that shifts once its own point carries three seeds
+> was never located*. Each width's argmin and its tight-side neighbour were run at seeds
+> 1337/42/100, and every cell returned the same multiplier it had at n=1. Margins are
+> paired on the three seeds each pair shares, so seed-to-seed spread — which on these
+> boards reaches 0.0574, eighteen times the rerun floor — is differenced out rather than
+> averaged in:
+>
+> | width | mixer | argmin | runner-up | paired margin (n=3) | verdict |
+> |---|---|---|---|---|---|
+> | 384 | attention | 2x | 1x | +0.0144, 3/3 | resolved |
+> | 384 | minGRU | 2x | 1x | +0.0155, 3/3 | resolved |
+> | 768 | attention | 1x | 0.5x | +0.0391, 3/3 | resolved |
+> | 768 | minGRU | 1x | 0.5x | +0.0529, 3/3 | resolved |
+> | 1152 | attention | 0.667x | 1x | +0.0053, 3/3 | resolved |
+> | 1152 | minGRU | 0.667x | 1x | +0.0024, 3/3 | **flat — under the 0.0031 floor** |
+> | 1536 | attention | 0.5x | 1x | +0.0125, 3/3 | resolved |
+> | 1536 | minGRU | 0.5x | 1x | +0.0067, 3/3 | resolved |
+>
+> **Seven of the eight cells are resolved; `width x lr = 0.4608` holds at all eight.** The
+> exception is d1152 minGRU, where 0.667x leads 1x by 0.0024 — the right sign on 3 of 3
+> seeds, but under the floor, so it is reported as consistent with the law rather than
+> evidence for it.
+>
+> [dagger] d1152 was re-probed at the law's own point by G11b (2026-09-10), paired on 3
+> seeds. Attention's 0.667x beats **both** neighbours above the 0.0031 rerun floor --
+> 0.0100 over 0.5x (3/3) and 0.0053 over 1x (3/3) -- so the argmin there is **located**.
+> minGRU's 0.667x beats 0.5x by 0.0167 (3/3) but leads 1x by only +0.0024, *inside* the
+> floor: right sign, unresolved magnitude. Read minGRU's row as consistent with 0.667x,
+> not as evidence for it.
+>
+> **Phase 1's other conclusion -- that the argmin is width-invariant -- is the one that
+> breaks.** It holds at 10M and fails at 50M, where **all four widths** now sit exactly on
+> `lr` proportional to `1/width`. d1152 was the lone exception while the grid was 2x-spaced
+> -- 0.5x and 1x differ by 0.0064 there, straddling the prediction -- and G11b resolved it
+> by running the predicted point itself: the argmin was never at 1x, it is at 0.667x, and
+> `width x lr = 0.4608` holds at every rung. The two mixers still agree with each other at
+> every width, so the *asymmetry* this doc reports -- attention and minGRU wanting
+> different rates -- is also a 10M phenomenon and is gone at 50M.
+>
+> These runs have `mup: False`, so nothing applied a width divisor: hand-tuning each width
+> recovered muP's own 1/width prescription with muP switched off. Still labelled
+> **inferred**: d384/d768/d1536 were located on 2x-spaced grids and only d1152 has been
+> probed at the law's own point, so the constant is measured at one width and consistent
+> at three.
+>
+> So **"Phase 2 — the ladder at each cell's own best LR" is a misnomer**: phase 2 ran at
+> each cell's own best LR *for a 610-step run*, and spent it over 3051 steps. The phase-2
+> endpoint numbers stand as a comparison across widths at a **fixed 10M-derived LR
+> protocol**; they are not a comparison of arms at their own optima. See
+> `docs/GAP_PLAN_2026-09-07.md` §2.2b.
+
 Every board in this repo before this one is a single scale: `d_model` 768. The
 loudest reviewer objection to the paper is therefore not about any individual
 result, it is that the whole catalogue is one point in width. E21 answers it.
@@ -43,6 +108,8 @@ Final grid, `final_val` at 10M tokens:
 | 1152 | 5.1924 | **5.1541** | 5.1877 | 5.2796 | | 5.0002 | **4.9947** | 5.0479 |
 
 **Attention peaks at 8× base at every width; minGRU peaks at 4× at every width.**
+[SUPERSEDED 2026-09-09 -- true at this 10M probe; at 50M both mixers agree with each
+other and the argmin falls with width (2x/1x/1x/0.5x). See the status note above.]
 A consistent 2× separation, stable across a 3× span in width, with the curve
 turning over on both sides in every cell.
 

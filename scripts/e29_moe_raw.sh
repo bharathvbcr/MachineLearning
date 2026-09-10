@@ -12,7 +12,8 @@
 # parameters still not the bottleneck at 0.4 tokens/param; disjointly better ->
 # E19's conclusion was a router artifact.
 source "$(dirname "$0")/_stage_common.sh"
-stage_wait; stage_start e29
+stage_wait || stage_refused e29
+stage_start e29
 export CROSSOVER_ARMS=attention,moe_e1k1_raw,moe_e4k1_raw,moe_e8k1_raw
 export CROSSOVER_JOB_PREFIX=cx32moed
 python3 -u -m nanolab.crossover_replicate launch --out nanolab/out/crossover50m_moe32d --workers 2

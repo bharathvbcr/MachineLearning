@@ -1,0 +1,30 @@
+{
+  "jobs": [
+    {
+      "id": "cx32lad1536redo_w1536_attention_lr80_s1337",
+      "arm": "w1536_attention_lr80",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x8.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1789031391.525206,
+      "finished": 1789032389.2993786,
+      "detail": "best_val=4.424176"
+    },
+    {
+      "id": "cx32lad1536redo_w1536_attention_lr80_s42",
+      "arm": "w1536_attention_lr80",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "E21 ladder: d_model 1536, LR x8.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1789032393.191847,
+      "finished": 1789033388.8845103,
+      "detail": "best_val=4.420038"
+    }
+  ]
+}

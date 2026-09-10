@@ -9,7 +9,8 @@
 # Pre-registered: does the 50M crossing token scale with the budget, and what
 # is the ordering at ~5 tokens/param.
 source "$(dirname "$0")/_stage_common.sh"
-stage_wait; stage_start e35
+stage_wait || stage_refused e35
+stage_start e35
 export CROSSOVER_TOKEN_BUDGET=200000000
 export CROSSOVER_ARMS=w384_attention_lr80,w384_mingru_lr40,w384_hybrid_mingru8_attn4_lr40,w384_hybrid_mingru8_attn4_lr80
 export CROSSOVER_JOB_PREFIX=cx32w384x4

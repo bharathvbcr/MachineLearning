@@ -1,0 +1,69 @@
+{
+  "jobs": [
+    {
+      "id": "cx32lad1536m_w1536_mingru_lr40_s1337",
+      "arm": "w1536_mingru_lr40",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x4.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1788620300.0322711,
+      "finished": 1788621565.3347485,
+      "detail": "best_val=4.572998"
+    },
+    {
+      "id": "cx32lad1536m_w1536_mingru_lr40_s42",
+      "arm": "w1536_mingru_lr40",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "E21 ladder: d_model 1536, LR x4.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1788621565.337046,
+      "finished": 1788622826.2214391,
+      "detail": "best_val=4.560790"
+    },
+    {
+      "id": "cx32lad1536m_w1536_mingru_lr40_s100",
+      "arm": "w1536_mingru_lr40",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "E21 ladder: d_model 1536, LR x4.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1788622826.2375906,
+      "finished": 1788624078.161853,
+      "detail": "best_val=4.537715"
+    },
+    {
+      "id": "cx32lad1536m_w1536_mingru_lr40_s2026",
+      "arm": "w1536_mingru_lr40",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 2026,
+      "note": "E21 ladder: d_model 1536, LR x4.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1788624079.2679806,
+      "finished": 1788625341.7928405,
+      "detail": "best_val=4.557271"
+    },
+    {
+      "id": "cx32lad1536m_w1536_mingru_lr40_s777",
+      "arm": "w1536_mingru_lr40",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 777,
+      "note": "E21 ladder: d_model 1536, LR x4.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1788625341.7948008,
+      "finished": 1788626608.533071,
+      "detail": "best_val=4.551253"
+    }
+  ]
+}

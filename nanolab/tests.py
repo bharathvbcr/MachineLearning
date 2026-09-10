@@ -14,6 +14,8 @@ non-zero on any failure (so it works in CI or a bare shell).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import pathlib
 import sys
 import tempfile
@@ -57,6 +59,31 @@ class Skip(Exception):
 def test(fn):
     _RESULTS.append(fn)
     return fn
+
+
+@contextlib.contextmanager
+def _env_vars(**kw):
+    """Set env vars for the block, restore exactly what was there before.
+
+    The cluster_* accessors read os.environ at call time, so a test that wants a
+    specific recipe has to set one. Restoring matters more than usual here: the
+    suite shares one process, and a leaked CROSSOVER_* changes what every later
+    test measures.
+    """
+    prev = {k: os.environ.get(k) for k in kw}
+    try:
+        for k, v in kw.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = str(v)
+        yield
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 def _cfg(**kw):
@@ -2660,6 +2687,218 @@ def e8_run_name_carries_the_recipe_so_resume_cannot_mix_configs():
     assert e8_config("attention", 1).run_name == a.run_name, "must be stable"
 
 
+class _ConstantBatcher:
+    """Minimal `data.Batcher` stand-in for the resume round-trip below.
+
+    Uses the `batchers=` seam `train.train` already exposes for MQAR, so the
+    test needs no corpus on disk.
+    """
+
+    def __init__(self, cfg, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        self.x = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.block_size),
+                               generator=g)
+        self.y = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.block_size),
+                               generator=g)
+
+    def batch(self, block_size=None, frontier=1.0):
+        return self.x, self.y
+
+    def iterator(self):
+        while True:
+            yield self.batch()
+
+
+@test
+def a_resumed_run_continues_the_token_axis_instead_of_restarting_it():
+    """`step` and `tokens_seen` have to resume together.
+
+    Until 2026-09-07 `train.train` restored `start_step` from the checkpoint
+    and then re-zeroed `tokens_seen`, so a resumed run wrote a metrics file
+    whose `tokens` axis restarted mid-file while `step` kept climbing, and
+    whose `done` record reported the post-resume count as the run total.
+    `cx32lad1536_w1536_attention_lr80_s1337` and `_s42` each carry 3050 steps
+    recorded as 25.41M tokens. `final_val` was never touched -- every loss
+    table stands -- but anything keyed on the token axis silently read half a
+    run, which is why the crossing analysis keys on `step`.
+
+    Two seeds a decreasing token axis: the resume itself, and the eventual
+    `done`. Both are asserted, because a fix that only repairs the summary
+    leaves every eval row still mislabelled.
+    """
+    from . import train as T
+    with tempfile.TemporaryDirectory() as directory:
+        cfg = _cfg(out_dir=directory, run_name="resume", max_steps=4,
+                   ckpt_interval=2, eval_interval=2, eval_iters=1,
+                   n_layer=1, d_model=32, n_head=2, head_dim=16,
+                   block_size=16, batch_size=2)
+        batchers = (_ConstantBatcher(cfg), _ConstantBatcher(cfg, seed=1))
+        T.train(cfg, batchers=batchers)
+        first = [json.loads(x) for x in
+                 (Path(directory) / "resume" / "metrics.jsonl")
+                 .read_text(encoding="utf-8").splitlines()]
+        halfway = [r for r in first if r["event"] == "done"][-1]["tokens"]
+
+        cfg.max_steps = 8
+        with _env_vars(RESUME="1"):
+            T.train(cfg, batchers=batchers)
+        rows = [json.loads(x) for x in
+                (Path(directory) / "resume" / "metrics.jsonl")
+                .read_text(encoding="utf-8").splitlines()]
+
+    axis = [r["tokens"] for r in rows if r["event"] in ("eval", "done")]
+    assert axis == sorted(axis), f"token axis went backwards on resume: {axis}"
+    final = [r for r in rows if r["event"] == "done"][-1]["tokens"]
+    assert final > halfway, (
+        f"resumed run reported {final} tokens, no more than the {halfway} it "
+        "had already spent before the resume")
+
+    # Exactly the schedule, with no slack. This assertion used to allow one extra
+    # step: `tokens_seen` is incremented before the checkpoint is written, so the
+    # saved `step` named an update that had already happened and
+    # `range(start_step, max_steps)` executed it a second time. That was a second
+    # defect -- resume replayed one optimizer step -- found by this test having to
+    # carry the slack to stay green. `next_step` closed it on 2026-09-08, so the
+    # ideal total is now the right expectation and any slack is a regression.
+    ideal = T._tokens_through(cfg, cfg.max_steps)
+    assert final == ideal, f"expected exactly {ideal}, got {final}"
+
+
+@test
+def a_resume_starts_at_the_step_that_has_not_run_and_replays_nothing():
+    """The resume checkpoint must name the NEXT step, not the last one done.
+
+    `step` in the blob names the update that had just been applied when the
+    checkpoint was written, so `range(start_step, max_steps)` re-executed it:
+    one extra optimizer update, one extra batch, one step of extra tokens, every
+    resume. Two of this repo's committed runs were resumed. `next_step` records
+    the resume point instead of leaving it to be inferred.
+
+    A blob written before `next_step` existed gets the same correction: `step`
+    was always written from inside the loop after that step's update, so
+    `step + 1` is the resume point either way. Preserving the replay for old
+    files was tried and is worse -- replaying a step forces the token axis to
+    either dip or over-count, with no third option -- so the legacy path is
+    pinned here to the same monotone axis and the same exact total.
+    """
+    from . import train as T
+    with tempfile.TemporaryDirectory() as directory:
+        cfg = _cfg(out_dir=directory, run_name="nx", max_steps=4, ckpt_interval=2,
+                   eval_interval=2, eval_iters=1, n_layer=1, d_model=32, n_head=2,
+                   head_dim=16, block_size=16, batch_size=2)
+        batchers = (_ConstantBatcher(cfg), _ConstantBatcher(cfg, seed=1))
+        T.train(cfg, batchers=batchers)
+        blob = torch.load(Path(directory) / "nx" / "ckpt.pt",
+                          map_location="cpu", weights_only=False)
+        assert "next_step" in blob, sorted(blob)
+        assert blob["next_step"] == blob["step"] + 1, (blob["next_step"], blob["step"])
+        # tokens_seen is taken after the step completes, so it must already cover
+        # every step up to and including the one `step` names -- i.e. next_step of them.
+        assert blob["tokens_seen"] == T._tokens_through(cfg, blob["next_step"]), (
+            blob["tokens_seen"], T._tokens_through(cfg, blob["next_step"]))
+
+        # Legacy blob: drop next_step, keep a tokens_seen that is one step ahead
+        # of `step`, and check the reconstruction refuses to trust it.
+        legacy = {k: v for k, v in blob.items() if k != "next_step"}
+        torch.save(legacy, Path(directory) / "nx" / "ckpt.pt")
+        cfg.max_steps = 6
+        with _env_vars(RESUME="1"):
+            T.train(cfg, batchers=batchers)
+        rows = [json.loads(x) for x in
+                (Path(directory) / "nx" / "metrics.jsonl")
+                .read_text(encoding="utf-8").splitlines()]
+        axis = [r["tokens"] for r in rows if r["event"] in ("eval", "done")]
+        assert axis == sorted(axis), f"legacy resume broke the token axis: {axis}"
+        final = [r for r in rows if r["event"] == "done"][-1]["tokens"]
+        assert final == T._tokens_through(cfg, cfg.max_steps), (
+            "a legacy checkpoint must resume at step+1 like any other, replaying "
+            f"nothing: expected {T._tokens_through(cfg, cfg.max_steps)}, got {final}")
+
+
+@test
+def tokens_through_sums_the_curriculum_rather_than_multiplying_by_block_size():
+    """`steps * batch * block_size` is wrong whenever a seqlen curriculum runs.
+
+    The reconstruction path for pre-fix checkpoints (which carry no
+    `tokens_seen`) has to agree with what the loop would actually have counted,
+    or resuming an old checkpoint trades one wrong token axis for another.
+    """
+    from .train import _tokens_through, _curriculum_len
+    # grad_accum is part of a step's token count and defaults to 4 here, so the
+    # flat case is steps * batch * grad_accum * block_size, not steps * batch * ctx.
+    flat = _cfg(max_steps=10, block_size=32, batch_size=4)
+    assert _tokens_through(flat, 10) == 10 * flat.batch_size * flat.grad_accum * 32
+    curr = _cfg(max_steps=10, block_size=32, batch_size=4,
+                curriculum="seqlen", curriculum_start_len=8, curriculum_frac=0.5)
+    expected = sum(curr.batch_size * curr.grad_accum * _curriculum_len(curr, s)
+                   for s in range(10))
+    assert _tokens_through(curr, 10) == expected
+    assert _tokens_through(curr, 10) < _tokens_through(flat, 10), \
+        "a seqlen curriculum must cost fewer tokens than a full-length run"
+    assert _tokens_through(flat, 0) == 0
+
+
+@test
+def the_arm_of_a_recall_record_is_read_from_its_name_not_its_arm_column():
+    """The `arm` column is a summary; the run name is the identifier.
+
+    `run_one` gained an explicit `arm` argument partway through this program.
+    Before that it fell back to `cfg.mixer`, which for a hybrid is its recurrent
+    half, so 165 committed rows file `hybrid_mingru10_attn2` as `mingru` (90) and
+    `hybrid_gdn_periodic` as `gdn` (75). Grouping a board on that column pools
+    each hybrid into the pure arm it was built to beat: it reported `mingru` at
+    12/30 on a cell where pure minGRU solves 0/15, and that number reached a
+    paper draft before a cross-check caught it. `arm_of` is the one way to ask,
+    and it must beat the column rather than defer to it.
+    """
+    from .mqar_suite import arm_of, e8_config
+    from .crossover_replicate import ARMS
+    for arm in ("attention", "mingru", "gdn", "swa_w64", "swa_w64_nosink",
+                "hybrid_mingru10_attn2", "hybrid_mingru8_attn4",
+                "hybrid_mingru_periodic", "hybrid_gdn_periodic"):
+        assert arm in {a.name for a in ARMS}, arm
+        for pairs, batch, steps, rule in ((4, 256, 3000, "none"), (64, 64, 3000, "sqrt"),
+                                          (128, 128, 9000, "sqrt")):
+            cfg = e8_config(arm, 7, n_pairs=pairs, n_queries=pairs, batch_size=batch,
+                            steps=steps, lr_rule=rule)
+            got = arm_of({"run": cfg.run_name, "arm": "WRONG"})
+            assert got == arm, (cfg.run_name, got, arm)
+
+    # The exact shape of a committed mislabelled row.
+    legacy = {"run": "mqar_p8_b256_t3000_hybrid_mingru10_attn2_s4", "arm": "mingru"}
+    assert arm_of(legacy) == "hybrid_mingru10_attn2", arm_of(legacy)
+    legacy_gdn = {"run": "mqar_p4_b256_t3000_hybrid_gdn_periodic_s1_lrsqrt", "arm": "gdn"}
+    assert arm_of(legacy_gdn) == "hybrid_gdn_periodic", arm_of(legacy_gdn)
+    # An unparseable name must fall back rather than invent an arm.
+    assert arm_of({"run": "not_an_mqar_name", "arm": "mingru"}) == "mingru"
+
+
+@test
+def every_committed_recall_record_resolves_to_a_registered_arm():
+    """Run names in the ledgers must all parse, or `arm_of` is silently falling
+    back to the column it exists to distrust. Reads what is committed rather
+    than a constructed example: the fallback is invisible unless something
+    checks the real corpus."""
+    from .mqar_suite import arm_of
+    from .crossover_replicate import ARMS
+    names = {a.name for a in ARMS}
+    root = pathlib.Path(__file__).resolve().parent / "out"
+    ledgers = sorted(root.glob("mqar_*/runs.jsonl"))
+    if not ledgers:
+        raise Skip("no mqar ledgers in this checkout")
+    seen = {}
+    for ledger in ledgers:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                seen[rec["run"]] = rec
+    unresolved = sorted({r["run"] for r in seen.values() if arm_of(r) not in names})
+    assert not unresolved, f"{len(unresolved)} unparseable run names, e.g. {unresolved[:3]}"
+    corrected = sum(1 for r in seen.values() if arm_of(r) != r.get("arm"))
+    assert corrected > 0, ("no record disagrees with its arm column -- either the "
+                           "legacy rows were rewritten or arm_of stopped correcting")
+
+
 @test
 def launch_records_the_tenancy_it_actually_runs_at():
     """`launch --workers N` must write N into recipe.json, not the env default.
@@ -4525,6 +4764,892 @@ def e21_ladder_varies_width_alone_and_can_be_read_at_each_width():
     assert widths[-1] / widths[0] >= 2.5, (
         f"ladder spans only {widths[-1]/widths[0]:.1f}x in width; too narrow to "
         "say anything about scale")
+
+
+@test
+def verify_wallclock_reads_the_last_run_not_the_mean_of_a_restarted_file():
+    """A restarted directory holds two runs. Report the one that survived.
+
+    ``metrics.jsonl`` is opened "a" (nanolab/utils.py), so resetting a job to
+    pending and relaunching into the same directory concatenates runs rather
+    than replacing them. Reachable through the repair path: `claim_job` only
+    claims `pending`, but a manual status reset makes a completed run claimable
+    again and its `done` record stays on disk.
+
+    Averaging the two reports a duration no run had -- here 635s for a run that
+    took 800s and was exactly on target, which sends the reader hunting a 20%
+    wall-clock miss that does not exist. The docstring always said "terminal
+    metrics record"; this pins the implementation to it.
+    """
+    import json
+    from .crossover_replicate import verify_wallclock
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        d = root / "cxwc_attention_s1337"
+        d.mkdir(parents=True)
+        (d / "config.json").write_text(json.dumps(
+            {"batch_size": 32, "block_size": 512, "mixer": "attention"}),
+            encoding="utf-8")
+        (d / "metrics.jsonl").write_text("\n".join([
+            # the crashed-then-repaired first attempt, 1.7x too fast
+            json.dumps({"event": "start", "params": 1}),
+            json.dumps({"event": "done", "best_val": 4.9, "final_val": 4.9,
+                        "tokens": 1000, "elapsed_s": 470.0}),
+            # the rerun that actually stands
+            json.dumps({"event": "start", "params": 1}),
+            json.dumps({"event": "done", "best_val": 4.0, "final_val": 4.0,
+                        "tokens": 1000, "elapsed_s": 800.0}),
+        ]) + "\n", encoding="utf-8")
+
+        v = verify_wallclock(root, 800.0)
+        assert v["arms"]["attention"] == 800.0, (
+            f"reported {v['arms']['attention']}, which is the mean of two runs "
+            f"and the duration of neither")
+        assert v["ok"] is True, v["reason"]
+        # One directory contributed one number, whatever the file holds.
+        assert v["n"]["attention"] == 1, v["n"]
+        # And the restart is surfaced, not swallowed: one recipe per directory
+        # is a repo rule, and a file holding two finished runs broke it.
+        assert "cxwc_attention_s1337" in v["restarted"], v["restarted"]
+
+
+@test
+def an_unrecorded_recipe_field_is_not_a_free_one():
+    """A field missing from a recipe means "ran at its default", not "no value".
+
+    `lock_recipe` backfills a field the on-disk recipe never recorded, on the
+    reasoning that it was added after the suite ran and so cannot conflict. True
+    of a field that only describes a run; false of one that changes it.
+
+    crossover50m_ratioplace32 is the live case. Its recipe.json was written
+    before `fused_ce` was a field, and E30 adds `attention` to that directory on
+    purpose, so the hybrids become a within-suite comparison. Launch that with
+    the CE unfused and the old behaviour accepted it and stamped
+    `fused_ce: false` on a directory whose 25 runs were fused -- worth 0.0037
+    nats, above the 0.0031 rerun floor, against a pre-registered +-0.005.
+
+    Both directions are pinned here, because a check that refuses the growth E30
+    needs would be worse than no check: it would be routed around.
+    """
+    import json
+    from .crossover_replicate import lock_recipe, LEGACY_RECIPE_DEFAULTS
+
+    on_disk = {
+        "batch_size": 32, "block_size": 512, "workers": 3, "budget_by_arm": None,
+        "eval_iters": 20, "token_budget": 50000000, "lr_horizon": None,
+        "arms": ["hybrid_mingru8_attn4", "hybrid_mingru10_attn2"],
+        "prefix": "cx32p", "compile": False,
+    }
+    assert "fused_ce" not in on_disk, "the point of the fixture"
+    env = dict(CROSSOVER_ARMS="hybrid_mingru8_attn4,hybrid_mingru10_attn2,attention",
+               CROSSOVER_JOB_PREFIX="cx32p", CROSSOVER_BATCH="32",
+               CROSSOVER_BLOCK="512", CROSSOVER_WORKERS="3",
+               CROSSOVER_EVAL_ITERS="20", CROSSOVER_TOKEN_BUDGET="50000000")
+
+    def attempt(**extra):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "recipe.json").write_text(json.dumps(on_disk), encoding="utf-8")
+            with _env_vars(**{**env, **extra}):
+                return lock_recipe(root)
+
+    # Refuses the unfused launch, and says which field.
+    try:
+        merged = attempt(CROSSOVER_FUSED_CE="0")
+    except SystemExit as e:
+        assert "fused_ce" in str(e), e
+    else:
+        raise AssertionError(
+            f"accepted an unfused launch into a fused directory, stamping "
+            f"fused_ce={merged.get('fused_ce')!r} on 25 runs that were fused")
+
+    # Accepts the launch that matches what those runs actually did, and still
+    # grows the arm list -- which is the whole reason E30 reuses the directory.
+    merged = attempt(CROSSOVER_FUSED_CE="1")
+    assert merged["fused_ce"] is True, merged
+    assert "attention" in merged["arms"], merged["arms"]
+    assert len(merged["arms"]) == 3, merged["arms"]
+
+    # And every legacy default is the value its accessor's docstring claims.
+    from .crossover_replicate import (cluster_compile, cluster_fused_ce,
+                                      cluster_copy_probe)
+    with _env_vars(CROSSOVER_COMPILE="", CROSSOVER_FUSED_CE="",
+                  CROSSOVER_COPY_PROBE=""):
+        live = {"compile": cluster_compile(), "fused_ce": cluster_fused_ce(),
+                "copy_probe": cluster_copy_probe()}
+    assert live == LEGACY_RECIPE_DEFAULTS, (
+        f"a legacy default drifted from the accessor's default: {live} vs "
+        f"{LEGACY_RECIPE_DEFAULTS}")
+
+
+@test
+def a_board_run_at_each_arms_own_argmin_can_still_be_paired():
+    """`paired_board.py` refused the only comparison G7 exists to make.
+
+    `lr` and `matrix_lr` sit in RECIPE_KEYS, so pairing `w768_attention_lr40`
+    against `w768_attention_lr80` -- two REGISTERED arms whose entire difference
+    is the learning rate -- exited with "recipes differ on {'lr': ...}". G7 ran
+    30 jobs at each arm's own argmin and then could not be read at all.
+
+    The guard now waves through a field the registry declares for one of the arms
+    and names it in the header, so no reader can mistake a deliberate LR
+    difference for a matched pair. The second half of this test is the half that
+    matters: an UNDECLARED difference on the same pair still refuses. Exempting
+    the pair rather than the field would have turned a guard into a hole.
+    """
+    import importlib.util, io, json as _json, sys as _sys, tempfile
+    from contextlib import redirect_stdout
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "paired_board", root / "scripts" / "paired_board.py")
+    if spec is None or spec.loader is None:
+        raise Skip("no scripts/paired_board.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    base = dict(batch_size=32, block_size=512, eval_iters=20, max_steps=100,
+                lr_max_steps=100, warmup_steps=10, schedule="cosine",
+                optimizer="muon_ns5_adamw")
+
+    def build(tmp, name, extra_a=None):
+        d = Path(tmp) / "nanolab" / "out" / name
+        d.mkdir(parents=True)
+        (d / "recipe.json").write_text(_json.dumps({"prefix": "cxt"}))
+        for arm, lr in (("w768_attention_lr40", 0.0024), ("w768_attention_lr80", 0.0048)):
+            for seed in (42, 100):
+                r = d / f"cxt_{arm}_s{seed}"
+                r.mkdir()
+                cfg = dict(base, seed=seed, lr=lr, matrix_lr=lr / 0.024,
+                           mixer="attention", layer_mixers="", d_model=768,
+                           n_head=12, head_dim=64)
+                if extra_a and arm.endswith("lr40"):
+                    cfg.update(extra_a)
+                (r / "config.json").write_text(_json.dumps(cfg))
+                lines = [_json.dumps({"event": "eval", "step": st, "tokens": st * 16384,
+                                      "val_loss": 5.0 - 0.001 * st - 0.01 * (lr > 0.003)
+                                      + 1e-4 * seed})
+                         for st in (25, 50, 75, 100)]
+                lines.append(_json.dumps({"event": "done", "final_val": 4.9 + 1e-4 * seed}))
+                (r / "metrics.jsonl").write_text("\n".join(lines))
+        return name
+
+    argv = _sys.argv
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            mod.ROOT = Path(tmp)
+            name = build(tmp, "argmin_board")
+            _sys.argv = ["paired_board.py", f"w768_attention_lr40@{name}",
+                         "--ref", f"w768_attention_lr80@{name}", "--markers", "819200"]
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                mod.main()          # pre-fix: SystemExit("REFUSING to pair ...")
+            out = buf.getvalue()
+            assert "minus" in out, f"nothing paired:\n{out}"
+            assert "BY DESIGN" in out and "lr" in out, (
+                "a pair that differs in learning rate must say so in its header, "
+                f"or a reader will take it for a matched pair:\n{out}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mod.ROOT = Path(tmp)
+            # The same two arms, plus a difference NEITHER arm declares.
+            name = build(tmp, "drifted_board", extra_a={"eval_iters": 4})
+            _sys.argv = ["paired_board.py", f"w768_attention_lr40@{name}",
+                         "--ref", f"w768_attention_lr80@{name}", "--markers", "819200"]
+            try:
+                with redirect_stdout(io.StringIO()):
+                    mod.main()
+            except SystemExit as e:
+                assert "eval_iters" in str(e), f"refused for the wrong reason: {e}"
+            else:
+                raise AssertionError(
+                    "an undeclared recipe difference was waved through: the "
+                    "exemption must be per-FIELD, not per-pair")
+    finally:
+        _sys.argv = argv
+
+    assert mod.declared_keys("no_such_arm_at_all") == set(), (
+        "an unregistered arm name must not widen the exemption")
+    assert {"lr", "matrix_lr"} <= mod.declared_keys("w768_attention_lr40"), (
+        "the registry declares this arm's learning rate; declared_keys missed it")
+
+
+@test
+def an_lr_grid_that_bottoms_out_at_its_edge_is_not_reported_as_an_argmin():
+    """The rule E21 learned the hard way, now enforced instead of remembered.
+
+    E21's first LR sweep picked its TOP multiplier in all six cells with loss
+    monotone decreasing, and 4.0/8.0 had to be appended. Every 50M grid measured
+    since picks its BOTTOM one. Both are grids that have not found a minimum,
+    and reporting either as "the argmin" is how a board gets spent at a learning
+    rate nobody measured -- which is exactly what happened to the width ladder.
+
+    Also pins the cell key: shape comes from `layer_mixers` in the run's own
+    config, never the arm name. `periodic` carries three attention layers and
+    `bookend` two, and a board once compared them as if placement were the only
+    difference between them.
+    """
+    import importlib.util, json as _json, tempfile
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "lr_argmin", root / "scripts" / "lr_argmin.py")
+    if spec is None or spec.loader is None:
+        raise Skip("no scripts/lr_argmin.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    s = 1337
+    interior = {0.5: {s: 5.4}, 1.0: {s: 5.1}, 2.0: {s: 5.0}, 4.0: {s: 5.2}}
+    best, verdict = mod.argmin(interior)
+    assert best == 2.0 and verdict == "interior", (best, verdict)
+
+    bottom = {1.0: {s: 4.2181}, 4.0: {s: 4.3487}, 8.0: {s: 4.4732}}   # the G7 curve
+    best, verdict = mod.argmin(bottom)
+    assert best == 1.0 and verdict.startswith("EDGE (bottom)"), (best, verdict)
+    assert "DOWN" in verdict, "an edge must say which way to extend"
+
+    top = {0.5: {s: 5.8}, 1.0: {s: 5.5}, 2.0: {s: 5.3}}       # E21's first sweep
+    best, verdict = mod.argmin(top)
+    assert best == 2.0 and verdict.startswith("EDGE (top)"), (best, verdict)
+    assert "UP" in verdict
+
+    best, verdict = mod.argmin({1.0: {s: 5.0}, 2.0: {s: 4.9}})
+    assert "no argmin" in verdict, f"two points cannot locate an argmin: {verdict}"
+
+    # Shape from the config, not the name: two runs NAMED as one arm but carrying
+    # different layer_mixers must not be averaged into one LR curve.
+    with tempfile.TemporaryDirectory() as tmp:
+        d = Path(tmp) / "nanolab" / "out" / "s"
+        d.mkdir(parents=True)
+        for nm, mixers in (("cx_a_s1", "mingru*8,attention*4"),
+                           ("cx_a_s2", "mingru*3,attention,mingru*3,attention,mingru*3,attention")):
+            r = d / nm
+            r.mkdir()
+            (r / "config.json").write_text(_json.dumps(
+                {"d_model": 768, "lr": 6e-4, "mixer": "mingru", "layer_mixers": mixers}))
+            (r / "metrics.jsonl").write_text(_json.dumps({"event": "done", "final_val": 4.2}))
+        mod.ROOT = Path(tmp)
+        got = mod.cells("s")
+    assert len(got) == 2, (
+        "two different layer_mixers were pooled into one cell; the shape must "
+        f"come from the config, not the run name: {sorted(got)}")
+
+
+@test
+def relaunching_a_stage_preserves_what_the_failed_attempt_recorded():
+    """Three failure logs were destroyed by the hand-written relaunch that repaired them.
+
+    g4, g5 and g6 were relaunched with `nohup ... > nanolab/out/g4.log`, which
+    truncates. Those files held the only copy of the 2026-09-09 cascade: g4's CUDA
+    OOM traceback naming four foreign processes and `220.00 MiB free`, and g5's 18
+    arms failing on `CUBLAS_STATUS_ALLOC_FAILED`. The findings survived only
+    because they had been quoted into the gap plan an hour earlier.
+
+    Appending would be worse. `stage_wait` greps `^<stage> exit=` out of
+    `nanolab/out/<stage>.log`, so a marker retained from the previous attempt
+    releases the next stage the instant it starts waiting. The old log has to
+    leave that filename, not sit at the top of it.
+    """
+    import subprocess
+    import tempfile
+    import time
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    helper = root / "scripts" / "relaunch_stage.sh"
+    if not helper.exists():
+        raise Skip("no scripts/relaunch_stage.sh")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        lab = home / "MLSystemsLab"
+        (lab / "nanolab" / "out").mkdir(parents=True)
+        (lab / "scripts").mkdir(parents=True)
+        (lab / "scripts" / "relaunch_stage.sh").write_text(helper.read_text())
+        (lab / "scripts" / "gX_demo.sh").write_text(
+            '#!/usr/bin/env bash\necho "gX start"\nsleep 0.2\necho "gX exit=0"\n')
+        log = lab / "nanolab" / "out" / "gX.log"
+        log.write_text("gX start\nOOM TRACEBACK EVIDENCE\ngX exit=1\n")
+
+        subprocess.run(["bash", "scripts/relaunch_stage.sh", "gX"],
+                       cwd=lab, env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                       capture_output=True, text=True, timeout=60)
+        time.sleep(1.2)
+
+        rolled = [q for q in (lab / "nanolab" / "out").glob("gX.*.log")]
+        assert rolled, (
+            "the previous attempt's log was truncated, not rolled aside; this is "
+            "how the 2026-09-09 OOM tracebacks were lost")
+        assert any("OOM TRACEBACK EVIDENCE" in q.read_text() for q in rolled), (
+            "a rolled log that does not carry the evidence preserves nothing")
+        assert "exit=1" not in log.read_text(), (
+            "the failed attempt's exit marker is still in the live log; "
+            "stage_wait would read it and release the next stage immediately")
+
+
+@test
+def every_run_records_which_sampler_path_it_took():
+    """The one place tenancy changes what a job trains on, and it was unrecorded.
+
+    Above 150M tokens `should_gpu_resident` decides on *free VRAM at construction
+    time*, and this repo's train split is 497.5M tokens -- so the choice needs
+    `free > 9.27 GiB` and a co-resident worker can flip it. The two paths draw
+    windows from different RNG streams (a CUDA generator against a CPU one), so
+    they train on different tokens; and the fallback needs LESS memory, which
+    turns an OOM into a run that finishes and looks ordinary.
+
+    On 2026-09-09 a stage cascade put four boards under memory pressure at once
+    and nothing on disk could say which path any of those runs had taken. Loud
+    beats silent: the field is written for every run, "unknown" included.
+    """
+    import inspect
+    from . import utils
+
+    src = inspect.getsource(utils.Logger.banner)
+    assert "sampler" in inspect.signature(utils.Logger.banner).parameters, (
+        "banner must accept the sampler path; without it the start record "
+        "cannot carry which token stream the run drew from")
+    assert '"sampler"' in src, "the start record must carry the path, not just print it"
+
+    from .train import train as _train_fn
+    tsrc = inspect.getsource(_train_fn)
+    assert "gpu_resident" in tsrc and "memmap" in tsrc, (
+        "train() must pass the Batcher's real path to banner")
+    assert '"unknown"' in tsrc, (
+        "a run whose path cannot be established must say so rather than "
+        "defaulting to the fast path")
+
+    # The threshold this all turns on, asserted so a silent retune is caught.
+    from .data import should_gpu_resident
+    assert should_gpu_resident(10_000_000, "cpu") is False, "cpu is never resident"
+    assert should_gpu_resident(10_000_000, "cuda") is True, (
+        "a small split must not consult free VRAM -- that would make every run "
+        "a race")
+
+
+@test
+def a_queue_entry_that_vouches_for_a_run_that_is_not_there_is_requeued():
+    """G5's probe failed twice: once on the recipe lock, once on the queue.
+
+    A queue entry is a claim; `metrics.jsonl` is the run. Two disagreements both
+    hide work, and G5 hit both at once -- 12 entries stuck at `failed` from an
+    OOM cascade, and 6 marked `done` whose directories had since been quarantined.
+    A relaunch saw `pending 0` and exited reporting the old failures as if fresh.
+
+    `done` with no record on disk is the sharper one: it is a check that could not
+    run reporting the same result as one that ran and passed. The artifact wins
+    over the claim, never the other way round.
+    """
+    import importlib.util
+    import json as _json
+    import tempfile
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "requeue_incomplete", root / "scripts" / "requeue_incomplete.py")
+    if spec is None or spec.loader is None:
+        raise Skip("no scripts/requeue_incomplete.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mod.ROOT = Path(tmp)
+        suite = Path(tmp) / "nanolab" / "out" / "s"
+        suite.mkdir(parents=True)
+
+        def run(jid, done):
+            d = suite / jid
+            d.mkdir()
+            (d / "metrics.jsonl").write_text(
+                _json.dumps({"event": "done", "final_val": 4.2}) + "\n"
+                if done else _json.dumps({"event": "train", "step": 1}) + "\n")
+
+        run("really_done", True)      # done on disk AND in the queue
+        run("died_midway", False)     # queue says failed, no done record
+        run("claims_done", False)     # queue says done, but the record is absent
+        # 'moved_away' has no directory at all -- the quarantine case
+        (suite / "queue.json").write_text(_json.dumps([
+            {"id": "really_done", "status": "done", "worker": 0},
+            {"id": "died_midway", "status": "failed", "detail": "OOM"},
+            {"id": "claims_done", "status": "done", "worker": 1},
+            {"id": "moved_away", "status": "done", "worker": 2},
+            {"id": "waiting", "status": "pending"},
+        ]))
+
+        mod.reconcile("s", apply=True)
+        after = {j["id"]: j for j in _json.loads((suite / "queue.json").read_text())}
+
+    assert after["really_done"]["status"] == "done", (
+        "a run with a done record on disk must be left alone whatever else changes")
+    assert after["died_midway"]["status"] == "pending", (
+        "a failed job with no run on disk stays failed forever and the stage "
+        "relaunches into `pending 0`")
+    assert after["claims_done"]["status"] == "pending", (
+        "the queue kept vouching for data that is not on disk")
+    assert after["moved_away"]["status"] == "pending", (
+        "a quarantined run must come back as work, not as a completed job")
+    assert after["waiting"]["status"] == "pending"
+    for k in ("worker", "detail"):
+        assert k not in after["died_midway"] and k not in after["claims_done"], (
+            "stale execution metadata was left on a requeued job")
+
+
+@test
+def re_adding_an_arm_the_board_already_carries_is_not_a_recipe_conflict():
+    """G5's family probe never launched a single job because of this.
+
+    `arms` is a set wearing a list's clothes. The growth seam tests
+    `set(old) < set(rec)` -- a STRICT subset -- so a caller that extends the
+    recipe with arms the board already carries produces `set(rec) == set(old)`,
+    the test is false, and `lock_recipe` refuses on
+    `conflicting fields: ['arms']`. Both G5 and G10 built their arm list as
+    "everything on the board" + "everything I plan to run" and hit it; G10's
+    exit=1 was this and nothing else, and G5 lost its whole probe to it.
+
+    Shrinking and diverging must still refuse -- those lose runs or silently
+    re-point a suite at a different board -- so this checks all three.
+    """
+    import json as _json
+    import tempfile
+    from pathlib import Path
+
+    from . import crossover_replicate as cr
+
+    BASE = {"batch_size": 32, "block_size": 512, "workers": 3, "gpus": 1,
+            "eval_iters": 20, "token_budget": 50_000_000, "prefix": "t",
+            "compile": False, "fused_ce": True}
+
+    def lock(on_disk, incoming):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "recipe.json").write_text(
+                _json.dumps({**BASE, "arms": on_disk}), encoding="utf-8")
+            real = cr.current_recipe
+            cr.current_recipe = lambda: {**BASE, "arms": list(incoming)}
+            try:
+                return cr.lock_recipe(d), None
+            except SystemExit as e:
+                return None, str(e)
+            finally:
+                cr.current_recipe = real
+
+    # 1. Re-adding what is already there is a no-op, not a conflict.
+    got, err = lock(["a", "b"], ["a", "b", "a", "b"])
+    assert err is None, f"re-adding existing arms was refused: {err}"
+    assert got["arms"] == ["a", "b"], (
+        f"duplicates were stored rather than collapsed: {got['arms']}")
+
+    # 2. Genuinely new arms still grow the board, in order.
+    got, err = lock(["a", "b"], ["a", "b", "a", "c"])
+    assert err is None, f"a real addition was refused: {err}"
+    assert got["arms"] == ["a", "b", "c"], got["arms"]
+
+    # 3. Shrinking still refuses -- that loses runs.
+    got, err = lock(["a", "b", "c"], ["a", "b"])
+    assert err is not None and "arms" in err, (
+        f"dropping an arm must refuse, got {got}")
+
+    # 4. Diverging still refuses -- that re-points the suite at another board.
+    got, err = lock(["a", "b"], ["a", "z"])
+    assert err is not None and "arms" in err, (
+        f"swapping an arm must refuse, got {got}")
+
+
+@test
+def a_stage_never_launches_onto_a_gpu_another_stage_is_still_using():
+    """One timeout cost two stages on 2026-09-09, and the timeout was working as written.
+
+    `stage_wait` gave up after PREV_HOURS and printed "starting anyway". g10's
+    marker never came, so g4 started anyway -- onto a GH200 already carrying
+    g11b's workers. All four of g4's MQAR workers died of CUDA OOM. g4's own exit
+    marker then released g5, which launched into the same contention and lost 12
+    of its 18 family arms the same way.
+
+    The marker is a hint about a sibling process; the device is the fact. A
+    predecessor that has not finished is not a predecessor that finished, and a
+    wait that timed out must not proceed as though it had returned.
+    """
+    import os
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    common = root / "scripts" / "_stage_common.sh"
+    if not common.exists():
+        raise Skip("no scripts/_stage_common.sh")
+
+    def stage_wait_rc(busy_pids):
+        """Run the real stage_wait with a stubbed nvidia-smi. Returns (rc, output)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "MLSystemsLab" / "scripts").mkdir(parents=True)
+            (home / "MLSystemsLab" / "nanolab" / "out").mkdir(parents=True)
+            (home / "MLSystemsLab" / "scripts" / "_stage_common.sh").write_text(
+                common.read_text())
+            # The predecessor HAS written its marker: the only thing under test
+            # here is whether an occupied device still stops the launch.
+            (home / "MLSystemsLab" / "nanolab" / "out" / "prev.log").write_text(
+                "prev exit=0 2026-09-09T00:00:00Z\n")
+            binn = home / "bin"
+            binn.mkdir()
+            body = "".join(f'echo "  {p}"\n' for p in busy_pids) or "exit 0\n"
+            smi = binn / "nvidia-smi"
+            smi.write_text("#!/bin/sh\n" + body)
+            smi.chmod(0o755)
+            env = dict(os.environ,
+                       HOME=str(home),
+                       PATH=f"{binn}:{os.environ.get('PATH', '')}",
+                       PREV="prev",
+                       DEVICE_WAIT_HOURS="0")
+            r = subprocess.run(
+                ["bash", "-c",
+                 'source "$HOME/MLSystemsLab/scripts/_stage_common.sh"; stage_wait'],
+                env=env, capture_output=True, text=True, timeout=60)
+            return r.returncode, r.stdout + r.stderr
+
+    rc, out = stage_wait_rc(["312601", "312878"])
+    assert rc == 75, (
+        f"stage_wait returned {rc} with two compute processes still on the "
+        f"device; this is the g4/g5 cascade, which cost 16 runs: {out!r}")
+    assert "REFUSING" in out, out
+    assert "312601" in out, "a refusal must name what it is waiting on: " + out
+
+    rc, out = stage_wait_rc([])
+    assert rc == 0, f"an idle device must not block a stage: rc={rc} {out!r}"
+
+    # And the guard has to be wired up: a script that calls stage_wait without
+    # checking it is exactly as exposed as the pre-fix code was.
+    unchecked = []
+    for s in sorted((root / "scripts").glob("*.sh")):
+        # A line that CALLS stage_wait, not one that mentions it in a comment --
+        # relaunch_stage.sh explains the marker semantics without invoking them.
+        calls = [ln for ln in s.read_text().splitlines()
+                 if ln.strip().startswith("stage_wait")
+                 and not ln.strip().startswith("stage_wait()")]
+        if not calls:
+            continue
+        if not all("|| stage_refused" in ln for ln in calls):
+            unchecked.append(s.name)
+    assert not unchecked, (
+        "these stages call stage_wait but ignore its refusal, so the guard "
+        f"cannot stop them: {unchecked}")
+
+
+@test
+def a_suite_whose_runs_could_not_be_read_is_not_reported_as_empty():
+    """`crossover50m` has 50 finished runs and this reader called it empty.
+
+    That board predates `final_val`; its end-of-schedule value is the last `eval`
+    record, which is exactly what the published Mamba-2 (+0.4348) and MLA
+    (+0.3843) rows were computed from. `cells()` dropped every run for lacking a
+    field and `show()` printed "(no finished runs)" -- the same output it gives
+    for a genuinely empty directory.
+
+    A reader that cannot read must not be indistinguishable from one that read
+    and found nothing. Skips are counted, attributed, and a suite that is empty
+    ONLY because everything was skipped is refused rather than reported.
+    """
+    import importlib.util
+    import io
+    import json as _json
+    import tempfile
+    from contextlib import redirect_stdout
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "lr_argmin", root / "scripts" / "lr_argmin.py")
+    if spec is None or spec.loader is None:
+        raise Skip("no scripts/lr_argmin.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mod.ROOT = Path(tmp)
+        s = Path(tmp) / "nanolab" / "out" / "old_board"
+        s.mkdir(parents=True)
+        for seed in (1337, 42):
+            d = s / f"r_s{seed}"
+            d.mkdir()
+            (d / "config.json").write_text(_json.dumps(
+                {"d_model": 768, "lr": 6e-4, "mixer": "mla", "seed": seed}))
+            # finished, but the old schema: best_val only, no final_val
+            (d / "metrics.jsonl").write_text(
+                _json.dumps({"event": "eval", "val": 4.59}) + "\n"
+                + _json.dumps({"event": "done", "best_val": 4.59, "tokens": 5}) + "\n")
+
+        got = mod.cells("old_board")
+        assert got == {}, "fixture should be unreadable by the current schema"
+        assert sum(mod.SKIPPED.values()) == 2, (
+            f"skips were not counted: {mod.SKIPPED}")
+        assert any("final_val" in k for k in mod.SKIPPED), (
+            f"the skip reason must name the missing field: {mod.SKIPPED}")
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            mod.show("old_board")
+        out = buf.getvalue()
+
+    assert "no finished runs" not in out, (
+        "a board of 50 finished runs was reported the same way as an empty "
+        f"directory:\n{out}")
+    assert "REFUSING" in out and "2 run(s) not read" in out, out
+
+
+@test
+def an_lr_curve_is_read_paired_by_seed_not_by_whichever_seeds_a_point_happens_to_have():
+    """G11 added two seeds to one point per curve and two argmins appeared to move.
+
+    Neither had. `argmin` was taking the plain mean of whatever seeds each point
+    carried, and on these boards seed 100 is the easiest at every cell and 777
+    the hardest -- 4.1229 against 4.1803 at d1152 attention 1x, a 0.0574 spread,
+    eighteen times the 0.0031 rerun floor. Enriching one point with seed 100 and
+    not its neighbour therefore moves that point down by more than any argmin
+    margin on these grids, and the readout reports a relocated optimum.
+
+    The numbers below are the real d1152 attention curve at the moment G11 exited:
+    0.5x carrying seeds 42/100/1337 against 1x carrying all five. Unpaired, 0.5x
+    wins by 0.0018 and the argmin "moves". Paired on the seeds they share, 1x wins
+    by 0.0047 on 3 of 3 and it never moved.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "lr_argmin", root / "scripts" / "lr_argmin.py")
+    if spec is None or spec.loader is None:
+        raise Skip("no scripts/lr_argmin.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    d1152_attention = {
+        0.25: {1337: 4.2360},
+        0.5: {42: 4.1575, 100: 4.1237, 1337: 4.1659},
+        1.0: {42: 4.1507, 100: 4.1229, 777: 4.1803, 1337: 4.1595, 2026: 4.1404},
+        4.0: {42: 4.3313, 100: 4.2923, 777: 4.3469, 1337: 4.3358, 2026: 4.3052},
+        8.0: {42: 4.4546, 100: 4.4194, 777: 4.4734, 1337: 4.4575, 2026: 4.4335},
+    }
+    import statistics
+    unpaired = {m: statistics.mean(v.values()) for m, v in d1152_attention.items()}
+    assert min(unpaired, key=lambda k: unpaired[k]) == 0.5, (
+        "this fixture no longer reproduces the bug it was written for")
+
+    best, verdict = mod.argmin(d1152_attention)
+    assert best == 1.0, (
+        f"the argmin was read off an unbalanced seed set: got {best}x, and the "
+        f"only thing distinguishing it from 1x is which seeds were run [{verdict}]")
+    assert verdict == "interior", verdict
+
+    # A margin at or under the rerun floor is a flat basin, not a located argmin,
+    # however many seeds stand behind it.
+    flat = {0.5: {1: 5.100, 2: 5.101}, 1.0: {1: 5.098, 2: 5.099},
+            2.0: {1: 5.200, 2: 5.201}}
+    best, verdict = mod.argmin(flat)
+    assert best == 1.0 and verdict.startswith("FLAT"), (best, verdict)
+    assert "0.0031" in verdict, "a flat verdict must name the floor it failed"
+
+    # The two pairings are computed independently: the grid argmin on the seeds
+    # every point shares, the runner-up margin on every seed those two share.
+    # Here that is 1 seed and 3 seeds respectively, and collapsing them to one
+    # number would throw away the power that decides the margin.
+    _, verdict = mod.argmin(
+        {0.25: {1337: 9.000},
+         0.5: {42: 5.202, 100: 5.202, 1337: 5.202},
+         1.0: {42: 5.200, 100: 5.200, 1337: 5.200},
+         2.0: {1337: 5.300}})
+    assert "of the 3 seeds they share" in verdict, (
+        f"the margin was read on the whole grid's shared seeds, not the pair's: {verdict}")
+    assert "paired on 1 seed [1337]" in verdict, verdict
+
+    # No seed common to every point: the curve cannot be read paired at all, and
+    # saying so is not the same as returning an answer.
+    best, verdict = mod.argmin(
+        {0.5: {1337: 5.4}, 1.0: {42: 5.1}, 2.0: {100: 5.0}})
+    assert "no seed is common" in verdict, verdict
+    assert verdict != "interior"
+
+
+@test
+def a_curve_whose_token_axis_restarted_is_refused_not_silently_interpolated():
+    """D1's blast radius reaches the analysis scripts, not just the harness.
+
+    Before D1, a resumed run restarted `tokens` at 0 while `step` carried on, so
+    the axis folded back on itself mid-curve. `paired_board.py` reads every
+    marker and every crossing against that axis and interpolated straight across
+    the fold without complaining -- which is how a crossing analysis once
+    reported no crossing where there was one. The harness is fixed, but records
+    written before the fix are still on disk and still readable.
+
+    Refusing is the point: a run that cannot be read must not come back looking
+    like one that read cleanly.
+    """
+    import importlib.util, json as _json, tempfile
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "paired_board", root / "scripts" / "paired_board.py")
+    if spec is None or spec.loader is None:
+        raise Skip("no scripts/paired_board.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def build(tmp, tokens):
+        d = Path(tmp) / "nanolab" / "out" / "s"
+        d.mkdir(parents=True)
+        (d / "recipe.json").write_text(_json.dumps({"prefix": "cxt"}))
+        r = d / "cxt_attention_s42"
+        r.mkdir()
+        (r / "config.json").write_text(_json.dumps(
+            {"seed": 42, "lr": 6e-4, "matrix_lr": 0.025, "mixer": "attention",
+             "layer_mixers": "", "batch_size": 32, "block_size": 512,
+             "eval_iters": 20, "max_steps": 4, "lr_max_steps": 4,
+             "warmup_steps": 1, "schedule": "cosine", "optimizer": "muon_ns5_adamw"}))
+        lines = [_json.dumps({"event": "eval", "step": i, "tokens": t, "val_loss": 5.0 - 0.01 * i})
+                 for i, t in enumerate(tokens)]
+        lines.append(_json.dumps({"event": "done", "final_val": 4.9}))
+        (r / "metrics.jsonl").write_text("\n".join(lines))
+        mod.ROOT = Path(tmp)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        build(tmp, [16384, 32768, 49152, 65536])
+        assert mod.load_arm("s", "attention"), "a clean monotone curve must load"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # step 0,1 then a resume that restarts the token counter: 3rd eval folds.
+        build(tmp, [16384, 32768, 16384, 32768])
+        try:
+            mod.load_arm("s", "attention")
+        except SystemExit as e:
+            assert "backwards" in str(e) and "cxt_attention_s42" in str(e), (
+                f"refused without naming the run or the reason: {e}")
+        else:
+            raise AssertionError(
+                "a folded token axis was accepted; every marker read off it and "
+                "every crossing computed from it would be silently wrong")
+
+
+@test
+def the_reladder_planner_refuses_an_edge_and_refuses_to_extrapolate_w1536():
+    """G9 spends ~$15 at a learning rate no human picks. Its guards are the review.
+
+    The re-tuned ladder is launched from `g9_plan.py` without anyone looking at the
+    probe in between, so the planner has to fail closed on exactly the two ways it
+    could be wrong: a grid that never found a minimum, and a width that was never
+    probed. w1536 has no probe of its own -- it inherits a multiplier only when all
+    three probed widths agree, because that agreement IS the invariance the
+    inheritance rests on.
+    """
+    import importlib.util, io, sys as _sys
+    from contextlib import redirect_stdout, redirect_stderr
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("g9_plan", root / "scripts" / "g9_plan.py")
+    if spec is None or spec.loader is None:
+        raise Skip("no scripts/g9_plan.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def run(fake):
+        mod.lr_argmin.cells = lambda board: fake
+        argv = _sys.argv
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            _sys.argv = ["g9_plan.py", "--arms"]
+            with redirect_stdout(out), redirect_stderr(err):
+                mod.main()
+            return out.getvalue().strip(), None
+        except SystemExit as e:
+            return out.getvalue().strip(), f"{e}\n{err.getvalue()}"
+        finally:
+            _sys.argv = argv
+
+    def curve(best):
+        """An interior minimum at `best` on a 0.25..8 grid."""
+        grid = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+        return {m: {1337: 5.0 + 0.1 * abs((grid.index(m)) - grid.index(best))}
+                for m in grid}
+
+    # 1. every cell interior and every width agreeing -> w1536 inherits.
+    ok = {(w, mx): curve(1.0) for w in (384, 768, 1152, 1536)
+          for mx in ("attention", "mingru")}
+    arms, err = run(ok)
+    assert err is None, f"a clean plan was refused: {err}"
+    got = set(arms.split(","))
+    assert "w1536_attention_lr10" in got and "w1536_mingru_lr10" in got, got
+    assert len(got) == 8, f"expected 4 widths x 2 mixers, got {sorted(got)}"
+    # A ladder width with no probe of its own is never planned -- w1920 exists in the
+    # registry for G6 and must not be swept in here on somebody else's measurement.
+    assert not any(x.startswith("w1920_") for x in got), sorted(got)
+
+    # 2. one cell bottoms out at the edge -> refuse, and say which way to extend.
+    edge = dict(ok)
+    edge[(768, "attention")] = {0.25: {1337: 4.0}, 0.5: {1337: 4.2}, 1.0: {1337: 4.4}}
+    arms, err = run(edge)
+    assert err and "EDGE" in err and "DOWN" in err, f"an edge was planned on: {err!r}"
+    assert not arms, "refusal must emit no arm list"
+
+    # 3. widths that disagree are planned INDIVIDUALLY, never averaged or inherited.
+    # The 50M probe came back with d384 at 2x and d768 at 1x, so this is the real case,
+    # not a hypothetical: each width must carry its own multiplier into its own arm.
+    split = dict(ok)
+    split[(384, "mingru")] = curve(2.0)
+    arms, err = run(split)
+    assert err is None, f"a per-width plan was refused: {err}"
+    got = set(arms.split(","))
+    assert "w384_mingru_lr20" in got and "w768_mingru_lr10" in got, (
+        f"a width's own argmin did not reach its own arm: {sorted(got)}")
+
+
+@test
+def a_planned_arm_that_duplicates_one_already_on_the_board_reuses_it():
+    """Two names, one model -- and the 50M probe landed exactly on the collision.
+
+    `w768_attention_lr10` restates the base Config (d_model 768, lr 6e-4), so it
+    trains the identical model to the bare `attention` arm. The probe put d768's
+    argmin at 1x for all four section-5 shapes, so planning the generated names
+    would have queued fifteen jobs reproducing runs already sitting on
+    `crossover50m_ratioplace32` at n=5.
+
+    The swap is conditional on the board actually carrying the twin, so a board with
+    its own naming convention and no base arm keeps the generated name.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("g9_plan", root / "scripts" / "g9_plan.py")
+    if spec is None or spec.loader is None:
+        raise Skip("no scripts/g9_plan.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    from .crossover_replicate import ARMS
+    spec_by_name = {a.name: a for a in ARMS}
+
+    assert mod.resolved(spec_by_name["w768_attention_lr10"]) == \
+        mod.resolved(spec_by_name["attention"]), (
+            "these two arms must resolve to one model, or the collision this guards "
+            "has moved and the guard is now inert")
+
+    board = ("attention", "hybrid_mingru8_attn4", "hybrid_mingru_periodic")
+    assert mod.canonical("w768_attention_lr10", board) == "attention"
+    assert mod.canonical("w768_hybrid_mingru8_attn4_lr10", board) == "hybrid_mingru8_attn4"
+
+    # A different learning rate is a different model: never swapped.
+    assert mod.canonical("w768_attention_lr05", board) == "w768_attention_lr05"
+    assert mod.canonical("w768_attention_lr20", board) == "w768_attention_lr20"
+    # A board without the twin keeps the generated name, convention intact.
+    assert mod.canonical("w768_attention_lr10", ("w384_attention_lr80",)) == \
+        "w768_attention_lr10"
+    # An unregistered name passes through rather than raising.
+    assert mod.canonical("not_an_arm", board) == "not_an_arm"
 
 
 def main():

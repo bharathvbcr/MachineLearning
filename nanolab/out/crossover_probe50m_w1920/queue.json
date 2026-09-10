@@ -1,0 +1,132 @@
+{
+  "jobs": [
+    {
+      "id": "cx32p1920_w1920_attention_lr025_s1337",
+      "arm": "w1920_attention_lr025",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1920, LR x0.25",
+      "status": "running",
+      "worker": 0,
+      "started": 1788998325.7464354
+    },
+    {
+      "id": "cx32p1920_w1920_attention_lr05_s1337",
+      "arm": "w1920_attention_lr05",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1920, LR x0.5",
+      "status": "done",
+      "worker": 0,
+      "started": 1789018910.4240627,
+      "finished": 1789020270.695234,
+      "detail": "best_val=4.058745"
+    },
+    {
+      "id": "cx32p1920_w1920_attention_lr10_s1337",
+      "arm": "w1920_attention_lr10",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1920, LR x1.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1789020270.7023773,
+      "finished": 1789021630.232366,
+      "detail": "best_val=4.078784"
+    },
+    {
+      "id": "cx32p1920_w1920_attention_lr20_s1337",
+      "arm": "w1920_attention_lr20",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1920, LR x2.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1789021630.2677908,
+      "finished": 1789022989.345797,
+      "detail": "best_val=4.148355"
+    },
+    {
+      "id": "cx32p1920_w1920_attention_lr40_s1337",
+      "arm": "w1920_attention_lr40",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1920, LR x4.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1789022989.3477883,
+      "finished": 1789024343.2089198,
+      "detail": "best_val=4.290975"
+    },
+    {
+      "id": "cx32p1920_w1920_mingru_lr025_s1337",
+      "arm": "w1920_mingru_lr025",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1920, LR x0.25",
+      "status": "done",
+      "worker": 0,
+      "started": 1789024343.2148268,
+      "finished": 1789026083.0588765,
+      "detail": "best_val=4.332626"
+    },
+    {
+      "id": "cx32p1920_w1920_mingru_lr05_s1337",
+      "arm": "w1920_mingru_lr05",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1920, LR x0.5",
+      "status": "done",
+      "worker": 0,
+      "started": 1789026083.0608904,
+      "finished": 1789027827.9847374,
+      "detail": "best_val=4.288770"
+    },
+    {
+      "id": "cx32p1920_w1920_mingru_lr10_s1337",
+      "arm": "w1920_mingru_lr10",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1920, LR x1.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1789027828.004799,
+      "finished": 1789029572.7754107,
+      "detail": "best_val=4.309133"
+    },
+    {
+      "id": "cx32p1920_w1920_mingru_lr20_s1337",
+      "arm": "w1920_mingru_lr20",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1920, LR x2.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1789029572.7888079,
+      "finished": 1789031318.1327572,
+      "detail": "best_val=4.401965"
+    },
+    {
+      "id": "cx32p1920_w1920_mingru_lr40_s1337",
+      "arm": "w1920_mingru_lr40",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1920, LR x4.0",
+      "status": "failed",
+      "worker": 0,
+      "started": 1789031318.148779,
+      "finished": 1789031328.2621658,
+      "detail": "OutOfMemoryError: CUDA out of memory. Tried to allocate 240.00 MiB. GPU 0 has a total capacity of 94.50 GiB of which 232.81 MiB is free. Including non-PyTorch memory, this process has 93.53 GiB memory in use. Of the allocated memory 86.70 GiB is allocated by PyTorch, and 6.08 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)"
+    }
+  ]
+}

@@ -1,0 +1,863 @@
+# GH200 tuning sprint — 2026-09-05
+
+**Question.** The E28–E35 program (`docs/architecture-review-2026-09-04/inputs/04-efficiency-reconciliation-memo.md` §7)
+was priced from elapsed times of past suites divided by their tenancy. Before
+spending ~$110 of GH200 time on it, measure the knobs that set how long it takes,
+and separate the ones that change only speed from the ones that change what a
+board measures.
+
+**Box.** NVIDIA GH200 480GB (94.5 GiB usable to the runner), aarch64, torch 2.7.0
+/ CUDA 12.8, $2.29/h. Measured dense bf16 ceiling **752.8 TFLOP/s** (8192³ matmul,
+50 iterations) — used as the MFU denominator below rather than a spec number.
+No throttling during the sprint: SM clocks pinned at 1980/1980 MHz, 542 W of a
+900 W limit, 56 °C, `clocks_throttle_reasons.active = 0x0`.
+
+**Method.** Two independent harnesses, which agree where they overlap (attention:
+130.4K tok/s from the arm sweep, 131.0K from the tenancy driver):
+
+* `nanolab.sweep_gpu arm` — one row per `crossover_replicate` ARM, configured
+  through `job_config` so hybrids and per-arm overrides are priced exactly as the
+  suite runner would launch them. Synthetic in-GPU batches, so a row is compute,
+  not the dataloader.
+* `scripts/tune_tenancy.py` — N concurrent processes of one arm over a **shared
+  wall-clock window**, so a high-tenancy row cannot be flattered by start-up skew.
+
+Nothing here changes a recipe. Where a speed-up would change one, that is stated
+as its price.
+
+---
+
+## The headline
+
+At the 50M board shape a 124M model reaches **13.8% MFU** (104 of 752.8 TFLOP/s)
+with the GPU busy essentially 100% of the wall clock — the kernels are small, not
+the GPU idle. That single fact explains every result below.
+
+**Tenancy is not one number.** `workers` is a recipe field every board sets by
+hand — 2 for the ladder, 3 for E18/E19/E20, 4 for the recall grid — and the knee
+had never been measured. Thirteen of the fifteen token-matched suites on disk ran
+at 2 or 3. What the measurement shows:
+
+1. **Without MPS, concurrent processes time-slice the GPU rather than sharing
+   SMs.** For an arm that already saturates (attention, the minGRU hybrids)
+   tenancy ≥ 2 is a flat **~9% loss**. For a *dispatch-bound* arm it is a
+   **1.53× gain**, because time-slicing recovers the idle gaps between one job's
+   many small kernel launches. GDN is the dispatch-bound case (2.7% MFU).
+2. **There is no MPS daemon running on the box, and starting one changes the
+   answer** for the saturating arms too.
+
+So the correct rule is not "use tenancy N" but: *tenancy pays in proportion to
+the GPU idle time a single job leaves behind.* An arm's MFU predicts its sign.
+
+---
+
+## The five findings, in order of what they change
+
+### 1. `torch.compile` is 1.94x and it is switched off everywhere
+
+| arm | eager | compiled | speed-up | compile time |
+|---|---:|---:|---:|---:|
+| `attention` | 113.6K tok/s | 220.9K | **1.94x** | 31 s |
+| `mingru` | 91.8K | 179.6K | **1.96x** | 29 s |
+| `gdn` | 26.4K | 83.7K | **3.17x** | 603 s (244 s warm) |
+| `hybrid_mingru8_attn4` | 98.0K | 191.2K | **1.95x** | 38 s |
+| `hybrid_mingru_periodic` | 96.4K | 187.9K | **1.95x** | 56 s |
+| `moe_e8k1` | 55.0K | 65.5K | 1.19x | 23 s |
+
+**Three rows of this table were wrong in its first version, and the error was in
+the harness, not the box.** `hybrid_mingru8_attn4` was reported at 1.00x, `gdn`
+at 0.97x and `moe_e8k1` at 1.08x. Adding `dynamo.reset()` between arms, they are
+**1.95x**, **3.17x** and **1.19x**.
+
+The recompile limit was the right mechanism and the wrong culprit. The probe's
+log carries exactly ONE Dynamo warning, and where it falls settles it:
+
+```
+attention   compiled 31s -> 1.94x
+mingru      compiled 29s -> 1.96x
+hybrid      eager measured...
+  W [0/8] torch._dynamo hit config.recompile_limit (8)
+     function: 'forward' (nanolab/model.py:410)
+     last reason: 0/7: GLOBAL_STATE changed: grad_mode
+hybrid      compiled 29s -> 1.00x
+gdn         compiled  1s -> 0.97x     <- 1 second is not a compile
+moe_e8k1    compiled  0s -> 1.08x     <- neither is 0
+```
+
+The counter is **per code object**, and `forward` at `model.py:410` is the same
+object for every arm. attention's and minGRU's compiles plus the hybrid's
+`grad_mode` flips spent the budget of 8; the limit happened to trip during the
+hybrid, which is why the hybrid was blamed for it. Once tripped, Dynamo
+permanently skips that frame, so `gdn` and `moe_e8k1` never attempted
+compilation at all -- the 1 s and 0 s are the tell, and the single warning is
+Dynamo warning once per frame rather than once per arm.
+
+So the first version's diagnosis was wrong in attribution, not in mechanism: it
+is not that a stack with two mixer kinds exhausts the budget, it is that
+**every arm measured in one process shares one budget**. The suite launches each
+job as its own process and never had the problem. An earlier revision of this
+page claimed that raising the limit to 64 "falsifies the recompile-limit story";
+that inference was invalid, because the limit-64 cell also had `dynamo.reset()`
+applied and so never exercised the accumulation case.
+
+`gdn`'s 3.17x is a kernel-level number and its compile is expensive -- 603 s
+cold, 244 s once Inductor's on-disk cache is warm. End to end for a 50M job:
+1894 s eager against 603 + 597 = 1200 s. Across five seeds with the cache
+warming, roughly **2.1x**, which is the number to plan with.
+
+`compile=False` is hardcoded in `job_config` and `current_recipe`, and `train.py`
+additionally refuses to compile anything but a pure-attention stack. Both date
+from an Inductor stall on aarch64 that torch 2.7.0 does not reproduce.
+
+The old gate was wrong in both directions, though not for the reason first
+given here. It *excluded* a pure minGRU stack (1.96x) and a pure GDN stack
+(3.17x, the largest win measured). It also excluded the hybrids, justified by
+their blowing Dynamo's recompile limit -- which they do not do on their own; the
+budget was spent by the arms measured before them in the same process. Measured
+with a reset the hybrids reach **1.95x**, so **the one-mixer-kind condition is
+not the right gate either**: every arm tested gains, from 1.19x (`moe_e8k1`) to
+3.17x (`gdn`). Compile everything, and let the recorded recipe field keep
+compiled and eager runs in separate directories.
+
+The one thing worth carrying forward from the original diagnosis: the
+`grad_mode` flip is real. The suite evaluates 61 times per 50M run inside
+`torch.no_grad()`, and each flip is a guard miss. One arm per process has
+budget for that; five arms sharing one process do not.
+
+This is a numerics change: Inductor fuses and re-associates. `compile` is now a
+recorded recipe field (`CROSSOVER_COMPILE`, default off), so a compiled run
+cannot pool with an eager one by accident.
+
+**Measured end to end**, five seeds x 20M tokens through the real suite runner
+(`_tune/cmp_eager` and `_tune/cmp_on`), eager against compiled. Note this board
+runs **`mingru`**, not attention — an earlier version of this table labelled it
+attention and quoted 961 s -> 495 s, which no board in `_tune/` produces:
+
+| | eager | compiled |
+|---|---:|---:|
+| wall clock, 5 jobs | 1197 s | **597 s** (2.01x) |
+| in-run rate | 131.1K tok/s | **289K tok/s** |
+| MFU | 10.6% | **23.3%** |
+| `final_val` vs eager, mean over seeds | — | **0.0023 nats** (max 0.0040) |
+
+Step 0 is bit-identical (15.3669 both); the trajectories then diverge slowly.
+For scale, two runs of the *same* configuration land 0.0014 nats apart (below),
+so compile moves the reported number by about 1.6x the nondeterminism that is
+already there, and roughly 8x less than the effects the boards measure.
+
+#### 1b. Compiling makes `fused_ce` a cost rather than a saving (step loop)
+
+`crossover50m` sets `fused_ce=True`, and the comment above it dates the choice:
+the measured throughput peak *"on the 3070 Ti (8 GB)"*, where 16 chunks
+*"frees the VRAM ... that lets bs32 fit"*. VRAM is the binding constraint on an
+8 GB card. It is not one here, and the setting stops being free the moment
+compile is available, because Inductor fuses the CE reduction itself — the
+hand-written chunking blocks the fusion it exists to provide.
+
+The 2x2, attention at bs32/ctx512, one fwd+bwd on fixed weights:
+
+| | tok/s | ms/step | peak |
+|---|---:|---:|---:|
+| fused/16, eager — **what the suite runs today** | 113.6K | 144.3 | 15.2 GB |
+| fused/16, compiled | 220.5K | 74.3 | 12.6 GB |
+| unfused, eager | 146.4K | 111.9 | 26.4 GB |
+| **unfused, compiled** | **342.6K** | 47.8 | 14.5 GB |
+
+Unfused is the memory-hungry option only while eager (+11.2 GB). Compiled, it
+costs **+1.9 GB** over fused and still lands *under* today's fused-eager
+footprint, so the recommended cell is faster *and* slightly lighter than the
+current one. Read 3.02x as the step-loop ceiling: section 1c runs it on a board
+and gets 1.14x for the `fused_ce` half, for about 2.2x stacked.
+
+Two independent checks that this is real. The eager column is **1.29x** (113.6K -> 146.4K), which
+reproduces the standalone fused-CE sweep in appendix F (113.1K -> 145.6K). For
+compile, the only board that exists is `mingru`'s, and there the step loop
+(1.96x) does agree with the board (2.01x) — but see 1c, where the same reasoning
+applied to `fused_ce` fails. There is **no attention compile board**; attention's
+1.94x is step-loop only.
+
+Numerically it is the cheapest change on this page: unfused differs from fused
+by **9.9e-7 relative** on attention and **2.2e-5** on the 8+4 hybrid — at a loss
+near 15.36 that is 1.5e-5 and 3.4e-4 nats, one to two orders under the 0.0031
+nat rerun floor. `fused_ce_chunks` 16 and 4 give **bit-identical** losses, so the
+chunk count is not a second knob to sweep.
+
+`fused_ce` was *not* a recorded recipe field, so two runs differing on it would
+have pooled silently — the same confound `compile` is recorded to prevent. It is
+now gated and recorded exactly like `compile` (`CROSSOVER_FUSED_CE`, **default
+on**, so nothing changes until a run opts out):
+
+```python
+def cluster_fused_ce() -> bool:
+    raw = os.environ.get("CROSSOVER_FUSED_CE", "").strip().lower()
+    if not raw:
+        return True
+    return raw in ("1", "true", "yes")
+```
+
+#### 1c. The board says 1.14x, not 1.55x — and the numerics cost is real
+
+That caveat was worth writing, because the board did not confirm it. Five seeds,
+20M tokens, compile ON in both cells, `fused_ce` the only variable:
+
+| seed | fused `final_val` | unfused | diff | fused s | unfused s | speed-up |
+|---|---:|---:|---:|---:|---:|---:|
+| 42 | 4.7506 | 4.7554 | +0.0048 | 84 | 74 | 1.14x |
+| 100 | 4.7813 | 4.7901 | +0.0088 | 84 | 74 | 1.14x |
+| 777 | 4.7748 | 4.7739 | -0.0009 | 85 | 75 | 1.14x |
+| 1337 | 4.7812 | 4.7802 | -0.0010 | 107 | 118 | 0.91x |
+| 2026 | 4.7481 | 4.7451 | -0.0030 | 84 | 74 | 1.14x |
+
+**Throughput: 1.14x steady state, not 1.55x.** Four seeds agree to three digits;
+s1337 is the one paying Inductor's cold compile and runs 0.91x. Whole-board wall
+clock is 461 s against 434 s = 1.06x, because that cold compile is paid once
+either way. The step loop over-promised by 36%: it timed training steps only,
+and a real run also does 61 evaluations, data loading and checkpointing, none of
+which the CE path speeds up.
+
+**And it is not numerically free.** Mean absolute `final_val` difference is
+**0.0037** (max 0.0088) — *above* the 0.0014/0.0031 rerun floor, and above
+compile's own 0.0023/0.0040. The single-forward comparison in 1b (9.9e-7
+relative) istrue but irrelevant at board scale: like compile, the per-step
+difference compounds over 20M tokens.
+
+So the honest stack is **1.94x from compile, then 1.14x from unfusing** — about
+**2.2x**, not the 3.02x this section first claimed. Unfusing is still worth
+taking: 14% for +1.9 GB, at a numerics cost in the same category as compile's.
+But it is a recipe change to adopt board-wide, not a free win, and recording
+`fused_ce` turns out to matter more than it looked.
+
+### 2. Tenancy's sign is predicted by the arm's MFU
+
+The repo treats `workers` as a per-board choice and thirteen of the fifteen
+token-matched suites on disk record 2 or 3. It is not a choice that can be made
+once: with no MPS daemon, concurrent processes time-slice, which *costs* ~9% for
+an arm that already saturates the device and *recovers* idle launch gaps for one
+that does not. Ranked by MFU the relationship is monotone:
+
+| arm | MFU at t=1 | best tenancy, no MPS | gain |
+|---|---:|---|---:|
+| `gdn` | 2.7% | 3 | **1.53x** |
+| `moe_e8k1_raw` | 4.5% | 4 | **1.33x** |
+| `w384_mingru_lr40` | 7.0% | 1 | 1.00x |
+| `w384_attention_lr80` | 7.8% | 1 | 1.00x |
+| `mingru` | 13.0% | 1 | 1.00x |
+| `hybrid_mingru8_attn4` | 13.2% | 1 | 1.00x |
+| `attention` | 13.8% | 1 | 1.00x |
+
+Two controls: the sweep run in **descending** tenancy order reproduces the
+ascending one (130.5K at t=1, ~119K at 2–6), so this is not an ordering or
+warm-up artifact; and no throttling occurred (SM clocks pinned at 1980/1980 MHz,
+542 W of 900 W, 56 °C, `clocks_throttle_reasons.active = 0x0`).
+
+**The recall grid is the other regime.** At ~9.5M parameters and seq 31 the same
+cell takes 613 s at `--workers 1` and 229 s at 4 — a **2.68x** gain. So
+`mqar_suite`'s existing default of 4 for E28/E32 is right, and the 124M result
+must not be generalised to it.
+
+### 3. MPS refunds the tenancy tax, without touching any recipe
+
+`workers` is a recipe field (`current_recipe`), so a board reusing an existing
+directory cannot change it. MPS is not a recipe field, and it is worth most
+exactly where tenancy is locked:
+
+| arm | t=2 no MPS → MPS | t=3 no MPS → MPS |
+|---|---|---|
+| `attention` | 118.8K → 142.5K (**1.20x**) | 119.0K → 144.5K (**1.21x**) |
+| `hybrid_mingru8_attn4` | 100.7K → 122.6K (**1.22x**) | 100.7K → 123.8K (**1.23x**) |
+| `gdn` | 44.2K → 51.8K (1.17x) | 45.1K → 57.4K (**1.27x**) |
+
+Against *serial* the same daemon is worth only ~1.10x, because serial was already
+the best non-MPS configuration. It needs no code change: `launch` copies
+`os.environ` into every worker, so exporting `CUDA_MPS_PIPE_DIRECTORY` suffices.
+
+Two cautions. Verify the daemon is **serving** (`echo get_server_list |
+nvidia-cuda-mps-control` returning a pid) rather than merely present — `pgrep`
+races the daemon's fork, and that race mislabelled a stage of this sprint before
+the gate was made fail-closed. And MPS weakens fault isolation.
+
+### 4. The sampler silently switches token streams on free VRAM
+
+`data.should_gpu_resident` returns the GPU-resident path only when free VRAM
+exceeds **9.27 GiB** at `Batcher` construction. That path seeds a **CUDA**
+generator; the memmap fallback seeds a **CPU** one. Measured, same seed and split:
+
+```
+free 93.8 GiB → gpu_resident → first batch [247, 82, 2057, 12, 44708, 1410, 290, 262]
+free  7.4 GiB → memmap       → first batch [393, 7734, 416, 4737, 257, 1545, 11, 1641]
+```
+
+Construction happens *before* the model is built, so which path a worker takes
+depends on how many co-resident workers have already allocated — a race, not a
+setting. This is the one place tenancy changes what a job *trains on* rather than
+merely how it is scheduled, and it fails silently: the fallback needs *less* VRAM, so it converts an OOM into a run that
+looks fine and trains on different tokens.
+
+> **UPDATE 2026-09-10 — it stopped failing silently, after it cost something.**
+>
+> The exact threshold: `should_gpu_resident` returns True unconditionally only below
+> `_GPU_RESIDENT_MAX_TOKENS` (150M). This repo's train split is **497.5M tokens**, so the
+> branch that actually runs requires `1.85 GiB < 0.2 x free` — **free > 9.27 GiB** at
+> construction. Under that, the memmap path samples with a **CPU** generator where the
+> resident path uses a **CUDA** one: same seed, different tokens.
+>
+> On 2026-09-09 a stage-chaining fault (`stage_wait` timing out and starting anyway) put
+> four boards on one device at once, and **nothing on disk could say which path any run
+> had taken**. Nine completed runs became unreadable — not wrong, unreadable, which is
+> worse to discover late.
+>
+> `Logger.banner(sampler=...)` now writes `"sampler"` into every run's `start` record:
+> `gpu_resident`, `memmap`, or `"unknown"`. The third value is the point — a run whose
+> path cannot be established must not look like one that took the fast path. Covered by
+> `every_run_records_which_sampler_path_it_took`.
+>
+> Note what throughput does **not** buy you here: `mean_tok_s` separates solo from
+> co-resident, but a degraded rate is equally consistent with either path, so it can clear
+> a run (a cohort-topping rate means it ran alone and resident) and can never condemn one.
+> The decisive test is determinism — rerun at the same seed and compare against the
+> 0.0031 floor.
+
+### 5. Two knobs that are simply mis-set for a 94 GiB card
+
+**Fused cross-entropy.** `crossover50m` sets `fused_ce=True, fused_ce_chunks=16`,
+which exists to avoid materialising a 16384 x 50304 logits tensor — a real
+constraint on the 8 GB card this repo started on. Unfused is **1.29x** faster on
+attention (145.6K vs 113.1K) and 1.24x on the hybrid, for +10.8 GB.
+
+**GDN chunk width.** `mixer_chunk` is 32; width 128 runs **1.98x** faster
+(53.2K vs 26.9K) for +7.7 GB. **Validated**: on fixed projections at the board's
+head count and context, every width agrees with the O(T) reference to 3e-6-1.6e-5
+max absolute (relative RMS 2e-7-6e-7), identically under both `gdn_rule`
+variants; width 128 differs from the configured 32 by 7.2e-6. So the width
+changes the floating-point association order, not the operator, and the win is
+adoptable at a numerics cost far below compile's.
+
+| chunk | tok/s | max abs vs O(T) reference | max abs vs chunk 32 |
+|---|---:|---:|---:|
+| 16 | 14.5K | 3.34e-06 | 4.77e-06 |
+| **32 (current)** | 26.9K | 3.34e-06 | — |
+| 64 | 46.3K | 4.29e-06 | 3.34e-06 |
+| **128** | **53.2K** | 9.06e-06 | 7.15e-06 |
+| 256 | 44.3K | 1.57e-05 | 1.81e-05 |
+
+The first attempt at this check was vacuous — it compared a freshly built model
+against its own reference with a zero-initialised output projection, so both
+sides were all zeros and every width "agreed" to exactly 0.000e+00 with a nan
+relative RMS. The rewrite asserts the reference is non-trivial before believing
+any agreement, which then caught a second fault: the delta rule only stays
+bounded for unit keys, which `GatedDeltaNet._project` supplies (`F.normalize`)
+and synthetic Gaussian projections do not.
+
+### What was ruled out
+
+* **Deferring the eval loop's per-iteration `.item()`**: 1.00x. Eval is not
+  sync-bound, and the idea is dead. (297.9 → 297.2 ms per eval.)
+* **Tenancy rescuing itself on real jobs.** The synthetic harness omits evals,
+  checkpointing and start-up, which biases it *against* tenancy. Measured
+  end-to-end on real suite jobs it does not recover: at 20M tokens, 844 s at
+  `--workers 1` against 871 s at 3; at 5M, 549 s against 555 s.
+
+---
+
+## Does any of this change what a board measures?
+
+The gate for every claim above. Same arms and seeds, 5M tokens,
+one directory per condition; **a1 and a2 are the same configuration run twice**,
+so their difference is the floor any other difference must clear.
+
+| comparison | mean abs `final_val` difference | max |
+|---|---:|---:|
+| a1 vs a2 — identical config, identical seeds | **0.0014** | 0.0031 |
+| a1 vs t3 — `--workers` 1 against 3 | **0.0012** | 0.0022 |
+| a1 vs m3 — `--workers` 3 with MPS (17 clients connected) | **0.0023** | 0.0055 |
+| eager vs compiled (attention) | **0.0023** | 0.0040 |
+| eager vs compiled (minGRU) | **0.0016** | 0.0030 |
+
+Tenancy's effect on the reported number is *smaller than re-running the same job*.
+
+That makes tenancy **numerically benign**. It does not make it recipe-neutral, and
+the two are separate claims this report earlier ran together: `workers` is a field
+`current_recipe()` records and `lock_recipe` enforces, so re-tenanting still forks
+run identity and the new jobs will not pool with the old ones. Only MPS changes no
+recorded field — and MPS is the one that is *not* numerically free, at 0.0023 nats.
+
+It also gives the repo a number it did not have. The trainer is **not run-to-run
+deterministic** — two identical jobs land ~0.0014 nats apart in `final_val` (max
+0.0031 over ten runs), which is what non-deterministic cuBLAS/cuDNN backward
+kernels cost. For scale, the paired gap the architecture review reports for the
+8+4 hybrid is **-0.0176 nats**, about 12x that floor, so its conclusion is not at
+risk; but any future per-seed claim below ~0.003 nats is indistinguishable from
+running the same job again. Measured at 5M tokens; the floor at 50M is unmeasured.
+
+The MPS condition (`m3`) is still missing: it was skipped twice because the
+daemon was not serving. It was *skipped rather than mislabelled*, which is the
+behaviour the gate was built for, and it is being rerun.
+
+## What eval_iters buys, and what it costs
+
+Eval is ~16% of a 50M run (61 evaluations x 20 iterations x a forward pass), and
+`eval_iters` is a recipe field. Two trained checkpoints at the same seed, scored
+on the same 200 val batches:
+
+* per-batch SD 0.0736 nats; **correlation between the two arms 0.9957** — because
+  `Batcher` seeds val with `cfg.seed + 1`, both arms see identical batches
+* the pairing therefore removes ~90% of the noise: the paired difference has
+  SD 0.0068 against 0.0736 for a single arm
+
+| `eval_iters` | SE of one arm's mean | SE of the **paired difference** | eval cost |
+|---|---:|---:|---:|
+| 5 | 0.0329 | 0.0031 | 25% |
+| 10 | 0.0233 | 0.0022 | 50% |
+| **20 (current)** | 0.0165 | **0.0015** | 100% |
+| 40 | 0.0116 | 0.0011 | 200% |
+
+Note the first column: a *single* arm's mean at `eval_iters=20` has SE 0.0165,
+which is the same size as the 8+4 effect. Absolute `final_val` is far noisier
+than the paired difference — which is exactly why the boards pair, and is
+independent support for that choice.
+
+At `eval_iters=5` the paired difference is still resolved at ~5.7 SE and eval
+drops from 16% of a run to 4%. That is a recipe change (it moves every board's
+markers), so it is a decision, not a recommendation.
+
+---
+
+## What to change, and what it costs
+
+Ordered by (value × confidence). "Recipe-neutral" means the loss curve is
+provably unchanged — safe even for boards that pool with existing runs.
+
+### 1. Start an MPS daemon: ~20% back, at compile-sized numerics cost
+
+`workers` is a **recipe field**: `current_recipe()` records it and `lock_recipe`
+refuses a directory whose recorded tenancy differs. So for the boards that must
+reuse an existing directory — the E27 ladder (locked at 2), E30a into
+`crossover50m_ratioplace32` (locked at 3) — tenancy cannot be changed at all.
+
+MPS is **not** a recipe field. It is a scheduling layer outside the training
+process, and it is exactly where those boards are losing the most:
+
+| tenancy the recipe locks | without MPS | with MPS | gain |
+|---|---:|---:|---:|
+| 2 (E27 ladder) | 118.8K tok/s | 142.5K | **1.20x** |
+| 3 (E18/E19/E20/E30a) | 119.0K | 144.5K | **1.21x** |
+
+Against *serial* the same daemon is worth only ~1.10x, because serial was already
+the best non-MPS configuration. The 20% is the tenancy tax being refunded.
+
+Operationally it needs no code change: `launch` copies `os.environ` into every
+worker (`crossover_replicate.py:1674`), so exporting `CUDA_MPS_PIPE_DIRECTORY`
+in the launching shell is enough.
+
+**But it is not numerically free, and this is the one place the first draft of
+this document over-claimed.** MPS changes no *recorded* recipe field, which is
+what makes it usable on a locked directory — but it does change kernel
+interleaving, and that perturbs non-deterministic backward kernels more than
+plain tenancy does:
+
+| condition vs the serial reference | mean abs `final_val` diff | max |
+|---|---:|---:|
+| same config, rerun (the floor) | 0.0014 | 0.0031 |
+| `--workers` 3, no MPS | 0.0012 | 0.0022 |
+| **`--workers` 3, MPS** | **0.0023** | **0.0055** |
+| eager vs compiled, for comparison | 0.0023 | 0.0040 |
+
+So MPS sits in the same category as `torch.compile`: about 1.6x the rerun floor,
+roughly 8x below the effects the boards resolve — worth taking, but it should be
+turned on for a whole board, not mid-way through one, and a board that pools with
+existing runs inherits that perturbation.
+
+Two operational cautions. The daemon must be verified *answering* — `pgrep`
+races its fork, and `get_server_list` returns an empty list until a client first
+attaches, so a freshly started daemon looks dead to a naive check; both mistakes
+cost this sprint a stage. Verify instead by counting the clients that connected
+(the control log records `NEW CLIENT`): the m3 condition above shows 17. And MPS
+weakens fault isolation, so a client that dies hard can take the server with it.
+
+### 2. Pick tenancy per arm, from the arm's MFU — new dirs only
+
+The sign of the tenancy effect is predictable from how much GPU idle time a
+single job leaves behind:
+
+* **Saturating arms** (attention, the minGRU hybrids; ~13–14% MFU but the GPU
+  busy ~100% of the wall clock): tenancy ≥ 2 without MPS is a flat ~9% loss.
+* **Dispatch-bound arms** (GDN, 2.7% MFU): tenancy 3 is a **1.53x gain** even
+  without MPS, because time-slicing recovers the gaps between its many small
+  kernel launches.
+
+### 3. VRAM: budget from the real number, not the bench number
+
+A bench row understates a real job by ~4.1 GiB, paid **per co-resident job**:
+
+| term | size | why the bench misses it |
+|---|---:|---|
+| peak reserved (measured) | per arm, table A | — |
+| CUDA context | **2.24 GiB** | per process, not a PyTorch allocation |
+| resident corpus | **1.85 GiB** | `Batcher` copies 497.5M tokens as int32 |
+
+The context figure comes from the tenancy-6 OOM trace: PyTorch reported 15.31 GiB
+in use while the process held 17.55 GiB. Bharath's uncommitted `nanolab/vram.py`
+anchors (attention 17.0, minGRU 23.3 GiB) reconcile with the bench rows once both
+terms are added — independent support for both.
+
+### 4. The sampler switches on free VRAM, and the two paths are not the same run
+
+`data.should_gpu_resident` returns GPU-resident only when free VRAM exceeds
+**9.27 GiB** at `Batcher` construction. That path seeds a **CUDA** generator; the
+memmap fallback seeds a **CPU** one. Same seed, different token stream.
+Construction happens before the model is built, so which path a worker takes
+depends on how many co-resident workers have already allocated — a race, not a
+setting. This is the one place where tenancy changes the token stream itself.
+
+---
+
+## What this changes for the interrupted E27 ladder
+
+E27's state is unchanged from the handoff and was re-verified at the start of this
+sprint: `crossover_ladder1536` has 2 jobs stuck at `running` (orphaned 06:05Z,
+both with `ckpt.pt`, so they resume) and 8 `pending`; `crossover_ladder_probe1536`
+has 4 done and 2 failed to CUDA OOM.
+
+The sprint reproduced E27's failure directly. At the board shape,
+`hybrid_mingru8_attn4` at tenancy 6 OOMed 6/6 workers, and `attention` at tenancy
+6 reached **90.5 GB reserved of a 94.5 GiB card** — with no margin for the CUDA
+context and resident corpus each real job also carries. The two w1536 minGRU
+probe cells that failed were 45.9 + 48.4 GiB co-resident at `workers: 2`; that is
+the same arithmetic one width up.
+
+The repair the handoff prescribes is right, and the measurement now says *why*:
+
+* The probe rerun belongs at `--workers 1` in a new directory — the existing
+  probe dir records `workers: 2` and `lock_recipe` refuses a different tenancy.
+  At width 1536 tenancy 1 is not a sacrifice: two minGRU jobs do not fit at all.
+* The attention half must stay at `workers: 2`, because `crossover_ladder1536`
+  records that and the recipe is locked. That costs ~9% against serial for a
+  saturating arm, which is a price already paid, not a new decision.
+
+  > **Note 2026-09-09: this prescription is no longer executable, and the conclusion
+  > is that the board cannot be grown at all.** Tried on 2026-09-09 (stage G8c): the
+  > VRAM guard refuses `--workers 2` at this shape -- "attention d_model=1536
+  > batch=32 at 40.2 GiB, so 2 of them need 80.4 GiB of a 94.5 GiB device (85%)".
+  > The guard postdates those runs, which is why they exist. Dropping to
+  > `--workers 1` is not available either, for the reason the bullet above gives:
+  > `lock_recipe` refuses a tenancy change. So new w1536 attention work needs a NEW
+  > directory at `workers: 1`, exactly as the minGRU half already does -- the
+  > asymmetry this bullet describes is gone and both halves are now in the same
+  > position. Note also that `lock_recipe` runs BEFORE the guard, so a refused launch
+  > still leaves a stub `recipe.json` recording the tenancy it was refused at; delete
+  > it before retrying, after checking it holds no run directories.
+* The orphaned `running` jobs must be reset to `pending` before any relaunch:
+  `claim_job` only claims `pending`, so they are invisible to a new worker
+  regardless of tenancy.
+
+The tenancy finding does **not** retroactively invalidate any board. `workers`
+changes throughput, and — subject to the sampler caveat below — not the loss
+curve. What it invalidates is the arithmetic that converted elapsed time into
+per-job GPU-minutes by dividing by tenancy: for a saturating arm at `workers: 3`
+that divisor overstates per-job cost by ~2.7x.
+
+---
+
+## What is measured, what is inferred, and what is not verified
+
+**Verified** (a number in this document came from a run on the box today):
+the per-arm cost table; the tenancy curves with and without MPS; the absence of
+thermal or power throttling during the sprint; the 752.8 TFLOP/s bf16 ceiling;
+the reproduction of E27's OOM class at tenancy 6; that 13 of 15 token-matched
+suites on disk record `workers` of 2 or 3; that the suite runner copies its
+environment to workers, so MPS needs no code change.
+
+**Inferred** (arithmetic on measured numbers, not itself observed):
+the re-priced program totals; the claim that the ~9% context-switch tax roughly
+cancels start-up overlap at 50M but not at 5M; the ~4.1 GiB gap between a bench
+row and a real job's VRAM.
+
+**Not verified — and the limits that matter:**
+
+* **The cost model uses synthetic batches.** `bench_gpu.synth_batch` returns
+  `y == x`, a target the model can read off its own input, so loss collapses to
+  ~0 within the warm-up. For dense arms that changes nothing about timing, but it
+  is why `moe_e4k1` and `moe_e4k1_raw` — identical compute — differed by 17%:
+  a router that trains dispatches differently from one that cannot. The MoE rows
+  are therefore re-measured on real corpus batches, and only those should be used
+  to price E29.
+* **The tenancy driver runs one arm at a time, in lockstep, with no evaluation,
+  checkpointing or data loading.** Real jobs are staggered and heterogeneous and
+  leave GPU-idle gaps that a co-resident job can fill. That biases the synthetic
+  measurement *against* tenancy; the validation stage measures real wall clock at
+  1 vs 3 workers to bound it, at a token budget where start-up is a much larger
+  fraction than it is at 50M — so its ratio must not be read as the 50M ratio.
+* **45-second windows.** Long enough for 357 attention steps and 76 GDN steps.
+  Run-to-run spread across workers was 1.00–1.07x; no row is a single sample of
+  a noisy quantity, but none is a confidence interval either.
+* **Absolute throughput drifted ~13% between harnesses, and the ratios are what
+  survive.** The first arm sweep read attention at 130.4K tok/s and the tenancy
+  driver at 131.0K; the later `tune_compile` and `tune_fusedce` probes read
+  113.6K and 113.1K on the same `bench()` code path, while a real training job
+  running concurrently with this writing reports 131.1K. Every speed-up quoted
+  here is a **ratio measured within one probe**, where both arms of the
+  comparison saw the same conditions, so the 1.94x, 1.29x and 1.98x figures are
+  unaffected. The absolute levels are not interchangeable across probes, and the
+  cause is now identified: re-running the *identical* `sweep_gpu` invocation
+  hours later reproduces it to within 1-3% (attention 130.5K vs 130.4K, mingru
+  102.6K vs 102.5K, hybrid 110.4K vs 110.4K), so the box did not slow down. The
+  low readings are a harness artifact of building many models in one process --
+  `sweep_gpu` collects and empties the allocator between rows, `tune_compile` and
+  `tune_fusedce` do not. Where a probe measured eager first and compiled second,
+  that biases *against* the change, which is why the probe's 1.94x and the
+  end-to-end board's 1.94x agree while the in-run rate ratio is 2.2x.
+
+* **One box, one driver version.** Nothing here transfers to the M5 Pro items
+  (memo items 10, 12, 13) or to a different CUDA/driver stack.
+
+---
+
+## Appendix: the measured tables
+
+## A. Per-arm cost at the board shape (batch 32, ctx 512, tenancy 1)
+
+| arm | tok/s | ms/step | peak alloc | peak resv | params | 50M job |
+|---|---:|---:|---:|---:|---:|---:|
+| `attn6_w512` | 286.9K | 57 | 5.7 GB | 5.9 GB | 45.1M | 2.9 min |
+| `attn6_w576` | 259.1K | 63 | 6.3 GB | 6.6 GB | 52.9M | 3.2 min |
+| `w384_attention_lr80` | 215.2K | 76 | 7.5 GB | 7.8 GB | 40.6M | 3.9 min |
+| `w384_attention_lr10` | 214.2K | 76 | 7.5 GB | 7.8 GB | 40.6M | 3.9 min |
+| `w384_hybrid_mingru8_attn4_lr40` | 192.5K | 85 | 9.7 GB | 10.3 GB | 46.5M | 4.3 min |
+| `w384_mingru_lr40` | 177.3K | 92 | 10.9 GB | 11.6 GB | 49.4M | 4.7 min |
+| `attention_novr` | 136.8K | 120 | 14.2 GB | 14.8 GB | 123.7M | 6.1 min |
+| `attention_untied_novr` | 135.8K | 121 | 14.6 GB | 15.2 GB | 162.3M | 6.1 min |
+| `mingru_x1` | 132.0K | 124 | 15.5 GB | 16.1 GB | 130.7M | 6.3 min |
+| `hybrid_mingru_periodic_x1` | 131.4K | 125 | 15.3 GB | 15.8 GB | 128.9M | 6.3 min |
+| `hybrid_mingru8_attn4_x1` | 131.2K | 125 | 15.2 GB | 15.8 GB | 128.3M | 6.4 min |
+| `attention` | 130.4K | 126 | 14.4 GB | 15.1 GB | 123.7M | 6.4 min |
+| `attention_untied` | 129.4K | 127 | 14.9 GB | 15.5 GB | 162.3M | 6.4 min |
+| `moe_e1k1_raw` | 118.6K | 138 | 15.1 GB | 15.7 GB | 123.7M | 7.0 min |
+| `moe_e1k1` | 118.4K | 138 | 15.1 GB | 15.7 GB | 123.7M | 7.0 min |
+| `hybrid_mingru8_attn4` | 110.4K | 148 | 19.0 GB | 19.7 GB | 147.2M | 7.5 min |
+| `hybrid_mingru_periodic` | 108.3K | 151 | 19.6 GB | 20.4 GB | 150.2M | 7.7 min |
+| `hybrid_mingru10_attn2` | 106.3K | 154 | 20.2 GB | 20.9 GB | 153.1M | 7.8 min |
+| `hybrid_mingru_bookend` | 106.2K | 154 | 20.2 GB | 21.0 GB | 153.1M | 7.8 min |
+| `hybrid_mingru11_attn1` | 104.4K | 157 | 20.8 GB | 21.6 GB | 156.0M | 8.0 min |
+| `mingru` | 102.5K | 160 | 21.3 GB | 22.3 GB | 159.0M | 8.1 min |
+| `moe_e4k1` | 73.4K | 223 | 16.9 GB | 19.4 GB | 293.6M | 11.4 min |
+| `moe_e4k1_raw` | 62.6K | 262 | 16.9 GB | 19.4 GB | 293.6M | 13.3 min |
+| `w1536_attention_lr80` | 61.8K | 265 | 29.6 GB | 32.4 GB | 417.5M | 13.5 min |
+| `moe_e8k1` | 55.0K | 298 | 19.1 GB | 25.9 GB | 520.1M | 15.2 min |
+| `w1536_mingru_lr20` | 48.6K | 337 | 44.0 GB | 46.2 GB | 558.6M | 17.1 min |
+| `w1536_mingru_lr80` | 48.6K | 337 | 44.0 GB | 46.2 GB | 558.6M | 17.1 min |
+| `w1536_mingru_lr40` | 48.6K | 337 | 44.0 GB | 46.2 GB | 558.6M | 17.2 min |
+| `moe_e8k1_raw` | 42.6K | 385 | 19.2 GB | 25.3 GB | 520.1M | 19.6 min |
+| `hybrid_gdn_periodic` | 36.1K | 454 | 22.8 GB | 23.8 GB | 123.8M | 23.1 min |
+| `hybrid_gdn_periodic_pub` | 36.1K | 454 | 22.8 GB | 23.8 GB | 123.8M | 23.1 min |
+| `gdn_pub` | 27.8K | 588 | 25.6 GB | 26.8 GB | 123.8M | 29.9 min |
+| `gdn` | 27.8K | 589 | 25.6 GB | 26.8 GB | 123.8M | 30.0 min |
+
+## B. Aggregate throughput vs tenancy
+
+| arm | MPS | t=1 | t=2 | t=3 | t=4 | t=6 | best |
+|---|---|---:|---:|---:|---:|---:|---|
+| `attention` | off | 131.0K | 118.8K | 119.0K | 119.0K | 118.9K | **1** |
+| `hybrid_mingru8_attn4` | off | 110.8K | 100.7K | 100.7K | 100.8K | **OOM** | **1** |
+| `gdn` | off | 29.4K | 44.2K | 45.1K | — | — | **3** |
+| `attention` | on | 129.6K | 142.5K | 144.5K | 144.5K | 142.8K | **4** |
+| `hybrid_mingru8_attn4` | on | 110.1K | 122.6K | 123.8K | 123.6K | **OOM** | **3** |
+| `gdn` | on | 29.9K | 51.8K | 57.4K | — | — | **3** |
+| `attention` (descending order) | off | 130.5K | 118.9K | 119.0K | 118.8K | 118.9K | **1** |
+
+## C. torch.compile
+
+| arm | eager | compiled | speed-up | compile time | max abs logit diff |
+|---|---:|---:|---:|---:|---:|
+| `attention` | 113.6K | 220.9K | **1.94x** | 31 s | None |
+| `mingru` | 91.8K | 179.6K | **1.96x** | 29 s | None |
+| `hybrid_mingru8_attn4` | 98.1K | 98.1K | **1.00x** | 29 s | None |
+| `gdn` | 26.0K | 25.2K | **0.97x** | 1 s | None |
+| `moe_e8k1` | 55.9K | 60.5K | **1.08x** | 0 s | None |
+
+## D. Probes
+
+**Sampler path (data.should_gpu_resident)**
+
+- corpus 497,500,000 tokens = 1.85 GiB as int32; the GPU-resident path needs **> 9.27 GiB free** at Batcher construction
+- with an empty GPU: `gpu_resident`; squeezed to 7.41 GiB free: `memmap`
+- same seed, same split, first batch identical: **False**
+- HAZARD: same seed, different tokens -- the sampler that runs depends on free VRAM at construction
+
+**GDN chunk width (`mixer_chunk`, default 32)**
+
+| chunk | tok/s | ms/step | peak | max abs vs O(T) reference |
+|---|---:|---:|---:|---:|
+| 16 | 14.5K | 1129 | 25.6 GB | 0.00e+00 |
+| 32 | 26.9K | 610 | 25.6 GB | 0.00e+00 |
+| 64 | 46.3K | 354 | 27.9 GB | 0.00e+00 |
+| 128 | 53.2K | 308 | 33.3 GB | 0.00e+00 |
+| 256 | 44.3K | 370 | 44.6 GB | 0.00e+00 |
+
+**Eval loop host sync**
+
+- as written: 298 ms/eval; one deferred transfer: 297 ms/eval (**1.00x**)
+- means bit-identical: **False**; saves 0 s per 50M run (61 evals)
+
+**MoE arms re-timed on real corpus batches**
+
+| arm | tok/s (real) | ms/step | peak |
+|---|---:|---:|---:|
+| `attention` | 114.2K | 144 | 16.4 GB |
+| `moe_e1k1` | 104.6K | 157 | 17.0 GB |
+| `moe_e1k1_raw` | 104.8K | 156 | 17.0 GB |
+| `moe_e4k1` | 54.9K | 298 | 18.9 GB |
+| `moe_e4k1_raw` | 61.4K | 267 | 18.9 GB |
+| `moe_e8k1` | 38.4K | 427 | 21.2 GB |
+| `moe_e8k1_raw` | 44.2K | 371 | 21.1 GB |
+
+
+## E. Per-arm tenancy, derived from the rows above
+
+| arm | MFU @ t=1 | t=1 | best without MPS | best with MPS | recommend |
+|---|---:|---:|---|---|---|
+| `attention` | 13.8% | 131.0K | 1 @ 131.0K (1.00x) | 4 @ 144.5K (1.10x) | **4 (MPS)** (1.10x) |
+| `hybrid_mingru8_attn4` | 13.2% | 110.8K | 1 @ 110.8K (1.00x) | 3 @ 123.8K (1.12x) | **3 (MPS)** (1.12x) |
+| `mingru` | 13.0% | 102.9K | 1 @ 102.9K (1.00x) | — | **1** (1.00x) |
+| `w384_attention_lr80` | 7.8% | 235.6K | 1 @ 235.6K (1.00x) | — | **1** (1.00x) |
+| `w384_mingru_lr40` | 7.0% | 176.9K | 1 @ 176.9K (1.00x) | — | **1** (1.00x) |
+| `moe_e8k1_raw` | 4.5% | 50.9K | 4 @ 67.6K (1.33x) | — | **4 (no MPS)** (1.33x) |
+| `gdn` | 2.7% | 29.4K | 3 @ 45.1K (1.53x) | 3 @ 57.4K (1.96x) | **3 (MPS)** (1.96x) |
+
+## F. Fused cross-entropy chunking
+
+| arm | setting | tok/s | ms/step | peak resv | loss on fixed input |
+|---|---|---:|---:|---:|---:|
+| `attention` | fused/4 | 115.6K | 142 | 18.3 GB | 0.002640 |
+| `attention` | fused/8 | 115.2K | 142 | 16.0 GB | 0.002617 |
+| `attention` | fused/16 | 113.1K | 145 | 15.1 GB | 0.002414 |
+| `attention` | fused/32 | 109.4K | 150 | 14.5 GB | 0.002742 |
+| `attention` | unfused | 145.6K | 113 | 25.9 GB | 0.002606 |
+| `hybrid_mingru8_attn4` | fused/4 | 99.6K | 164 | 22.9 GB | 0.000640 |
+| `hybrid_mingru8_attn4` | fused/8 | 99.3K | 165 | 20.6 GB | 0.000628 |
+| `hybrid_mingru8_attn4` | fused/16 | 97.8K | 168 | 19.7 GB | 0.000622 |
+| `hybrid_mingru8_attn4` | fused/32 | 95.0K | 172 | 19.1 GB | 0.000628 |
+| `hybrid_mingru8_attn4` | unfused | 121.1K | 135 | 30.5 GB | 0.000630 |
+
+Every row above is **eager**. Read with section 1b: compiled, the ordering is
+unchanged but the memory column collapses — `unfused` drops from 26.4 GB to
+14.5 GB, which is what removes the reason `fused_ce` was turned on.
+
+## G. What eval_iters buys
+
+Two trained arms at seed 1337 (`cx32loop_attention_s1337` vs `cx32loop_attn6_s1337`), scored on the same 200 val batches.
+
+- per-batch SD: 0.0736 and 0.0733 nats; correlation between the arms **0.9957**
+- paired difference -0.0765, SD 0.0068 (the pairing removes most of the batch noise)
+
+| eval_iters | SE of one arm's mean | SE of the paired difference | eval cost |
+|---|---:|---:|---:|
+| 5 | 0.0329 | 0.0031 | 25% |
+| 10 | 0.0233 | 0.0022 | 50% |
+| 20 | 0.0165 | 0.0015 | 100% |
+| 40 | 0.0116 | 0.0011 | 200% |
+
+---
+
+## What the tuning actually bought, measured on a real board
+
+Everything above is probe work. The first board run under the tuned recipe is
+E31 (`crossover50m_tie32`, 20 jobs, 50M tokens, tenancy 3, compile on), and it
+gives the number the probes were trying to predict:
+
+| | per job | mean rate |
+|---|---:|---:|
+| 50M-token job, compiled, tenancy 3 | **630 s** | **79.3K tok/s** |
+| the same jobs' step-loop rate | — | 90.0K tok/s |
+
+The step-loop rate over-reads the thing that matters by **13%**, on the same
+runs, at the same moment. That is the third time this sprint a step-loop probe
+came in optimistic, and it is worth stating as a rule rather than an anecdote:
+**a step-loop probe is an upper bound on a board, not an estimate of one.**
+
+The reason is not subtle once you count it. `eval_iters=20`, 61 evaluations per
+run, batch 32, ctx 512 is 20M tokens of forward pass **per run** — at the 20M
+budget, as much compute as the training it is measuring. Wall-clock rates sit
+below step-loop rates because a run is not only its step loop.
+
+**Do not price the compile factor by scaling the old eager figure.** The 844 s /
+20M measurement was taken at a different budget, where those fixed costs
+amortise differently. E30 phase (a) runs eager at *exactly* this shape, budget
+and tenancy — because `crossover50m_ratioplace32`'s recipe records
+`compile: false` and the comparison has to stay within-suite — so the program
+produces a directly measured eager control for free. Use that.
+
+## Archive
+
+Run metadata for **982 runs** across 102 suites is at
+`s3://mlsystemslab-artifacts-511192439661/results/nanolab-out/` (3481 objects,
+111.9 MB), with a `manifest.json` listing every run's `done` record so the
+archive can be checked without downloading it. Every table in this report and in
+`docs/SWA_BOARD_2026-08-31.md` recomputes from that metadata alone.
+
+**Weights ARE archived, as a stated subset** (2026-09-07). 49 objects, 25.8 GB,
+at `checkpoints/<suite>/<run>/final.pt`, indexed by
+`checkpoints/manifest-september-2026.json`.
+
+Selection rule: **one `final.pt` per (suite, arm), lowest seed present**, across
+the nine suites that back a claim. Not `best.pt` — repo rule 7 reads `final_val`
+and never `best_val`, so archiving a checkpoint selected by the statistic the
+repo refuses to quote would be archiving the wrong file. Not `ckpt.pt` — that is
+optimizer moments and RNG state for runs that have already **finished**, which is
+both the largest thing on the box and the least useful.
+
+| | files | size | archived |
+|---|---:|---:|---|
+| `ckpt.pt` (resume state) | 378 | 523.6 GB | no |
+| `best.pt` | 453 | 272.9 GB | no |
+| `final.pt`, all seeds | 453 | 272.9 GB | no |
+| `final.pt`, one per (suite, arm), 9 suites | **49** | **25.8 GB** | **yes** |
+
+The exclusions are recorded in the manifest with reasons, not just omitted. The
+two that are judgement rather than arithmetic:
+
+- **`crossover50m_moe32`, `_moe32b`, `_moe32c` (59.4 GB) — superseded.** Every
+  `moe_e*k1` run in them renormalises the top-1 router weight to exactly 1, so
+  the gate never saw a task gradient. E29 is the rerun that fixes it. Keeping
+  the weights of a board whose conclusion is being retested invites someone to
+  load them.
+- **The other four seeds of every kept arm (96.8 GB).** The seed spread is the
+  point of five seeds, and it lives in `metrics.jsonl` — archived whole, and
+  tracked in git. A second copy of the same architecture at a different seed
+  adds nothing you can read off the weights that the metrics do not already say.
+
+**How they got there, given the box has no AWS credentials and should not.**
+`scripts/archive_to_s3.sh` states the rule this repo works under — *"aws
+configure # you do this; I never handle keys"* — and the box is rented hardware
+that gets destroyed. So the bytes went **direct from the box to S3** under
+12-hour presigned PUT URLs generated on the laptop (`scratchpad/presign.py`,
+pure-python SigV4; `scripts/upload_weights_presigned.sh` on the box). A
+presigned URL is scoped to one key and one verb and expires; no credential was
+installed on the box, and 25.8 GB did not travel twice to pass through a laptop.
+The URL list was mode 600 and shredded after use.
+
+**Verify by size, not by exit status.** The uploader reported one failure that
+had not happened: `curl` reports the 100-continue code after a retry, so a
+successful retried PUT reads as `100`. All 49 objects were re-checked
+byte-for-byte against their on-box sizes afterwards, and that check — not the
+log — is what establishes the archive is complete.
+
+---
+
+## Per-family throughput at w768, tenancy 3 (measured 2026-09-10)
+
+The 50M family probe was budgeted as "roughly the ladder again" on the assumption that
+Mamba-2, MLA and GDN cost about what attention costs. They do not, and the spread is
+large enough to change what an experiment is worth:
+
+| family | mean tok/s | MFU | one 50M run |
+|---|---|---|---|
+| MLA | 30,479 | — | ~27 min |
+| GDN | 14,685 | — | ~57 min |
+| **Mamba-2** | **10,600** | **0.9%** | **~79 min** |
+| (attention, same board) | ~30,000 | — | ~28 min |
+
+**Mamba-2 is ~3x slower than MLA on identical shape, board and tenancy**, at 0.9% MFU —
+the signature of a sequential scan with no fused kernel, not a tuning problem. An 18-arm
+probe over the three families is **~978 run-minutes, ~5.4 h at tenancy 3**, against the
+~2.5 h a uniform-cost estimate gives. Price these per family, never as a single per-arm
+rate.

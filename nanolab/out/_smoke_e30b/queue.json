@@ -1,0 +1,43 @@
+{
+  "jobs": [
+    {
+      "id": "smke30b_hybrid_mingru8_attn4_x1_s1337",
+      "arm": "hybrid_mingru8_attn4_x1",
+      "mixer": "mingru",
+      "layer_mixers": "mingru*8,attention*4",
+      "seed": 1337,
+      "note": "8+4 at expansion 1: parameter parity with attention",
+      "status": "done",
+      "worker": 1,
+      "started": 1788785119.7878883,
+      "finished": 1788785165.5793269,
+      "detail": "best_val=6.184161"
+    },
+    {
+      "id": "smke30b_hybrid_mingru_periodic_x1_s1337",
+      "arm": "hybrid_mingru_periodic_x1",
+      "mixer": "mingru",
+      "layer_mixers": "mingru*3,attention,mingru*3,attention,mingru*3,attention",
+      "seed": 1337,
+      "note": "9+3 periodic at expansion 1",
+      "status": "done",
+      "worker": 2,
+      "started": 1788785119.8312883,
+      "finished": 1788785165.8958433,
+      "detail": "best_val=6.190240"
+    },
+    {
+      "id": "smke30b_mingru_x1_s1337",
+      "arm": "mingru_x1",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "minGRU at expansion 1",
+      "status": "done",
+      "worker": 0,
+      "started": 1788785119.8484368,
+      "finished": 1788785159.2623017,
+      "detail": "best_val=6.257936"
+    }
+  ]
+}

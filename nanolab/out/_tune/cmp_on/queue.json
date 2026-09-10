@@ -1,0 +1,69 @@
+{
+  "jobs": [
+    {
+      "id": "cmpon_mingru_s1337",
+      "arm": "mingru",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "suite-14 early leader",
+      "status": "done",
+      "worker": 0,
+      "started": 1788617645.7939272,
+      "finished": 1788617805.5851884,
+      "detail": "best_val=4.833444"
+    },
+    {
+      "id": "cmpon_mingru_s42",
+      "arm": "mingru",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "suite-14 early leader",
+      "status": "done",
+      "worker": 0,
+      "started": 1788617805.8792589,
+      "finished": 1788617918.540775,
+      "detail": "best_val=4.830100"
+    },
+    {
+      "id": "cmpon_mingru_s100",
+      "arm": "mingru",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "suite-14 early leader",
+      "status": "done",
+      "worker": 0,
+      "started": 1788617918.8018026,
+      "finished": 1788618030.261607,
+      "detail": "best_val=4.831183"
+    },
+    {
+      "id": "cmpon_mingru_s2026",
+      "arm": "mingru",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 2026,
+      "note": "suite-14 early leader",
+      "status": "done",
+      "worker": 0,
+      "started": 1788618030.5317924,
+      "finished": 1788618143.1579032,
+      "detail": "best_val=4.818906"
+    },
+    {
+      "id": "cmpon_mingru_s777",
+      "arm": "mingru",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 777,
+      "note": "suite-14 early leader",
+      "status": "done",
+      "worker": 0,
+      "started": 1788618143.7702062,
+      "finished": 1788618256.8862755,
+      "detail": "best_val=4.826732"
+    }
+  ]
+}

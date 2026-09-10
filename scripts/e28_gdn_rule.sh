@@ -13,7 +13,8 @@
 # seq 255 -> the variant was the defect. Otherwise capacity/optimisation, and
 # the fast-weight line proceeds on the published rule regardless.
 source "$(dirname "$0")/_stage_common.sh"
-stage_wait; stage_start e28
+stage_wait || stage_refused e28
+stage_start e28
 rc_any=0
 for STEPS in 3000 9000; do for PAIRS in 4 8; do
   echo "--- cell p=$PAIRS steps=$STEPS start $(date -u +%FT%TZ)"

@@ -12,12 +12,26 @@
       "lr": 0.0048,
       "matrix_lr": 0.2
     },
+    "w384_mingru_lr20": {
+      "d_model": 384,
+      "n_head": 6,
+      "head_dim": 64,
+      "lr": 0.0012,
+      "matrix_lr": 0.05
+    },
     "w384_mingru_lr40": {
       "d_model": 384,
       "n_head": 6,
       "head_dim": 64,
       "lr": 0.0024,
       "matrix_lr": 0.1
+    },
+    "w384_mingru_lr80": {
+      "d_model": 384,
+      "n_head": 6,
+      "head_dim": 64,
+      "lr": 0.0048,
+      "matrix_lr": 0.2
     },
     "w768_attention_lr80": {
       "d_model": 768,
@@ -33,6 +47,13 @@
       "lr": 0.0024,
       "matrix_lr": 0.1
     },
+    "w1152_attention_lr40": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0024,
+      "matrix_lr": 0.1
+    },
     "w1152_attention_lr80": {
       "d_model": 1152,
       "n_head": 18,
@@ -40,27 +61,144 @@
       "lr": 0.0048,
       "matrix_lr": 0.2
     },
+    "w1152_attention_lr160": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0096,
+      "matrix_lr": 0.4
+    },
+    "w1152_mingru_lr20": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0012,
+      "matrix_lr": 0.05
+    },
     "w1152_mingru_lr40": {
       "d_model": 1152,
       "n_head": 18,
       "head_dim": 64,
       "lr": 0.0024,
       "matrix_lr": 0.1
+    },
+    "w1152_mingru_lr80": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0048,
+      "matrix_lr": 0.2
+    },
+    "w1152_attention_lr025": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.00015,
+      "matrix_lr": 0.00625
+    },
+    "w1152_attention_lr05": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0003,
+      "matrix_lr": 0.0125
+    },
+    "w1152_attention_lr10": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0006,
+      "matrix_lr": 0.025
+    },
+    "w1152_mingru_lr025": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.00015,
+      "matrix_lr": 0.00625
+    },
+    "w1152_mingru_lr05": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0003,
+      "matrix_lr": 0.0125
+    },
+    "w1152_mingru_lr10": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.0006,
+      "matrix_lr": 0.025
+    },
+    "w384_attention_lr20": {
+      "d_model": 384,
+      "n_head": 6,
+      "head_dim": 64,
+      "lr": 0.0012,
+      "matrix_lr": 0.05
+    },
+    "w768_attention_lr10": {
+      "d_model": 768,
+      "n_head": 12,
+      "head_dim": 64,
+      "lr": 0.0006,
+      "matrix_lr": 0.025
+    },
+    "w768_mingru_lr10": {
+      "d_model": 768,
+      "n_head": 12,
+      "head_dim": 64,
+      "lr": 0.0006,
+      "matrix_lr": 0.025
+    },
+    "w1152_attention_lr0667": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.00039999999999999996,
+      "matrix_lr": 0.016666666666666666
+    },
+    "w1152_mingru_lr0667": {
+      "d_model": 1152,
+      "n_head": 18,
+      "head_dim": 64,
+      "lr": 0.00039999999999999996,
+      "matrix_lr": 0.016666666666666666
     }
   },
   "swa_chunk": -1,
   "eval_iters": 20,
+  "copy_probe": false,
   "token_budget": 50000000,
   "lr_horizon": null,
   "arms": [
     "w384_attention_lr80",
+    "w384_mingru_lr20",
     "w384_mingru_lr40",
+    "w384_mingru_lr80",
     "w768_attention_lr80",
     "w768_mingru_lr40",
+    "w1152_attention_lr40",
     "w1152_attention_lr80",
-    "w1152_mingru_lr40"
+    "w1152_attention_lr160",
+    "w1152_mingru_lr20",
+    "w1152_mingru_lr40",
+    "w1152_mingru_lr80",
+    "w1152_attention_lr025",
+    "w1152_attention_lr05",
+    "w1152_attention_lr10",
+    "w1152_mingru_lr025",
+    "w1152_mingru_lr05",
+    "w1152_mingru_lr10",
+    "w384_attention_lr20",
+    "w768_attention_lr10",
+    "w768_mingru_lr10",
+    "w1152_attention_lr0667",
+    "w1152_mingru_lr0667"
   ],
   "prefix": "cx32lad50",
   "device": "NVIDIA GH200 480GB",
-  "compile": false
+  "compile": false,
+  "fused_ce": true
 }

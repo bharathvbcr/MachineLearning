@@ -11,7 +11,8 @@
   "token_budget": 20000000,
   "lr_horizon": null,
   "arms": [
-    "attention"
+    "attention",
+    "mingru"
   ],
   "prefix": "cmpeager",
   "device": "NVIDIA GH200 480GB",
