@@ -830,6 +830,19 @@ def budget_by_arm() -> dict[str, int]:
     return {k: int(v) for k, v in json.loads(raw).items()}
 
 
+def cluster_compile() -> bool:
+    """torch.compile for the suite's jobs. Default OFF, as every committed run.
+
+    Recorded in the recipe, so a compiled run can never pool with an eager one:
+    Inductor fuses and re-associates, which moves the loss in the last places,
+    and two runs whose curves differ for that reason must not share a directory.
+    Measured 2026-09-05 on the GH200: 1.94x on attention, 1.96x on minGRU. The
+    `compile=False` this replaces was hardcoded when Inductor stalled on aarch64;
+    on torch 2.7.0 it compiles in ~30 s.
+    """
+    return os.environ.get("CROSSOVER_COMPILE", "").strip() in ("1", "true", "yes")
+
+
 def cluster_copy_probe() -> bool:
     """E34: log the repeated-span copy loss at every eval. Recorded in the
     recipe (a launch that turns it on in a directory that ran without it is a
@@ -911,7 +924,7 @@ def current_recipe() -> dict:
         # mixed a GH200 suite and an H100 suite in one directory without a word --
         # in a repo whose paper is about rankings moving with the recipe.
         "device": live_device_name() or None,
-        "compile": False,
+        "compile": cluster_compile(),
     }
 
 
@@ -1220,7 +1233,7 @@ def job_config(job: dict, out_root: Path, smoke: bool = False):
         swa_chunk=cluster_swa_chunk(),
         eval_iters=cluster_eval_iters(),
         copy_probe=cluster_copy_probe(),
-        compile=False,
+        compile=cluster_compile(),
         mem_fraction=0.0,
     )
     # Applied last: an arm's own knobs (e.g. the SWA window) are what makes it

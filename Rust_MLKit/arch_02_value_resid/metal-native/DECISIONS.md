@@ -204,9 +204,22 @@ Plan (do not edit as status source of truth here): Cursor plan
     - `flash_attn_tensorops_tile_f32` — session 330 single Br×Bc tile
     - `flash_attn_tensorops_online_f32` — experimental multi-block causal GQA
       online FA that still stages S/P/O through threadgroup between TensorOps
-      tiles (partially defeats cooperative-input). Smoke vs simdgroup FA-2 on
-      tiny shapes: max_abs≈7e-9 (`flash_tensorops_online_probe_smoke`); kept off
-      hot path until sota-shape goldens + TensorOps bwd + NAX win.
+      tiles (partially defeats cooperative-input). The 2026-09-04 audit removed
+      redundant Q/K/V staging and aliases the disjoint S/P lifetimes, reducing
+      explicit static threadgroup storage from 28,928 to 12,544 bytes (-56.6%).
+      On the current physical M5 Pro validation run, the compiled pipeline
+      reported 25,088 bytes static and 0 bytes dynamic against the 32,768-byte
+      device limit, leaving 7,680 bytes headroom. Parity against FA-2 measured
+      max-absolute error 1.117587e-8 at T=256 and 7.451e-9 at ragged T=65, with
+      zero non-finite outputs.
+      The old shader-validation pipeline reported 57,856 bytes against the
+      M5 Pro's 32,768-byte limit; the refactor makes that validation lane
+      executable while preserving aligned T=256 and ragged T=65 parity. The
+      opt-in selector now falls back before this D=32-only shader for all other
+      supported head dimensions. These are correctness/resource results, not a
+      timing claim: the kernel stays off the hot path until pinned pre/post
+      paired timings, sota-shape goldens, TensorOps bwd, and an Instruments NAX
+      win.
   - **`--flash-tensorops` Soft A/B (2026-07-12):** EMA **2.0462** but late gnorm
     **~13 @2999** — **REJECT** for Soft ladder; M8 still blocks default.
 - **Blockers to wiring TensorOps flash as default:**

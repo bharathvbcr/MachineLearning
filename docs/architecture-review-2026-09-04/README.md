@@ -9,6 +9,12 @@ selecting a new memory layer.
 
 ## Reading order and authority
 
+**September 8 revision:** the [second audit and revised experiment plan](SECOND_AUDIT_PLAN_2026-09-08.md)
+now governs the ordering and controls for the BINN and NanoLab mechanism studies.
+It corrects the frozen-substrate assumption, teacher-forced query task, state-reset
+interpretation, and missing replay/checkpoint prerequisites. The dated findings
+below remain historical evidence; the mathematical protocol remains applicable.
+
 1. This page: current verdict, corrections, and research priorities.
 2. [Evidence review](EVIDENCE_REVIEW.md): the original broad review of MLSystemsLab
    and related BINN findings, with dated snapshot boundaries and supersession notes.

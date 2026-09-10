@@ -61,12 +61,8 @@ pub fn default_hybrid_pattern(num_layers: usize) -> Vec<MixerKind> {
         MixerKind::Mamba2,
         MixerKind::Attention,
     ];
-    (0..num_layers)
-        .map(|i| unit[i % unit.len()])
-        .collect()
+    (0..num_layers).map(|i| unit[i % unit.len()]).collect()
 }
-
-
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelConfig {
@@ -523,16 +519,12 @@ mod tests {
 }
 
 pub struct BlockWeights {
-
-
-
     pub q_gain: Tensor,    // [H]
     pub vr_lambda: Tensor, // [2]
     pub attn_scale: Tensor,
     pub mlp_scale: Tensor,
     pub resid_mix: Tensor, // [2, C]
 }
-
 
 pub struct Weights {
     pub cfg: ModelConfig,
@@ -562,17 +554,16 @@ pub struct Weights {
     pub mamba_d: Option<Tensor>,
     pub mamba_dt_bias: Option<Tensor>,
     pub mamba_norm: Option<Tensor>,
-    pub qo_bank: Tensor,      // [8, C, C]  [in,out] after load
-    pub kv_bank: Tensor,      // [8, C, kv]
+    pub qo_bank: Tensor, // [8, C, C]  [in,out] after load
+    pub kv_bank: Tensor, // [8, C, kv]
 
-    pub mlp_up: Tensor,       // [4, C, mlp]
-    pub mlp_down: Tensor,     // [4, mlp, C]
+    pub mlp_up: Tensor,   // [4, C, mlp]
+    pub mlp_down: Tensor, // [4, mlp, C]
     pub blocks: Vec<BlockWeights>,
     pub rope_cos: Tensor, // [T, half]
     pub rope_sin: Tensor,
     /// Audit 4 P1b: persistent bf16 copies of GEMM banks (masters stay f32).
     pub bf16_banks: Option<Bf16WeightBanks>,
-
 }
 
 /// Persistent bf16 weight banks (f32 masters remain source of truth for optim).
@@ -586,7 +577,11 @@ pub struct Bf16WeightBanks {
 }
 
 impl Weights {
-    pub fn load_from_golden(rt: &Arc<GpuRuntime>, golden: &Path, cfg: ModelConfig) -> Result<Self, String> {
+    pub fn load_from_golden(
+        rt: &Arc<GpuRuntime>,
+        golden: &Path,
+        cfg: ModelConfig,
+    ) -> Result<Self, String> {
         Self::load_from_python_npy(rt, &golden.join("weights_init"), cfg)
     }
 
@@ -613,7 +608,10 @@ impl Weights {
         let ve_scale = load_f32(rt, &wdir.join("ve_shared/scale.npy"))?;
         let mut ve_layer_scales = Vec::new();
         for i in 0..cfg.ve_layers.len() {
-            ve_layer_scales.push(load_f32(rt, &wdir.join(format!("ve_layer_scales/{i}.npy")))?);
+            ve_layer_scales.push(load_f32(
+                rt,
+                &wdir.join(format!("ve_layer_scales/{i}.npy")),
+            )?);
         }
 
         let skip_weights = load_f32(rt, &wdir.join("skip_weights.npy"))?;
@@ -835,7 +833,10 @@ fn load_bank_transpose(rt: &Arc<GpuRuntime>, path: &Path) -> Result<Tensor, Stri
     load_linear_transpose(rt, path)
 }
 
-pub(crate) fn make_rope(rt: &Arc<GpuRuntime>, cfg: &ModelConfig) -> Result<(Tensor, Tensor), String> {
+pub(crate) fn make_rope(
+    rt: &Arc<GpuRuntime>,
+    cfg: &ModelConfig,
+) -> Result<(Tensor, Tensor), String> {
     let rd = cfg.rope_dims;
     let half = rd / 2;
     let mut cos = vec![0.0f32; cfg.seq_len * half];

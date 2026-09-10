@@ -130,7 +130,10 @@ forms the induction head on **13/15** seeds and minGRU on **1/15**, at identical
 difficulty and step count (PAPER §6.8). minGRU is immovable by compute on that task — 3× the steps
 changes neither its success rate nor its median recall. Treat "linear-recurrent" as a cost class,
 not a capability class: the delta rule retrieves, minGRU does not. *(Mamba-2 was not run in that
-grid, so the table's "vanilla SSMs" comparison remains uncited.)*
+grid, so the table's "vanilla SSMs" comparison remains uncited. And the delta rule measured
+there is nanolab's variant, which reads the correction off the undecayed state; the published
+Gated DeltaNet reads the decayed one. Both are in the repo behind `gdn_rule`, and the ablation
+on this exact grid — E28 in the September 2026 program — had not run when this was written.)*
 
 **Recommendation:** at this scale a **well-tuned Transformer is the strongest, most reliable default** — the NanoGPT speedrun and Parameter Golf leaderboards both converged on optimized attention. Linear-recurrent mixers buy **cheaper long context and faster, constant-memory inference**, *not* better small-scale perplexity, so reach for them only when context length or throughput is the bottleneck. The decisive factor sub-200M is the **training recipe (optimizer / LR / data), not the mixer** — lock the recipe first (Phases 1–2), then A/B mixers with tokens + seed fixed.
 

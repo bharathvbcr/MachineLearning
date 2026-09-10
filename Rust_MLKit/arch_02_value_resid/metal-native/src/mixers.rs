@@ -3,21 +3,37 @@ use crate::runtime::GpuRuntime;
 use crate::tensor::{DType, Tensor};
 use std::sync::Arc;
 
-pub fn mingru_fwd(
-    rt: &Arc<GpuRuntime>,
-    z_in: &Tensor,
-    h_in: &Tensor,
-) -> Result<Tensor, String> {
-    let b = z_in.shape[0];
-    let t = z_in.shape[1];
-    let h = z_in.shape[2];
-    assert_eq!(h_in.shape, z_in.shape);
-    
-    let out = match z_in.dtype {
-        DType::F32 => rt.alloc_tensor_f32(&[b, t, h])?,
-        DType::BF16 => rt.alloc_tensor_bf16(&[b, t, h])?,
+fn validate_mingru_fwd_inputs(
+    z_shape: &[usize],
+    z_dtype: DType,
+    h_shape: &[usize],
+    h_dtype: DType,
+) -> Result<(usize, usize, usize), String> {
+    // `mingru_fwd` binds every operand as `device float*`. Reject two-byte
+    // storage before allocation, pipeline lookup, or dispatch rather than
+    // reinterpreting BF16/F16 buffers as f32 and reading out of bounds.
+    if z_dtype != DType::F32 || h_dtype != DType::F32 {
+        return Err(format!(
+            "mingru_fwd requires f32 inputs, got z={z_dtype:?}, h={h_dtype:?}"
+        ));
+    }
+    let [b, t, h] = z_shape else {
+        return Err(format!(
+            "mingru_fwd requires rank-3 z input, got shape {z_shape:?}"
+        ));
     };
-    
+    if h_shape != z_shape {
+        return Err(format!(
+            "mingru_fwd requires equal input shapes, got z={z_shape:?}, h={h_shape:?}"
+        ));
+    }
+    Ok((*b, *t, *h))
+}
+
+pub fn mingru_fwd(rt: &Arc<GpuRuntime>, z_in: &Tensor, h_in: &Tensor) -> Result<Tensor, String> {
+    let (b, t, h) = validate_mingru_fwd_inputs(&z_in.shape, z_in.dtype, &h_in.shape, h_in.dtype)?;
+    let out = rt.alloc_tensor_f32(&[b, t, h])?;
+
     let pipe = rt.pipeline("mingru_fwd")?;
     dispatch_2d(rt, &pipe, h, b, |bnd| {
         set_tensor(bnd, z_in, 0);
@@ -27,8 +43,33 @@ pub fn mingru_fwd(
         set_u32(bnd, t as u32, 4);
         set_u32(bnd, h as u32, 5);
     })?;
-    
+
     Ok(out)
+}
+
+#[cfg(test)]
+mod mingru_fwd_contract_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_every_non_f32_input_before_gpu_work() {
+        assert_eq!(
+            validate_mingru_fwd_inputs(&[2, 3, 4], DType::F32, &[2, 3, 4], DType::F32),
+            Ok((2, 3, 4))
+        );
+        for (z, h) in [
+            (DType::BF16, DType::F32),
+            (DType::F16, DType::F32),
+            (DType::F32, DType::BF16),
+            (DType::F32, DType::F16),
+            (DType::BF16, DType::BF16),
+            (DType::F16, DType::F16),
+        ] {
+            let error = validate_mingru_fwd_inputs(&[2, 3, 4], z, &[2, 3, 4], h)
+                .expect_err("two-byte inputs must be rejected");
+            assert!(error.contains("requires f32 inputs"), "{error}");
+        }
+    }
 }
 
 pub fn mingru_bwd(
@@ -41,10 +82,10 @@ pub fn mingru_bwd(
     let b = z_in.shape[0];
     let t = z_in.shape[1];
     let h = z_in.shape[2];
-    
+
     let grad_z = rt.alloc_tensor_f32(&[b, t, h])?;
     let grad_h_in = rt.alloc_tensor_f32(&[b, t, h])?;
-    
+
     let pipe = rt.pipeline("mingru_bwd")?;
     dispatch_2d(rt, &pipe, h, b, |bnd| {
         set_tensor(bnd, z_in, 0);
@@ -57,7 +98,7 @@ pub fn mingru_bwd(
         set_u32(bnd, t as u32, 7);
         set_u32(bnd, h as u32, 8);
     })?;
-    
+
     Ok((grad_z, grad_h_in))
 }
 
@@ -128,10 +169,10 @@ pub fn mamba2_fwd(
     let h_sz = x_scaled.shape[2];
     let p_sz = x_scaled.shape[3];
     let n_sz = b_h.shape[2];
-    
+
     let y = rt.alloc_tensor_f32(&[b_sz, t_sz, h_sz, p_sz])?;
     let h_states = rt.alloc_tensor_f32(&[b_sz, t_sz, h_sz, p_sz, n_sz])?;
-    
+
     let pipe = rt.pipeline("mamba2_fwd")?;
     dispatch_3d(rt, &pipe, p_sz, h_sz, b_sz, |bnd| {
         set_tensor(bnd, x_scaled, 0);
@@ -146,7 +187,7 @@ pub fn mamba2_fwd(
         set_u32(bnd, p_sz as u32, 9);
         set_u32(bnd, n_sz as u32, 10);
     })?;
-    
+
     Ok(Mamba2FwdOutputs { y, h_states })
 }
 
@@ -171,17 +212,17 @@ pub fn mamba2_bwd(
     let h_sz = x_scaled.shape[2];
     let p_sz = x_scaled.shape[3];
     let n_sz = b_h.shape[2];
-    
+
     let grad_x_scaled = rt.alloc_tensor_f32(&[b_sz, t_sz, h_sz, p_sz])?;
     let grad_b_h = rt.alloc_tensor_f32(&[b_sz, t_sz, n_sz])?;
     let grad_c_h = rt.alloc_tensor_f32(&[b_sz, t_sz, n_sz])?;
     let grad_log_da = rt.alloc_tensor_f32(&[b_sz, t_sz, h_sz])?;
-    
+
     // Zero-initialize atomic accumulated gradients
     grad_b_h.buffer.zero();
     grad_c_h.buffer.zero();
     grad_log_da.buffer.zero();
-    
+
     let pipe = rt.pipeline("mamba2_bwd")?;
     dispatch_3d(rt, &pipe, p_sz, h_sz, b_sz, |bnd| {
         set_tensor(bnd, x_scaled, 0);
@@ -200,7 +241,7 @@ pub fn mamba2_bwd(
         set_u32(bnd, p_sz as u32, 13);
         set_u32(bnd, n_sz as u32, 14);
     })?;
-    
+
     Ok(Mamba2BwdOutputs {
         grad_x_scaled,
         grad_b_h,

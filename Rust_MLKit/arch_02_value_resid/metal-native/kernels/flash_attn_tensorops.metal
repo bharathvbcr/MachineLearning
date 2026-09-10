@@ -170,28 +170,23 @@ kernel void flash_attn_tensorops_online_f32(
     const uint t_q_max = min(t_q0 + (uint)Br, T) - 1u;
     const uint n_k_blocks = (t_q_max / Bc) + 1u;
 
-    // Online FA state in threadgroup (row-owned by lane when lid < Br).
+    // Online FA state in threadgroup (row-owned by lane when lid < Br). Q/K/V
+    // stay in device memory: tensor views preserve the interleaved head stride,
+    // avoid three 4 KiB staging arrays, and let TensorOps handle ragged edge
+    // loads. Scores and probabilities have disjoint lifetimes, so one tile is
+    // their canonical scratch owner. Besides removing copies and barriers,
+    // this keeps the 12.25 KiB static allocation below Shader Validation's
+    // instrumented threadgroup-memory ceiling.
     threadgroup float O_acc[Br * Dd];
     threadgroup float m_row[Br];
     threadgroup float l_row[Br];
-    threadgroup float Q_tile[Br * Dd];
-    threadgroup float K_tile[Bc * Dd];
-    threadgroup float V_tile[Bc * Dd];
-    threadgroup float S_tile[Br * Bc];
-    threadgroup float P_tile[Br * Bc];
+    threadgroup float SP_tile[Br * Bc];
     threadgroup float O_tile[Br * Dd];
 
-    // Init online state + load Q tile.
+    // Init online state. The strided Q view below is read directly per key
+    // block; it remains cache-resident and avoids a threadgroup round-trip.
     for (uint i = lid; i < Br * Dd; i += 32) {
         O_acc[i] = 0.0f;
-        const uint row = i / Dd;
-        const uint d = i % Dd;
-        const uint t_q = t_q0 + row;
-        if (t_q < T) {
-            Q_tile[i] = Q[((b * T + t_q) * H + h) * D + d];
-        } else {
-            Q_tile[i] = 0.0f;
-        }
     }
     if (lid < Br) {
         m_row[lid] = -INFINITY;
@@ -209,23 +204,15 @@ kernel void flash_attn_tensorops_online_f32(
     for (uint kb = 0; kb < n_k_blocks; ++kb) {
         const uint t_k0 = kb * Bc;
         const uint n_k = min((uint)Bc, T - t_k0);
-
-        for (uint i = lid; i < Bc * Dd; i += 32) {
-            const uint tk = i / Dd;
-            const uint d = i % Dd;
-            if (tk < n_k) {
-                const uint off = ((b * T + (t_k0 + tk)) * Hkv + hkv) * D + d;
-                K_tile[i] = K[off];
-                V_tile[i] = V[off];
-            } else {
-                K_tile[i] = 0.0f;
-                V_tile[i] = 0.0f;
-            }
-        }
-        simdgroup_barrier(mem_flags::mem_threadgroup);
-
-        auto mQ = tensor(Q_tile, dextents<int, 2>{Dd, Br}, array<int, 2>{1, Dd});
-        auto mK = tensor(K_tile, dextents<int, 2>{Dd, Bc}, array<int, 2>{1, Dd});
+        const uint n_q = min((uint)Br, T - t_q0);
+        const ulong q_off = ((ulong)b * T * H + (ulong)t_q0 * H + h) * D;
+        const ulong kv_off = ((ulong)b * T * Hkv + (ulong)t_k0 * Hkv + hkv) * D;
+        auto mQ = tensor(const_cast<device float *>(Q) + q_off,
+                         dextents<int, 2>{Dd, (int)n_q},
+                         array<int, 2>{1, (int)(H * D)});
+        auto mK = tensor(const_cast<device float *>(K) + kv_off,
+                         dextents<int, 2>{Dd, (int)n_k},
+                         array<int, 2>{1, (int)(Hkv * D)});
         auto sT = op_qk.get_destination_cooperative_tensor<decltype(mQ), decltype(mK), float>();
 #pragma unroll
         for (ushort i = 0; i < sT.get_capacity(); ++i) {
@@ -235,7 +222,7 @@ kernel void flash_attn_tensorops_online_f32(
 
         // Scale + causal / ragged mask into -inf, then store scores to TG for
         // online FA (cooperative max alone is full-tile softmax, not online).
-        auto mS = tensor(S_tile, dextents<int, 2>{Bc, Br}, array<int, 2>{1, Bc});
+        auto mS = tensor(SP_tile, dextents<int, 2>{Bc, Br}, array<int, 2>{1, Bc});
         sT.store(mS);
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -244,11 +231,14 @@ kernel void flash_attn_tensorops_online_f32(
             const uint col = i % Bc;
             const uint t_q = t_q0 + row;
             const uint t_k = t_k0 + col;
-            float s = S_tile[i] * scale;
-            if (t_q >= T || col >= n_k || t_k > t_q) {
-                s = -INFINITY;
+            float s = -INFINITY;
+            // A ragged TensorOps destination is permitted to leave edge
+            // elements unstored. Test bounds before reading the shared tile;
+            // masking an already-read uninitialized value is still UB.
+            if (t_q < T && col < n_k && t_k <= t_q) {
+                s = SP_tile[i] * scale;
             }
-            S_tile[i] = s;
+            SP_tile[i] = s;
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -261,7 +251,7 @@ kernel void flash_attn_tensorops_online_f32(
             float m_ij = -INFINITY;
             if (t_q < T) {
                 for (uint col = 0; col < n_k; ++col) {
-                    m_ij = max(m_ij, S_tile[row * Bc + col]);
+                    m_ij = max(m_ij, SP_tile[row * Bc + col]);
                 }
             }
             const float m_new = max(m_i, m_ij);
@@ -271,10 +261,10 @@ kernel void flash_attn_tensorops_online_f32(
             for (uint col = 0; col < Bc; ++col) {
                 float p = 0.0f;
                 if (t_q < T && col < n_k) {
-                    float s = S_tile[row * Bc + col];
+                    float s = SP_tile[row * Bc + col];
                     p = (s > -INFINITY) ? metal::exp(s - m_new) : 0.0f;
                 }
-                P_tile[row * Bc + col] = p;
+                SP_tile[row * Bc + col] = p;
                 row_sum += p;
             }
             l_i = l_i * alpha + row_sum;
@@ -288,8 +278,10 @@ kernel void flash_attn_tensorops_online_f32(
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
         // P @ V via TensorOps (P from TG — cooperative-input often incompatible).
-        auto mP = tensor(P_tile, dextents<int, 2>{Bc, Br}, array<int, 2>{1, Bc});
-        auto mV = tensor(V_tile, dextents<int, 2>{Dd, Bc}, array<int, 2>{1, Dd});
+        auto mP = tensor(SP_tile, dextents<int, 2>{Bc, Br}, array<int, 2>{1, Bc});
+        auto mV = tensor(const_cast<device float *>(V) + kv_off,
+                         dextents<int, 2>{Dd, (int)n_k},
+                         array<int, 2>{1, (int)(Hkv * D)});
         auto mOt = tensor(O_tile, dextents<int, 2>{Dd, Br}, array<int, 2>{1, Dd});
         auto oT = op_pv.get_destination_cooperative_tensor<decltype(mP), decltype(mV), float>();
 #pragma unroll

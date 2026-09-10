@@ -1,7 +1,7 @@
-//! Phase 2 Gemma Metal kernels — real dispatch via metal-runtime Binder.
+//! Phase 2 Gemma Metal kernels — real dispatch via the tessl Binder.
 //!
 //! Overlay metallib (`GEMMA_METAL_METALLIB`) is registered on a shared
-//! [`GpuRuntime`]. Prefill GEMM uses metal-runtime TensorOps / simdgroup.
+//! [`GpuRuntime`]. Prefill GEMM uses tessl TensorOps / simdgroup kernels.
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -239,20 +239,24 @@ fn gemv_blocked_enabled() -> bool {
     // Default OFF: row-major / Interleaved4 simd coalesces better than BlockedBn
     // (blocked left for A/B via GEMMA_METAL_GEMV_BLOCKED=1).
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("GEMMA_METAL_GEMV_BLOCKED").ok().as_deref() {
-        Some("1") | Some("true") | Some("on") => true,
-        _ => false,
-    })
+    *V.get_or_init(
+        || match std::env::var("GEMMA_METAL_GEMV_BLOCKED").ok().as_deref() {
+            Some("1") | Some("true") | Some("on") => true,
+            _ => false,
+        },
+    )
 }
 
 fn gemv_interleave_enabled() -> bool {
     // Default OFF: Interleaved4 `_simd_i4` measured ~22.8 vs row-major ~23.8 E4B (bfloat2+qdot).
     // Kernels + upload path remain; opt in with `GEMMA_METAL_GEMV_INTERLEAVE=1`.
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("GEMMA_METAL_GEMV_INTERLEAVE").ok().as_deref() {
-        Some("1") | Some("true") | Some("on") => true,
-        _ => false,
-    })
+    *V.get_or_init(
+        || match std::env::var("GEMMA_METAL_GEMV_INTERLEAVE").ok().as_deref() {
+            Some("1") | Some("true") | Some("on") => true,
+            _ => false,
+        },
+    )
 }
 
 fn trace_gemv_enabled() -> bool {
@@ -304,8 +308,9 @@ fn repack_q4_mlx_blocked(
         for g in 0..groups {
             for r in 0..bn {
                 let row = rb * bn + r;
-                let dst_p =
-                    rb * groups * bn * bytes_per_group + g * bn * bytes_per_group + r * bytes_per_group;
+                let dst_p = rb * groups * bn * bytes_per_group
+                    + g * bn * bytes_per_group
+                    + r * bytes_per_group;
                 let dst_s = rb * groups * bn + g * bn + r;
                 if row >= rows {
                     continue;
@@ -382,6 +387,15 @@ fn pack_mlx_sb_bf16(scales: &[f32], biases: &[f32]) -> Vec<u16> {
 ///
 /// The overlay now carries only `ple_lookup*` and `persistent_interp*`; the
 /// general kernels live in tessl's primary metallib.
+///
+/// The stable scalar pool is an internal implementation detail: safe callers
+/// cannot reset or overwrite dimensions after a wrapper validates them.
+///
+/// ```compile_fail
+/// fn overwrite_validated_scalar(gpu: &gemma_metal::GemmaGpu) {
+///     gpu.icb_scalars.reset_step();
+/// }
+/// ```
 pub struct GemmaGpu {
     pub rt: Arc<GpuRuntime>,
     /// Reused Cold scratch for f32→bf16 activation casts feeding simd GEMV.
@@ -391,7 +405,7 @@ pub struct GemmaGpu {
     act_f32: std::sync::Mutex<Option<(GpuBuffer, usize)>>,
     /// Stable scalar pool for ICB / encode-once binds (FA/kv/softcap). Fixed
     /// GPU addresses — contents rewritten per dispatch/step; not const-arena.
-    pub icb_scalars: IcbScalarPool,
+    pub(crate) icb_scalars: IcbScalarPool,
 }
 
 /// Stable `GpuBuffer` arena for per-token / per-dispatch scalars (A0 / D16).
@@ -405,22 +419,22 @@ pub struct GemmaGpu {
 ///
 /// Cursors are atomics (not Mutex): decode is single-threaded per session; A2
 /// cuts ~hundreds of lock/unlock pairs per binder-nop prep step.
-pub struct IcbScalarPool {
+pub(crate) struct IcbScalarPool {
     /// Softcap f32×1 (model-constant; rewritten per softcap dispatch).
-    pub softcap: GpuBuffer,
+    softcap: GpuBuffer,
     /// Hot u32 workspace (bump-allocated per bind within a step).
-    pub u32s: GpuBuffer,
+    u32s: GpuBuffer,
     /// Hot f32 workspace (FA scale + other per-dispatch floats).
-    pub f32s: GpuBuffer,
+    f32s: GpuBuffer,
     cursor_u32: std::sync::atomic::AtomicUsize,
     cursor_f32: std::sync::atomic::AtomicUsize,
 }
 
 impl IcbScalarPool {
     /// ~4k u32s — enough for E4B decode scalars with headroom.
-    pub const U32_SLOTS: usize = 4096;
+    const U32_SLOTS: usize = 4096;
     /// ~1k f32s — FA scale + misc floats per step.
-    pub const F32_SLOTS: usize = 1024;
+    const F32_SLOTS: usize = 1024;
 
     fn new(rt: &GpuRuntime) -> Result<Self> {
         let softcap = rt.alloc_buffer_hot(4).map_err(map_metal)?;
@@ -447,18 +461,18 @@ impl IcbScalarPool {
         })
     }
 
-    pub fn set_softcap(&self, v: f32) {
+    pub(crate) fn set_softcap(&self, v: f32) {
         self.softcap.write_f32(&[v]);
     }
 
     /// Reset bump cursors (call once per decode/verify step before layer loop).
-    pub fn reset_step(&self) {
+    pub(crate) fn reset_step(&self) {
         self.cursor_u32.store(0, Ordering::Relaxed);
         self.cursor_f32.store(0, Ordering::Relaxed);
     }
 
     /// Current bump watermarks (debug / ICB offset parity).
-    pub fn cursor_snapshot(&self) -> (usize, usize) {
+    pub(crate) fn cursor_snapshot(&self) -> (usize, usize) {
         (
             self.cursor_u32.load(Ordering::Relaxed),
             self.cursor_f32.load(Ordering::Relaxed),
@@ -466,13 +480,13 @@ impl IcbScalarPool {
     }
 
     /// Force cursors (scalar-write tape apply / watermark restore).
-    pub fn set_cursors(&self, u32_n: usize, f32_n: usize) {
+    pub(crate) fn set_cursors(&self, u32_n: usize, f32_n: usize) {
         self.cursor_u32.store(u32_n, Ordering::Relaxed);
         self.cursor_f32.store(f32_n, Ordering::Relaxed);
     }
 
     /// Push a u32; returns byte offset into [`Self::u32s`] for `set_gpu_buf_offset`.
-    pub fn push_u32(&self, v: u32) -> Result<usize> {
+    pub(crate) fn push_u32(&self, v: u32) -> Result<usize> {
         let slot = self.cursor_u32.fetch_add(1, Ordering::Relaxed);
         if slot >= Self::U32_SLOTS {
             // Keep cursor from walking forever on repeated OOB (best-effort).
@@ -488,7 +502,7 @@ impl IcbScalarPool {
     }
 
     /// Push a u32 that must be recomputed on DecodeIcb skip-nop replay.
-    pub fn push_u32_dyn(&self, v: u32, src: IcbDynSrc) -> Result<usize> {
+    pub(crate) fn push_u32_dyn(&self, v: u32, src: IcbDynSrc) -> Result<usize> {
         let slot = self.cursor_u32.fetch_add(1, Ordering::Relaxed);
         if slot >= Self::U32_SLOTS {
             self.cursor_u32.store(Self::U32_SLOTS, Ordering::Relaxed);
@@ -503,7 +517,7 @@ impl IcbScalarPool {
     }
 
     /// Push an f32; returns byte offset into [`Self::f32s`] for `set_gpu_buf_offset`.
-    pub fn push_f32(&self, v: f32) -> Result<usize> {
+    pub(crate) fn push_f32(&self, v: f32) -> Result<usize> {
         let slot = self.cursor_f32.fetch_add(1, Ordering::Relaxed);
         if slot >= Self::F32_SLOTS {
             self.cursor_f32.store(Self::F32_SLOTS, Ordering::Relaxed);
@@ -518,29 +532,24 @@ impl IcbScalarPool {
     }
 
     #[inline]
-    pub fn bind_u32(
-        &self,
-        bnd: &mut tessl::dispatch::Binder<'_>,
-        off: usize,
-        index: usize,
-    ) {
+    fn bind_u32(&self, bnd: &mut tessl::dispatch::Binder<'_>, off: usize, index: usize) {
         set_gpu_buf_offset(bnd, &self.u32s, off, index);
     }
 
     #[inline]
-    pub fn bind_f32(
-        &self,
-        bnd: &mut tessl::dispatch::Binder<'_>,
-        off: usize,
-        index: usize,
-    ) {
+    fn bind_f32(&self, bnd: &mut tessl::dispatch::Binder<'_>, off: usize, index: usize) {
         set_gpu_buf_offset(bnd, &self.f32s, off, index);
     }
 }
 
 /// Push `rows/cols/group_size` before `with_binder` (binder-nop must still refresh).
 #[inline]
-fn push_gemv_dims(gpu: &GemmaGpu, rows: u32, cols: u32, group_size: u32) -> Result<(usize, usize, usize)> {
+fn push_gemv_dims(
+    gpu: &GemmaGpu,
+    rows: u32,
+    cols: u32,
+    group_size: u32,
+) -> Result<(usize, usize, usize)> {
     Ok((
         gpu.icb_scalars.push_u32(rows)?,
         gpu.icb_scalars.push_u32(cols)?,
@@ -636,9 +645,7 @@ pub fn icb_scalar_write_tape_active() -> bool {
 
 pub fn take_icb_scalar_write_tape() -> Option<IcbScalarWriteTape> {
     ICB_TAPE_KV_CTX.with(|c| *c.borrow_mut() = None);
-    ICB_SCALAR_TAPE.with(|t| {
-        t.borrow_mut().take().map(|ops| IcbScalarWriteTape { ops })
-    })
+    ICB_SCALAR_TAPE.with(|t| t.borrow_mut().take().map(|ops| IcbScalarWriteTape { ops }))
 }
 
 pub fn icb_tape_set_kv_ctx_sliding(index: usize) {
@@ -789,7 +796,9 @@ impl GemmaGpu {
         );
         if path.is_empty() || !Path::new(path).exists() {
             let e = Error::Metal(
-                "GEMMA_METAL_METALLIB empty or missing — build without GEMMA_METAL_SKIP_AOT".into(),
+                "GEMMA_METAL_METALLIB empty or missing — build the overlay, or set \
+                 GEMMA_METAL_SKIP_AOT with a valid GEMMA_METAL_PREBUILT_METALLIB"
+                    .into(),
             );
             diag::err("kernels", "metallib missing", &e);
             return Err(e);
@@ -852,9 +861,10 @@ impl GemmaGpu {
     /// Grow-once bf16 activation scratch (≥ `n` elements).
     pub fn act_bf16_scratch(&self, n: usize) -> Result<GpuBuffer> {
         let need = n.max(1);
-        let mut slot = self.act_bf16.lock().map_err(|_| {
-            Error::Metal("act_bf16 scratch lock poisoned".into())
-        })?;
+        let mut slot = self
+            .act_bf16
+            .lock()
+            .map_err(|_| Error::Metal("act_bf16 scratch lock poisoned".into()))?;
         let realloc = match slot.as_ref() {
             Some((_, cap)) if *cap >= need => false,
             _ => true,
@@ -869,9 +879,10 @@ impl GemmaGpu {
     /// Grow-once f32 activation scratch (≥ `n` elements) for bf16→f32 expand.
     pub fn act_f32_scratch(&self, n: usize) -> Result<GpuBuffer> {
         let need = n.max(1);
-        let mut slot = self.act_f32.lock().map_err(|_| {
-            Error::Metal("act_f32 scratch lock poisoned".into())
-        })?;
+        let mut slot = self
+            .act_f32
+            .lock()
+            .map_err(|_| Error::Metal("act_f32 scratch lock poisoned".into()))?;
         let realloc = match slot.as_ref() {
             Some((_, cap)) if *cap >= need => false,
             _ => true,
@@ -923,60 +934,35 @@ fn map_metal(e: String) -> Error {
     Error::Metal(e)
 }
 
-fn dispatch_gemv_row(
-    gpu: &GemmaGpu,
-    entry: &str,
-    packed: &GpuBuffer,
-    scales: &GpuBuffer,
-    zeros: &GpuBuffer,
-    x: &GpuBuffer,
-    y: &GpuBuffer,
-    rows: u32,
-    cols: u32,
-    group_size: u32,
-) -> Result<()> {
-    if rows == 0 {
-        return Ok(());
+fn validate_f32_range(buffer: &GpuBuffer, offset: u32, len: u32, what: &str) -> Result<usize> {
+    let start = offset as usize;
+    let end = start
+        .checked_add(len as usize)
+        .ok_or_else(|| Error::Metal(format!("{what}: element range overflows usize")))?;
+    let have = buffer.nbytes() / std::mem::size_of::<f32>();
+    if end > have {
+        return Err(Error::Metal(format!(
+            "{what}: range {start}..{end} exceeds buffer capacity {have}"
+        )));
     }
-    // One thread per output row; dynamic TG mem = cols*4 (not static 32 KiB).
-    let p = gpu.rt.pipeline(entry).map_err(map_metal)?;
-    // Prefer TG=128 for x-cache amortization; only go wide for tall lm_head-class mats.
-    let tptg = if rows >= 65_536 {
-        256usize.min(rows as usize).max(32)
-    } else if cols >= 4096 || rows >= 1024 {
-        128usize.min(rows as usize).max(32)
-    } else {
-        // Wide-short projections: smaller TG still fine with dynamic x-cache.
-        64usize.min(rows as usize).max(16)
-    };
-    let groups = ((rows as usize) + tptg - 1) / tptg;
-    let tg_mem = (cols as usize) * 4;
-    // Opt-in: GEMMA_METAL_TRACE_GEMV=1 (very noisy on E4B).
-    if trace_gemv_enabled() {
-        eprintln!(
-            "[trace] gemv entry={entry} rows={rows} cols={cols} tg={tptg} groups={groups} tg_mem={tg_mem}"
-        );
+    start
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| Error::Metal(format!("{what}: byte offset overflows usize")))
+}
+
+fn validate_kv_capacity(dst: &GpuBuffer, n: u32, dst_capacity: u32, what: &str) -> Result<()> {
+    if dst_capacity < n {
+        return Err(Error::Metal(format!(
+            "{what}: dst_capacity {dst_capacity} is smaller than n {n}"
+        )));
     }
-    let (rows_off, cols_off, gs_off) = push_gemv_dims(gpu, rows, cols, group_size)?;
-    gpu.rt
-        .with_binder(|bnd| {
-            bnd.set_pipeline(&p);
-            set_gpu_buf(bnd, packed, 0);
-            set_gpu_buf(bnd, scales, 1);
-            set_gpu_buf(bnd, zeros, 2);
-            set_gpu_buf(bnd, x, 3);
-            set_gpu_buf(bnd, y, 4);
-            gpu.icb_scalars.bind_u32(bnd, rows_off, 5);
-            gpu.icb_scalars.bind_u32(bnd, cols_off, 6);
-            gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
-            bnd.set_threadgroup_memory(0, tg_mem);
-            bnd.dispatch(
-                tessl::runtime::mtl_size(groups, 1, 1),
-                tessl::runtime::mtl_size(tptg, 1, 1),
-            );
-            Ok(())
-        })
-        .map_err(map_metal)
+    let have = dst.nbytes() / std::mem::size_of::<f32>();
+    if dst_capacity as usize > have {
+        return Err(Error::Metal(format!(
+            "{what}: declared capacity {dst_capacity} exceeds buffer capacity {have}"
+        )));
+    }
+    Ok(())
 }
 
 /// One TG per `GEMV_BN` output rows; `GEMV_LANES` K-lanes/row (simd_sum).
@@ -991,11 +977,21 @@ fn dispatch_gemv_blocked(
     cols: u32,
     group_size: u32,
 ) -> Result<()> {
+    let shape = tessl::nn::QuantShape {
+        rows,
+        cols,
+        group_size,
+    };
+    let bank = tessl::nn::Q4MlxBank {
+        packed,
+        scales_biases: scales,
+    };
+    tessl::nn::validate_gemv_q4_mlx_blocked(&gpu.rt, bank, x, y, shape)
+        .map_err(map_metal)?;
     if rows == 0 {
         return Ok(());
     }
     let entry = "gemv_q4_mlx_blocked";
-    let p = gpu.rt.pipeline(entry).map_err(map_metal)?;
     let tptg = (GEMV_BN * GEMV_LANES) as usize;
     let n_tg = ((rows as usize) + GEMV_BN as usize - 1) / GEMV_BN as usize;
     let tg_mem = (cols as usize).min(GEMV_X_TILE) * 4;
@@ -1005,25 +1001,25 @@ fn dispatch_gemv_blocked(
         );
     }
     let (rows_off, cols_off, gs_off) = push_gemv_dims(gpu, rows, cols, group_size)?;
-    gpu.rt
-        .with_binder(|bnd| {
-            bnd.set_pipeline(&p);
-            set_gpu_buf(bnd, packed, 0);
-            set_gpu_buf(bnd, scales, 1);
-            set_gpu_buf(bnd, zeros, 2);
-            set_gpu_buf(bnd, x, 3);
-            set_gpu_buf(bnd, y, 4);
-            gpu.icb_scalars.bind_u32(bnd, rows_off, 5);
-            gpu.icb_scalars.bind_u32(bnd, cols_off, 6);
-            gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
-            bnd.set_threadgroup_memory(0, tg_mem);
-            bnd.dispatch(
-                tessl::runtime::mtl_size(n_tg, 1, 1),
-                tessl::runtime::mtl_size(tptg, 1, 1),
-            );
-            Ok(())
-        })
-        .map_err(map_metal)
+    // The legacy `zeros` argument is an unused shader slot for MLX banks.
+    let _ = zeros;
+    // SAFETY: preflight validated the exact shape and buffers before scalar
+    // reservation. The closure binds only those values from the stable pool.
+    unsafe {
+        tessl::nn::gemv_q4_mlx_blocked_with_scalars(
+            &gpu.rt,
+            bank,
+            x,
+            y,
+            shape,
+            |bnd| {
+                gpu.icb_scalars.bind_u32(bnd, rows_off, 5);
+                gpu.icb_scalars.bind_u32(bnd, cols_off, 6);
+                gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
+            },
+        )
+    }
+    .map_err(map_metal)
 }
 
 /// Decode GEMV: `y[rows] = W_q[rows, cols] @ x[cols]`.
@@ -1038,18 +1034,32 @@ pub fn gemv_q4(
     cols: u32,
     group_size: u32,
 ) -> Result<()> {
-    dispatch_gemv_row(
-        gpu,
-        KernelId::GemvQ4.entry_name(),
-        packed,
-        scales,
-        zeros,
-        x,
-        y,
+    let shape = tessl::nn::QuantShape {
         rows,
         cols,
         group_size,
-    )
+    };
+    let bank = tessl::nn::Q4Bank {
+        packed,
+        scales,
+        zeros,
+    };
+    tessl::nn::validate_gemv_q4(&gpu.rt, bank, x, y, shape, false).map_err(map_metal)?;
+    if rows == 0 {
+        return Ok(());
+    }
+    let (rows_off, cols_off, gs_off) = push_gemv_dims(gpu, rows, cols, group_size)?;
+    // SAFETY: the preflight above validates the exact host dimensions and
+    // buffers. This closure binds only those dimensions from Gemma's stable,
+    // runtime-owned scalar pool, which remains resident across ICB replays.
+    unsafe {
+        tessl::nn::gemv_q4_with_scalars(&gpu.rt, bank, x, y, shape, false, |bnd| {
+            gpu.icb_scalars.bind_u32(bnd, rows_off, 5);
+            gpu.icb_scalars.bind_u32(bnd, cols_off, 6);
+            gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
+        })
+    }
+    .map_err(map_metal)
 }
 
 /// MLX affine Q4 GEMV: `y = (scale * q_u + bias) @ x` (row-major Hot).
@@ -1065,9 +1075,54 @@ pub fn gemv_q4_mlx(
     cols: u32,
     group_size: u32,
 ) -> Result<()> {
+    gemv_q4_mlx_with_simd_policy(
+        gpu,
+        packed,
+        scales,
+        biases,
+        x,
+        y,
+        rows,
+        cols,
+        group_size,
+        gemv_simd_enabled(),
+    )
+}
+
+fn gemv_q4_mlx_with_simd_policy(
+    gpu: &GemmaGpu,
+    packed: &GpuBuffer,
+    scales: &GpuBuffer,
+    biases: &GpuBuffer,
+    x: &GpuBuffer,
+    y: &GpuBuffer,
+    rows: u32,
+    cols: u32,
+    group_size: u32,
+    allow_simd: bool,
+) -> Result<()> {
+    let shape = tessl::nn::QuantShape {
+        rows,
+        cols,
+        group_size,
+    };
+    // MLX Hot storage interleaves each bf16 scale/bias pair in `scales`.
+    // The legacy `biases` operand remains for the crate's public ABI, but none
+    // of the MLX kernels reads slot 2; Tessl deliberately rebinds this bank.
+    let bank = tessl::nn::Q4MlxBank {
+        packed,
+        scales_biases: scales,
+    };
+    // Validate the complete public boundary before a bf16 conversion can
+    // allocate scratch, consume stable scalar slots, or mutate device state.
+    tessl::nn::validate_gemv_q4_mlx_inputs(&gpu.rt, bank, x, y, shape).map_err(map_metal)?;
+    if rows == 0 {
+        return Ok(());
+    }
+
     // Prefer simdgroup-cooperative row-major GEMV (MLX qmv structure).
     // Full K-blocks are 512; remainder handled when cols % 16 == 0.
-    if gemv_simd_enabled()
+    if allow_simd
         && cols >= 256
         && cols % 16 == 0
         && group_size > 0
@@ -1084,39 +1139,65 @@ pub fn gemv_q4_mlx(
             gpu, packed, scales, biases, &x_bf16, y, rows, cols, group_size, false,
         );
     }
+    let needs_tiled = (cols as usize).saturating_mul(std::mem::size_of::<f32>())
+        > gpu.rt.max_threadgroup_memory();
     // Tall (lm_head) vs wide-short — same peel; Rust picks TG size from shape.
-    let entry = if rows >= 65_536 {
+    let entry = if needs_tiled {
+        "gemv_q4_mlx_tiled"
+    } else if rows >= 65_536 {
         KernelId::GemvQ4Mlx.entry_name()
     } else {
         "gemv_q4_mlx_wide"
     };
-    dispatch_gemv_row(
-        gpu,
-        entry,
-        packed,
-        scales,
-        biases,
-        x,
-        y,
-        rows,
-        cols,
-        group_size,
-    )
+    let variant = if needs_tiled {
+        tessl::nn::Q4MlxRowVariant::Tiled
+    } else if entry == KernelId::GemvQ4Mlx.entry_name() {
+        tessl::nn::Q4MlxRowVariant::Standard
+    } else {
+        tessl::nn::Q4MlxRowVariant::Wide
+    };
+    tessl::nn::validate_gemv_q4_mlx(&gpu.rt, bank, x, y, shape, variant)
+        .map_err(map_metal)?;
+    if rows == 0 {
+        return Ok(());
+    }
+    let (rows_off, cols_off, gs_off) = push_gemv_dims(gpu, rows, cols, group_size)?;
+    // SAFETY: the preflight above validates the exact host dimensions and
+    // buffers. This closure binds only those dimensions from Gemma's stable,
+    // runtime-owned scalar pool, which remains resident across ICB replays.
+    unsafe {
+        tessl::nn::gemv_q4_mlx_with_scalars(
+            &gpu.rt,
+            bank,
+            x,
+            y,
+            shape,
+            variant,
+            |bnd| {
+                gpu.icb_scalars.bind_u32(bnd, rows_off, 5);
+                gpu.icb_scalars.bind_u32(bnd, cols_off, 6);
+                gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
+            },
+        )
+    }
+    .map_err(map_metal)
 }
 
 fn gemv_simd_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("GEMMA_METAL_GEMV_SIMD").ok().as_deref() {
-        Some("0") | Some("false") | Some("off") => false,
-        _ => true,
-    })
+    *V.get_or_init(
+        || match std::env::var("GEMMA_METAL_GEMV_SIMD").ok().as_deref() {
+            Some("0") | Some("false") | Some("off") => false,
+            _ => true,
+        },
+    )
 }
 
 fn dispatch_gemv_simd(
     gpu: &GemmaGpu,
     packed: &GpuBuffer,
     scales: &GpuBuffer,
-    zeros: &GpuBuffer,
+    _biases: &GpuBuffer,
     x: &GpuBuffer,
     y: &GpuBuffer,
     rows: u32,
@@ -1124,16 +1205,31 @@ fn dispatch_gemv_simd(
     group_size: u32,
     interleaved: bool,
 ) -> Result<()> {
-    if rows == 0 {
-        return Ok(());
-    }
     // `x` must already be bf16 (see `prepare_act_bf16` at call sites).
     let entry = if interleaved {
         "gemv_q4_mlx_simd_i4"
     } else {
         "gemv_q4_mlx_simd"
     };
-    let p = gpu.rt.pipeline(entry).map_err(map_metal)?;
+    let shape = tessl::nn::QuantShape {
+        rows,
+        cols,
+        group_size,
+    };
+    let bank = tessl::nn::Q4MlxBank {
+        packed,
+        scales_biases: scales,
+    };
+    let layout = if interleaved {
+        tessl::nn::Q4MlxLayout::Interleaved4
+    } else {
+        tessl::nn::Q4MlxLayout::RowMajor
+    };
+    tessl::nn::validate_gemv_q4_mlx_simd(&gpu.rt, bank, x, y, shape, layout, None)
+        .map_err(map_metal)?;
+    if rows == 0 {
+        return Ok(());
+    }
     let rows_per_tg = GEMV_SIMD_SG * GEMV_SIMD_ROWS; // 8
     let n_tg = ((rows as usize) + rows_per_tg as usize - 1) / rows_per_tg as usize;
     if trace_gemv_enabled() {
@@ -1144,24 +1240,25 @@ fn dispatch_gemv_simd(
         );
     }
     let (rows_off, cols_off, gs_off) = push_gemv_dims(gpu, rows, cols, group_size)?;
-    gpu.rt
-        .with_binder(|bnd| {
-            bnd.set_pipeline(&p);
-            set_gpu_buf(bnd, packed, 0);
-            set_gpu_buf(bnd, scales, 1);
-            set_gpu_buf(bnd, zeros, 2);
-            set_gpu_buf(bnd, x, 3);
-            set_gpu_buf(bnd, y, 4);
-            gpu.icb_scalars.bind_u32(bnd, rows_off, 5);
-            gpu.icb_scalars.bind_u32(bnd, cols_off, 6);
-            gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
-            bnd.dispatch(
-                tessl::runtime::mtl_size(n_tg, 1, 1),
-                tessl::runtime::mtl_size(GEMV_SIMD_TPTG, 1, 1),
-            );
-            Ok(())
-        })
-        .map_err(map_metal)
+    // SAFETY: preflight validated the exact shape and buffers before scalar
+    // reservation. The closure binds only those values from the stable pool.
+    unsafe {
+        tessl::nn::gemv_q4_mlx_simd_with_scalars(
+            &gpu.rt,
+            bank,
+            x,
+            y,
+            shape,
+            layout,
+            None,
+            |bnd| {
+                gpu.icb_scalars.bind_u32(bnd, rows_off, 5);
+                gpu.icb_scalars.bind_u32(bnd, cols_off, 6);
+                gpu.icb_scalars.bind_u32(bnd, gs_off, 7);
+            },
+        )
+    }
+    .map_err(map_metal)
 }
 
 /// MLX Q4 GEMV on `BlockedBn16` Hot layout.
@@ -1176,9 +1273,7 @@ pub fn gemv_q4_mlx_blocked(
     cols: u32,
     group_size: u32,
 ) -> Result<()> {
-    dispatch_gemv_blocked(
-        gpu, packed, scales, biases, x, y, rows, cols, group_size,
-    )
+    dispatch_gemv_blocked(gpu, packed, scales, biases, x, y, rows, cols, group_size)
 }
 
 pub fn gemv_q8(
@@ -1198,14 +1293,17 @@ pub fn gemv_q8(
 }
 
 /// Store one K or V timestep into a GPU KV cache slot (`dst[offset..] = src[0..n]`).
+/// `dst_capacity` is the logical f32-element bound enforced by the shader; it
+/// may be smaller than the backing allocation for a suballocated cache.
 pub fn kv_store_timestep(
     gpu: &GemmaGpu,
     src: &GpuBuffer,
     dst: &GpuBuffer,
     n: u32,
     dst_offset: u32,
+    dst_capacity: u32,
 ) -> Result<()> {
-    kv_store_timestep_off(gpu, src, 0, dst, n, dst_offset)
+    kv_store_timestep_off(gpu, src, 0, dst, n, dst_offset, dst_capacity)
 }
 
 /// Like [`kv_store_timestep`] with a float-element offset into `src`.
@@ -1216,25 +1314,30 @@ pub fn kv_store_timestep_off(
     dst: &GpuBuffer,
     n: u32,
     dst_offset: u32,
+    dst_capacity: u32,
 ) -> Result<()> {
     use tessl::dispatch::set_gpu_buf_offset;
+    let src_bytes = validate_f32_range(src, src_elem_off, n, "kv_store_timestep src")?;
+    validate_kv_capacity(dst, n, dst_capacity, "kv_store_timestep dst")?;
     let p = gpu
         .rt
         .pipeline(KernelId::KvStoreTimestep.entry_name())
         .map_err(map_metal)?;
-    let src_bytes = (src_elem_off as usize).saturating_mul(4);
     let n_off = gpu.icb_scalars.push_u32(n)?;
     let dst_off = gpu.icb_scalars.push_u32(dst_offset)?;
+    let capacity_off = gpu.icb_scalars.push_u32(dst_capacity)?;
     dispatch_1d(&gpu.rt, &p, n as usize, |bnd| {
         set_gpu_buf_offset(bnd, src, src_bytes, 0);
         set_gpu_buf(bnd, dst, 1);
         gpu.icb_scalars.bind_u32(bnd, n_off, 2);
         gpu.icb_scalars.bind_u32(bnd, dst_off, 3);
+        gpu.icb_scalars.bind_u32(bnd, capacity_off, 4);
     })
     .map_err(map_metal)
 }
 
 /// Fuse K+V store into one dispatch (same src element offset + dst slot offset).
+/// Both destinations share the explicit logical `dst_capacity` bound.
 pub fn kv_store_timestep_pair_off(
     gpu: &GemmaGpu,
     src_k: &GpuBuffer,
@@ -1244,19 +1347,24 @@ pub fn kv_store_timestep_pair_off(
     dst_v: &GpuBuffer,
     n: u32,
     dst_offset: u32,
+    dst_capacity: u32,
 ) -> Result<()> {
     use tessl::dispatch::set_gpu_buf_offset;
+    let src_bytes = validate_f32_range(src_k, src_elem_off, n, "kv_store_timestep_pair src_k")?;
+    validate_f32_range(src_v, src_elem_off, n, "kv_store_timestep_pair src_v")?;
+    validate_kv_capacity(dst_k, n, dst_capacity, "kv_store_timestep_pair dst_k")?;
+    validate_kv_capacity(dst_v, n, dst_capacity, "kv_store_timestep_pair dst_v")?;
     let p = gpu
         .rt
         .pipeline(KernelId::KvStoreTimestepPair.entry_name())
         .map_err(map_metal)?;
-    let src_bytes = (src_elem_off as usize).saturating_mul(4);
     let n_off = gpu.icb_scalars.push_u32(n)?;
     let dst_off = if let Some(src) = dyn_src_peek_from_ctx() {
         gpu.icb_scalars.push_u32_dyn(dst_offset, src)?
     } else {
         gpu.icb_scalars.push_u32(dst_offset)?
     };
+    let capacity_off = gpu.icb_scalars.push_u32(dst_capacity)?;
     dispatch_1d(&gpu.rt, &p, n as usize, |bnd| {
         set_gpu_buf_offset(bnd, src_k, src_bytes, 0);
         set_gpu_buf_offset(bnd, src_v, src_bytes, 1);
@@ -1264,6 +1372,7 @@ pub fn kv_store_timestep_pair_off(
         set_gpu_buf(bnd, dst_v, 3);
         gpu.icb_scalars.bind_u32(bnd, n_off, 4);
         gpu.icb_scalars.bind_u32(bnd, dst_off, 5);
+        gpu.icb_scalars.bind_u32(bnd, capacity_off, 6);
     })
     .map_err(map_metal)
 }
@@ -1281,8 +1390,15 @@ pub fn kv_ring_densify(
     filled: u32,
     start: u32,
 ) -> Result<()> {
-    let n = (capacity as usize).saturating_mul(n_slot as usize);
-    if n == 0 || filled == 0 {
+    let n = (capacity as usize)
+        .checked_mul(n_slot as usize)
+        .ok_or_else(|| Error::Metal("kv_ring_densify: fixed grid overflows usize".into()))?;
+    if n > u32::MAX as usize {
+        return Err(Error::Metal(format!(
+            "kv_ring_densify: fixed grid {n} exceeds Metal uint indexing"
+        )));
+    }
+    if n == 0 {
         return Ok(());
     }
     let p = gpu
@@ -1313,11 +1429,7 @@ pub fn kv_ring_densify(
 }
 
 /// Upload a [`QuantMatrix`] Hot bank and run GEMV against host `x`.
-pub fn gemv_quant_host(
-    gpu: &GemmaGpu,
-    w: &QuantMatrix,
-    x: &[f32],
-) -> Result<Vec<f32>> {
+pub fn gemv_quant_host(gpu: &GemmaGpu, w: &QuantMatrix, x: &[f32]) -> Result<Vec<f32>> {
     if x.len() != w.cols {
         return Err(Error::Metal(format!(
             "gemv x len {} != cols {}",
@@ -1330,7 +1442,10 @@ pub fn gemv_quant_host(
         .group_size()
         .ok_or_else(|| Error::Metal("gemv requires Q4/Q8".into()))? as u32;
 
-    let packed = gpu.rt.alloc_buffer(w.packed.len().max(1)).map_err(map_metal)?;
+    let packed = gpu
+        .rt
+        .alloc_buffer(w.packed.len().max(1))
+        .map_err(map_metal)?;
     packed.write_bytes(&w.packed);
     let mlx = matches!(w.scheme, crate::quant::QuantScheme::Q4Mlx { .. });
     let (scales, zeros) = if mlx {
@@ -1402,20 +1517,67 @@ pub fn gemv_quant_host(
     Ok(yb.read_f32())
 }
 
-/// Prefill GEMM via metal-runtime TensorOps (preferred) / simdgroup.
+/// Prefill GEMM via tessl TensorOps (preferred) / simdgroup.
 pub fn gemm_prefill(a: &Tensor, b: &Tensor, c: &Tensor) -> Result<()> {
     let rt = a.runtime();
     let backend = select_backend(rt);
     gemm(a, b, c, backend).map_err(map_metal)
 }
 
-pub fn gemm_prefill_backend(a: &Tensor, b: &Tensor, c: &Tensor, backend: GemmBackend) -> Result<()> {
+pub fn gemm_prefill_backend(
+    a: &Tensor,
+    b: &Tensor,
+    c: &Tensor,
+    backend: GemmBackend,
+) -> Result<()> {
     gemm(a, b, c, backend).map_err(map_metal)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_direct_attn_storage(
+    gpu: &GemmaGpu,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    v: &GpuBuffer,
+    o: &GpuBuffer,
+    b: u32,
+    tq: u32,
+    h: u32,
+    hkv: u32,
+    d: u32,
+    window: u32,
+    scale: f32,
+    out_bf16: bool,
+) -> Result<u32> {
+    let dims = tessl::nn::AttnDims {
+        batch: b,
+        tq,
+        heads: h,
+        heads_kv: hkv,
+        window,
+        scale,
+    };
+    let capacity =
+        tessl::nn::validate_attn_storage(&dims, d, q, k, v, o, out_bf16).map_err(map_metal)?;
+    // Every direct binder below puts mutable Tkv/position values and immutable
+    // dimensions in this stable pool. An output alias could overwrite values a
+    // concurrent threadgroup or later ICB replay still reads.
+    tessl::nn::validate_attn_output_scalar_aliases(
+        &dims,
+        o,
+        &[
+            ("ICB u32 pool", &gpu.icb_scalars.u32s),
+            ("ICB f32 pool", &gpu.icb_scalars.f32s),
+        ],
+    )
+    .map_err(map_metal)?;
+    Ok(capacity)
 }
 
 /// Sliding-window FA @ D=256.
 ///
-/// Layout: Q/O `[B,Tq,H,D]`, K/V `[B,Tkv,Hkv,D]`. Absolute positions are
+/// Layout: Q/O `[B,Tq,H,D]`, K/V `[B,capacity,Hkv,D]`; only the first live
+/// `Tkv` positions are visited. Absolute positions are
 /// `q_pos_offset + t_q` / `kv_pos_offset + t_k` (prefill: offsets 0, Tq=Tkv;
 /// decode / ring densify: Tq=1, Tkv=cache_len, offsets set accordingly).
 pub fn flash_attn_swa_h256(
@@ -1435,7 +1597,21 @@ pub fn flash_attn_swa_h256(
     kv_pos_offset: u32,
 ) -> Result<()> {
     flash_attn_swa_h256_ex(
-        gpu, q, k, v, o, b, tq, tkv, h, hkv, window, scale, q_pos_offset, kv_pos_offset, false,
+        gpu,
+        q,
+        k,
+        v,
+        o,
+        b,
+        tq,
+        tkv,
+        h,
+        hkv,
+        window,
+        scale,
+        q_pos_offset,
+        kv_pos_offset,
+        false,
     )
 }
 
@@ -1456,13 +1632,17 @@ pub fn flash_attn_swa_h256_ex(
     kv_pos_offset: u32,
     out_bf16: bool,
 ) -> Result<()> {
+    let kv_capacity =
+        validate_direct_attn_storage(gpu, q, k, v, o, b, tq, h, hkv, 256, window, scale, out_bf16)?;
     let p = gpu
         .rt
         .pipeline(KernelId::FlashAttnSwaH256.entry_name())
         .map_err(map_metal)?;
     const BR: usize = 8;
     let groups_x = ((tq as usize) + BR - 1) / BR;
-    let groups_y = (b * h) as usize;
+    let groups_y = (b as usize)
+        .checked_mul(h as usize)
+        .ok_or_else(|| Error::Metal("flash_attn_swa_h256: grid height overflows".into()))?;
     let tptg = 32usize;
     let b_off = gpu.icb_scalars.push_u32(b)?;
     let tq_off = gpu.icb_scalars.push_u32(tq)?;
@@ -1482,6 +1662,7 @@ pub fn flash_attn_swa_h256_ex(
         gpu.icb_scalars.push_u32(kv_pos_offset)?
     };
     let out_bf16_off = gpu.icb_scalars.push_u32(if out_bf16 { 1 } else { 0 })?;
+    let kv_capacity_off = gpu.icb_scalars.push_u32(kv_capacity)?;
     dispatch_2d_tg(&gpu.rt, &p, groups_x, groups_y, tptg, |bnd| {
         set_gpu_buf(bnd, q, 0);
         set_gpu_buf(bnd, k, 1);
@@ -1497,6 +1678,7 @@ pub fn flash_attn_swa_h256_ex(
         set_gpu_buf_offset(bnd, &gpu.icb_scalars.u32s, q_pos_off, 11);
         set_gpu_buf_offset(bnd, &gpu.icb_scalars.u32s, kv_pos_off, 12);
         set_gpu_buf_offset(bnd, &gpu.icb_scalars.u32s, out_bf16_off, 13);
+        set_gpu_buf_offset(bnd, &gpu.icb_scalars.u32s, kv_capacity_off, 14);
     })
     .map_err(map_metal)
 }
@@ -1535,13 +1717,17 @@ pub fn flash_attn_swa_h128(
     q_pos_offset: u32,
     kv_pos_offset: u32,
 ) -> Result<()> {
+    let kv_capacity =
+        validate_direct_attn_storage(gpu, q, k, v, o, b, tq, h, hkv, 128, window, scale, false)?;
     let p = gpu
         .rt
         .pipeline(KernelId::FlashAttnSwaH128.entry_name())
         .map_err(map_metal)?;
     const BR: usize = 8;
     let groups_x = ((tq as usize) + BR - 1) / BR;
-    let groups_y = (b * h) as usize;
+    let groups_y = (b as usize)
+        .checked_mul(h as usize)
+        .ok_or_else(|| Error::Metal("flash_attn_swa_h128: grid height overflows".into()))?;
     let tptg = 32usize;
     let b_off = gpu.icb_scalars.push_u32(b)?;
     let tq_off = gpu.icb_scalars.push_u32(tq)?;
@@ -1552,6 +1738,7 @@ pub fn flash_attn_swa_h128(
     let scale_off = gpu.icb_scalars.push_f32(scale)?;
     let q_pos_off = gpu.icb_scalars.push_u32(q_pos_offset)?;
     let kv_pos_off = gpu.icb_scalars.push_u32(kv_pos_offset)?;
+    let kv_capacity_off = gpu.icb_scalars.push_u32(kv_capacity)?;
     dispatch_2d_tg(&gpu.rt, &p, groups_x, groups_y, tptg, |bnd| {
         set_gpu_buf(bnd, q, 0);
         set_gpu_buf(bnd, k, 1);
@@ -1566,6 +1753,7 @@ pub fn flash_attn_swa_h128(
         set_gpu_buf_offset(bnd, &gpu.icb_scalars.f32s, scale_off, 10);
         set_gpu_buf_offset(bnd, &gpu.icb_scalars.u32s, q_pos_off, 11);
         set_gpu_buf_offset(bnd, &gpu.icb_scalars.u32s, kv_pos_off, 12);
+        set_gpu_buf_offset(bnd, &gpu.icb_scalars.u32s, kv_capacity_off, 13);
     })
     .map_err(map_metal)
 }
@@ -1604,7 +1792,20 @@ pub fn flash_attn_global_h512(
     kv_pos_offset: u32,
 ) -> Result<()> {
     flash_attn_global_h512_ex(
-        gpu, q, k, v, o, b, tq, tkv, h, hkv, scale, q_pos_offset, kv_pos_offset, false,
+        gpu,
+        q,
+        k,
+        v,
+        o,
+        b,
+        tq,
+        tkv,
+        h,
+        hkv,
+        scale,
+        q_pos_offset,
+        kv_pos_offset,
+        false,
     )
 }
 
@@ -1624,13 +1825,17 @@ pub fn flash_attn_global_h512_ex(
     kv_pos_offset: u32,
     out_bf16: bool,
 ) -> Result<()> {
+    let kv_capacity =
+        validate_direct_attn_storage(gpu, q, k, v, o, b, tq, h, hkv, 512, 0, scale, out_bf16)?;
     let p = gpu
         .rt
         .pipeline(KernelId::FlashAttnGlobalH512.entry_name())
         .map_err(map_metal)?;
     const BR: usize = 4;
     let groups_x = ((tq as usize) + BR - 1) / BR;
-    let groups_y = (b * h) as usize;
+    let groups_y = (b as usize)
+        .checked_mul(h as usize)
+        .ok_or_else(|| Error::Metal("flash_attn_global_h512: grid height overflows".into()))?;
     let tptg = 32usize;
     let b_off = gpu.icb_scalars.push_u32(b)?;
     let tq_off = gpu.icb_scalars.push_u32(tq)?;
@@ -1649,6 +1854,7 @@ pub fn flash_attn_global_h512_ex(
         gpu.icb_scalars.push_u32(kv_pos_offset)?
     };
     let out_bf16_off = gpu.icb_scalars.push_u32(if out_bf16 { 1 } else { 0 })?;
+    let kv_capacity_off = gpu.icb_scalars.push_u32(kv_capacity)?;
     dispatch_2d_tg(&gpu.rt, &p, groups_x, groups_y, tptg, |bnd| {
         set_gpu_buf(bnd, q, 0);
         set_gpu_buf(bnd, k, 1);
@@ -1663,6 +1869,7 @@ pub fn flash_attn_global_h512_ex(
         set_gpu_buf_offset(bnd, &gpu.icb_scalars.u32s, q_pos_off, 10);
         set_gpu_buf_offset(bnd, &gpu.icb_scalars.u32s, kv_pos_off, 11);
         set_gpu_buf_offset(bnd, &gpu.icb_scalars.u32s, out_bf16_off, 12);
+        set_gpu_buf_offset(bnd, &gpu.icb_scalars.u32s, kv_capacity_off, 13);
     })
     .map_err(map_metal)
 }
@@ -1725,31 +1932,31 @@ pub fn rms_qkv_rope_ex(
     eps: f32,
     q_only: bool,
 ) -> Result<()> {
-    let p = gpu
-        .rt
-        .pipeline(KernelId::RmsQkvRope.entry_name())
-        .map_err(map_metal)?;
-    let n = if q_only {
-        (t * hq) as usize
-    } else {
-        (t * hq + 2 * t * hkv) as usize
-    };
-    dispatch_1d(&gpu.rt, &p, n, |bnd| {
-        set_gpu_buf(bnd, q, 0);
-        set_gpu_buf(bnd, k, 1);
-        set_gpu_buf(bnd, v, 2);
-        set_gpu_buf(bnd, q_w, 3);
-        set_gpu_buf(bnd, k_w, 4);
-        set_gpu_buf(bnd, v_w, 5);
-        set_u32(bnd, t, 6);
-        set_u32(bnd, hq, 7);
-        set_u32(bnd, hkv, 8);
-        set_u32(bnd, d, 9);
-        set_u32(bnd, rotary_dim, 10);
-        set_u32(bnd, pos_offset, 11);
-        set_f32(bnd, theta, 12);
-        set_f32(bnd, eps, 13);
-    })
+    tessl::nn::rms_qkv_rope(
+        &gpu.rt,
+        tessl::nn::QkvRopeVariant::PosConst,
+        tessl::nn::QkvBuffers {
+            q,
+            k,
+            v,
+            q_weight: q_w,
+            k_weight: k_w,
+            v_weight: v_w,
+        },
+        tessl::nn::QkvRopeDims {
+            t,
+            heads_q: hq,
+            heads_kv: hkv,
+            head_dim: d,
+            rotary_dim,
+            theta,
+            eps,
+        },
+        pos_offset,
+        None,
+        None,
+        q_only,
+    )
     .map_err(map_metal)
 }
 
@@ -1774,15 +1981,38 @@ pub fn rms_qkv_rope_ex_posbuf(
     eps: f32,
     q_only: bool,
 ) -> Result<()> {
-    let p = gpu
-        .rt
+    let qkv = tessl::nn::QkvBuffers {
+        q,
+        k,
+        v,
+        q_weight: q_w,
+        k_weight: k_w,
+        v_weight: v_w,
+    };
+    let dims = tessl::nn::QkvRopeDims {
+        t,
+        heads_q: hq,
+        heads_kv: hkv,
+        head_dim: d,
+        rotary_dim,
+        theta,
+        eps,
+    };
+    tessl::nn::validate_rms_qkv_rope(
+        &gpu.rt,
+        tessl::nn::QkvRopeVariant::PosBuffer,
+        qkv,
+        dims,
+        Some(pos_buf),
+        None,
+        q_only,
+    )
+    .map_err(map_metal)?;
+    // Resolve before mutating the stable scalar pool or its capture tape. The
+    // canonical dispatch reuses this cached pipeline after the scalar writes.
+    gpu.rt
         .pipeline(KernelId::RmsQkvRopePosbuf.entry_name())
         .map_err(map_metal)?;
-    let n = if q_only {
-        (t * hq) as usize
-    } else {
-        (t * hq + 2 * t * hkv) as usize
-    };
     let t_off = gpu.icb_scalars.push_u32(t)?;
     let hq_off = gpu.icb_scalars.push_u32(hq)?;
     let hkv_off = gpu.icb_scalars.push_u32(hkv)?;
@@ -1790,27 +2020,34 @@ pub fn rms_qkv_rope_ex_posbuf(
     let rotary_off = gpu.icb_scalars.push_u32(rotary_dim)?;
     let theta_off = gpu.icb_scalars.push_f32(theta)?;
     let eps_off = gpu.icb_scalars.push_f32(eps)?;
-    dispatch_1d(&gpu.rt, &p, n, |bnd| {
-        set_gpu_buf(bnd, q, 0);
-        set_gpu_buf(bnd, k, 1);
-        set_gpu_buf(bnd, v, 2);
-        set_gpu_buf(bnd, q_w, 3);
-        set_gpu_buf(bnd, k_w, 4);
-        set_gpu_buf(bnd, v_w, 5);
-        gpu.icb_scalars.bind_u32(bnd, t_off, 6);
-        gpu.icb_scalars.bind_u32(bnd, hq_off, 7);
-        gpu.icb_scalars.bind_u32(bnd, hkv_off, 8);
-        gpu.icb_scalars.bind_u32(bnd, d_off, 9);
-        gpu.icb_scalars.bind_u32(bnd, rotary_off, 10);
-        set_gpu_buf(bnd, pos_buf, 11);
-        gpu.icb_scalars.bind_f32(bnd, theta_off, 12);
-        gpu.icb_scalars.bind_f32(bnd, eps_off, 13);
-    })
+    // SAFETY: the callback binds exactly the documented, prevalidated scalar
+    // values from runtime-owned Hot storage that remains resident for replay.
+    unsafe {
+        tessl::nn::rms_qkv_rope_with_scalars(
+            &gpu.rt,
+            tessl::nn::QkvRopeVariant::PosBuffer,
+            qkv,
+            dims,
+            Some(pos_buf),
+            None,
+            q_only,
+            |bnd, _| {
+                gpu.icb_scalars.bind_u32(bnd, t_off, 6);
+                gpu.icb_scalars.bind_u32(bnd, hq_off, 7);
+                gpu.icb_scalars.bind_u32(bnd, hkv_off, 8);
+                gpu.icb_scalars.bind_u32(bnd, d_off, 9);
+                gpu.icb_scalars.bind_u32(bnd, rotary_off, 10);
+                gpu.icb_scalars.bind_f32(bnd, theta_off, 12);
+                gpu.icb_scalars.bind_f32(bnd, eps_off, 13);
+            },
+        )
+    }
     .map_err(map_metal)
 }
 
 /// Producer fusion: RoPE(+norms) into scratch Q/K/V **and** store K/V into the
 /// cache slot at `kv_dst_offset` (replaces a follow-up `kv_store_timestep_pair`).
+/// `kv_capacity` is the logical f32-element bound shared by both cache buffers.
 pub fn rms_qkv_rope_kv_store(
     gpu: &GemmaGpu,
     q: &GpuBuffer,
@@ -1830,12 +2067,46 @@ pub fn rms_qkv_rope_kv_store(
     dst_k: &GpuBuffer,
     dst_v: &GpuBuffer,
     kv_dst_offset: u32,
+    kv_capacity: u32,
 ) -> Result<()> {
-    let p = gpu
-        .rt
+    let qkv = tessl::nn::QkvBuffers {
+        q,
+        k,
+        v,
+        q_weight: q_w,
+        k_weight: k_w,
+        v_weight: v_w,
+    };
+    let dims = tessl::nn::QkvRopeDims {
+        t,
+        heads_q: hq,
+        heads_kv: hkv,
+        head_dim: d,
+        rotary_dim,
+        theta,
+        eps,
+    };
+    let target = tessl::nn::KvStoreTarget {
+        dst_k,
+        dst_v,
+        // The stable-pool element is selected by the callback's validated
+        // byte-offset rebind at slot 16 below.
+        dst_offset: &gpu.icb_scalars.u32s,
+        capacity: kv_capacity,
+    };
+    tessl::nn::validate_rms_qkv_rope(
+        &gpu.rt,
+        tessl::nn::QkvRopeVariant::PosBufferKvStore,
+        qkv,
+        dims,
+        Some(pos_buf),
+        Some(target),
+        false,
+    )
+    .map_err(map_metal)?;
+    gpu.rt
         .pipeline(KernelId::RmsQkvRopeKvStore.entry_name())
         .map_err(map_metal)?;
-    let n = (t * hq + 2 * t * hkv) as usize;
     let t_off = gpu.icb_scalars.push_u32(t)?;
     let hq_off = gpu.icb_scalars.push_u32(hq)?;
     let hkv_off = gpu.icb_scalars.push_u32(hkv)?;
@@ -1848,25 +2119,33 @@ pub fn rms_qkv_rope_kv_store(
     } else {
         gpu.icb_scalars.push_u32(kv_dst_offset)?
     };
-    dispatch_1d(&gpu.rt, &p, n, |bnd| {
-        set_gpu_buf(bnd, q, 0);
-        set_gpu_buf(bnd, k, 1);
-        set_gpu_buf(bnd, v, 2);
-        set_gpu_buf(bnd, q_w, 3);
-        set_gpu_buf(bnd, k_w, 4);
-        set_gpu_buf(bnd, v_w, 5);
-        gpu.icb_scalars.bind_u32(bnd, t_off, 6);
-        gpu.icb_scalars.bind_u32(bnd, hq_off, 7);
-        gpu.icb_scalars.bind_u32(bnd, hkv_off, 8);
-        gpu.icb_scalars.bind_u32(bnd, d_off, 9);
-        gpu.icb_scalars.bind_u32(bnd, rotary_off, 10);
-        set_gpu_buf(bnd, pos_buf, 11);
-        gpu.icb_scalars.bind_f32(bnd, theta_off, 12);
-        gpu.icb_scalars.bind_f32(bnd, eps_off, 13);
-        set_gpu_buf(bnd, dst_k, 14);
-        set_gpu_buf(bnd, dst_v, 15);
-        gpu.icb_scalars.bind_u32(bnd, kv_dst_off, 16);
-    })
+    let kv_capacity_off = gpu.icb_scalars.push_u32(kv_capacity)?;
+    // SAFETY: all scalar values were included in the canonical preflight.
+    // Slot 16 is the documented stable-pool exception and stays within the
+    // validated `target.dst_offset` allocation.
+    unsafe {
+        tessl::nn::rms_qkv_rope_with_scalars(
+            &gpu.rt,
+            tessl::nn::QkvRopeVariant::PosBufferKvStore,
+            qkv,
+            dims,
+            Some(pos_buf),
+            Some(target),
+            false,
+            |bnd, validated_capacity| {
+                debug_assert_eq!(validated_capacity, Some(kv_capacity));
+                gpu.icb_scalars.bind_u32(bnd, t_off, 6);
+                gpu.icb_scalars.bind_u32(bnd, hq_off, 7);
+                gpu.icb_scalars.bind_u32(bnd, hkv_off, 8);
+                gpu.icb_scalars.bind_u32(bnd, d_off, 9);
+                gpu.icb_scalars.bind_u32(bnd, rotary_off, 10);
+                gpu.icb_scalars.bind_f32(bnd, theta_off, 12);
+                gpu.icb_scalars.bind_f32(bnd, eps_off, 13);
+                gpu.icb_scalars.bind_u32(bnd, kv_dst_off, 16);
+                gpu.icb_scalars.bind_u32(bnd, kv_capacity_off, 17);
+            },
+        )
+    }
     .map_err(map_metal)
 }
 
@@ -1976,9 +2255,14 @@ pub fn mlp_gelu_tanh(
     n: u32,
 ) -> Result<()> {
     let n_off = gpu.icb_scalars.push_u32(n)?;
-    tessl::nn::mlp_gelu_tanh_with_scalars(&gpu.rt, gate, up, out, n, |bnd| {
-        gpu.icb_scalars.bind_u32(bnd, n_off, 3);
-    })
+    // SAFETY: the closure binds only documented slot 3 to the exact `n` value.
+    // `gpu` owns the same-runtime scalar pool, which outlives this dispatch and
+    // any ICB replay that references the stable buffer address.
+    unsafe {
+        tessl::nn::mlp_gelu_tanh_with_scalars(&gpu.rt, gate, up, out, n, |bnd| {
+            gpu.icb_scalars.bind_u32(bnd, n_off, 3);
+        })
+    }
     .map_err(map_metal)
 }
 
@@ -1991,9 +2275,14 @@ pub fn mlp_gelu_tanh_bf16(
     n: u32,
 ) -> Result<()> {
     let n_off = gpu.icb_scalars.push_u32(n)?;
-    tessl::nn::mlp_gelu_tanh_bf16_with_scalars(&gpu.rt, gate, up, out_bf16, n, |bnd| {
-        gpu.icb_scalars.bind_u32(bnd, n_off, 3);
-    })
+    // SAFETY: the closure binds only documented slot 3 to the exact `n` value.
+    // `gpu` owns the same-runtime scalar pool, which outlives this dispatch and
+    // any ICB replay that references the stable buffer address.
+    unsafe {
+        tessl::nn::mlp_gelu_tanh_bf16_with_scalars(&gpu.rt, gate, up, out_bf16, n, |bnd| {
+            gpu.icb_scalars.bind_u32(bnd, n_off, 3);
+        })
+    }
     .map_err(map_metal)
 }
 
@@ -2006,10 +2295,37 @@ pub fn mlp_silu(
     n: u32,
 ) -> Result<()> {
     let n_off = gpu.icb_scalars.push_u32(n)?;
-    tessl::nn::mlp_silu_with_scalars(&gpu.rt, gate, up, out, n, |bnd| {
-        gpu.icb_scalars.bind_u32(bnd, n_off, 3);
-    })
+    // SAFETY: the closure binds only documented slot 3 to the exact `n` value.
+    // `gpu` owns the same-runtime scalar pool, which outlives this dispatch and
+    // any ICB replay that references the stable buffer address.
+    unsafe {
+        tessl::nn::mlp_silu_with_scalars(&gpu.rt, gate, up, out, n, |bnd| {
+            gpu.icb_scalars.bind_u32(bnd, n_off, 3);
+        })
+    }
     .map_err(map_metal)
+}
+
+/// Validate scalar values that are otherwise visible only through the raw
+/// Tessl binder closure. This must run before allocating a scalar-pool slot or
+/// entering an unsafe `_with_scalars` call.
+fn validate_rms_scalars(entry: &str, dim: u32, eps: f32, layer_scale: Option<f32>) -> Result<()> {
+    if dim == 0 {
+        return Err(Error::Metal(format!("{entry}: dim must be non-zero")));
+    }
+    if !eps.is_finite() || eps <= 0.0 {
+        return Err(Error::Metal(format!(
+            "{entry}: eps must be finite and > 0, got {eps}"
+        )));
+    }
+    if let Some(scale) = layer_scale {
+        if !scale.is_finite() {
+            return Err(Error::Metal(format!(
+                "{entry}: layer_scale must be finite, got {scale}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Hidden/residual RMSNorm: `out[rows, dim] = rms(x) * weight`.
@@ -2022,14 +2338,20 @@ pub fn rms_norm_f32(
     dim: u32,
     eps: f32,
 ) -> Result<()> {
+    validate_rms_scalars("rms_norm_f32", dim, eps, None)?;
     let rows_off = gpu.icb_scalars.push_u32(rows)?;
     let dim_off = gpu.icb_scalars.push_u32(dim)?;
     let eps_off = gpu.icb_scalars.push_f32(eps)?;
-    tessl::nn::rms_norm_f32_with_scalars(&gpu.rt, x, weight, out, rows, dim, |bnd| {
-        gpu.icb_scalars.bind_u32(bnd, rows_off, 3);
-        gpu.icb_scalars.bind_u32(bnd, dim_off, 4);
-        gpu.icb_scalars.bind_f32(bnd, eps_off, 5);
-    })
+    // SAFETY: the closure binds only documented slots 3..=5 to the exact
+    // `rows`, `dim`, and `eps` values. `gpu` owns the same-runtime scalar pool,
+    // which outlives this dispatch and any ICB replay using its stable buffers.
+    unsafe {
+        tessl::nn::rms_norm_f32_with_scalars(&gpu.rt, x, weight, out, rows, dim, |bnd| {
+            gpu.icb_scalars.bind_u32(bnd, rows_off, 3);
+            gpu.icb_scalars.bind_u32(bnd, dim_off, 4);
+            gpu.icb_scalars.bind_f32(bnd, eps_off, 5);
+        })
+    }
     .map_err(map_metal)
 }
 
@@ -2043,14 +2365,20 @@ pub fn rms_norm_bf16(
     dim: u32,
     eps: f32,
 ) -> Result<()> {
+    validate_rms_scalars("rms_norm_bf16", dim, eps, None)?;
     let rows_off = gpu.icb_scalars.push_u32(rows)?;
     let dim_off = gpu.icb_scalars.push_u32(dim)?;
     let eps_off = gpu.icb_scalars.push_f32(eps)?;
-    tessl::nn::rms_norm_bf16_with_scalars(&gpu.rt, x, weight, out_bf16, rows, dim, |bnd| {
-        gpu.icb_scalars.bind_u32(bnd, rows_off, 3);
-        gpu.icb_scalars.bind_u32(bnd, dim_off, 4);
-        gpu.icb_scalars.bind_f32(bnd, eps_off, 5);
-    })
+    // SAFETY: the closure binds only documented slots 3..=5 to the exact
+    // `rows`, `dim`, and `eps` values. `gpu` owns the same-runtime scalar pool,
+    // which outlives this dispatch and any ICB replay using its stable buffers.
+    unsafe {
+        tessl::nn::rms_norm_bf16_with_scalars(&gpu.rt, x, weight, out_bf16, rows, dim, |bnd| {
+            gpu.icb_scalars.bind_u32(bnd, rows_off, 3);
+            gpu.icb_scalars.bind_u32(bnd, dim_off, 4);
+            gpu.icb_scalars.bind_f32(bnd, eps_off, 5);
+        })
+    }
     .map_err(map_metal)
 }
 
@@ -2063,6 +2391,7 @@ pub fn rms_norm_to_act_bf16(
     dim: u32,
     eps: f32,
 ) -> Result<GpuBuffer> {
+    validate_rms_scalars("rms_norm_to_act_bf16", dim, eps, None)?;
     let n = (rows as usize).saturating_mul(dim as usize);
     let dst = gpu.act_bf16_scratch(n.max(1))?;
     rms_norm_bf16(gpu, x, weight, &dst, rows, dim, eps)?;
@@ -2094,26 +2423,41 @@ pub fn rms_norm_residual_add_f32_scaled(
     eps: f32,
     layer_scale: f32,
 ) -> Result<()> {
+    validate_rms_scalars(
+        "rms_norm_residual_add_f32_scaled",
+        dim,
+        eps,
+        Some(layer_scale),
+    )?;
     let rows_off = gpu.icb_scalars.push_u32(rows)?;
     let dim_off = gpu.icb_scalars.push_u32(dim)?;
     let eps_off = gpu.icb_scalars.push_f32(eps)?;
     let scale_off = gpu.icb_scalars.push_f32(layer_scale)?;
-    tessl::nn::rms_norm_residual_add_f32_with_scalars(&gpu.rt, x, weight, resid, rows, dim, |bnd| {
-        gpu.icb_scalars.bind_u32(bnd, rows_off, 3);
-        gpu.icb_scalars.bind_u32(bnd, dim_off, 4);
-        gpu.icb_scalars.bind_f32(bnd, eps_off, 5);
-        gpu.icb_scalars.bind_f32(bnd, scale_off, 6);
-    })
+    // SAFETY: the closure binds only documented slots 3..=6 to the exact
+    // `rows`, `dim`, `eps`, and `layer_scale` values. `gpu` owns the
+    // same-runtime scalar pool, which outlives this dispatch and any ICB replay
+    // using its stable buffers.
+    unsafe {
+        tessl::nn::rms_norm_residual_add_f32_with_scalars(
+            &gpu.rt,
+            x,
+            weight,
+            resid,
+            rows,
+            dim,
+            |bnd| {
+                gpu.icb_scalars.bind_u32(bnd, rows_off, 3);
+                gpu.icb_scalars.bind_u32(bnd, dim_off, 4);
+                gpu.icb_scalars.bind_f32(bnd, eps_off, 5);
+                gpu.icb_scalars.bind_f32(bnd, scale_off, 6);
+            },
+        )
+    }
     .map_err(map_metal)
 }
 
 /// Cast `src[0..n]` f32 → bf16 into `dst` (n bf16 elements).
-pub fn cast_f32_to_bf16(
-    gpu: &GemmaGpu,
-    src: &GpuBuffer,
-    dst: &GpuBuffer,
-    n: u32,
-) -> Result<()> {
+pub fn cast_f32_to_bf16(gpu: &GemmaGpu, src: &GpuBuffer, dst: &GpuBuffer, n: u32) -> Result<()> {
     if n == 0 {
         return Ok(());
     }
@@ -2158,10 +2502,10 @@ pub fn prepare_act_bf16(gpu: &GemmaGpu, x_f32: &GpuBuffer, n: u32) -> Result<Gpu
 /// Mid-size Q4Mlx defaults to Interleaved4 (`GEMMA_METAL_GEMV_INTERLEAVE=0` → row-major;
 /// `GEMMA_METAL_GEMV_BLOCKED=1` → BlockedBn16). Q4Mlx scale+bias → interleaved bfloat2.
 pub fn upload_quant_hot(gpu: &GemmaGpu, w: &QuantMatrix) -> Result<HotQuantBanks> {
-    let group_size = w
-        .scheme
-        .group_size()
-        .ok_or_else(|| Error::Metal("upload_quant_hot: need Q4/Q8".into()))? as u32;
+    let group_size =
+        w.scheme
+            .group_size()
+            .ok_or_else(|| Error::Metal("upload_quant_hot: need Q4/Q8".into()))? as u32;
 
     let use_blocked = matches!(w.scheme, crate::quant::QuantScheme::Q4Mlx { .. })
         && prefer_blocked_q4_mlx(w.rows, w.cols, group_size as usize);
@@ -2233,29 +2577,23 @@ pub fn upload_quant_hot(gpu: &GemmaGpu, w: &QuantMatrix) -> Result<HotQuantBanks
             ),
         );
     }
-    let packed = gpu
-        .rt
-        .alloc_buffer_hot(packed_n)
-        .map_err(|e| {
-            diag::err_msg(
-                "kernels",
-                &format!("alloc_buffer_hot packed n={packed_n}"),
-                &e,
-            );
-            map_metal(e)
-        })?;
+    let packed = gpu.rt.alloc_buffer_hot(packed_n).map_err(|e| {
+        diag::err_msg(
+            "kernels",
+            &format!("alloc_buffer_hot packed n={packed_n}"),
+            &e,
+        );
+        map_metal(e)
+    })?;
     packed.write_bytes(packed_bytes);
-    let scales = gpu
-        .rt
-        .alloc_buffer_hot(scales_n)
-        .map_err(|e| {
-            diag::err_msg(
-                "kernels",
-                &format!("alloc_buffer_hot scales n={scales_n}"),
-                &e,
-            );
-            map_metal(e)
-        })?;
+    let scales = gpu.rt.alloc_buffer_hot(scales_n).map_err(|e| {
+        diag::err_msg(
+            "kernels",
+            &format!("alloc_buffer_hot scales n={scales_n}"),
+            &e,
+        );
+        map_metal(e)
+    })?;
     let zeros = gpu.rt.alloc_buffer_hot(zeros_n).map_err(|e| {
         diag::err_msg(
             "kernels",
@@ -2374,11 +2712,7 @@ impl HotQuantBanks {
                 }
                 HotGemvLayout::RowMajor | HotGemvLayout::Interleaved4 => {
                     let interleaved = self.layout == HotGemvLayout::Interleaved4;
-                    if x_is_bf16
-                        && gemv_simd_enabled()
-                        && self.cols >= 256
-                        && self.cols % 16 == 0
-                    {
+                    if x_is_bf16 && gemv_simd_enabled() && self.cols >= 256 && self.cols % 16 == 0 {
                         dispatch_gemv_simd(
                             gpu,
                             &self.packed,
@@ -2496,9 +2830,7 @@ impl HotQuantBanks {
             && self.layout == other.layout
             && matches!(
                 self.layout,
-                HotGemvLayout::BlockedBn16
-                    | HotGemvLayout::RowMajor
-                    | HotGemvLayout::Interleaved4
+                HotGemvLayout::BlockedBn16 | HotGemvLayout::RowMajor | HotGemvLayout::Interleaved4
             )
             && self.rows == other.rows
             && self.cols == other.cols
@@ -2868,8 +3200,7 @@ impl HotQuantBanks {
                 if matches!(
                     self.layout,
                     HotGemvLayout::RowMajor | HotGemvLayout::Interleaved4
-                )
-                    && gemv_simd_enabled()
+                ) && gemv_simd_enabled()
                     && self.cols >= 256
                     && self.cols % 16 == 0
                     && self.rows > 0 =>
@@ -2921,10 +3252,12 @@ fn fuse_gate_up_enabled() -> bool {
     // Default ON after precise::tanh + inner clamp fixed fast_tanh NaNs in gelu.
     // Set GEMMA_METAL_FUSE_MLP=0 to force unfused gate∥up → mlp_gelu_tanh.
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("GEMMA_METAL_FUSE_MLP").ok().as_deref() {
-        Some("0") | Some("false") | Some("off") => false,
-        _ => true,
-    })
+    *V.get_or_init(
+        || match std::env::var("GEMMA_METAL_FUSE_MLP").ok().as_deref() {
+            Some("0") | Some("false") | Some("off") => false,
+            _ => true,
+        },
+    )
 }
 
 /// Fuse Gemma4 dual-norm tails: `proj → post_ln → resid +=` into gemv + one
@@ -2932,10 +3265,12 @@ fn fuse_gate_up_enabled() -> bool {
 /// Default ON; set `GEMMA_METAL_FUSE_DUAL_NORM=0` to restore the 3-op path.
 pub fn fuse_dual_norm_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("GEMMA_METAL_FUSE_DUAL_NORM").ok().as_deref() {
-        Some("0") | Some("false") | Some("off") => false,
-        _ => true,
-    })
+    *V.get_or_init(
+        || match std::env::var("GEMMA_METAL_FUSE_DUAL_NORM").ok().as_deref() {
+            Some("0") | Some("false") | Some("off") => false,
+            _ => true,
+        },
+    )
 }
 
 /// Producers emit bf16 (rms / FA / gelu → act scratch), killing per-layer cast passes.
@@ -2947,13 +3282,15 @@ pub fn fuse_bf16_enabled() -> bool {
 
 fn fuse_bf16_mode() -> Option<&'static str> {
     static V: OnceLock<Option<&'static str>> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("GEMMA_METAL_FUSE_BF16").ok().as_deref() {
-        Some("rms") => Some("rms"),
-        Some("fa") => Some("fa"),
-        Some("mlp") => Some("mlp"),
-        Some("0") | Some("false") | Some("off") => None,
-        _ => Some("all"),
-    })
+    *V.get_or_init(
+        || match std::env::var("GEMMA_METAL_FUSE_BF16").ok().as_deref() {
+            Some("rms") => Some("rms"),
+            Some("fa") => Some("fa"),
+            Some("mlp") => Some("mlp"),
+            Some("0") | Some("false") | Some("off") => None,
+            _ => Some("all"),
+        },
+    )
 }
 
 #[inline]
@@ -2974,10 +3311,12 @@ pub fn fuse_bf16_mlp() -> bool {
 /// Fused producer K∥V GEMV (shared x). Default on; set `GEMMA_METAL_FUSE_KV=0` to disable.
 fn fuse_kv_enabled() -> bool {
     static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| match std::env::var("GEMMA_METAL_FUSE_KV").ok().as_deref() {
-        Some("0") | Some("false") | Some("off") => false,
-        _ => true,
-    })
+    *V.get_or_init(
+        || match std::env::var("GEMMA_METAL_FUSE_KV").ok().as_deref() {
+            Some("0") | Some("false") | Some("off") => false,
+            _ => true,
+        },
+    )
 }
 
 // --- Layer-fusion v1 (opt-in) ----------------------------------------------
@@ -3086,7 +3425,11 @@ pub fn fuse_ple_residual_enabled() -> bool {
 /// Fused producer `rms_qkv_rope` + `kv_store_timestep_pair`. Saves 1 dispatch
 /// per producer layer (shared-KV append still separate when needed).
 pub fn fuse_rope_kv_enabled() -> bool {
-    flag_cached(&FUSE_ROPE_KV, "GEMMA_METAL_FUSE_ROPE_KV", fuse_layer_enabled)
+    flag_cached(
+        &FUSE_ROPE_KV,
+        "GEMMA_METAL_FUSE_ROPE_KV",
+        fuse_layer_enabled,
+    )
 }
 
 /// Bounded-TG persistent gate→down replaces shipping gate_up_gelu + down add.
@@ -3210,7 +3553,9 @@ pub fn persistent_interp_gate_down(
         )));
     }
     if n_insns == 0 {
-        return Err(Error::Metal("persistent_interp: empty instruction stream".into()));
+        return Err(Error::Metal(
+            "persistent_interp: empty instruction stream".into(),
+        ));
     }
     let entry = KernelId::PersistentInterpGateDown.entry_name();
     let p = gpu.rt.pipeline(entry).map_err(map_metal)?;
@@ -3281,7 +3626,9 @@ pub fn persistent_interp_gate_down_q4(
         )));
     }
     if n_insns == 0 {
-        return Err(Error::Metal("persistent_interp: empty instruction stream".into()));
+        return Err(Error::Metal(
+            "persistent_interp: empty instruction stream".into(),
+        ));
     }
     let entry = KernelId::PersistentInterpGateDownQ4.entry_name();
     let p = gpu.rt.pipeline(entry).map_err(map_metal)?;
@@ -3361,7 +3708,9 @@ pub fn persistent_interp_fa_o_proj(
         )));
     }
     if n_insns == 0 {
-        return Err(Error::Metal("persistent_interp: empty instruction stream".into()));
+        return Err(Error::Metal(
+            "persistent_interp: empty instruction stream".into(),
+        ));
     }
     let entry = KernelId::PersistentInterpFaOProj.entry_name();
     let p = gpu.rt.pipeline(entry).map_err(map_metal)?;
@@ -3703,8 +4052,7 @@ pub fn gemv_q4_mlx_simd_gate_up_gelu(
             gate.rows, gate.cols
         );
     }
-    let (rows_off, cols_off, gs_off) =
-        push_gemv_dims(gpu, gate.rows, gate.cols, gate.group_size)?;
+    let (rows_off, cols_off, gs_off) = push_gemv_dims(gpu, gate.rows, gate.cols, gate.group_size)?;
     let mid_bf16_off = gpu.icb_scalars.push_u32(if mid_as_bf16 { 1 } else { 0 })?;
     gpu.rt
         .with_binder(|bnd| {
@@ -3858,8 +4206,7 @@ pub fn gemv_q4_mlx_blocked_gate_up_gelu(
             gate.rows, gate.cols
         );
     }
-    let (rows_off, cols_off, gs_off) =
-        push_gemv_dims(gpu, gate.rows, gate.cols, gate.group_size)?;
+    let (rows_off, cols_off, gs_off) = push_gemv_dims(gpu, gate.rows, gate.cols, gate.group_size)?;
     let mid_bf16_off = gpu.icb_scalars.push_u32(if mid_as_bf16 { 1 } else { 0 })?;
     gpu.rt
         .with_binder(|bnd| {
@@ -3943,12 +4290,7 @@ const ARGMAX_TG: u32 = 256;
 /// First pass fuses softcap on-read (no separate write of 262k logits). Original
 /// indices propagate on GPU. Scratch ping-pong buffers are reused across calls
 /// when `scratch` is provided (avoids per-token Metal alloc + sync).
-pub fn softcap_argmax(
-    gpu: &GemmaGpu,
-    logits: &GpuBuffer,
-    softcap: f32,
-    n: u32,
-) -> Result<u32> {
+pub fn softcap_argmax(gpu: &GemmaGpu, logits: &GpuBuffer, softcap: f32, n: u32) -> Result<u32> {
     softcap_argmax_scratch(gpu, logits, softcap, n, None)
 }
 
@@ -4009,9 +4351,14 @@ pub fn softcap_argmax_encode_offset(
     // multipass only; one-pass requires aligned buffer starts.
     let want_multipass = {
         static V: OnceLock<bool> = OnceLock::new();
-        *V.get_or_init(|| match std::env::var("GEMMA_METAL_ARGMAX_MULTIPASS").ok().as_deref() {
-            Some("1") | Some("true") | Some("on") => true,
-            _ => false,
+        *V.get_or_init(|| {
+            match std::env::var("GEMMA_METAL_ARGMAX_MULTIPASS")
+                .ok()
+                .as_deref()
+            {
+                Some("1") | Some("true") | Some("on") => true,
+                _ => false,
+            }
         })
     };
     if !want_multipass && logits_byte_off == 0 && out_byte_off == 0 {
@@ -4452,8 +4799,8 @@ pub fn embed_lookup_quant_n(
     .map_err(map_metal)
 }
 
-    /// Q4 affine thin GEMM: `Y[M, rows] = X[M, cols] @ W^T` (bf16 X, f32 Y).
-    pub fn gemm_q4_mlx_simd(
+/// Q4 affine thin GEMM: `Y[M, rows] = X[M, cols] @ W^T` (bf16 X, f32 Y).
+pub fn gemm_q4_mlx_simd(
     gpu: &GemmaGpu,
     packed: &GpuBuffer,
     scales: &GpuBuffer,
@@ -4563,7 +4910,7 @@ pub fn scale_f32_inplace(gpu: &GemmaGpu, x: &GpuBuffer, scale: f32, n: u32) -> R
     .map_err(map_metal)
 }
 
-/// `dst[i] += src[i]` via metal-runtime util metallib.
+/// `dst[i] += src[i]` via the tessl utility metallib.
 pub fn add_inplace_f32(gpu: &GemmaGpu, dst: &GpuBuffer, src: &GpuBuffer, n: u32) -> Result<()> {
     let p = gpu.rt.pipeline("add_inplace_f32").map_err(map_metal)?;
     let n_off = gpu.icb_scalars.push_u32(n)?;
@@ -4614,6 +4961,37 @@ mod tests {
     }
 
     #[test]
+    fn rms_scalar_validation_rejects_invalid_domains() {
+        let err = validate_rms_scalars("rms_test", 0, 1e-6, None).unwrap_err();
+        assert!(err.to_string().contains("dim must be non-zero"));
+
+        for eps in [0.0, -0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = validate_rms_scalars("rms_test", 1, eps, None).unwrap_err();
+            assert!(
+                err.to_string().contains("eps must be finite and > 0"),
+                "eps={eps:?}: {err}"
+            );
+        }
+
+        for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = validate_rms_scalars("rms_test", 1, 1e-6, Some(scale)).unwrap_err();
+            assert!(
+                err.to_string().contains("layer_scale must be finite"),
+                "layer_scale={scale:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rms_scalar_validation_accepts_valid_boundaries() {
+        for eps in [f32::MIN_POSITIVE, 1e-6, f32::MAX] {
+            for scale in [None, Some(-1.0), Some(0.0), Some(f32::MAX)] {
+                validate_rms_scalars("rms_test", 1, eps, scale).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn pipelines_resolve() {
         let Some(gpu) = gpu_or_skip() else { return };
         for id in KernelId::all() {
@@ -4635,6 +5013,27 @@ mod tests {
         y
     }
 
+    /// CPU oracle for the actual Hot MLX representation: the GPU stores each
+    /// scale/bias as bf16, so round those values before dequantizing rows.
+    fn cpu_gemv_q4_mlx_hot(q: &QuantMatrix, x: &[f32]) -> Vec<f32> {
+        assert!(q.scheme.is_mlx_affine());
+        assert_eq!(x.len(), q.cols);
+        let mut hot = q.clone();
+        for value in hot.scales.iter_mut().chain(hot.zeros.iter_mut()) {
+            *value = crate::quant::bf16_bits_to_f32(crate::quant::f32_to_bf16_bits(*value));
+        }
+        (0..hot.rows)
+            .map(|row| {
+                hot.dequant_row(row)
+                    .expect("validated Q4 MLX row")
+                    .iter()
+                    .zip(x)
+                    .map(|(&w, &v)| w * v)
+                    .sum()
+            })
+            .collect()
+    }
+
     #[test]
     fn gemv_q4_matches_dequant() {
         let Some(gpu) = gpu_or_skip() else { return };
@@ -4653,6 +5052,185 @@ mod tests {
             max_err = max_err.max((a - b).abs());
         }
         assert!(max_err < 1e-4, "max_err={max_err}");
+    }
+
+    #[test]
+    fn gemv_q4_mlx_rejects_invalid_boundary_before_scalar_or_gpu_work() {
+        let Some(gpu) = gpu_or_skip() else { return };
+        let packed = gpu.rt.alloc_buffer(32).unwrap();
+        let short_packed = gpu.rt.alloc_buffer(31).unwrap();
+        let scales_biases = gpu.rt.alloc_buffer(4).unwrap();
+        let short_scales_biases = gpu.rt.alloc_buffer(3).unwrap();
+        let ignored_biases = gpu.rt.alloc_buffer(1).unwrap();
+        let x = gpu.rt.alloc_buffer(64 * std::mem::size_of::<f32>()).unwrap();
+        let short_x = gpu.rt.alloc_buffer(63 * std::mem::size_of::<f32>()).unwrap();
+        let y = gpu.rt.alloc_buffer(std::mem::size_of::<f32>()).unwrap();
+        let short_y = gpu.rt.alloc_buffer(1).unwrap();
+
+        let reject = |packed: &GpuBuffer,
+                      scales_biases: &GpuBuffer,
+                      x: &GpuBuffer,
+                      y: &GpuBuffer,
+                      rows: u32,
+                      cols: u32,
+                      group_size: u32,
+                      needle: &str| {
+            let cursor_before = gpu.icb_scalars.cursor_snapshot();
+            let err = gemv_q4_mlx_with_simd_policy(
+                &gpu,
+                packed,
+                scales_biases,
+                &ignored_biases,
+                x,
+                y,
+                rows,
+                cols,
+                group_size,
+                false,
+            )
+            .expect_err("malformed MLX GEMV boundary must be rejected");
+            assert!(
+                err.to_string().contains(needle),
+                "expected {needle:?}, got {err}"
+            );
+            assert_eq!(
+                gpu.icb_scalars.cursor_snapshot(),
+                cursor_before,
+                "rejected inputs must not consume stable scalar slots"
+            );
+        };
+
+        reject(
+            &packed,
+            &scales_biases,
+            &x,
+            &short_y,
+            0,
+            64,
+            0,
+            "group_size must be non-zero",
+        );
+        reject(
+            &packed,
+            &scales_biases,
+            &x,
+            &short_y,
+            0,
+            64,
+            48,
+            "is not a multiple",
+        );
+        reject(
+            &short_packed,
+            &scales_biases,
+            &x,
+            &y,
+            1,
+            64,
+            64,
+            "packed: buffer holds 31",
+        );
+        reject(
+            &packed,
+            &short_scales_biases,
+            &x,
+            &y,
+            1,
+            64,
+            64,
+            "scales_biases",
+        );
+        reject(
+            &packed,
+            &scales_biases,
+            &short_x,
+            &y,
+            1,
+            64,
+            64,
+            "x: buffer holds 63",
+        );
+        reject(
+            &packed,
+            &scales_biases,
+            &x,
+            &short_y,
+            1,
+            64,
+            64,
+            "y: buffer holds 0",
+        );
+        reject(
+            &packed,
+            &scales_biases,
+            &x,
+            &x,
+            1,
+            64,
+            64,
+            "overlaps read-only buffer x",
+        );
+
+        let foreign_rt = GpuRuntime::new_inference().unwrap();
+        let foreign_packed = foreign_rt.alloc_buffer(32).unwrap();
+        reject(
+            &foreign_packed,
+            &scales_biases,
+            &x,
+            &y,
+            1,
+            64,
+            64,
+            "belongs to another runtime",
+        );
+
+        let cursor_before = gpu.icb_scalars.cursor_snapshot();
+        let err = gemv_q4(
+            &gpu,
+            &packed,
+            &scales_biases,
+            &scales_biases,
+            &x,
+            &short_y,
+            0,
+            64,
+            0,
+        )
+        .expect_err("classic Q4 must reject group_size=0 before zero work");
+        assert!(err.to_string().contains("group_size must be non-zero"));
+        assert_eq!(gpu.icb_scalars.cursor_snapshot(), cursor_before);
+
+        let cursor_before = gpu.icb_scalars.cursor_snapshot();
+        let err = gemv_q4_mlx_blocked(
+            &gpu,
+            &packed,
+            &scales_biases,
+            &ignored_biases,
+            &x,
+            &short_y,
+            0,
+            64,
+            0,
+        )
+        .expect_err("blocked Q4 MLX must reject group_size=0 before zero work");
+        assert!(err.to_string().contains("group_size must be non-zero"));
+        assert_eq!(gpu.icb_scalars.cursor_snapshot(), cursor_before);
+
+        let cursor_before = gpu.icb_scalars.cursor_snapshot();
+        gemv_q4_mlx_with_simd_policy(
+            &gpu,
+            &packed,
+            &scales_biases,
+            &ignored_biases,
+            &x,
+            &short_y,
+            0,
+            64,
+            64,
+            false,
+        )
+        .expect("valid zero-row GEMV is a no-op");
+        assert_eq!(gpu.icb_scalars.cursor_snapshot(), cursor_before);
     }
 
     #[test]
@@ -4694,14 +5272,8 @@ mod tests {
         let x: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.01 - 0.15).collect();
         let expect = gemv_quant_host(&gpu, &q, &x).unwrap();
 
-        let (p, s, z) = repack_q4_mlx_blocked(
-            &q.packed,
-            &q.scales,
-            &q.zeros,
-            q.rows,
-            q.cols,
-            group,
-        );
+        let (p, s, z) =
+            repack_q4_mlx_blocked(&q.packed, &q.scales, &q.zeros, q.rows, q.cols, group);
         let packed_b = gpu.rt.alloc_buffer_hot(p.len()).unwrap();
         packed_b.write_bytes(&p);
         let sb_bits = pack_mlx_sb_bf16(&s, &z);
@@ -4772,14 +5344,8 @@ mod tests {
         let x: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.01 - 0.15).collect();
         let expect = gemv_quant_host(&gpu, &q, &x).unwrap();
 
-        let (p, s, z) = repack_q4_mlx_blocked(
-            &q.packed,
-            &q.scales,
-            &q.zeros,
-            q.rows,
-            q.cols,
-            group,
-        );
+        let (p, s, z) =
+            repack_q4_mlx_blocked(&q.packed, &q.scales, &q.zeros, q.rows, q.cols, group);
         let packed_b = gpu.rt.alloc_buffer_hot(p.len()).unwrap();
         packed_b.write_bytes(&p);
         let sb_bits = pack_mlx_sb_bf16(&s, &z);
@@ -4815,20 +5381,18 @@ mod tests {
 
     /// E4B-shaped + wide MLP-down (cols > GEMV_X_TILE → device-x peel).
     #[test]
-    fn gemv_q4_mlx_blocked_e4b_shapes_match_row_major() {
+    fn gemv_q4_mlx_blocked_e4b_shapes_match_cpu_oracle() {
         let Some(gpu) = gpu_or_skip() else { return };
-        if gpu.rt.pipeline("gemv_q4_mlx_blocked").is_err()
-            || gpu.rt.pipeline("gemv_q4_mlx_wide").is_err()
-        {
-            eprintln!("skip: blocked/wide gemv not in metallib");
+        if gpu.rt.pipeline("gemv_q4_mlx_blocked").is_err() {
+            eprintln!("skip: blocked gemv not in metallib");
             return;
         }
         let cases = [
-            (32usize, 256usize),     // smoke
-            (64, 2560),              // Q-like cols
-            (48, 2560),              // gate-like cols, non-BN multiple rows
-            (32, 5120),              // > GEMV_X_TILE device-x
-            (16, 10240),             // E4B down cols
+            (32usize, 256usize), // smoke
+            (64, 2560),          // Q-like cols
+            (48, 2560),          // gate-like cols, non-BN multiple rows
+            (32, 5120),          // > GEMV_X_TILE device-x
+            (16, 10240),         // E4B down cols
         ];
         for (rows, cols) in cases {
             let group = 64usize;
@@ -4851,42 +5415,57 @@ mod tests {
                 }
             }
             let q = crate::quant::quant_matrix_from_mlx_q4(
-                rows, cols, group, &weight_u32, &scales, &biases,
+                rows,
+                cols,
+                group,
+                &weight_u32,
+                &scales,
+                &biases,
             )
             .unwrap();
-            let x: Vec<f32> = (0..cols)
-                .map(|i| ((i % 97) as f32) * 0.01 - 0.3)
-                .collect();
+            let x: Vec<f32> = (0..cols).map(|i| ((i % 97) as f32) * 0.01 - 0.3).collect();
 
-            // Row-major wide float peel reference (bypass simd).
-            let packed_rm = gpu.rt.alloc_buffer_hot(q.packed.len()).unwrap();
-            packed_rm.write_bytes(&q.packed);
-            let sb_rm = pack_mlx_sb_bf16(&q.scales, &q.zeros);
-            let scales_rm = gpu.rt.alloc_buffer_hot(sb_rm.len() * 2).unwrap();
-            scales_rm.write_bf16_bits(&sb_rm);
-            let zeros_rm = gpu.rt.alloc_buffer_hot(4).unwrap();
+            // A 10,240-column row kernel would require 40,960 bytes of
+            // dynamic threadgroup memory, exceeding the 32 KiB M5 limit.
+            // Use an independent CPU oracle instead of an invalid GPU launch.
+            let expect = cpu_gemv_q4_mlx_hot(&q, &x);
             let xb = gpu.rt.alloc_buffer(x.len() * 4).unwrap();
             xb.write_f32(&x);
-            let y_rm = gpu.rt.alloc_buffer(rows * 4).unwrap();
-            dispatch_gemv_row(
-                &gpu,
-                "gemv_q4_mlx_wide",
-                &packed_rm,
-                &scales_rm,
-                &zeros_rm,
-                &xb,
-                &y_rm,
-                rows as u32,
-                cols as u32,
-                group as u32,
-            )
-            .unwrap();
-            gpu.synchronize().unwrap();
-            let expect = y_rm.read_f32();
 
-            let (p, s, z) = repack_q4_mlx_blocked(
-                &q.packed, &q.scales, &q.zeros, q.rows, q.cols, group,
-            );
+            // Exercise the production non-SIMD fallback at the oversized
+            // E4B-down shape. Before the fallback this exact shape reached
+            // Binder with a 40,960-byte dynamic allocation and failed.
+            if cols == 10_240 {
+                let packed_rm = gpu.rt.alloc_buffer_hot(q.packed.len()).unwrap();
+                packed_rm.write_bytes(&q.packed);
+                let sb_rm = pack_mlx_sb_bf16(&q.scales, &q.zeros);
+                let scales_rm = gpu.rt.alloc_buffer_hot(sb_rm.len() * 2).unwrap();
+                scales_rm.write_bf16_bits(&sb_rm);
+                let biases_rm = gpu.rt.alloc_buffer_hot(4).unwrap();
+                let y_fallback = gpu.rt.alloc_buffer(rows * 4).unwrap();
+                gemv_q4_mlx_with_simd_policy(
+                    &gpu,
+                    &packed_rm,
+                    &scales_rm,
+                    &biases_rm,
+                    &xb,
+                    &y_fallback,
+                    rows as u32,
+                    cols as u32,
+                    group as u32,
+                    false,
+                )
+                .unwrap();
+                gpu.synchronize().unwrap();
+                let fallback_err = max_abs_err(&expect, &y_fallback.read_f32());
+                assert!(
+                    fallback_err < 1e-3,
+                    "tiled fallback vs CPU rows={rows} cols={cols} max_err={fallback_err}"
+                );
+            }
+
+            let (p, s, z) =
+                repack_q4_mlx_blocked(&q.packed, &q.scales, &q.zeros, q.rows, q.cols, group);
             let packed_b = gpu.rt.alloc_buffer_hot(p.len()).unwrap();
             packed_b.write_bytes(&p);
             let sb_b = pack_mlx_sb_bf16(&s, &z);
@@ -4919,18 +5498,22 @@ mod tests {
             }
             assert!(
                 max_err < 1e-3,
-                "blocked vs wide rows={rows} cols={cols} max_err={max_err} @row={worst} expect={} got={}",
+                "blocked vs CPU rows={rows} cols={cols} max_err={max_err} @row={worst} expect={} got={}",
                 expect[worst],
                 got[worst]
             );
         }
     }
 
-    /// Real E4B Hot weights: BlockedBn repack+kernel vs row-major `gemv_quant_host`.
+    /// Real E4B Hot weights: BlockedBn repack+kernel vs a bf16-bank CPU oracle.
     /// Opt-in (`GEMMA_METAL_BLOCKED_HOT_PARITY=1`) — loads HF cache once.
     #[test]
     fn gemv_q4_mlx_blocked_real_e4b_weights_match() {
-        if std::env::var("GEMMA_METAL_BLOCKED_HOT_PARITY").ok().as_deref() != Some("1") {
+        if std::env::var("GEMMA_METAL_BLOCKED_HOT_PARITY")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
             eprintln!("skip: set GEMMA_METAL_BLOCKED_HOT_PARITY=1 to run");
             return;
         }
@@ -4961,42 +5544,17 @@ mod tests {
             "layers.0.mlp.down_proj.weight",
         ];
         for name in names {
-            let q = banks
-                .find(name)
-                .unwrap_or_else(|| panic!("missing {name}"));
+            let q = banks.find(name).unwrap_or_else(|| panic!("missing {name}"));
             let group = q.scheme.group_size().expect("q4 group") as usize;
             let x: Vec<f32> = (0..q.cols)
                 .map(|i| ((i * 17) % 89) as f32 * 0.01 - 0.25)
                 .collect();
-            // Float peel reference (bypass simd OnceLock).
-            let packed_rm = gpu.rt.alloc_buffer_hot(q.packed.len()).unwrap();
-            packed_rm.write_bytes(&q.packed);
-            let sb_rm = pack_mlx_sb_bf16(&q.scales, &q.zeros);
-            let scales_rm = gpu.rt.alloc_buffer_hot(sb_rm.len() * 2).unwrap();
-            scales_rm.write_bf16_bits(&sb_rm);
-            let zeros_rm = gpu.rt.alloc_buffer_hot(4).unwrap();
+            let expect = cpu_gemv_q4_mlx_hot(q, &x);
             let xb = gpu.rt.alloc_buffer(x.len() * 4).unwrap();
             xb.write_f32(&x);
-            let y_rm = gpu.rt.alloc_buffer(q.rows * 4).unwrap();
-            dispatch_gemv_row(
-                &gpu,
-                "gemv_q4_mlx_wide",
-                &packed_rm,
-                &scales_rm,
-                &zeros_rm,
-                &xb,
-                &y_rm,
-                q.rows as u32,
-                q.cols as u32,
-                group as u32,
-            )
-            .unwrap();
-            gpu.synchronize().unwrap();
-            let expect = y_rm.read_f32();
 
-            let (p, s, z) = repack_q4_mlx_blocked(
-                &q.packed, &q.scales, &q.zeros, q.rows, q.cols, group,
-            );
+            let (p, s, z) =
+                repack_q4_mlx_blocked(&q.packed, &q.scales, &q.zeros, q.rows, q.cols, group);
             let packed_b = gpu.rt.alloc_buffer_hot(p.len()).unwrap();
             packed_b.write_bytes(&p);
             let sb = pack_mlx_sb_bf16(&s, &z);
@@ -5032,7 +5590,7 @@ mod tests {
             );
             assert!(
                 max_err < 2e-3,
-                "{name} blocked vs row-major Hot max_err={max_err}"
+                "{name} blocked vs CPU Hot max_err={max_err}"
             );
         }
     }
@@ -5065,10 +5623,8 @@ mod tests {
                     biases[r * groups + g] = -0.15 - seed as f32 * 0.01;
                 }
             }
-            crate::quant::quant_matrix_from_mlx_q4(
-                rows, cols, group, &weight_u32, &scales, &biases,
-            )
-            .unwrap()
+            crate::quant::quant_matrix_from_mlx_q4(rows, cols, group, &weight_u32, &scales, &biases)
+                .unwrap()
         };
         let qg = mk_q(1);
         let qu = mk_q(2);
@@ -5081,22 +5637,10 @@ mod tests {
             .map(|(g, u)| gelu_pytorch_tanh(*g) * *u)
             .collect();
 
-        let (p, s, z) = repack_q4_mlx_blocked(
-            &qg.packed,
-            &qg.scales,
-            &qg.zeros,
-            qg.rows,
-            qg.cols,
-            group,
-        );
-        let (pu, su, zu) = repack_q4_mlx_blocked(
-            &qu.packed,
-            &qu.scales,
-            &qu.zeros,
-            qu.rows,
-            qu.cols,
-            group,
-        );
+        let (p, s, z) =
+            repack_q4_mlx_blocked(&qg.packed, &qg.scales, &qg.zeros, qg.rows, qg.cols, group);
+        let (pu, su, zu) =
+            repack_q4_mlx_blocked(&qu.packed, &qu.scales, &qu.zeros, qu.rows, qu.cols, group);
         let mk_banks = |p: Vec<u8>, s: Vec<f32>, z: Vec<f32>, q: &QuantMatrix| {
             let packed_b = gpu.rt.alloc_buffer_hot(p.len()).unwrap();
             packed_b.write_bytes(&p);
@@ -5164,10 +5708,8 @@ mod tests {
                     biases[r * groups + g] = -0.15 - seed as f32 * 0.01;
                 }
             }
-            crate::quant::quant_matrix_from_mlx_q4(
-                rows, cols, group, &weight_u32, &scales, &biases,
-            )
-            .unwrap()
+            crate::quant::quant_matrix_from_mlx_q4(rows, cols, group, &weight_u32, &scales, &biases)
+                .unwrap()
         };
         let qg = mk_q(1);
         let qu = mk_q(2);
@@ -5180,22 +5722,10 @@ mod tests {
             .map(|(g, u)| gelu_pytorch_tanh(*g) * *u)
             .collect();
 
-        let (p, s, z) = repack_q4_mlx_blocked(
-            &qg.packed,
-            &qg.scales,
-            &qg.zeros,
-            qg.rows,
-            qg.cols,
-            group,
-        );
-        let (pu, su, zu) = repack_q4_mlx_blocked(
-            &qu.packed,
-            &qu.scales,
-            &qu.zeros,
-            qu.rows,
-            qu.cols,
-            group,
-        );
+        let (p, s, z) =
+            repack_q4_mlx_blocked(&qg.packed, &qg.scales, &qg.zeros, qg.rows, qg.cols, group);
+        let (pu, su, zu) =
+            repack_q4_mlx_blocked(&qu.packed, &qu.scales, &qu.zeros, qu.rows, qu.cols, group);
         let mk_banks = |p: Vec<u8>, s: Vec<f32>, z: Vec<f32>, q: &QuantMatrix| {
             let packed_b = gpu.rt.alloc_buffer_hot(p.len()).unwrap();
             packed_b.write_bytes(&p);
@@ -5260,7 +5790,12 @@ mod tests {
             }
         }
         let q = crate::quant::quant_matrix_from_mlx_q4(
-            rows, cols, group, &weight_u32, &scales, &biases,
+            rows,
+            cols,
+            group,
+            &weight_u32,
+            &scales,
+            &biases,
         )
         .unwrap();
         let x: Vec<f32> = (0..cols).map(|i| (i as f32) * 0.01 - 0.15).collect();
@@ -5276,10 +5811,8 @@ mod tests {
         xb.write_f32(&x);
         let y_row = gpu.rt.alloc_buffer(rows * 4).unwrap();
         let y_simd = gpu.rt.alloc_buffer(rows * 4).unwrap();
-        let entry = "gemv_q4_mlx_wide";
-        dispatch_gemv_row(
+        gemv_q4_mlx_with_simd_policy(
             &gpu,
-            entry,
             &packed,
             &scales_b,
             &zeros_b,
@@ -5288,6 +5821,7 @@ mod tests {
             rows as u32,
             cols as u32,
             group as u32,
+            false,
         )
         .unwrap();
         let x_bf16 = prepare_act_bf16(&gpu, &xb, cols as u32).unwrap();
@@ -5322,10 +5856,7 @@ mod tests {
         for (a, b) in cpu.iter().zip(got.iter()) {
             cpu_err = cpu_err.max((a - b).abs());
         }
-        assert!(
-            cpu_err < 0.75,
-            "simd vs cpu dequant GEMV max_err={cpu_err}"
-        );
+        assert!(cpu_err < 0.75, "simd vs cpu dequant GEMV max_err={cpu_err}");
     }
 
     /// Producer-shaped RowMajor Q4Mlx banks for QKV fusion parity tests.
@@ -5356,7 +5887,12 @@ mod tests {
             }
         }
         let q = crate::quant::quant_matrix_from_mlx_q4(
-            rows, cols, group, &weight_u32, &scales, &biases,
+            rows,
+            cols,
+            group,
+            &weight_u32,
+            &scales,
+            &biases,
         )
         .unwrap();
         let packed = gpu.rt.alloc_buffer(q.packed.len().max(1)).unwrap();
@@ -5403,17 +5939,16 @@ mod tests {
             }
         }
         let q = crate::quant::quant_matrix_from_mlx_q4(
-            rows, cols, group, &weight_u32, &scales, &biases,
-        )
-        .unwrap();
-        let (packed_i4, scales_i4, biases_i4) = repack_q4_mlx_interleaved4(
-            &q.packed,
-            &q.scales,
-            &q.zeros,
             rows,
             cols,
             group,
-        );
+            &weight_u32,
+            &scales,
+            &biases,
+        )
+        .unwrap();
+        let (packed_i4, scales_i4, biases_i4) =
+            repack_q4_mlx_interleaved4(&q.packed, &q.scales, &q.zeros, rows, cols, group);
         let packed = gpu.rt.alloc_buffer(packed_i4.len().max(1)).unwrap();
         packed.write_bytes(&packed_i4);
         let sb = pack_mlx_sb_bf16(&scales_i4, &biases_i4);
@@ -5479,10 +6014,8 @@ mod tests {
         let q_fused = gpu.rt.alloc_buffer(rows_q * 4).unwrap();
         let k_fused = gpu.rt.alloc_buffer(rows_kv * 4).unwrap();
         let v_fused = gpu.rt.alloc_buffer(rows_kv * 4).unwrap();
-        gemv_q4_mlx_simd_qkv_bf16_x(
-            &gpu, &q, &k, &v, &x_bf16, &q_fused, &k_fused, &v_fused,
-        )
-        .unwrap();
+        gemv_q4_mlx_simd_qkv_bf16_x(&gpu, &q, &k, &v, &x_bf16, &q_fused, &k_fused, &v_fused)
+            .unwrap();
         gpu.synchronize().unwrap();
 
         let err_q = max_abs_err(&q_ref.read_f32(), &q_fused.read_f32());
@@ -5530,10 +6063,8 @@ mod tests {
             let q_fused = gpu.rt.alloc_buffer(rows_q * 4).unwrap();
             let k_fused = gpu.rt.alloc_buffer(rows_kv * 4).unwrap();
             let v_fused = gpu.rt.alloc_buffer(rows_kv * 4).unwrap();
-            gemv_q4_mlx_simd_qkv_bf16_x(
-                &gpu, &q, &k, &v, &x_bf16, &q_fused, &k_fused, &v_fused,
-            )
-            .unwrap();
+            gemv_q4_mlx_simd_qkv_bf16_x(&gpu, &q, &k, &v, &x_bf16, &q_fused, &k_fused, &v_fused)
+                .unwrap();
             gpu.synchronize().unwrap();
 
             let err_q = max_abs_err(&q_ref.read_f32(), &q_fused.read_f32());
@@ -5597,10 +6128,8 @@ mod tests {
         let q_fused = gpu.rt.alloc_buffer(rows_q * 4).unwrap();
         let k_fused = gpu.rt.alloc_buffer(rows_kv * 4).unwrap();
         let v_fused = gpu.rt.alloc_buffer(rows_kv * 4).unwrap();
-        gemv_q4_mlx_simd_qkv_bf16_x(
-            &gpu, &q, &k, &v, &x_bf16, &q_fused, &k_fused, &v_fused,
-        )
-        .unwrap();
+        gemv_q4_mlx_simd_qkv_bf16_x(&gpu, &q, &k, &v, &x_bf16, &q_fused, &k_fused, &v_fused)
+            .unwrap();
         gpu.synchronize().unwrap();
 
         let err_q = max_abs_err(&q_ref.read_f32(), &q_fused.read_f32());
@@ -5662,10 +6191,8 @@ mod tests {
         let q_fused = gpu.rt.alloc_buffer(rows_q * 4).unwrap();
         let k_fused = gpu.rt.alloc_buffer(rows_kv * 4).unwrap();
         let v_fused = gpu.rt.alloc_buffer(rows_kv * 4).unwrap();
-        gemv_q4_mlx_simd_qkv_bf16_x(
-            &gpu, &q, &k, &v, &x_bf16, &q_fused, &k_fused, &v_fused,
-        )
-        .unwrap();
+        gemv_q4_mlx_simd_qkv_bf16_x(&gpu, &q, &k, &v, &x_bf16, &q_fused, &k_fused, &v_fused)
+            .unwrap();
         gpu.synchronize().unwrap();
 
         let err_q = max_abs_err(&q_ref.read_f32(), &q_fused.read_f32());
@@ -5683,9 +6210,7 @@ mod tests {
         let Some(gpu) = gpu_or_skip() else { return };
         let rows = 8usize;
         let cols = 32usize;
-        let data: Vec<f32> = (0..rows * cols)
-            .map(|i| (i as f32) * 0.02 - 0.5)
-            .collect();
+        let data: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.02 - 0.5).collect();
         let q = quantize_affine_f32(rows, cols, &data, QuantScheme::q8_default()).unwrap();
         let w_dq = q.dequant_f32().unwrap();
         let x: Vec<f32> = (0..cols).map(|i| ((i % 5) as f32) * 0.1).collect();
@@ -5702,7 +6227,7 @@ mod tests {
         let k = (2.0f32 / std::f32::consts::PI).sqrt();
         let xc = x.clamp(-20.0, 20.0);
         let inner = (k * (xc + 0.044715 * xc * xc * xc)).clamp(-10.0, 10.0);
-        0.5 * xc * (1.0 + inner.tanh())
+        0.5 * x * (1.0 + inner.tanh())
     }
 
     #[test]
@@ -5899,8 +6424,7 @@ mod tests {
         kw.write_f32(&vec![1.0f32; d as usize]);
         vw.write_f32(&vec![1.0f32; d as usize]);
         rms_qkv_rope(
-            &gpu, &q, &k, &v, &qw, &kw, &vw, t, hq, hkv, d, /*rotary*/ 4, 0, 10000.0,
-            1e-6,
+            &gpu, &q, &k, &v, &qw, &kw, &vw, t, hq, hkv, d, /*rotary*/ 4, 0, 10000.0, 1e-6,
         )
         .unwrap();
         gpu.synchronize().unwrap();
@@ -5958,8 +6482,8 @@ mod tests {
         k_c.write_f32(&k0);
         v_c.write_f32(&v0);
         rms_qkv_rope_ex(
-            &gpu, &q_c, &k_c, &v_c, &qw, &kw, &vw, t, hq, hkv, d, rotary, pos, theta,
-            eps, /*q_only*/ false,
+            &gpu, &q_c, &k_c, &v_c, &qw, &kw, &vw, t, hq, hkv, d, rotary, pos, theta, eps,
+            /*q_only*/ false,
         )
         .unwrap();
         gpu.synchronize().unwrap();
@@ -5974,8 +6498,8 @@ mod tests {
         k_p.write_f32(&k0);
         v_p.write_f32(&v0);
         rms_qkv_rope_ex_posbuf(
-            &gpu, &q_p, &k_p, &v_p, &qw, &kw, &vw, t, hq, hkv, d, rotary, &pos_buf, theta,
-            eps, /*q_only*/ false,
+            &gpu, &q_p, &k_p, &v_p, &qw, &kw, &vw, t, hq, hkv, d, rotary, &pos_buf, theta, eps,
+            /*q_only*/ false,
         )
         .unwrap();
         gpu.synchronize().unwrap();
@@ -5989,6 +6513,88 @@ mod tests {
         );
         // Non-trivial RoPE (pos≠0) so we did not compare zeros.
         assert!(q_p.read_f32().iter().any(|&x| x != 0.0));
+    }
+
+    #[test]
+    fn qkv_adapter_rejects_overflow_before_scalar_pool_mutation() {
+        let gpu = GemmaGpu::new().expect("Metal 4 runtime for QKV adapter regression");
+        let q = gpu.rt.alloc_buffer(4).unwrap();
+        let inactive = gpu.rt.alloc_buffer(4).unwrap();
+        let weight = gpu.rt.alloc_buffer(4).unwrap();
+        let pos = gpu.rt.alloc_buffer(4).unwrap();
+        pos.write_u32(&[0]);
+        let before = gpu.icb_scalars.cursor_snapshot();
+
+        // The former adapter multiplies these in u32 before casting: debug
+        // builds panic and release builds wrap to a tiny dispatch. The Tessl
+        // preflight must return an error without reserving stable scalar slots.
+        let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rms_qkv_rope_ex_posbuf(
+                &gpu,
+                &q,
+                &inactive,
+                &inactive,
+                &weight,
+                &inactive,
+                &inactive,
+                u32::MAX,
+                u32::MAX,
+                1,
+                1,
+                0,
+                &pos,
+                10_000.0,
+                1e-6,
+                true,
+            )
+        }));
+        assert!(call.is_ok(), "safe adapter panicked on caller dimensions");
+        assert!(call.unwrap().is_err(), "oversized shape reached dispatch");
+        assert_eq!(gpu.icb_scalars.cursor_snapshot(), before);
+    }
+
+    #[test]
+    fn qkv_adapter_rejects_foreign_active_buffer_before_dispatch() {
+        let gpu = GemmaGpu::new().expect("Metal 4 runtime for QKV adapter regression");
+        let foreign = GpuRuntime::new().expect("second runtime for ownership regression");
+        let foreign_q = foreign.alloc_buffer(16).unwrap();
+        let local = gpu.rt.alloc_buffer(16).unwrap();
+        let weight = gpu.rt.alloc_buffer(16).unwrap();
+        let pos = gpu.rt.alloc_buffer(4).unwrap();
+        pos.write_u32(&[0]);
+        let before_cursor = gpu.icb_scalars.cursor_snapshot();
+        let before_dispatches = gpu.rt.take_dispatch_count();
+
+        let err = rms_qkv_rope_ex_posbuf(
+            &gpu, &foreign_q, &local, &local, &weight, &local, &local, 1, 1, 1, 4, 0, &pos,
+            10_000.0, 1e-6, true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("another runtime"), "{err}");
+        assert_eq!(gpu.icb_scalars.cursor_snapshot(), before_cursor);
+        assert_eq!(gpu.rt.take_dispatch_count(), 0);
+        assert_eq!(before_dispatches, 0);
+    }
+
+    #[test]
+    fn q_only_adapter_ignores_foreign_inactive_kv_placeholders() {
+        let gpu = GemmaGpu::new().expect("Metal 4 runtime for QKV adapter regression");
+        let foreign = GpuRuntime::new().expect("second runtime for inactive-operand regression");
+        let q = gpu.rt.alloc_buffer(16).unwrap();
+        let q_weight = gpu.rt.alloc_buffer(16).unwrap();
+        let pos = gpu.rt.alloc_buffer(4).unwrap();
+        let inactive = foreign.alloc_buffer(1).unwrap();
+        q.write_f32(&[0.5, -0.25, 1.0, 0.75]);
+        q_weight.write_f32(&[1.0; 4]);
+        pos.write_u32(&[3]);
+
+        rms_qkv_rope_ex_posbuf(
+            &gpu, &q, &inactive, &inactive, &q_weight, &inactive, &inactive, 1, 1, 1, 4, 4, &pos,
+            10_000.0, 1e-6, true,
+        )
+        .unwrap();
+        gpu.synchronize().unwrap();
+        assert!(q.read_f32().iter().all(|value| value.is_finite()));
     }
 
     /// Layer-fusion: fused `rms_qkv_rope_kv_store` vs unfused rope + `kv_store_timestep_pair`.
@@ -6049,8 +6655,8 @@ mod tests {
         dst_v_u.write_f32(&vec![0f32; cache_elems]);
 
         rms_qkv_rope_ex_posbuf(
-            &gpu, &q_u, &k_u, &v_u, &qw, &kw, &vw, t, hq, hkv, d, rotary, &pos_buf, theta,
-            eps, /*q_only*/ false,
+            &gpu, &q_u, &k_u, &v_u, &qw, &kw, &vw, t, hq, hkv, d, rotary, &pos_buf, theta, eps,
+            /*q_only*/ false,
         )
         .unwrap();
         // RAW: rope writes scratch; store reads it (hazard skip-auto can reorder).
@@ -6064,6 +6670,7 @@ mod tests {
             &dst_v_u,
             hkv * d,
             kv_dst_offset,
+            cache_elems as u32,
         )
         .unwrap();
         gpu.synchronize().unwrap();
@@ -6081,8 +6688,25 @@ mod tests {
         dst_v_f.write_f32(&vec![0f32; cache_elems]);
 
         rms_qkv_rope_kv_store(
-            &gpu, &q_f, &k_f, &v_f, &qw, &kw, &vw, t, hq, hkv, d, rotary, &pos_buf, theta,
-            eps, &dst_k_f, &dst_v_f, kv_dst_offset,
+            &gpu,
+            &q_f,
+            &k_f,
+            &v_f,
+            &qw,
+            &kw,
+            &vw,
+            t,
+            hq,
+            hkv,
+            d,
+            rotary,
+            &pos_buf,
+            theta,
+            eps,
+            &dst_k_f,
+            &dst_v_f,
+            kv_dst_offset,
+            cache_elems as u32,
         )
         .unwrap();
         gpu.synchronize().unwrap();
@@ -6128,7 +6752,11 @@ mod tests {
         gpu.synchronize().unwrap();
         let got = out.read_f32();
         for v in &got {
-            assert!((*v - 2.0 * scale).abs() < 0.02, "got={v} expect={}", 2.0 * scale);
+            assert!(
+                (*v - 2.0 * scale).abs() < 0.02,
+                "got={v} expect={}",
+                2.0 * scale
+            );
         }
     }
 
@@ -6237,6 +6865,42 @@ mod tests {
     }
 
     #[test]
+    fn flash_attn_swa_h256_bf16_zero_live_kv_overwrites_output() {
+        let Some(gpu) = gpu_or_skip() else { return };
+        const B: usize = 2;
+        const TQ: usize = 9;
+        const H: usize = 4;
+        const HKV: usize = 2;
+        const D: usize = 256;
+        const KV_CAPACITY: usize = 3;
+
+        let output_elems = B * TQ * H * D;
+        let kv_elems = B * KV_CAPACITY * HKV * D;
+        let q = gpu.rt.alloc_buffer(output_elems * 4).unwrap();
+        let k = gpu.rt.alloc_buffer(kv_elems * 4).unwrap();
+        let v = gpu.rt.alloc_buffer(kv_elems * 4).unwrap();
+        q.zero();
+        k.zero();
+        v.zero();
+
+        // This is the production half-width output mode used by Gemma. Seed
+        // each packed word with two bf16 1.0 values so an early-return no-op is
+        // distinguishable from the required zero output.
+        let output = gpu.rt.alloc_buffer(output_elems * 2).unwrap();
+        output.write_u32(&vec![0x3f80_3f80; output_elems / 2]);
+        flash_attn_swa_h256_ex(
+            &gpu, &q, &k, &v, &output, B as u32, TQ as u32, 0, H as u32, HKV as u32, 4, 0.125, 17,
+            41, true,
+        )
+        .unwrap();
+        gpu.synchronize().unwrap();
+
+        for (i, &bits) in output.read_u32()[..output_elems / 2].iter().enumerate() {
+            assert_eq!(bits, 0, "zero-live-KV bf16 word {i} stayed {bits:#x}");
+        }
+    }
+
+    #[test]
     fn flash_attn_swa_h128_matches_cpu() {
         let Some(gpu) = gpu_or_skip() else { return };
         let b = 1usize;
@@ -6303,16 +6967,7 @@ mod tests {
         kb.write_f32(&k_h);
         vb.write_f32(&v_h);
         flash_attn_global_h512_prefill(
-            &gpu,
-            &qb,
-            &kb,
-            &vb,
-            &ob,
-            b as u32,
-            t as u32,
-            h as u32,
-            hkv as u32,
-            1.0,
+            &gpu, &qb, &kb, &vb, &ob, b as u32, t as u32, h as u32, hkv as u32, 1.0,
         )
         .unwrap();
         gpu.synchronize().unwrap();
@@ -6383,12 +7038,30 @@ mod tests {
         let deps = gpu.rt.alloc_buffer(8).unwrap();
         let fail = gpu.rt.alloc_buffer(4).unwrap();
         let err = persistent_interp_gate_down(
-            &gpu, &insns, prog.len() as u32, &gate, &up, &mid, &w, &out, &deps, &fail, 1, 1, 1,
+            &gpu,
+            &insns,
+            prog.len() as u32,
+            &gate,
+            &up,
+            &mid,
+            &w,
+            &out,
+            &deps,
+            &fail,
+            1,
+            1,
+            1,
         );
         assert!(err.is_err(), "must reject when flag off");
     }
 
-    fn cpu_gate_down(gate: &[f32], up: &[f32], w_down: &[f32], n_mid: usize, n_out: usize) -> Vec<f32> {
+    fn cpu_gate_down(
+        gate: &[f32],
+        up: &[f32],
+        w_down: &[f32],
+        n_mid: usize,
+        n_out: usize,
+    ) -> Vec<f32> {
         let mid: Vec<f32> = gate
             .iter()
             .zip(up.iter())
@@ -6510,7 +7183,9 @@ mod tests {
         let n_out = 256usize;
         let n_tg = PERSISTENT_INTERP_MAX_TG;
         let gate: Vec<f32> = (0..n_mid).map(|i| ((i % 23) as f32) * 0.02 - 0.2).collect();
-        let up: Vec<f32> = (0..n_mid).map(|i| ((i % 19) as f32) * 0.015 - 0.1).collect();
+        let up: Vec<f32> = (0..n_mid)
+            .map(|i| ((i % 19) as f32) * 0.015 - 0.1)
+            .collect();
         let w_down: Vec<f32> = (0..n_out * n_mid)
             .map(|i| ((i % 29) as f32) * 0.002 - 0.02)
             .collect();
@@ -6695,8 +7370,12 @@ mod tests {
         let n_out = 256usize;
         let n_tg = PERSISTENT_INTERP_MAX_TG;
         let scale = (n_ctx as f32).sqrt().recip();
-        let q: Vec<f32> = (0..n_ctx).map(|i| ((i % 17) as f32) * 0.03 - 0.25).collect();
-        let k: Vec<f32> = (0..n_ctx).map(|i| ((i % 13) as f32) * 0.025 - 0.15).collect();
+        let q: Vec<f32> = (0..n_ctx)
+            .map(|i| ((i % 17) as f32) * 0.03 - 0.25)
+            .collect();
+        let k: Vec<f32> = (0..n_ctx)
+            .map(|i| ((i % 13) as f32) * 0.025 - 0.15)
+            .collect();
         let v: Vec<f32> = (0..n_ctx).map(|i| ((i % 11) as f32) * 0.02 - 0.1).collect();
         let w_o: Vec<f32> = (0..n_out * n_ctx)
             .map(|i| ((i % 31) as f32) * 0.001 - 0.015)
@@ -6777,7 +7456,20 @@ mod tests {
         let deps = gpu.rt.alloc_buffer(8).unwrap();
         let fail = gpu.rt.alloc_buffer(4).unwrap();
         let err = persistent_interp_fa_o_proj(
-            &gpu, &insns, prog.len() as u32, &q, &k, &v, &ctx, &w, &out, &deps, &fail, 1, 1, 1,
+            &gpu,
+            &insns,
+            prog.len() as u32,
+            &q,
+            &k,
+            &v,
+            &ctx,
+            &w,
+            &out,
+            &deps,
+            &fail,
+            1,
+            1,
+            1,
             1.0,
         );
         assert!(err.is_err(), "must reject when flag off");
@@ -6854,7 +7546,11 @@ mod tests {
         .unwrap();
         gpu.synchronize().unwrap();
 
-        assert_eq!(fail.read_u32()[0], 0, "barrier fail at E4B dense stress dims");
+        assert_eq!(
+            fail.read_u32()[0],
+            0,
+            "barrier fail at E4B dense stress dims"
+        );
         let max_err = max_abs_err(&expect, &ob.read_f32());
         assert!(
             max_err < 5e-4,
@@ -6888,7 +7584,12 @@ mod tests {
             }
         }
         let q = crate::quant::quant_matrix_from_mlx_q4(
-            rows, cols, group, &weight_u32, &scales, &biases,
+            rows,
+            cols,
+            group,
+            &weight_u32,
+            &scales,
+            &biases,
         )
         .unwrap();
         let packed = gpu.rt.alloc_buffer(q.packed.len().max(1)).unwrap();
@@ -6959,7 +7660,8 @@ mod tests {
         // hazard_barriers_skip_auto: sync between producer mid and down resid.
         gemv_q4_mlx_gate_up_gelu_bf16_x_out_bf16(&gpu, &gate, &up, &xb, &mid).unwrap();
         gpu.synchronize().unwrap();
-        down.gemv_add_into_bf16_x(&gpu, &mid, &x_ref, &x_ref).unwrap();
+        down.gemv_add_into_bf16_x(&gpu, &mid, &x_ref, &x_ref)
+            .unwrap();
         gpu.synchronize().unwrap();
         let expect = x_ref.read_f32();
 
@@ -7042,7 +7744,8 @@ mod tests {
 
         gemv_q4_mlx_gate_up_gelu_bf16_x_out_bf16(&gpu, &gate, &up, &xb, &mid).unwrap();
         gpu.synchronize().unwrap();
-        down.gemv_add_into_bf16_x(&gpu, &mid, &x_ref, &x_ref).unwrap();
+        down.gemv_add_into_bf16_x(&gpu, &mid, &x_ref, &x_ref)
+            .unwrap();
         gpu.synchronize().unwrap();
         let expect = x_ref.read_f32();
 
@@ -7153,8 +7856,7 @@ mod tests {
             .count();
         let x_down_only = gpu.rt.alloc_buffer(n_hidden * 4).unwrap();
         x_down_only.write_f32(&resid);
-        down
-            .gemv_add_into_bf16_x(&gpu, &mid_f, &x_down_only, &x_down_only)
+        down.gemv_add_into_bf16_x(&gpu, &mid_f, &x_down_only, &x_down_only)
             .unwrap();
         gpu.synchronize().unwrap();
         let down_only_err = max_abs_err(&expect, &x_down_only.read_f32());

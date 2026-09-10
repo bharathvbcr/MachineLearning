@@ -292,7 +292,11 @@ pub fn init_weights_seeded(
     let tok_emb_t = upload(rt, &tok_t_shape, &tok_t)?;
 
     // bigram: zeros + scale 0.05
-    let bigram_emb = upload(rt, &[cfg.bigram_vocab, cfg.bigram_dim], &vec![0.0; cfg.bigram_vocab * cfg.bigram_dim])?;
+    let bigram_emb = upload(
+        rt,
+        &[cfg.bigram_vocab, cfg.bigram_dim],
+        &vec![0.0; cfg.bigram_vocab * cfg.bigram_dim],
+    )?;
     let bigram_proj = upload(rt, &[cfg.bigram_dim, c], &vec![0.0; cfg.bigram_dim * c])?;
     let bigram_scale = upload(rt, &[1], &[0.05])?;
 
@@ -316,7 +320,23 @@ pub fn init_weights_seeded(
     let n_mingru = cfg.mixer_count(MixerKind::MinGRU);
     let n_mamba = cfg.mixer_count(MixerKind::Mamba2);
 
-    let (qo_bank, kv_bank, mingru_to_z, mingru_to_h, mingru_out, mingru_v_proj, mingru_v0_up, mamba_in_proj, mamba_conv1d_weight, mamba_conv1d_bias, mamba_out_proj, mamba_a_log, mamba_d, mamba_dt_bias, mamba_norm) = {
+    let (
+        qo_bank,
+        kv_bank,
+        mingru_to_z,
+        mingru_to_h,
+        mingru_out,
+        mingru_v_proj,
+        mingru_v0_up,
+        mamba_in_proj,
+        mamba_conv1d_weight,
+        mamba_conv1d_bias,
+        mamba_out_proj,
+        mamba_a_log,
+        mamba_d,
+        mamba_dt_bias,
+        mamba_norm,
+    ) = {
         let qo = if n_attn > 0 {
             let qo_bank = alloc_hot_zeroed(rt, &[2 * n_attn, c, c])?;
             let mut matrix = vec![0.0f32; c * c];
@@ -381,66 +401,90 @@ pub fn init_weights_seeded(
             (None, None, None, None, None)
         };
 
-        let (mamba_in_proj, mamba_conv1d_weight, mamba_conv1d_bias, mamba_out_proj, mamba_a_log, mamba_d, mamba_dt_bias, mamba_norm) =
-            if n_mamba > 0 {
-                let d_inner = cfg.mamba_d_inner();
-                let n_head = cfg.mamba_n_head();
-                let conv_dim = cfg.mamba_conv_dim();
-                let in_out = cfg.mamba_in_proj_out();
-                let d_conv = cfg.d_conv;
+        let (
+            mamba_in_proj,
+            mamba_conv1d_weight,
+            mamba_conv1d_bias,
+            mamba_out_proj,
+            mamba_a_log,
+            mamba_d,
+            mamba_dt_bias,
+            mamba_norm,
+        ) = if n_mamba > 0 {
+            let d_inner = cfg.mamba_d_inner();
+            let n_head = cfg.mamba_n_head();
+            let conv_dim = cfg.mamba_conv_dim();
+            let in_out = cfg.mamba_in_proj_out();
+            let d_conv = cfg.d_conv;
 
-                let in_proj = alloc_hot_zeroed(rt, &[n_mamba, c, in_out])?;
-                let mut matrix = vec![0.0f32; in_out * c];
-                for i in 0..n_mamba {
-                    orthogonal_fill(&mut rng, in_out, c, 1.0, &mut matrix);
-                    write_burn_bank_matrix(&in_proj, i, c, in_out, &matrix);
+            let in_proj = alloc_hot_zeroed(rt, &[n_mamba, c, in_out])?;
+            let mut matrix = vec![0.0f32; in_out * c];
+            for i in 0..n_mamba {
+                orthogonal_fill(&mut rng, in_out, c, 1.0, &mut matrix);
+                write_burn_bank_matrix(&in_proj, i, c, in_out, &matrix);
+            }
+
+            // `[n_mamba, conv_dim, d_conv]` matches mamba2_conv1d kernel w(C, K); no linear transpose.
+            let conv_w = alloc_hot_zeroed(rt, &[n_mamba, conv_dim, d_conv])?;
+            let mut conv_slice = vec![0.0f32; conv_dim * d_conv];
+            let mut conv_dst = conv_w.buffer.contents_f32();
+            for i in 0..n_mamba {
+                rng.fill_normal(&mut conv_slice, 0.02);
+                let base = i * conv_dim * d_conv;
+                conv_dst[base..base + conv_dim * d_conv].copy_from_slice(&conv_slice);
+            }
+            drop(conv_dst);
+            let conv_b = upload(rt, &[n_mamba, conv_dim], &vec![0.0; n_mamba * conv_dim])?;
+
+            let out_proj = alloc_hot_zeroed(rt, &[n_mamba, d_inner, c])?;
+            matrix.resize(c * d_inner, 0.0);
+            for i in 0..n_mamba {
+                orthogonal_fill(&mut rng, c, d_inner, 1.0, &mut matrix);
+                write_burn_bank_matrix(&out_proj, i, d_inner, c, &matrix);
+            }
+
+            let mut a_data = vec![0.0f32; n_mamba * n_head];
+            for layer in 0..n_mamba {
+                for h in 0..n_head {
+                    a_data[layer * n_head + h] = ((h + 1) as f32).ln();
                 }
+            }
+            let a_log = upload(rt, &[n_mamba, n_head], &a_data)?;
+            let d_param = upload(rt, &[n_mamba, n_head], &vec![1.0; n_mamba * n_head])?;
+            let dt_bias = upload(rt, &[n_mamba, n_head], &vec![0.0; n_mamba * n_head])?;
+            let norm = upload(rt, &[n_mamba, d_inner], &vec![1.0; n_mamba * d_inner])?;
 
-                // `[n_mamba, conv_dim, d_conv]` matches mamba2_conv1d kernel w(C, K); no linear transpose.
-                let conv_w = alloc_hot_zeroed(rt, &[n_mamba, conv_dim, d_conv])?;
-                let mut conv_slice = vec![0.0f32; conv_dim * d_conv];
-                let mut conv_dst = conv_w.buffer.contents_f32();
-                for i in 0..n_mamba {
-                    rng.fill_normal(&mut conv_slice, 0.02);
-                    let base = i * conv_dim * d_conv;
-                    conv_dst[base..base + conv_dim * d_conv].copy_from_slice(&conv_slice);
-                }
-                drop(conv_dst);
-                let conv_b = upload(rt, &[n_mamba, conv_dim], &vec![0.0; n_mamba * conv_dim])?;
+            (
+                Some(in_proj),
+                Some(conv_w),
+                Some(conv_b),
+                Some(out_proj),
+                Some(a_log),
+                Some(d_param),
+                Some(dt_bias),
+                Some(norm),
+            )
+        } else {
+            (None, None, None, None, None, None, None, None)
+        };
 
-                let out_proj = alloc_hot_zeroed(rt, &[n_mamba, d_inner, c])?;
-                matrix.resize(c * d_inner, 0.0);
-                for i in 0..n_mamba {
-                    orthogonal_fill(&mut rng, c, d_inner, 1.0, &mut matrix);
-                    write_burn_bank_matrix(&out_proj, i, d_inner, c, &matrix);
-                }
-
-                let mut a_data = vec![0.0f32; n_mamba * n_head];
-                for layer in 0..n_mamba {
-                    for h in 0..n_head {
-                        a_data[layer * n_head + h] = ((h + 1) as f32).ln();
-                    }
-                }
-                let a_log = upload(rt, &[n_mamba, n_head], &a_data)?;
-                let d_param = upload(rt, &[n_mamba, n_head], &vec![1.0; n_mamba * n_head])?;
-                let dt_bias = upload(rt, &[n_mamba, n_head], &vec![0.0; n_mamba * n_head])?;
-                let norm = upload(rt, &[n_mamba, d_inner], &vec![1.0; n_mamba * d_inner])?;
-
-                (
-                    Some(in_proj),
-                    Some(conv_w),
-                    Some(conv_b),
-                    Some(out_proj),
-                    Some(a_log),
-                    Some(d_param),
-                    Some(dt_bias),
-                    Some(norm),
-                )
-            } else {
-                (None, None, None, None, None, None, None, None)
-            };
-
-        (qo, kv_bank, mingru_to_z, mingru_to_h, mingru_out, mingru_v_proj, mingru_v0_up, mamba_in_proj, mamba_conv1d_weight, mamba_conv1d_bias, mamba_out_proj, mamba_a_log, mamba_d, mamba_dt_bias, mamba_norm)
+        (
+            qo,
+            kv_bank,
+            mingru_to_z,
+            mingru_to_h,
+            mingru_out,
+            mingru_v_proj,
+            mingru_v0_up,
+            mamba_in_proj,
+            mamba_conv1d_weight,
+            mamba_conv1d_bias,
+            mamba_out_proj,
+            mamba_a_log,
+            mamba_d,
+            mamba_dt_bias,
+            mamba_norm,
+        )
     };
 
     // mlp_up: [n,C,mlp] Burn orthogonal; mlp_down: [n,mlp,C] zeros.
@@ -568,9 +612,7 @@ mod tests {
 
     #[test]
     fn fineweb_skip_seed_divergent_unless_disabled() {
-        if std::env::var("METAL_NATIVE_DATA_SEED").ok().as_deref()
-            == Some("0")
-        {
+        if std::env::var("METAL_NATIVE_DATA_SEED").ok().as_deref() == Some("0") {
             assert_eq!(fineweb_token_skip(42), 0);
         } else {
             assert_ne!(fineweb_token_skip(42), fineweb_token_skip(1337));

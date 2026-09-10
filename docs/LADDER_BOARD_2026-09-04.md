@@ -113,6 +113,32 @@ minGRU at lr20/lr40/lr80, 50M, n=5 — 30 runs, ~5h at two workers.
 The larger standing caveat is unchanged and is not fixable by more sweeping:
 1152 is still a small model, and "stable from 384 to 1152" is not "stable at 7B".
 
+## Width 1536 — E27, in flight (state at 2026-09-05 15:05 UTC)
+
+The fourth rung was queued the same day this was written
+(`scripts/e27_ladder_w1536.sh`: probe at 10M over lr40/lr80/lr160 for attention and
+lr20/lr40/lr80 for minGRU, then five seeds at 50M). Its first night was lost to two
+mechanisms the ladder's smaller widths never met — two w1536 minGRU probe cells OOMed
+together at `workers: 2` (45.9 + 48.4 GiB), and the stage-2 workers were orphaned by
+their launching shell — and its repair the next morning lost four of five attention jobs
+to a second OOM when a tuning stage fired beside it. What stands:
+
+| piece | directory | state |
+|---|---|---|
+| attention probe | `crossover_ladder_probe1536` (workers 2) | lr40 5.1800, **lr80 5.1584**, lr160 5.2317 — interior argmin |
+| minGRU probe | `…probe1536` + `…probe1536b` (workers 1) | lr20 4.9556, **lr40 4.9534**, lr80 5.0126 — argmin lr40, interior; lr20 is 0.0022 away, inside the 0.0014-nat rerun floor, so the two are one choice |
+| attention × 5 | `crossover_ladder1536` (workers 2, recipe-locked) | 1 done (s777 4.4593), 4 to relaunch (`scripts/tune_e27_attn.sh`, after the minGRU arm) |
+| minGRU × 5 | `crossover_ladder1536_mingru` (workers 1) | running; ~17 min per job |
+
+Two things the rung adds to the caveat above. The minGRU arm lives in its own directory
+at tenancy 1 because two of its jobs do not fit on the card; reading the ladder across
+two tenancies is sound (the sprint measured tenancy moving `final_val` by 0.0012 nats
+against a 0.0014 rerun floor) but it forks recipe identity, and the writeup must say so.
+And the probe's n=1 argmin was, for the first time, a tie inside the floor — which the
+0.03–0.05-nat LR sensitivity above makes harmless for a 0.15-nat gap, and which would
+not be harmless for a smaller one. Prices for the rung (sprint, tenancy 1): attention
+13.5 min and minGRU 17.1 min per 50M job.
+
 ## Reproducing
 
 - `scripts/e21_ladder_probe.sh` — phase 1, out dir `nanolab/out/crossover_ladder_probe`, prefix `cx32lad`.

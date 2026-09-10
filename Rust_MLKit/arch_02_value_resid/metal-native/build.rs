@@ -71,20 +71,26 @@ fn main() {
          build a metallib with no GEMM kernels in it",
     ));
     track_kernel_sources(&tessl_kernels);
-    let mut tensorops_sources: Vec<PathBuf> = vec![
+    let tensorops_sources: Vec<PathBuf> = vec![
         tessl_kernels.join("matmul_tensorops.metal"),
         kernels_dir.join("flash_attn_tensorops.metal"),
         kernels_dir.join("matmul_batched.metal"),
     ];
     for src in &tensorops_sources {
-        let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("<unnamed>");
+        let name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unnamed>");
         if !src.exists() {
             panic!(
                 "required TensorOps source missing: {}; Metal 4 / macOS 26 toolchain required",
                 src.display()
             );
         }
-        let air = out_dir.join(format!("{}.air", src.file_stem().unwrap().to_string_lossy()));
+        let air = out_dir.join(format!(
+            "{}.air",
+            src.file_stem().unwrap().to_string_lossy()
+        ));
         let status = Command::new(&metal)
             .args([
                 "-std=metal4.0",
@@ -94,7 +100,7 @@ fn main() {
                 "-mmacosx-version-min=26.0",
                 "-c",
             ])
-            .arg(&src)
+            .arg(src)
             .arg("-o")
             .arg(&air)
             .status()
@@ -123,35 +129,30 @@ fn main() {
         .map(|e| e.path())
         .filter(|p| {
             p.extension().and_then(|s| s.to_str()) == Some("metal")
-                && !skip.iter().any(|s| p.file_name().and_then(|n| n.to_str()) == Some(*s))
+                && !skip
+                    .iter()
+                    .any(|s| p.file_name().and_then(|n| n.to_str()) == Some(*s))
         })
         .collect();
     others.sort();
-    // tessl's remaining kernels (portable simdgroup GEMM + shared util ops).
-    // Same rule as above: compile tessl's copy, never a local duplicate.
-    let mut tessl_others: Vec<PathBuf> = fs::read_dir(&tessl_kernels)
-        .unwrap_or_else(|e| panic!("read tessl kernels/: {e}"))
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension().and_then(|s| s.to_str()) == Some("metal")
-                && p.file_name().and_then(|n| n.to_str()) != Some("matmul_tensorops.metal")
-        })
-        .collect();
-    tessl_others.sort();
-    others.extend(tessl_others);
+    // Compile only the Tessl sources used by its re-exported runtime/GEMM
+    // surface. `DEP_TESSL_KERNELS` now also contains inference/NN kernels; a
+    // directory-wide glob both bloated this training library and collided with
+    // the training-specific `rms_norm_f32` ABI in stem_fwd.metal. Keep the
+    // owner files explicit and fail immediately if Tessl moves one.
+    for name in ["matmul_simdgroup.metal", "utils.metal"] {
+        let source = tessl_kernels.join(name);
+        if !source.is_file() {
+            panic!("required Tessl shared kernel missing: {}", source.display());
+        }
+        others.push(source);
+    }
 
     for src in &others {
         let stem = src.file_stem().unwrap().to_string_lossy();
         let air = out_dir.join(format!("{stem}.air"));
         // Try metal4.0 first; fall back to metal3.2 if this kernel fails under 4.0.
-        let ok_m4 = try_metal_compile(
-            &metal,
-            &sdk,
-            src,
-            &air,
-            "metal4.0",
-        );
+        let ok_m4 = try_metal_compile(&metal, &sdk, src, &air, "metal4.0");
         if !ok_m4 {
             println!(
                 "cargo:warning={} failed under -std=metal4.0; falling back to -std=metal3.2 \
@@ -179,9 +180,14 @@ fn main() {
 
     // Metal can retain file-backed library data after loading. Never relink a
     // pathname baked into a prior binary: each build owns an immutable artifact.
-    let build_id = format!("{}-{}", std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before Unix epoch").as_nanos());
+    let build_id = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos()
+    );
     let metallib_out = out_dir.join(format!("default-{build_id}.metallib"));
     fs::File::create_new(&metallib_out).expect("reserve unique metallib output");
     let mut link = Command::new(&metallib);

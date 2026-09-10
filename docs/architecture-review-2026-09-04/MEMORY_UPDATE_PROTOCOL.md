@@ -7,6 +7,12 @@ or shown to improve language modeling. See the [current assessment](README.md) f
 the evidence base and [historical inputs](README.md#reading-order-and-authority)
 for the proposals and corrections that led here.
 
+**Execution revision, September 8:** use the [second audit plan](SECOND_AUDIT_PLAN_2026-09-08.md)
+for experiment ordering, task semantics, state-intervention controls, and decision
+rules. In particular, complete-state restoration is a sanity control, and the
+current teacher-forced MQAR task does not implement query-only evaluation.
+This document remains the mathematical reference.
+
 ## Question and decomposition
 
 Determine whether a failure arises because the model never constructs the right

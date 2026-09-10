@@ -73,7 +73,9 @@ impl ShardStream {
             .collect();
         shards.sort();
         if shards.is_empty() {
-            return Err(format!("no shards matching '{pattern_contains}' in {dir:?}"));
+            return Err(format!(
+                "no shards matching '{pattern_contains}' in {dir:?}"
+            ));
         }
         let current = load_shard(&shards[0])?;
         Ok(Self {
@@ -156,7 +158,15 @@ impl PrefetchLoader {
         bigram_vocab_size: usize,
         depth: usize,
     ) -> Result<Self, String> {
-        Self::new_with_seed(dir, pattern_contains, micro_batch, seq_len, bigram_vocab_size, depth, None)
+        Self::new_with_seed(
+            dir,
+            pattern_contains,
+            micro_batch,
+            seq_len,
+            bigram_vocab_size,
+            depth,
+            None,
+        )
     }
 
     /// Like `new`, optionally skipping `token_skip` tokens before the first batch

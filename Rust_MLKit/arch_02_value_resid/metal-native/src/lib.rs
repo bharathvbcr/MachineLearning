@@ -37,14 +37,11 @@ pub mod tape;
 pub mod weights;
 
 pub use checkpoint::{
-    collect_divergence_norms, collect_divergence_norms_device,
-    load_ema_state_python_npy, load_muon_momentum_python_npy,
-    load_optim_state_python_npy, read_training_checkpoint_meta,
-    save_ema_state_python_npy, save_optim_state_python_npy,
-    save_training_checkpoint, save_weights_python_npy, DivergenceNorms,
-    TrainingCheckpointMeta, CHECKPOINT_VERSION,
+    collect_divergence_norms, collect_divergence_norms_device, load_ema_state_python_npy,
+    load_muon_momentum_python_npy, load_optim_state_python_npy, read_training_checkpoint_meta,
+    save_ema_state_python_npy, save_optim_state_python_npy, save_training_checkpoint,
+    save_weights_python_npy, DivergenceNorms, TrainingCheckpointMeta, CHECKPOINT_VERSION,
 };
-pub use tessl::gemm::{gemm_f32, GemmBackend};
 pub use engine::{EngineCreateConfig, EngineStepMetrics, PrecisionModeConfig, TrainingEngine};
 pub use optim::{
     clip_grad_norm_device, copy_ema_into_weights, lr_mul_at, optim_step, ClipMode, LrSchedule,
@@ -53,14 +50,15 @@ pub use optim::{
 pub use optimizer_registry::OptimizerKind;
 pub use runtime::{BufferKind, DeviceMemoryInfo, GpuRuntime, PrecisionMode};
 pub use tensor::{DType, GpuBuffer, Tensor};
+pub use tessl::gemm::{gemm_f32, GemmBackend};
 pub use weights::{ModelConfig, Weights};
 
 /// This crate's GPU runtime.
 ///
-/// `GpuRuntime::new()` loads **tessl's** metallib, which holds only the shared
-/// GEMM and util kernels. arch_02 needs its own — build.rs compiles tessl's
-/// canonical GEMM sources together with this crate's ~28 training kernels into
-/// a single library — so every runtime here must be built from
+/// `GpuRuntime::new()` loads **tessl's** inference/runtime metallib. arch_02
+/// needs its own training kernels too, so build.rs compiles only tessl's
+/// canonical GEMM/runtime owner sources together with this crate's training
+/// kernels into a single library — so every runtime here must be built from
 /// [`metallib_path`]. Calling `GpuRuntime::new()` directly in this crate gets a
 /// runtime that is missing every training kernel, and the failure surfaces late,
 /// as "kernel 'x' not found in metallib" at first dispatch.

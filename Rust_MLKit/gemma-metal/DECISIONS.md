@@ -46,8 +46,9 @@ Inference-stack decisions for agents. Training decisions stay in
 ## D5. Decode = GEMV; prefill = GEMM (± quant MTLTensor)
 
 - **Decision:** Never decode through M=1 TensorOps matmul tiles. Prefill may use
-  TensorOps GEMM / future quant MTLTensor (`mtl_tensor::try_quant_tensorops_prefill_gemm`
-  still returns not-wired).
+  TensorOps GEMM / future quant MTLTensor. The host-side `mtl_tensor` module
+  reports that path as unwired through `QUANT_PREFILL_GEMM_WIRED`; its old
+  always-error `try_quant_tensorops_prefill_gemm` stub was removed.
 - **Why:** Decode is bandwidth-bound; BaseRT / challenge transfer = fewer bytes/token + MTP.
 
 ---
@@ -77,9 +78,11 @@ Inference-stack decisions for agents. Training decisions stay in
   `tensorSizeAndAlign` / `newTensor` in default CI without a Phase-2 smoke gate.
 - **Evidence:** Comments in `metal-runtime/src/mtl_tensor.rs` — some objc2/SDK combos
   SIGSEGV on unsupported layouts.
-- **Int4 / FP8 E8M0:** not in objc2-metal 0.3; `QuantDType::{Int4,Fp8E8M0}` maps to `Err`.
-  Probe: `metal_runtime::nax_verify_readiness()` records Int4 unbound (TensorOps Q4
-  **not shipped**; verify stays on hand simdgroup Q4).
+- **Int4 / FP8 E8M0 host descriptors:** not in objc2-metal 0.3;
+  `QuantDType::{Int4,Fp8E8M0}` maps to `Err`. This is separate from the raw-address
+  TensorOps design. `tessl::nax_verify_readiness()` records that Q4 TensorOps is
+  **not shipped** because its shader-side sub-byte tensor constructor and wired
+  host dispatch are missing; verify therefore stays on hand simdgroup Q4.
 
 ---
 
@@ -319,7 +322,7 @@ Inference-stack decisions for agents. Training decisions stay in
      `MTL4CommandBuffer` object. True CB object reuse is **impossible** on this SDK
      (`beginCommandBufferWithAllocator:` always re-records). Inference ICB is OK
      only after a measured A/B vs live encode on mini → E4B. Prototype scaffolding
-     lives in [`metal_runtime::cb_replay`](../crates/metal-runtime/src/cb_replay.rs)
+     lives in [`tessl::cb_replay`](../crates/tessl/src/cb_replay.rs)
      (`PingPongCbReplay`, `IcbReplayStub`, `ArgTableSlotPlan`,
      `survey_cb_replay_api_gaps`) and session hooks
      [`GpuDecodeSession::pos_buf`](src/gpu_model.rs) /
@@ -338,6 +341,10 @@ Inference-stack decisions for agents. Training decisions stay in
   3. **`METAL_RUNTIME_MID_COMMIT` ≠ encode-once.** Mid-commit only overlaps host
      encode with GPU drain of the *previous* chunk (dual allocator). It does not
      remove per-token host encode (~2.5 ms) or argument-table traffic.
+- **Evidence policy for the artifact names below:** `_latest.json` is a
+  continuity slot, not proof that a result is current. Apply
+  `docs/dev.md#benchmark-artifact-writes`; `diagnostic_only` and
+  `historical_unverified` records are not current performance evidence.
 - **What works today (v0.5.9 cut, 2026-07-19):**
   - GPU-resident `seed_tok` / `argmax_tok` (D13) and `pos_buf` (`u32×1`) written
     **once per step** (not every layer).

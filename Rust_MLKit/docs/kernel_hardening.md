@@ -1,4 +1,4 @@
-# GEMM hardening and publication readiness — 2026-08-30
+# Kernel hardening and performance evidence — 2026-08-30 baseline, 2026-09-04 addendum
 
 **Verified scope:** GEMM dispatch and its tensor boundaries in `crates/tessl`
 and `arch_02_value_resid/metal-native`, on Apple M5 Pro / 64 GiB / macOS 27.0
@@ -7,6 +7,11 @@ full training/inference kernel catalogue or a general-purpose PyTorch replacemen
 
 Raw measurements, pre-fix failure output, and source hashes are in
 [`kernel_hardening_evidence.json`](kernel_hardening_evidence.json).
+
+> **Evidence chronology.** The original 2026-08-30 audit is retained below as a
+> dated record. Its test counts and isolated timings are not current-tree
+> results. The 2026-09-04 addendum records the broader Tessl/Sparsl hardening
+> verification and links to each component's canonical performance tables.
 
 ## Changes and contracts
 
@@ -61,12 +66,69 @@ constant-arena validation. The parity and Gemma activation reports reject empty,
 unequal, non-finite, or invalid-tolerance evidence. A 128M checkpoint gate also
 uses the same finite evidence comparator.
 
-The build scripts now emit a unique immutable library path per build and publish
-the legacy `default.metallib` compatibility copy by staging and atomic rename;
-link and publication failures are propagated. This closes a real concurrent
-rebuild abort where Metal observed a truncated library file.
+The build scripts emit a unique immutable library path per build. The original
+hardening pass also published a legacy crate-root `default.metallib` by atomic
+rename, which prevented inode truncation but still mutated dependency source
+trees and allowed competing builds to replace the shared name. Tessl now keeps
+all generated libraries in `OUT_DIR`, exposes the path as
+`DEP_TESSL_METALLIB`, and requires an explicit absolute
+`TESSL_PREBUILT_METALLIB` for offline reuse. This closes both the original live
+inode failure and the remaining registry/vendor source-mutation race.
 
-## Verification
+### 2026-09-04 whole-kernel audit addendum
+
+The current audit broadened the scope from GEMM boundaries to Tessl's runtime,
+attention, KV cache, DecodeICB, quantized/f16 GEMM, reductions and build
+publication contracts, plus Sparsl's nine sparse/scan operation families. These
+are current verification results, not evidence that one Apple GPU generalizes
+to every device or OS:
+
+| Current check | Observed result |
+|---|---|
+| Tessl release, all features and all targets, Metal API/GPU validation | **372 passed, 1 ignored**; the ignored deep GEMM fuzz lane was run separately |
+| Tessl deep GEMM fuzz | **7,500 adversarial cases passed** |
+| Tessl doctests | **9/9 passed** |
+| Tessl benchmark kernel inventory | **147/147 entry points dispatched** |
+| Sparsl physical-Metal randomized differential campaign | **50,000 operations passed** across nine operation families |
+| Sparsl full Metal suite | **189 top-level tests passed**, plus **3** marker-verified isolated watchdog regressions |
+| Sparsl CPU and doctest suites | **127 + 1 passed** |
+| Arch02 TensorOps online-attention resource/parity probe | **25,088 B static + 0 B dynamic / 32,768 B limit**; T=256 max-abs **1.117587e-8**; ragged T=65 **7.451e-9**; 0 non-finite |
+
+The Arch02 probe removed redundant Q/K/V staging and aliased disjoint S/P
+lifetimes: explicit source storage fell from **28,928 to 12,544 bytes
+(-56.6%)**. It remains opt-in and D=32-only with a supported fallback for other
+head dimensions. This is a resource/correctness result, not a latency or
+throughput claim; it stays off the hot path pending paired timing, backward
+support, shape goldens, and Instruments NAX evidence.
+
+#### Performance verdict
+
+No checked-in current-tree timing artifact satisfies Tessl's new publication
+schema with `status: published`, and Sparsl retains no raw output from a fresh
+hardened timing run. The numbers below are therefore historical observations or
+an explicitly identified direct optimization delta, not a universal routing
+policy:
+
+| Area | Recorded result | Evidence status |
+|---|---:|---|
+| Tessl exact-f32 GEMM, rep B | **1.045× torch / 0.999× MLX** throughput | Historical; parity; spread gate failed |
+| Tessl relaxed-tf32 GEMM, rep B | **2.145× torch / 1.998× MLX f32** throughput | Historical; large but not precision-matched; spread gate failed |
+| Tessl bf16 GEMM, rep B | **0.979× torch / 2.631× MLX** throughput | Historical; parity/slightly behind the stronger torch baseline; spread gate failed |
+| Tessl routed attention, rep C | **0.624× torch / 1.150× MLX** latency | Historical; ~1.60× faster than torch, 15% slower than MLX; spread gate failed |
+| Tessl kernel-amortized decode, three reps | **0.22× torch / 0.91–0.97× MLX** latency | Historical diagnostic; ~4.5× faster than torch and ~3–9% lower latency than MLX |
+| Sparsl resident weights, 20M nonzeros | **3.03 → 1.01 ms** (~3.00×) | Retained historical measurement |
+| Sparsl Metal SpMM vs repeated Metal SpMV | **8.4–22.5×** | Retained historical same-backend measurement |
+| Sparsl packed spikes at the largest vector | **1.30–1.48×** | Retained historical measurement; no small-vector win |
+| Sparsl scan reformat removal at 4.2M states | **13.53 → 8.99–10.55 ms** (1.28–1.50×) | Direct optimization delta; Metal still slower than 6.47 ms CPU sequential |
+
+The canonical detailed tables and ratio conventions are in the
+[Tessl performance summary](../crates/tessl/README.md#latest-checked-in-result-snapshot)
+and [Sparsl performance section](../crates/sparsl/README.md). A
+current claim requires an idle-host, balanced paired rerun that passes the
+spread and provenance gates; correctness/stress success is not substituted for
+that timing evidence.
+
+## Historical 2026-08-30 verification
 
 Nine new regression tests failed against their pre-fix implementation, including:
 `public Result API panicked`, alias accepted, wrong transpose dtype accepted,
@@ -112,11 +174,15 @@ MTL_SHADER_VALIDATION=1 MTL_SHADER_VALIDATION_REPORT_TO_STDERR=1 MTL_SHADER_VALI
 cargo test --release --manifest-path Rust_MLKit/crates/tessl/Cargo.toml --lib benchmark_simdgroup_zero_cost -- --ignored --test-threads=1 --nocapture
 ```
 
-Gemma tests write benchmark JSON files. This run's generated files were archived
-under `/tmp/mlsystems-gemma-test-artifacts`; pre-existing tracked reports were
-restored to avoid bundling unrelated test artifacts.
+The 2026-08-30 Gemma tests wrote benchmark JSON files. That run's generated
+files were archived under `/tmp/mlsystems-gemma-test-artifacts`; pre-existing
+tracked reports were restored to avoid bundling unrelated test artifacts.
+Current tests do not replace tracked latest-slot files unless explicitly opted
+in, and test output remains `diagnostic_only`; retained snapshots without a
+fresh gated run are `historical_unverified`. See
+[`gemma-metal/docs/dev.md`](../gemma-metal/docs/dev.md#benchmark-artifact-writes).
 
-## Performance
+## Historical 2026-08-30 isolated performance measurement
 
 **Verified isolated measurement:** alternating paired measurements compare
 `zero_f32 + current simdgroup GEMM` against `current simdgroup GEMM` on the same
@@ -140,24 +206,27 @@ lanes; do not infer a general TensorOps speedup from it. No end-to-end training
 speed or quality claim is made. The odd-shape path is correctness-oriented and
 has not been competitively tuned.
 
-## Publication gates still open
+## Publication gates after the 2026-09-04 addendum
 
-1. **Verified package gate:** all three crates still specify `publish = false`
-   and have no selected license or release metadata. AOT builds require the
-   Metal 4 toolchain. `*_SKIP_AOT` intentionally remains an offline escape hatch
-   and must not be used for a release because it can select a stale artifact.
+1. **Verified package gate:** Tessl and Sparsl now carry repository, license,
+   Rust-version and package metadata, and their local package verification
+   passes. Gemma and the Arch02 trainer remain `publish = false`. Tessl's public
+   source breaks require an explicit next-version/API decision before release.
+   AOT builds require the Metal 4 toolchain; `*_SKIP_AOT` remains an offline
+   escape hatch and must name a verified prebuilt artifact rather than silently
+   selecting a stale one.
 2. **Verified API boundary:** the high-level tensor/GEMM/copy paths are guarded,
    but the public low-level Metal binder and raw `MTLBuffer` access remain escape
    hatches. They accept shader-specific contracts that Rust cannot infer. Keep
    them out of a safe general-purpose package, or redesign them as explicitly
    unsafe APIs with typed kernel descriptors before publishing.
-3. **Unverified operation coverage:** the audit exercises the listed runtime,
-   GEMM, parity, checkpoint, and consumer paths. It does not prove every
-   attention, normalization, optimizer, quantization, ICB, or Gemma kernel for
-   every shape. The repository contains 23 shared-runtime, 152 training, and 52
-   Gemma explicit `kernel void` declarations; the inventory is structural, not
-   execution coverage. GPU hangs/fault recovery and other Apple GPU/OS versions
-   still need dedicated hardware gates.
+3. **Unverified hardware/shape universality:** the current Tessl benchmark
+   inventory dispatches 147/147 shipped entry points, and the current suites
+   cover runtime, GEMM, attention, KV, reductions, ICB and consumer paths. That
+   does not prove every supported shape, allocation pressure, Apple GPU/OS
+   version or raw low-level caller. Timeout/quarantine behavior is tested with
+   watchdog-isolated regressions, but opaque driver hangs and additional
+   hardware still need dedicated external gates.
 4. **Unverified release quality:** these tests do not establish multi-seed
    training quality, sustained whole-model throughput, profiler evidence, or
    PyTorch-compatible API/semantics. The measured clear-removal speedup is a

@@ -1,0 +1,76 @@
+{
+  "status": "PASS",
+  "scope": "sampler/operator counterexamples and exact finite enumeration; no training",
+  "python": "3.14.7",
+  "torch": "2.13.0",
+  "git_head": "fae1526b8b9fd198e0d91fe57dac4ee099cf449b",
+  "source_sha256": {
+    "nanolab/mqar.py": "c8d6baebd8ebeee890e8b5330a7a1684a6280a9f454ae18755761b9fd08d7b91",
+    "nanolab/mixers.py": "af60cc5420f8ba54c46a25e2b095344d9aa288ab1579d3a133f749d3f3feb548",
+    "nanolab/mqar_suite.py": "d9cf6218672d89d1fc282cdaa608e5e4217bcf714ff456cabeef81d5920ed8cf",
+    "nanolab/model.py": "3abb484c1b18228a440651c3ad92bd62d888affe130333081dcad5b3e2a30cc5"
+  },
+  "mqar": {
+    "batch_shape": [
+      2,
+      11
+    ],
+    "query_positions": [
+      6,
+      8,
+      10
+    ],
+    "earlier_gold_answers_in_input_per_episode": 2,
+    "checked_answer_tokens": 4,
+    "all_checked_tokens_equal_previous_gold_targets": true,
+    "queries_without_replacement_in_this_fixture": true,
+    "interpretation": "Current MQAR is teacher-forced and is not a query-only task."
+  },
+  "gdn": {
+    "controls": {
+      "repo": {
+        "disable_beta_only": [
+          1.0,
+          0.5,
+          0.25
+        ],
+        "disable_decay_and_beta": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "published": {
+        "disable_beta_only": [
+          1.0,
+          0.5,
+          0.25
+        ],
+        "disable_decay_and_beta": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    "rule_check": {
+      "repo": [
+        0.5,
+        0.5
+      ],
+      "published": [
+        0.5,
+        0.625
+      ]
+    },
+    "interpretation": "Disabling the delta write does not disable decay. Both rules exist and differ."
+  },
+  "synthetic_order": {
+    "permutations_per_label": 24,
+    "distinct_observed_sequences": 12,
+    "conditional_input_distributions_identical": true,
+    "balanced_bayes_accuracy_after_unobserved_random_permutation": 0.5,
+    "reversal_is_invertible": true,
+    "interpretation": "On this synthetic task, unrecoverable labels alone force chance accuracy after full random shuffling; no architecture defect is required."
+  }
+}

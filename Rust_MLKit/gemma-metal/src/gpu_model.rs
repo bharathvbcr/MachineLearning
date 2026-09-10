@@ -133,13 +133,215 @@ impl Drop for CaptureAlwaysOnGuard {
     }
 }
 
+/// Owns the two thread-local tapes started for a layer-graph capture.
+///
+/// `step_inner` has many fallible kernel calls between capture start and the
+/// normal take path. Keeping cleanup in `Drop` guarantees that any early `?`
+/// abandons both tapes instead of retaining bound buffers or recording scalar
+/// writes into the next decode step.
+struct LayerIcbCaptureGuard {
+    decode_active: bool,
+    scalar_active: bool,
+}
+
+impl LayerIcbCaptureGuard {
+    fn begin() -> Result<Self> {
+        let stale_decode = tessl::decode_icb_capture_active();
+        let stale_scalars = crate::kernels::icb_scalar_write_tape_active();
+        if stale_decode {
+            tessl::end_decode_icb_capture();
+        }
+        if stale_scalars {
+            let _ = take_icb_scalar_write_tape();
+        }
+        if stale_decode || stale_scalars {
+            return Err(Error::Metal(format!(
+                "layer ICB capture found stale thread-local state (decode={stale_decode}, \
+                 scalars={stale_scalars}); abandoned both tapes"
+            )));
+        }
+        tessl::begin_decode_icb_capture();
+        begin_icb_scalar_write_tape();
+        Ok(Self {
+            decode_active: true,
+            scalar_active: true,
+        })
+    }
+
+    fn take_decode_capture(&mut self) -> Option<tessl::DecodeIcbCapture> {
+        let capture = tessl::take_decode_icb_capture();
+        self.decode_active = false;
+        capture
+    }
+
+    fn take_scalar_write_tape(&mut self) -> Option<crate::kernels::IcbScalarWriteTape> {
+        let tape = take_icb_scalar_write_tape();
+        self.scalar_active = false;
+        tape
+    }
+}
+
+impl Drop for LayerIcbCaptureGuard {
+    fn drop(&mut self) {
+        if self.decode_active {
+            tessl::end_decode_icb_capture();
+            self.decode_active = false;
+        }
+        if self.scalar_active {
+            let _ = take_icb_scalar_write_tape();
+            self.scalar_active = false;
+        }
+    }
+}
+
 /// GPU-resident KV slot (sliding ring or full-length shared/global).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuKvLayout {
+    capacity_u32: u32,
+    slot_elems: usize,
+    slot_elems_u32: u32,
+    elem_capacity_u32: u32,
+    allocation_bytes: usize,
+}
+
+impl GpuKvLayout {
+    /// Validate every size used by both host allocation and the Metal `uint`
+    /// ABI before either cache buffer is allocated.
+    fn checked(capacity: usize, heads: usize, dim: usize) -> Result<Self> {
+        if capacity == 0 || heads == 0 || dim == 0 {
+            return Err(Error::Kv(format!(
+                "GPU KV layout requires non-zero capacity, heads, and dim; got {capacity}x{heads}x{dim}"
+            )));
+        }
+        let capacity_u32 = u32::try_from(capacity).map_err(|_| {
+            Error::Kv("GPU KV timestep capacity exceeds the device u32 range".into())
+        })?;
+        let slot_elems = heads
+            .checked_mul(dim)
+            .ok_or_else(|| Error::Kv("GPU KV slot width overflows usize".into()))?;
+        let slot_elems_u32 = u32::try_from(slot_elems)
+            .map_err(|_| Error::Kv("GPU KV slot width exceeds the device u32 range".into()))?;
+        let elem_capacity = capacity
+            .checked_mul(slot_elems)
+            .ok_or_else(|| Error::Kv("GPU KV element capacity overflows usize".into()))?;
+        let elem_capacity_u32 = u32::try_from(elem_capacity).map_err(|_| {
+            Error::Kv("GPU KV element capacity exceeds the device u32 range".into())
+        })?;
+        let allocation_bytes = elem_capacity
+            .checked_mul(std::mem::size_of::<f32>())
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or_else(|| Error::Kv("GPU KV allocation byte size overflows".into()))?;
+        Ok(Self {
+            capacity_u32,
+            slot_elems,
+            slot_elems_u32,
+            elem_capacity_u32,
+            allocation_bytes,
+        })
+    }
+
+    fn element_offset_u32(self, position: usize, what: &str) -> Result<u32> {
+        let offset = position
+            .checked_mul(self.slot_elems)
+            .ok_or_else(|| Error::Kv(format!("{what} overflows usize")))?;
+        u32::try_from(offset).map_err(|_| Error::Kv(format!("{what} exceeds the device u32 range")))
+    }
+
+    fn element_byte_offset(self, element_offset: u32, what: &str) -> Result<usize> {
+        usize::try_from(element_offset)
+            .map_err(|_| Error::Kv(format!("{what} byte offset exceeds usize")))?
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| Error::Kv(format!("{what} byte offset overflows usize")))
+    }
+
+    fn byte_len_for_positions(self, positions: usize, what: &str) -> Result<usize> {
+        positions
+            .checked_mul(self.slot_elems)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| Error::Kv(format!("{what} byte length overflows usize")))
+    }
+
+    fn elements_for_positions(
+        self,
+        positions: usize,
+        capacity: usize,
+        what: &str,
+    ) -> Result<usize> {
+        if positions > capacity {
+            return Err(Error::Kv(format!(
+                "{what}: {positions} positions exceed capacity {capacity}"
+            )));
+        }
+        positions
+            .checked_mul(self.slot_elems)
+            .ok_or_else(|| Error::Kv(format!("{what}: element count overflows usize")))
+    }
+
+    fn ring_position_u32(self, seq_len: usize, capacity: usize) -> Result<u32> {
+        let position = seq_len.saturating_sub(capacity);
+        u32::try_from(position)
+            .map_err(|_| Error::Kv("GPU KV ring position exceeds the device u32 range".into()))
+    }
+
+    /// Compute a complete append transition without touching the live slot.
+    /// Callers apply it only after the GPU write has encoded successfully.
+    fn next_append_state(
+        self,
+        logical_capacity: usize,
+        seq_len: usize,
+        head: usize,
+        is_ring: bool,
+    ) -> Result<(u32, usize, usize)> {
+        if logical_capacity == 0 {
+            return Err(Error::Kv("GPU KV capacity 0".into()));
+        }
+        let storage_capacity = self.capacity_u32 as usize;
+        if logical_capacity > storage_capacity {
+            return Err(Error::Kv(format!(
+                "GPU KV logical capacity {logical_capacity} exceeds storage capacity {storage_capacity}"
+            )));
+        }
+        let write_i = if is_ring {
+            if head >= storage_capacity {
+                return Err(Error::Kv(format!(
+                    "GPU KV ring cursor {head} is outside storage capacity {storage_capacity}"
+                )));
+            }
+            head
+        } else {
+            if seq_len >= logical_capacity {
+                return Err(Error::Kv("GPU KV full".into()));
+            }
+            seq_len
+        };
+        let offset = self.element_offset_u32(write_i, "GPU KV write offset")?;
+        let next_seq_len = seq_len
+            .checked_add(1)
+            .ok_or_else(|| Error::Kv("GPU KV sequence length overflows usize".into()))?;
+        if is_ring {
+            self.ring_position_u32(next_seq_len, logical_capacity)?;
+        }
+        let next_head = if is_ring {
+            head.checked_add(1)
+                .ok_or_else(|| Error::Kv("GPU KV ring cursor overflows usize".into()))?
+                % storage_capacity
+        } else {
+            head
+        };
+        Ok((offset, next_seq_len, next_head))
+    }
+}
+
 struct GpuKvSlot {
     k: GpuBuffer,
     v: GpuBuffer,
+    /// Logical attention window. Only the newest `capacity` rows are visible.
     capacity: usize,
-    heads: usize,
-    dim: usize,
+    /// Physical ring rows. Sliding slots reserve a bounded speculative suffix
+    /// so rejecting a verify block cannot destroy the logical history it must
+    /// restore; linear slots keep this equal to `capacity`.
+    storage_capacity: usize,
+    layout: GpuKvLayout,
     seq_len: usize,
     /// Next write index for rings; ignored for linear full buffers.
     head: usize,
@@ -147,36 +349,98 @@ struct GpuKvSlot {
 }
 
 impl GpuKvSlot {
-    fn new(gpu: &GemmaGpu, capacity: usize, heads: usize, dim: usize, is_ring: bool) -> Result<Self> {
-        let elems = capacity.saturating_mul(heads).saturating_mul(dim).max(1);
-        let bytes = elems * 4;
+    fn new(
+        gpu: &GemmaGpu,
+        capacity: usize,
+        heads: usize,
+        dim: usize,
+        is_ring: bool,
+    ) -> Result<Self> {
+        if capacity == 0 {
+            return Err(Error::Kv("GPU KV capacity 0".into()));
+        }
+        let storage_capacity = if is_ring {
+            capacity.checked_add(VERIFY_MAX_M).ok_or_else(|| {
+                Error::Kv("GPU sliding KV rollback capacity overflows usize".into())
+            })?
+        } else {
+            capacity
+        };
+        let layout = GpuKvLayout::checked(storage_capacity, heads, dim)?;
+        let bytes = layout.allocation_bytes;
         diag::log(
             "gpu",
             format_args!(
-                "KV alloc capacity={capacity} heads={heads} dim={dim} ring={is_ring} elems={elems} bytes/K={}",
+                "KV alloc logical_capacity={capacity} storage_capacity={storage_capacity} heads={heads} dim={dim} ring={is_ring} elems={} bytes/K={}",
+                layout.elem_capacity_u32,
                 diag::fmt_bytes(bytes as u64)
             ),
         );
-        let alloc = |n: usize| -> Result<GpuBuffer> {
-            gpu.rt.alloc_buffer_hot(n * 4).map_err(|e| {
-                diag::err_msg("gpu", &format!("KV alloc_buffer_hot n={}", n * 4), &e);
+        let alloc = || -> Result<GpuBuffer> {
+            gpu.rt.alloc_buffer_hot(bytes).map_err(|e| {
+                diag::err_msg("gpu", &format!("KV alloc_buffer_hot n={bytes}"), &e);
                 Error::Metal(e)
             })
         };
         Ok(Self {
-            k: alloc(elems)?,
-            v: alloc(elems)?,
+            k: alloc()?,
+            v: alloc()?,
             capacity,
-            heads,
-            dim,
+            storage_capacity,
+            layout,
             seq_len: 0,
             head: 0,
             is_ring,
         })
     }
 
-    fn slot_elems(&self) -> usize {
-        self.heads * self.dim
+    fn slot_elems_u32(&self) -> u32 {
+        self.layout.slot_elems_u32
+    }
+
+    fn storage_capacity_u32(&self) -> u32 {
+        self.layout.capacity_u32
+    }
+
+    fn elem_capacity_u32(&self) -> u32 {
+        self.layout.elem_capacity_u32
+    }
+
+    fn elements_for_positions(&self, positions: usize, what: &str) -> Result<usize> {
+        self.layout
+            .elements_for_positions(positions, self.capacity, what)
+    }
+
+    fn live_len_u32(&self) -> Result<u32> {
+        u32::try_from(self.seq_len.min(self.capacity))
+            .map_err(|_| Error::Kv("GPU KV live length exceeds the device u32 range".into()))
+    }
+
+    fn ring_start_u32(&self) -> Result<u32> {
+        if self.head >= self.storage_capacity {
+            return Err(Error::Kv(format!(
+                "GPU KV ring cursor {} is outside storage capacity {}",
+                self.head, self.storage_capacity
+            )));
+        }
+        let live = self.seq_len.min(self.capacity);
+        let start = if live <= self.head {
+            self.head - live
+        } else {
+            self.storage_capacity - (live - self.head)
+        };
+        u32::try_from(start)
+            .map_err(|_| Error::Kv("GPU KV ring cursor exceeds the device u32 range".into()))
+    }
+
+    fn ring_position_u32(&self) -> Result<u32> {
+        self.layout.ring_position_u32(self.seq_len, self.capacity)
+    }
+
+    /// Fully validate the next state before a cache-write dispatch is encoded.
+    fn next_append_state(&self) -> Result<(u32, usize, usize)> {
+        self.layout
+            .next_append_state(self.capacity, self.seq_len, self.head, self.is_ring)
     }
 
     fn reset(&mut self) {
@@ -187,24 +451,38 @@ impl GpuKvSlot {
     /// Drop the last `n` timesteps (speculative reject / verify rollback).
     ///
     /// Ring write head rewinds; full-slot buffers only shrink the logical length
-    /// (stale trailing floats are ignored by FA via `seq_len`). After a ring wrap
-    /// (`seq_len > capacity`) callers that reject should prefer densifying via
-    /// FA's wrap path with the rewound `head` — compaction is deferred to step 2+.
+    /// (stale trailing floats are ignored by FA via `seq_len`). Sliding rings
+    /// retain [`VERIFY_MAX_M`] physical rows beyond the logical attention window,
+    /// so any supported verify block can be rejected without overwriting live
+    /// history. A rewind beyond the retained physical horizon fails closed.
     fn trim(&mut self, n: usize) -> Result<()> {
         if n == 0 {
             return Ok(());
         }
         if n > self.seq_len {
-            return Err(Error::Kv(format!(
-                "KV trim {n} > seq_len {}",
-                self.seq_len
-            )));
+            return Err(Error::Kv(format!("KV trim {n} > seq_len {}", self.seq_len)));
         }
-        self.seq_len -= n;
-        if self.is_ring {
-            let cap = self.capacity.max(1);
-            self.head = (self.head + cap - (n % cap)) % cap;
-        }
+        let next_seq_len = self.seq_len - n;
+        let next_head = if self.is_ring {
+            let _ = self.ring_start_u32()?;
+            let oldest_retained = self.seq_len.saturating_sub(self.storage_capacity);
+            let oldest_needed = next_seq_len.saturating_sub(self.capacity);
+            if next_seq_len != 0 && oldest_needed < oldest_retained {
+                return Err(Error::Kv(format!(
+                    "KV trim {n} exceeds retained sliding history: need absolute row {oldest_needed}, oldest retained is {oldest_retained}"
+                )));
+            }
+            let rewind = n % self.storage_capacity;
+            if rewind <= self.head {
+                self.head - rewind
+            } else {
+                self.storage_capacity - (rewind - self.head)
+            }
+        } else {
+            self.head
+        };
+        self.seq_len = next_seq_len;
+        self.head = next_head;
         Ok(())
     }
 
@@ -215,28 +493,81 @@ impl GpuKvSlot {
 
     /// Next float-element write offset into `k`/`v` (does not advance).
     fn peek_write_offset(&self) -> Result<u32> {
-        if self.capacity == 0 {
-            return Err(Error::Kv("GPU KV capacity 0".into()));
-        }
-        let write_i = if self.is_ring {
-            self.head
-        } else {
-            if self.seq_len >= self.capacity {
-                return Err(Error::Kv("GPU KV full".into()));
-            }
-            self.seq_len
-        };
-        Ok((write_i * self.slot_elems()) as u32)
+        self.next_append_state().map(|state| state.0)
     }
 
     /// Advance ring head / seq_len after a fused rope+kv_store wrote the slot.
     fn commit_append(&mut self) -> Result<()> {
-        let _ = self.peek_write_offset()?;
-        if self.is_ring {
-            self.head = (self.head + 1) % self.capacity;
-        }
-        self.seq_len += 1;
+        let (_, next_seq_len, next_head) = self.next_append_state()?;
+        self.seq_len = next_seq_len;
+        self.head = next_head;
         Ok(())
+    }
+
+    fn preflight_append_buffers(
+        &self,
+        gpu: &GemmaGpu,
+        src_k: &GpuBuffer,
+        src_v: &GpuBuffer,
+        source_byte_offset: usize,
+        source_byte_len: usize,
+    ) -> Result<()> {
+        let rt = gpu.rt.as_ref();
+        tessl::nn::validate_buffer_byte_range(
+            rt,
+            src_k,
+            source_byte_offset,
+            source_byte_len,
+            "GPU KV append src_k",
+        )
+        .map_err(Error::Metal)?;
+        tessl::nn::validate_buffer_byte_range(
+            rt,
+            src_v,
+            source_byte_offset,
+            source_byte_len,
+            "GPU KV append src_v",
+        )
+        .map_err(Error::Metal)?;
+        tessl::nn::validate_buffer_byte_range(
+            rt,
+            &self.k,
+            0,
+            self.layout.allocation_bytes,
+            "GPU KV append dst_k",
+        )
+        .map_err(Error::Metal)?;
+        tessl::nn::validate_buffer_byte_range(
+            rt,
+            &self.v,
+            0,
+            self.layout.allocation_bytes,
+            "GPU KV append dst_v",
+        )
+        .map_err(Error::Metal)
+    }
+
+    fn append_from_offset_preflighted(
+        &mut self,
+        gpu: &GemmaGpu,
+        src_k: &GpuBuffer,
+        src_v: &GpuBuffer,
+        src_elem_off: u32,
+    ) -> Result<()> {
+        let n = self.slot_elems_u32();
+        let off = self.peek_write_offset()?;
+        kv_store_timestep_pair_off(
+            gpu,
+            src_k,
+            src_v,
+            src_elem_off,
+            &self.k,
+            &self.v,
+            n,
+            off,
+            self.elem_capacity_u32(),
+        )?;
+        self.commit_append()
     }
 
     /// Append timestep whose K/V vectors start at float-element `src_elem_off`.
@@ -247,10 +578,14 @@ impl GpuKvSlot {
         src_v: &GpuBuffer,
         src_elem_off: u32,
     ) -> Result<()> {
-        let n = self.slot_elems() as u32;
-        let off = self.peek_write_offset()?;
-        kv_store_timestep_pair_off(gpu, src_k, src_v, src_elem_off, &self.k, &self.v, n, off)?;
-        self.commit_append()
+        let source_byte_offset = self
+            .layout
+            .element_byte_offset(src_elem_off, "GPU KV append source")?;
+        let source_byte_len = self
+            .layout
+            .byte_len_for_positions(1, "GPU KV append source")?;
+        self.preflight_append_buffers(gpu, src_k, src_v, source_byte_offset, source_byte_len)?;
+        self.append_from_offset_preflighted(gpu, src_k, src_v, src_elem_off)
     }
 
     /// Append `m` consecutive timesteps packed as `[m, heads, dim]` in `src_k`/`src_v`.
@@ -261,11 +596,80 @@ impl GpuKvSlot {
         src_v: &GpuBuffer,
         m: usize,
     ) -> Result<()> {
-        let n = self.slot_elems();
+        if m == 0 {
+            return Ok(());
+        }
+        let final_seq_len = self
+            .seq_len
+            .checked_add(m)
+            .ok_or_else(|| Error::Kv("GPU KV append length overflows usize".into()))?;
+        if !self.is_ring && final_seq_len > self.capacity {
+            return Err(Error::Kv(format!(
+                "GPU KV append of {m} timesteps exceeds remaining capacity {}",
+                self.capacity.saturating_sub(self.seq_len)
+            )));
+        }
+        if self.is_ring {
+            self.layout
+                .ring_position_u32(final_seq_len, self.capacity)?;
+        }
+        // Prove the last source-row offset is representable before the first
+        // append can mutate cache state.
+        self.layout
+            .element_offset_u32(m - 1, "GPU KV append source offset")?;
+        let source_byte_len = self
+            .layout
+            .byte_len_for_positions(m, "GPU KV append source")?;
+        self.preflight_append_buffers(gpu, src_k, src_v, 0, source_byte_len)?;
         for mi in 0..m {
-            self.append_from_offset(gpu, src_k, src_v, (mi * n) as u32)?;
+            let src_offset = self
+                .layout
+                .element_offset_u32(mi, "GPU KV append source offset")?;
+            self.append_from_offset_preflighted(gpu, src_k, src_v, src_offset)?;
         }
         Ok(())
+    }
+
+    fn preflight_densify_buffers(
+        &self,
+        gpu: &GemmaGpu,
+        k_scratch: &GpuBuffer,
+        v_scratch: &GpuBuffer,
+        scratch_byte_len: usize,
+    ) -> Result<()> {
+        let rt = gpu.rt.as_ref();
+        tessl::nn::validate_buffer_byte_range(
+            rt,
+            &self.k,
+            0,
+            self.layout.allocation_bytes,
+            "GPU KV densify src_k",
+        )
+        .map_err(Error::Metal)?;
+        tessl::nn::validate_buffer_byte_range(
+            rt,
+            &self.v,
+            0,
+            self.layout.allocation_bytes,
+            "GPU KV densify src_v",
+        )
+        .map_err(Error::Metal)?;
+        tessl::nn::validate_buffer_byte_range(
+            rt,
+            k_scratch,
+            0,
+            scratch_byte_len,
+            "GPU KV densify dst_k",
+        )
+        .map_err(Error::Metal)?;
+        tessl::nn::validate_buffer_byte_range(
+            rt,
+            v_scratch,
+            0,
+            scratch_byte_len,
+            "GPU KV densify dst_v",
+        )
+        .map_err(Error::Metal)
     }
 
     /// FA-ready K/V handles.
@@ -280,24 +684,47 @@ impl GpuKvSlot {
         v_scratch: &GpuBuffer,
         tkv_limit: u32,
     ) -> Result<(GpuBuffer, GpuBuffer, u32, u32)> {
-        let filled = self.seq_len.min(self.capacity);
+        let filled = self.live_len_u32()?;
         if filled == 0 {
             return Ok((k_scratch.clone(), v_scratch.clone(), 0, 0));
         }
-        let tkv = (filled as u32).min(tkv_limit);
+        let tkv = filled.min(tkv_limit);
         if !self.is_ring {
             return Ok((self.k.clone(), self.v.clone(), 0, tkv));
         }
-        let n_slot = self.slot_elems() as u32;
+        let n_slot = self.slot_elems_u32();
         let wrapped = self.seq_len > self.capacity;
-        let start = if wrapped { self.head as u32 } else { 0 };
-        kv_ring_densify(gpu, &self.k, k_scratch, n_slot, self.capacity as u32, tkv, start)?;
-        kv_ring_densify(gpu, &self.v, v_scratch, n_slot, self.capacity as u32, tkv, start)?;
+        let start = if wrapped { self.ring_start_u32()? } else { 0 };
         let kv_pos_offset = if wrapped {
-            (self.seq_len - self.capacity) as u32
+            self.ring_position_u32()?
         } else {
             0
         };
+        let storage_capacity = self.storage_capacity_u32();
+        let tkv_usize = usize::try_from(tkv)
+            .map_err(|_| Error::Kv("GPU KV densify length exceeds usize".into()))?;
+        let scratch_byte_len = self
+            .layout
+            .byte_len_for_positions(tkv_usize, "GPU KV densify scratch")?;
+        self.preflight_densify_buffers(gpu, k_scratch, v_scratch, scratch_byte_len)?;
+        kv_ring_densify(
+            gpu,
+            &self.k,
+            k_scratch,
+            n_slot,
+            storage_capacity,
+            tkv,
+            start,
+        )?;
+        kv_ring_densify(
+            gpu,
+            &self.v,
+            v_scratch,
+            n_slot,
+            storage_capacity,
+            tkv,
+            start,
+        )?;
         Ok((k_scratch.clone(), v_scratch.clone(), kv_pos_offset, tkv))
     }
 }
@@ -1423,6 +1850,7 @@ impl GpuDecodeSession {
         let mut icb_replay_prep = false;
         let mut icb_live_replay_noted = false;
         let mut capturing_layer_icb = false;
+        let mut layer_icb_capture_guard: Option<LayerIcbCaptureGuard> = None;
         let mut binder_nop_guard: Option<tessl::BinderEncodeNopGuard> = None;
         if encode_once_enabled()
             && tessl::decode_icb_enabled()
@@ -1605,8 +2033,7 @@ impl GpuDecodeSession {
                 .map(|t| !t.is_empty())
                 .unwrap_or(false);
         if capturing_layer_icb {
-            tessl::begin_decode_icb_capture();
-            begin_icb_scalar_write_tape();
+            layer_icb_capture_guard = Some(LayerIcbCaptureGuard::begin()?);
         }
         if icb_replay_prep && !skip_nop_layers {
             binder_nop_guard = Some(tessl::BinderEncodeNopGuard::enter());
@@ -1986,19 +2413,29 @@ impl GpuDecodeSession {
                 let fuse_rope_kv = is_producer && fuse_rope_kv_enabled();
                 let fused_kv_store = if fuse_rope_kv {
                     // Resolve primary cache slot before rope so we can write in-kernel.
-                    let (dst_k, dst_v, off) = match &role {
+                    let (dst_k, dst_v, off, capacity) = match &role {
                         KvRole::Producer { slot } => match slot {
                             KvSlotId::SlidingRing { producer_index } => {
                                 let i = *producer_index;
                                 icb_tape_set_kv_ctx_sliding(i);
                                 let off = self.sliding_rings[i].peek_write_offset()?;
-                                (self.sliding_rings[i].k.clone(), self.sliding_rings[i].v.clone(), off)
+                                (
+                                    self.sliding_rings[i].k.clone(),
+                                    self.sliding_rings[i].v.clone(),
+                                    off,
+                                    self.sliding_rings[i].elem_capacity_u32(),
+                                )
                             }
                             KvSlotId::GlobalFull { producer_index } => {
                                 let i = *producer_index;
                                 icb_tape_set_kv_ctx_global(i);
                                 let off = self.global_slots[i].peek_write_offset()?;
-                                (self.global_slots[i].k.clone(), self.global_slots[i].v.clone(), off)
+                                (
+                                    self.global_slots[i].k.clone(),
+                                    self.global_slots[i].v.clone(),
+                                    off,
+                                    self.global_slots[i].elem_capacity_u32(),
+                                )
                             }
                         },
                         KvRole::Consumer { .. } => unreachable!(),
@@ -2029,6 +2466,7 @@ impl GpuDecodeSession {
                                 &dst_k,
                                 &dst_v,
                                 off,
+                                capacity,
                             )?;
                         }
                     );
@@ -2216,7 +2654,7 @@ impl GpuDecodeSession {
                                 icb_tape_set_kv_ctx_shared_global();
                                 &self.shared_global
                             };
-                            if tkv_want > slot.seq_len as u32 {
+                            if tkv_want > slot.live_len_u32()? {
                                 let e = Error::Kv(format!(
                                     "consumer pos={pos} shared tkv={}",
                                     slot.seq_len
@@ -2873,7 +3311,10 @@ impl GpuDecodeSession {
         // live on replay — lm_head/softcap via ICB was observed to collapse argmax→0
         // even when residual stayed finite (token-parity triage 2026-07-19).
         if capturing_layer_icb {
-            if let Some(cap) = tessl::take_decode_icb_capture() {
+            let capture_guard = layer_icb_capture_guard
+                .as_mut()
+                .expect("capturing_layer_icb always owns its paired tape guard");
+            if let Some(cap) = capture_guard.take_decode_capture() {
                 let n = cap.commands.len();
                 if n >= tessl::DecodeIcb::MIN_LAYER_GRAPH_COMMANDS {
                     match tessl::DecodeIcb::from_commands(&self.model.gpu.rt, cap.commands)
@@ -2887,7 +3328,7 @@ impl GpuDecodeSession {
                             // step. Replay steps must reproduce it exactly.
                             self.icb_capture_watermark =
                                 Some(self.model.gpu.icb_scalars.cursor_snapshot());
-                            if let Some(tape) = take_icb_scalar_write_tape() {
+                            if let Some(tape) = capture_guard.take_scalar_write_tape() {
                                 eprintln!(
                                     "encode_once: scalar-write tape ops={} (skip-nop replay)",
                                     tape.op_count()
@@ -2902,7 +3343,7 @@ impl GpuDecodeSession {
                         }
                         Err(e) => {
                             eprintln!("encode_once: DecodeIcb::from_commands failed: {e}");
-                            let _ = take_icb_scalar_write_tape();
+                            let _ = capture_guard.take_scalar_write_tape();
                             // mini_copy_chain is a dispatch-freeze proof for mini dims only.
                             if self.model.is_synthetic_mini() {
                                 match tessl::DecodeIcb::mini_copy_chain(
@@ -2926,7 +3367,7 @@ impl GpuDecodeSession {
                             "leaving DecodeIcb unwired (live encode)"
                         }
                     );
-                    let _ = take_icb_scalar_write_tape();
+                    let _ = capture_guard.take_scalar_write_tape();
                     if self.model.is_synthetic_mini() {
                         match tessl::DecodeIcb::mini_copy_chain(&self.model.gpu.rt, 64) {
                             Ok((icb, _)) => self.encode_once.attach_decode_icb(icb),
@@ -2937,7 +3378,7 @@ impl GpuDecodeSession {
                     }
                 }
             } else {
-                let _ = take_icb_scalar_write_tape();
+                let _ = capture_guard.take_scalar_write_tape();
             }
         }
 
@@ -3292,42 +3733,44 @@ impl GpuDecodeSession {
     }
 
     fn eval_icb_dyn_u32(&self, src: &IcbDynSrc, pos: usize) -> Result<u32> {
-        let tkv_limit = (pos + 1) as u32;
-        let filled_of = |slot: &GpuKvSlot| -> u32 {
-            (slot.seq_len.min(slot.capacity) as u32).min(tkv_limit)
+        let pos_u32 = u32::try_from(pos)
+            .map_err(|_| Error::Kv("decode position exceeds the device u32 range".into()))?;
+        let tkv_limit = pos_u32.saturating_add(1);
+        let filled_of = |slot: &GpuKvSlot| -> Result<u32> {
+            Ok(slot.live_len_u32()?.min(tkv_limit))
         };
-        let start_of = |slot: &GpuKvSlot| -> u32 {
+        let start_of = |slot: &GpuKvSlot| -> Result<u32> {
             if slot.is_ring && slot.seq_len > slot.capacity {
-                slot.head as u32
+                slot.ring_start_u32()
             } else {
-                0
+                Ok(0)
             }
         };
-        let kv_pos_of = |slot: &GpuKvSlot| -> u32 {
+        let kv_pos_of = |slot: &GpuKvSlot| -> Result<u32> {
             if slot.is_ring && slot.seq_len > slot.capacity {
-                (slot.seq_len - slot.capacity) as u32
+                slot.ring_position_u32()
             } else {
-                0
+                Ok(0)
             }
         };
         Ok(match src {
-            IcbDynSrc::Pos => pos as u32,
+            IcbDynSrc::Pos => pos_u32,
             IcbDynSrc::SlidingPeek(i) => self.sliding_rings[*i].peek_write_offset()?,
             IcbDynSrc::GlobalPeek(i) => self.global_slots[*i].peek_write_offset()?,
             IcbDynSrc::SharedSlidingPeek => self.shared_sliding.peek_write_offset()?,
             IcbDynSrc::SharedGlobalPeek => self.shared_global.peek_write_offset()?,
-            IcbDynSrc::SlidingFilled(i) => filled_of(&self.sliding_rings[*i]),
-            IcbDynSrc::SlidingStart(i) => start_of(&self.sliding_rings[*i]),
-            IcbDynSrc::SlidingKvPos(i) => kv_pos_of(&self.sliding_rings[*i]),
-            IcbDynSrc::SlidingTkv(i) => filled_of(&self.sliding_rings[*i]),
-            IcbDynSrc::GlobalFilled(i) => filled_of(&self.global_slots[*i]),
-            IcbDynSrc::GlobalTkv(i) => filled_of(&self.global_slots[*i]),
-            IcbDynSrc::SharedSlidingFilled => filled_of(&self.shared_sliding),
-            IcbDynSrc::SharedSlidingStart => start_of(&self.shared_sliding),
-            IcbDynSrc::SharedSlidingKvPos => kv_pos_of(&self.shared_sliding),
-            IcbDynSrc::SharedSlidingTkv => filled_of(&self.shared_sliding),
-            IcbDynSrc::SharedGlobalFilled => filled_of(&self.shared_global),
-            IcbDynSrc::SharedGlobalTkv => filled_of(&self.shared_global),
+            IcbDynSrc::SlidingFilled(i) => filled_of(&self.sliding_rings[*i])?,
+            IcbDynSrc::SlidingStart(i) => start_of(&self.sliding_rings[*i])?,
+            IcbDynSrc::SlidingKvPos(i) => kv_pos_of(&self.sliding_rings[*i])?,
+            IcbDynSrc::SlidingTkv(i) => filled_of(&self.sliding_rings[*i])?,
+            IcbDynSrc::GlobalFilled(i) => filled_of(&self.global_slots[*i])?,
+            IcbDynSrc::GlobalTkv(i) => filled_of(&self.global_slots[*i])?,
+            IcbDynSrc::SharedSlidingFilled => filled_of(&self.shared_sliding)?,
+            IcbDynSrc::SharedSlidingStart => start_of(&self.shared_sliding)?,
+            IcbDynSrc::SharedSlidingKvPos => kv_pos_of(&self.shared_sliding)?,
+            IcbDynSrc::SharedSlidingTkv => filled_of(&self.shared_sliding)?,
+            IcbDynSrc::SharedGlobalFilled => filled_of(&self.shared_global)?,
+            IcbDynSrc::SharedGlobalTkv => filled_of(&self.shared_global)?,
         })
     }
 
@@ -3898,7 +4341,7 @@ impl GpuDecodeSession {
                     } else {
                         &self.shared_global
                     };
-                    if tkv_want > slot.seq_len as u32 {
+                    if tkv_want > slot.live_len_u32()? {
                         return Err(Error::Kv(format!(
                             "consumer verify pos0={pos0} M={m} shared tkv={}",
                             slot.seq_len
@@ -4517,27 +4960,34 @@ impl GpuDecodeSession {
     /// the target graph (`update_shared` path).
     pub fn sync_mtp_cross_kv(&self, mtp: &mut MtpSession) -> Result<()> {
         self.model.gpu.synchronize()?;
-        let sn = self.shared_sliding.slot_elems();
-        let gn = self.shared_global.slot_elems();
-        let st = self.shared_sliding.seq_len.min(self.shared_sliding.capacity);
+        let st = self
+            .shared_sliding
+            .seq_len
+            .min(self.shared_sliding.capacity);
         let gt = self.shared_global.seq_len.min(self.shared_global.capacity);
+        let sliding_elems = self
+            .shared_sliding
+            .elements_for_positions(st, "MTP sliding KV sync")?;
+        let global_elems = self
+            .shared_global
+            .elements_for_positions(gt, "MTP global KV sync")?;
         let sk = if st > 0 {
-            self.shared_sliding.k.read_f32()[..st * sn].to_vec()
+            self.shared_sliding.k.read_f32()[..sliding_elems].to_vec()
         } else {
             Vec::new()
         };
         let sv = if st > 0 {
-            self.shared_sliding.v.read_f32()[..st * sn].to_vec()
+            self.shared_sliding.v.read_f32()[..sliding_elems].to_vec()
         } else {
             Vec::new()
         };
         let gk = if gt > 0 {
-            self.shared_global.k.read_f32()[..gt * gn].to_vec()
+            self.shared_global.k.read_f32()[..global_elems].to_vec()
         } else {
             Vec::new()
         };
         let gv = if gt > 0 {
-            self.shared_global.v.read_f32()[..gt * gn].to_vec()
+            self.shared_global.v.read_f32()[..global_elems].to_vec()
         } else {
             Vec::new()
         };
@@ -4758,7 +5208,342 @@ mod tests {
     use super::*;
     use crate::forward::SyntheticE4bGraph;
     use crate::kernels::{copy_u32_from_index, copy_u32_to_index};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    const UPDATE_LATEST_ARTIFACTS_ENV: &str = "GEMMA_METAL_UPDATE_LATEST_ARTIFACTS";
+
+    fn latest_artifact_update_requested(value: Option<&str>) -> bool {
+        value == Some("1")
+    }
+
+    /// Timing and parity tests may preserve timestamped diagnostics, but a
+    /// normal test run must never replace a tracked `*_latest.json` result.
+    /// Updating that release-facing pointer is an explicit publication action.
+    fn maybe_update_latest_artifact(path: &Path, body: &str) -> bool {
+        let setting = std::env::var(UPDATE_LATEST_ARTIFACTS_ENV).ok();
+        if !latest_artifact_update_requested(setting.as_deref()) {
+            return false;
+        }
+        std::fs::write(path, body)
+            .unwrap_or_else(|error| panic!("failed to update {}: {error}", path.display()));
+        true
+    }
+
+    #[test]
+    fn tracked_latest_artifacts_require_exact_opt_in() {
+        assert!(!latest_artifact_update_requested(None));
+        for value in ["", "0", "true", "yes", "01", " 1"] {
+            assert!(!latest_artifact_update_requested(Some(value)), "{value:?}");
+        }
+        assert!(latest_artifact_update_requested(Some("1")));
+    }
+
+    #[test]
+    fn gpu_kv_layout_rejects_unrepresentable_sizes_before_allocation() {
+        let beyond_u32 =
+            usize::try_from(u64::from(u32::MAX) + 1).expect("gemma-metal requires a 64-bit host");
+
+        for (label, dims, expected) in [
+            ("zero capacity", (0, 1, 1), "non-zero"),
+            ("zero heads", (1, 0, 1), "non-zero"),
+            ("zero dim", (1, 1, 0), "non-zero"),
+            (
+                "capacity ABI",
+                (beyond_u32, 1, 1),
+                "timestep capacity exceeds",
+            ),
+            ("slot ABI", (1, beyond_u32, 1), "slot width exceeds"),
+            (
+                "total ABI",
+                (2, (u32::MAX as usize / 2) + 1, 1),
+                "element capacity exceeds",
+            ),
+            ("host product", (1, usize::MAX, 2), "slot width overflows"),
+        ] {
+            let result = std::panic::catch_unwind(|| GpuKvLayout::checked(dims.0, dims.1, dims.2));
+            assert!(result.is_ok(), "{label}: validation panicked");
+            let err = result
+                .unwrap()
+                .expect_err("unrepresentable KV layout must be rejected");
+            assert!(err.to_string().contains(expected), "{label}: {err}");
+        }
+
+        let edge = GpuKvLayout::checked(u32::MAX as usize, 1, 1)
+            .expect("largest device-addressable element capacity");
+        assert_eq!(edge.capacity_u32, u32::MAX);
+        assert_eq!(edge.elem_capacity_u32, u32::MAX);
+        assert_eq!(
+            edge.allocation_bytes,
+            (u32::MAX as usize) * std::mem::size_of::<f32>()
+        );
+
+        let offsets = GpuKvLayout::checked(8, 2, 4).expect("small checked layout");
+        assert_eq!(offsets.element_offset_u32(3, "test offset").unwrap(), 24);
+        assert_eq!(
+            offsets.element_byte_offset(24, "test byte offset").unwrap(),
+            96
+        );
+        assert_eq!(
+            offsets
+                .byte_len_for_positions(3, "test byte length")
+                .unwrap(),
+            96
+        );
+        assert!(offsets
+            .byte_len_for_positions(usize::MAX, "test byte length")
+            .is_err());
+        assert_eq!(
+            offsets.elements_for_positions(8, 8, "test extent").unwrap(),
+            64
+        );
+        assert!(offsets.elements_for_positions(9, 8, "test extent").is_err());
+        assert!(offsets
+            .element_offset_u32(beyond_u32, "test offset")
+            .is_err());
+        assert_eq!(
+            offsets.ring_position_u32(8 + u32::MAX as usize, 8).unwrap(),
+            u32::MAX
+        );
+        assert!(offsets.ring_position_u32(8 + beyond_u32, 8).is_err());
+        assert_eq!(
+            offsets.next_append_state(8, 3, 0, false).unwrap(),
+            (24, 4, 0)
+        );
+        assert!(offsets.next_append_state(8, 8, 0, false).is_err());
+        assert!(offsets.next_append_state(8, 3, 8, true).is_err());
+        assert!(offsets
+            .next_append_state(8, 8 + u32::MAX as usize, 0, true)
+            .is_err());
+
+        let source = include_str!("gpu_model.rs");
+        let constructor = source
+            .split("impl GpuKvSlot {")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn slot_elems_u32(").next())
+            .expect("GpuKvSlot constructor source");
+        assert!(
+            constructor.find("GpuKvLayout::checked").unwrap()
+                < constructor.find("alloc_buffer_hot").unwrap(),
+            "invalid dimensions must fail before the first Metal allocation"
+        );
+        assert!(!constructor.contains("saturating_mul"));
+    }
+
+    #[test]
+    fn gpu_kv_multidispatch_paths_preflight_every_buffer_before_encoding() {
+        let source = include_str!("gpu_model.rs");
+        let slot_impl = source
+            .split("impl GpuKvSlot {")
+            .nth(1)
+            .expect("GpuKvSlot implementation source");
+
+        let append_preflight = slot_impl
+            .split("    fn preflight_append_buffers(")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn append_from_offset_preflighted(").next())
+            .expect("append source-buffer preflight source");
+        assert_eq!(
+            append_preflight
+                .matches("tessl::nn::validate_buffer_byte_range")
+                .count(),
+            4,
+            "both packed sources and both cache destinations must be preflighted"
+        );
+        for operand in ["src_k", "src_v", "&self.k", "&self.v"] {
+            assert!(
+                append_preflight.contains(operand),
+                "append preflight omitted {operand}"
+            );
+        }
+
+        let append_m = slot_impl
+            .split("    fn append_m(")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn preflight_densify_buffers(").next())
+            .expect("append_m source");
+        let append_byte_check = append_m
+            .find("byte_len_for_positions(m")
+            .expect("full packed source byte extent");
+        let append_preflight_call = append_m
+            .find("self.preflight_append_buffers")
+            .expect("append source preflight call");
+        let append_loop = append_m.find("for mi in 0..m").expect("append row loop");
+        assert!(append_byte_check < append_preflight_call);
+        assert!(append_preflight_call < append_loop);
+
+        let densify_preflight = slot_impl
+            .split("    fn preflight_densify_buffers(")
+            .nth(1)
+            .and_then(|tail| tail.split("    /// FA-ready K/V handles.").next())
+            .expect("densify buffer preflight source");
+        assert_eq!(
+            densify_preflight
+                .matches("tessl::nn::validate_buffer_byte_range")
+                .count(),
+            4,
+            "both ring sources and both scratch destinations must be preflighted"
+        );
+        for operand in ["&self.k", "&self.v", "k_scratch", "v_scratch"] {
+            assert!(
+                densify_preflight.contains(operand),
+                "densify preflight omitted {operand}"
+            );
+        }
+
+        let fa_buffers = slot_impl
+            .split("    fn fa_buffers(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n}\n\n/// Host-side Q4 twin").next())
+            .expect("fa_buffers source");
+        let scratch_byte_check = fa_buffers
+            .find("byte_len_for_positions(tkv_usize")
+            .expect("full scratch byte extent");
+        let densify_preflight_call = fa_buffers
+            .find("self.preflight_densify_buffers")
+            .expect("densify preflight call");
+        let first_dispatch = fa_buffers
+            .find("kv_ring_densify(")
+            .expect("first densify dispatch");
+        assert!(scratch_byte_check < densify_preflight_call);
+        assert!(densify_preflight_call < first_dispatch);
+    }
+
+    #[test]
+    fn sliding_kv_after_wrap_reject_then_continue_restores_history() {
+        let gpu = GemmaGpu::new().expect("Metal runtime for sliding-KV rollback regression");
+        let mut slot = GpuKvSlot::new(&gpu, 4, 1, 1, true).expect("four-row sliding slot");
+        let mut baseline = GpuKvSlot::new(&gpu, 4, 1, 1, true).expect("four-row baseline slot");
+        let src_k = gpu.rt.alloc_buffer(8 * 4).expect("K source");
+        let src_v = gpu.rt.alloc_buffer(8 * 4).expect("V source");
+        src_k.write_f32(&[10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 30.0]);
+        src_v.write_f32(&[110.0, 111.0, 112.0, 113.0, 120.0, 121.0, 122.0, 130.0]);
+
+        for source_row in 0..4 {
+            slot.append_from_offset(&gpu, &src_k, &src_v, source_row)
+                .expect("initial ring fill");
+            baseline
+                .append_from_offset(&gpu, &src_k, &src_v, source_row)
+                .expect("baseline ring fill");
+        }
+        for source_row in 4..7 {
+            slot.append_from_offset(&gpu, &src_k, &src_v, source_row)
+                .expect("speculative append");
+        }
+
+        // Accept only row 20, reject rows 21/22, and continue with row 30.
+        // Once a four-row ring is full, metadata-only rewind leaves rows 21/22
+        // in the slots that must again contain rows 11/12.
+        slot.trim(2).expect("reject speculative suffix");
+        slot.append_from_offset(&gpu, &src_k, &src_v, 7)
+            .expect("continue after reject");
+        baseline
+            .append_from_offset(&gpu, &src_k, &src_v, 4)
+            .expect("baseline accepted row");
+        baseline
+            .append_from_offset(&gpu, &src_k, &src_v, 7)
+            .expect("baseline continuation");
+        gpu.synchronize()
+            .expect("complete rollback regression writes");
+
+        let read_live = |slot: &GpuKvSlot, buffer: &GpuBuffer| {
+            let live = slot.seq_len.min(slot.capacity);
+            let start = slot.ring_start_u32().expect("chronological ring start") as usize;
+            let storage_capacity = slot.k.nbytes() / std::mem::size_of::<f32>();
+            let values = buffer.read_f32();
+            (0..live)
+                .map(|row| values[(start + row) % storage_capacity])
+                .collect::<Vec<_>>()
+        };
+        let baseline_k = read_live(&baseline, &baseline.k);
+        let baseline_v = read_live(&baseline, &baseline.v);
+        assert_eq!(read_live(&slot, &slot.k), baseline_k);
+        assert_eq!(read_live(&slot, &slot.v), baseline_v);
+        assert_eq!(baseline_k, vec![12.0, 13.0, 20.0, 30.0]);
+        assert_eq!(baseline_v, vec![112.0, 113.0, 120.0, 130.0]);
+    }
+
+    #[test]
+    fn sliding_kv_trim_fails_closed_beyond_retained_history() {
+        let gpu = GemmaGpu::new().expect("Metal runtime for sliding-KV retention regression");
+        let mut slot = GpuKvSlot::new(&gpu, 4, 1, 1, true).expect("four-row sliding slot");
+        let src = gpu.rt.alloc_buffer(4).expect("one-row source");
+        src.write_f32(&[1.0]);
+
+        // Physical capacity is logical window + VERIFY_MAX_M = 12. Once the
+        // thirteenth row lands, absolute row 0 is no longer recoverable.
+        for _ in 0..13 {
+            slot.append_from_offset(&gpu, &src, &src, 0)
+                .expect("fill beyond rollback horizon");
+        }
+        let before = (slot.seq_len, slot.head);
+        let err = slot
+            .trim(9)
+            .expect_err("rewind requiring evicted history must fail closed");
+        assert!(err.to_string().contains("oldest retained"), "{err}");
+        assert_eq!((slot.seq_len, slot.head), before);
+
+        slot.trim(VERIFY_MAX_M)
+            .expect("the full supported verify suffix remains recoverable");
+        gpu.synchronize().expect("complete retention-bound writes");
+    }
+
+    #[test]
+    fn layer_icb_capture_guard_cleans_both_tapes_after_an_early_error() {
+        // Leave this thread clean even if a preceding assertion failed while
+        // developing the regression.
+        tessl::end_decode_icb_capture();
+        let _ = crate::kernels::take_icb_scalar_write_tape();
+
+        fn injected_failure() -> Result<()> {
+            Err(Error::Metal("injected capture failure".into()))
+        }
+
+        fn fail_between_begin_and_take() -> Result<()> {
+            let _capture = LayerIcbCaptureGuard::begin()?;
+            assert!(tessl::decode_icb_capture_active());
+            assert!(crate::kernels::icb_scalar_write_tape_active());
+            injected_failure()?;
+            Ok(())
+        }
+
+        let err = fail_between_begin_and_take().expect_err("injected early return");
+        assert!(err.to_string().contains("injected capture failure"));
+        assert!(
+            !tessl::decode_icb_capture_active(),
+            "early `?` retained the DecodeIcb tape and its buffer clones"
+        );
+        assert!(
+            !crate::kernels::icb_scalar_write_tape_active(),
+            "early `?` left scalar writes recording into the next step"
+        );
+
+        // A subsequent capture must be fresh rather than a nested continuation
+        // of the failed one, and the successful take path must disarm Drop.
+        let mut capture = LayerIcbCaptureGuard::begin().expect("begin fresh paired capture");
+        let decode = capture.take_decode_capture().expect("fresh decode tape");
+        let scalars = capture
+            .take_scalar_write_tape()
+            .expect("fresh scalar-write tape");
+        assert_eq!(decode.nested_begins, 0);
+        assert!(decode.commands.is_empty());
+        assert!(scalars.is_empty());
+        drop(capture);
+        assert!(!tessl::decode_icb_capture_active());
+        assert!(!crate::kernels::icb_scalar_write_tape_active());
+
+        // If a different caller leaked either TLS tape, beginning a Gemma
+        // capture must clean both and fail loudly instead of incrementing the
+        // DecodeIcb `nested_begins` counter and consuming a mixed tape.
+        tessl::begin_decode_icb_capture();
+        crate::kernels::begin_icb_scalar_write_tape();
+        let stale = match LayerIcbCaptureGuard::begin() {
+            Ok(_) => panic!("stale tapes must not be reused"),
+            Err(err) => err,
+        };
+        assert!(stale.to_string().contains("stale thread-local state"));
+        assert!(!tessl::decode_icb_capture_active());
+        assert!(!crate::kernels::icb_scalar_write_tape_active());
+    }
 
     fn metal_ready(model: &GpuSynthModel) -> bool {
         // Probe the scheme this model actually uses — under GPU contention the
@@ -5159,7 +5944,9 @@ mod tests {
     /// Native verify(M) microbench for M=1..=8 on mini synth (Lane B / nax-verify).
     ///
     /// Writes `gemma-metal/bench/results/verify_m_sweep_<unix>.json` with ms/iter and
-    /// ratio vs M=1. Does **not** touch `bench.rs` writer metadata (Lane A).
+    /// ratio vs M=1. Does **not** touch `bench.rs` writer metadata (Lane A), and
+    /// updates the tracked `*_latest.json` pointer only when
+    /// `GEMMA_METAL_UPDATE_LATEST_ARTIFACTS=1` is set explicitly.
     ///
     /// **E4B:** after loading Hot banks into a session,
     /// `for m in 1..=8 { sess.bench_step_verify_ms(&tokens[..m], warmup, iters) }`
@@ -5224,6 +6011,7 @@ mod tests {
         let latest = out_dir.join("verify_m_sweep_latest.json");
         let doc = serde_json::json!({
             "artifact": "verify_m_sweep",
+            "evidence_status": "diagnostic_only",
             "model": "mini_synth",
             "unix_ts": ts,
             "warmup": warmup,
@@ -5255,12 +6043,12 @@ mod tests {
             "notes": [
                 "Mini graph via GpuDecodeSession::bench_step_verify_ms; does not touch bench.rs Lane A writer.",
                 "E4B: load Hot session then same M=1..8 loop; write model=e4b into this schema.",
-                "TensorOps/NAX Int4 unbound — verify stays on simdgroup Q4; DDTree parked until verify(M) flattens.",
+                "TensorOps Q4 is not shipped: raw-address kernels still lack a shader-side sub-byte tensor constructor and wired host dispatch; the missing Int4 host descriptor binding is separate.",
             ],
         });
         let body = serde_json::to_string_pretty(&doc).expect("json");
         std::fs::write(&path, &body).expect("write verify_m_sweep");
-        let _ = std::fs::write(&latest, &body);
+        let _latest_updated = maybe_update_latest_artifact(&latest, &body);
         eprintln!("wrote {}", path.display());
         assert!(ms_m1.unwrap() > 0.0);
         assert_eq!(rows.len(), VERIFY_MAX_M);
@@ -5505,6 +6293,7 @@ mod tests {
         };
         let doc = serde_json::json!({
             "artifact": "decode_icb_mini_token_parity",
+            "evidence_status": "diagnostic_only",
             "model": "mini_synth",
             "unix_ts": ts,
             "seeds": seeds,
@@ -5523,11 +6312,11 @@ mod tests {
             "verdict": verdict,
         });
         let body = serde_json::to_string_pretty(&doc).expect("json");
-        let _ = std::fs::write(&latest, &body);
+        let latest_updated = maybe_update_latest_artifact(&latest, &body);
         eprintln!(
             "decode_icb_mini_token_parity: {verdict} cmds={cmd_n} live={live_encodes} \
-             replays={icb_replays} → {}",
-            latest.display()
+             replays={icb_replays}; latest_updated={latest_updated} ({})",
+            latest.display(),
         );
         assert_eq!(
             live_out, icb_out,
@@ -5537,7 +6326,7 @@ mod tests {
         crate::kernels::set_encode_once(false);
         tessl::set_decode_icb(false);
         tessl::set_icb_pipelines(false);
-        tessl::set_binder_encode_nop(false);
+        tessl::clear_binder_encode_nop();
     }
 
     /// Rough free+purgeable RAM (bytes) from `vm_stat` — used to skip E4B Hot
@@ -5715,7 +6504,7 @@ mod tests {
                     crate::kernels::set_encode_once(false);
                     tessl::set_decode_icb(false);
                     tessl::set_icb_pipelines(false);
-                    tessl::set_binder_encode_nop(false);
+                    tessl::clear_binder_encode_nop();
                     return;
                 }
             }
@@ -5757,6 +6546,7 @@ mod tests {
         };
         let doc = serde_json::json!({
             "artifact": "decode_icb_e4b_hot_smoke",
+            "evidence_status": "diagnostic_only",
             "model": "e4b_hot",
             "unix_ts": ts,
             "seeds": seeds,
@@ -5770,16 +6560,16 @@ mod tests {
             "verdict": verdict,
         });
         let body = serde_json::to_string_pretty(&doc).expect("json");
-        let _ = std::fs::write(&latest, &body);
+        let latest_updated = maybe_update_latest_artifact(&latest, &body);
         eprintln!(
-            "decode_icb_e4b_hot_smoke: {verdict} → {}",
-            latest.display()
+            "decode_icb_e4b_hot_smoke: {verdict}; latest_updated={latest_updated} ({})",
+            latest.display(),
         );
 
         crate::kernels::set_encode_once(false);
         tessl::set_decode_icb(false);
         tessl::set_icb_pipelines(false);
-        tessl::set_binder_encode_nop(false);
+        tessl::clear_binder_encode_nop();
 
         assert!(
             ok,
@@ -5898,7 +6688,7 @@ mod tests {
                 crate::kernels::set_encode_once(false);
                 tessl::set_decode_icb(false);
                 tessl::set_icb_pipelines(false);
-                tessl::set_binder_encode_nop(false);
+                tessl::clear_binder_encode_nop();
                 return;
             }
         }
@@ -5910,7 +6700,7 @@ mod tests {
                 crate::kernels::set_encode_once(false);
                 tessl::set_decode_icb(false);
                 tessl::set_icb_pipelines(false);
-                tessl::set_binder_encode_nop(false);
+                tessl::clear_binder_encode_nop();
                 return;
             }
         }
@@ -5996,6 +6786,7 @@ mod tests {
         };
         let doc = serde_json::json!({
             "artifact": "encode_once_e4b_hot_ab",
+            "evidence_status": "diagnostic_only",
             "model": "e4b_hot",
             "unix_ts": ts,
             "warmup": warmup,
@@ -6030,7 +6821,7 @@ mod tests {
         });
         let body = serde_json::to_string_pretty(&doc).expect("json");
         let _ = std::fs::write(&path, &body);
-        let _ = std::fs::write(&latest, &body);
+        let _latest_updated = maybe_update_latest_artifact(&latest, &body);
         eprintln!(
             "encode_once_e4b_hot_encode_ab: {verdict} → {}",
             latest.display()
@@ -6039,7 +6830,7 @@ mod tests {
         crate::kernels::set_encode_once(false);
         tessl::set_decode_icb(false);
         tessl::set_icb_pipelines(false);
-        tessl::set_binder_encode_nop(false);
+        tessl::clear_binder_encode_nop();
 
         assert!(ok, "E4B Hot encode A/B: {verdict}");
     }
@@ -6193,6 +6984,7 @@ mod tests {
         };
         let doc = serde_json::json!({
             "artifact": "encode_once_mini_ab",
+            "evidence_status": "diagnostic_only",
             "model": "mini_synth",
             "unix_ts": ts,
             "warmup": warmup,
@@ -6223,7 +7015,7 @@ mod tests {
         });
         let body = serde_json::to_string_pretty(&doc).expect("json");
         std::fs::write(&path, &body).expect("write encode_once_mini_ab");
-        let _ = std::fs::write(&latest, &body);
+        let _latest_updated = maybe_update_latest_artifact(&latest, &body);
         eprintln!(
             "encode_once_mini_encode_ab: us_off={us_off:.1} us_on={us_on:.1} ratio={ratio:.2} \
              layer_graph={layer_graph} cmds={cmd_n} live={live} icb_replays={icb_replays} \
@@ -6235,7 +7027,7 @@ mod tests {
         crate::kernels::set_encode_once(false);
         tessl::set_decode_icb(false);
         tessl::set_icb_pipelines(false);
-        tessl::set_binder_encode_nop(false);
+        tessl::clear_binder_encode_nop();
     }
 
     /// Persistent-interp flag: mini `step_inner` exercises both stand-ins; tokens unchanged.
@@ -6348,6 +7140,76 @@ mod tests {
         // Full rollback of remaining.
         sess.trim_kv(3).unwrap();
         assert_eq!(sess.pos(), 0);
+    }
+
+    #[test]
+    fn step_verify_after_sliding_wrap_reject_then_continue_matches_sequential() {
+        let host = SyntheticE4bGraph::mini_parity().expect("synthetic rollback parity graph");
+        let model_a = GpuSynthModel::from_synthetic(host.clone(), QuantScheme::q4_default())
+            .expect("sequential rollback parity model");
+        let model_b = GpuSynthModel::from_synthetic(host, QuantScheme::q4_default())
+            .expect("speculative rollback parity model");
+        assert!(metal_ready(&model_a), "Metal pipeline unavailable");
+        assert!(metal_ready(&model_b), "Metal pipeline unavailable");
+        tessl::ab_flags::set_hazard_barriers(false);
+
+        let mut sequential = GpuDecodeSession::new(model_a).expect("sequential session");
+        let mut speculative = GpuDecodeSession::new(model_b).expect("speculative session");
+        for token in [1u32, 2, 3, 4, 5, 6] {
+            assert_eq!(
+                sequential.step(token).unwrap(),
+                speculative.step(token).unwrap()
+            );
+        }
+        assert!(
+            sequential.pos() > sequential.sliding_rings[0].capacity,
+            "fixture must cross the logical sliding window before speculation"
+        );
+
+        let accepted_next = sequential.step(7).expect("sequential accepted row");
+        let verified = speculative
+            .step_verify(&[7, 8, 9])
+            .expect("speculative verify block");
+        assert_eq!(verified.next_tokens[0], accepted_next);
+        speculative
+            .commit_verify(verified.tokens.len(), 1)
+            .expect("reject speculative suffix");
+        assert_eq!(speculative.pos(), sequential.pos());
+
+        let sequential_next = sequential.step(10).expect("sequential continuation");
+        let speculative_next = speculative.step(10).expect("rollback continuation");
+        assert_eq!(speculative_next, sequential_next);
+
+        let chronological = |slot: &GpuKvSlot, buffer: &GpuBuffer| {
+            let live = slot.seq_len.min(slot.capacity);
+            let width = slot.layout.slot_elems;
+            let start = slot.ring_start_u32().expect("ring start") as usize;
+            let values = buffer.read_f32();
+            let mut out = Vec::with_capacity(live * width);
+            for row in 0..live {
+                let physical = (start + row) % slot.storage_capacity;
+                out.extend_from_slice(&values[physical * width..(physical + 1) * width]);
+            }
+            out
+        };
+        assert_eq!(
+            sequential.sliding_rings.len(),
+            speculative.sliding_rings.len()
+        );
+        for (expected, actual) in sequential
+            .sliding_rings
+            .iter()
+            .zip(&speculative.sliding_rings)
+        {
+            assert_eq!(
+                chronological(actual, &actual.k),
+                chronological(expected, &expected.k)
+            );
+            assert_eq!(
+                chronological(actual, &actual.v),
+                chronological(expected, &expected.v)
+            );
+        }
     }
 
     #[test]

@@ -53,7 +53,11 @@ impl MuonOrthogonalizer {
     }
 
     fn norm_scale(self) -> f32 {
-        if matches!(self, Self::PolarExpress) { 1.02 } else { 1.0 }
+        if matches!(self, Self::PolarExpress) {
+            1.02
+        } else {
+            1.0
+        }
     }
 
     fn coefficients(self) -> Vec<(f32, f32, f32)> {
@@ -303,11 +307,7 @@ impl AdamSlot {
         })
     }
 
-    fn for_kind(
-        rt: &Arc<GpuRuntime>,
-        t: &Tensor,
-        kind: OptimizerKind,
-    ) -> Result<Self, String> {
+    fn for_kind(rt: &Arc<GpuRuntime>, t: &Tensor, kind: OptimizerKind) -> Result<Self, String> {
         Ok(Self {
             exp_avg: if kind == OptimizerKind::ScheduleFreeAdamw {
                 clone_like(rt, t)?
@@ -438,9 +438,6 @@ pub struct OptimState {
     pub ema_mamba_dt_bias: Option<Tensor>,
     pub mamba_norm: Option<AdamSlot>,
     pub ema_mamba_norm: Option<Tensor>,
-
-
-
 }
 
 pub struct BlockEma {
@@ -528,25 +525,62 @@ impl OptimState {
             prev_mamba_in_proj: w.mamba_in_proj.as_ref().map(|t| clone_like(rt, t).unwrap()),
             mag_v_mamba_in_proj: w.mamba_in_proj.as_ref().map(|t| clone_like(rt, t).unwrap()),
             ema_mamba_in_proj: w.mamba_in_proj.as_ref().map(|t| clone_like(rt, t).unwrap()),
-            mamba_conv1d_weight: w.mamba_conv1d_weight.as_ref().map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
-            ema_mamba_conv1d_weight: w.mamba_conv1d_weight.as_ref().map(|t| clone_like(rt, t).unwrap()),
-            mamba_conv1d_bias: w.mamba_conv1d_bias.as_ref().map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
-            ema_mamba_conv1d_bias: w.mamba_conv1d_bias.as_ref().map(|t| clone_like(rt, t).unwrap()),
-            mom_mamba_out_proj: w.mamba_out_proj.as_ref().map(|t| clone_like(rt, t).unwrap()),
-            var_mamba_out_proj: w.mamba_out_proj.as_ref().map(|t| clone_like(rt, t).unwrap()),
-            prev_mamba_out_proj: w.mamba_out_proj.as_ref().map(|t| clone_like(rt, t).unwrap()),
-            mag_v_mamba_out_proj: w.mamba_out_proj.as_ref().map(|t| clone_like(rt, t).unwrap()),
-            ema_mamba_out_proj: w.mamba_out_proj.as_ref().map(|t| clone_like(rt, t).unwrap()),
-            mamba_a_log: w.mamba_a_log.as_ref().map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
+            mamba_conv1d_weight: w
+                .mamba_conv1d_weight
+                .as_ref()
+                .map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
+            ema_mamba_conv1d_weight: w
+                .mamba_conv1d_weight
+                .as_ref()
+                .map(|t| clone_like(rt, t).unwrap()),
+            mamba_conv1d_bias: w
+                .mamba_conv1d_bias
+                .as_ref()
+                .map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
+            ema_mamba_conv1d_bias: w
+                .mamba_conv1d_bias
+                .as_ref()
+                .map(|t| clone_like(rt, t).unwrap()),
+            mom_mamba_out_proj: w
+                .mamba_out_proj
+                .as_ref()
+                .map(|t| clone_like(rt, t).unwrap()),
+            var_mamba_out_proj: w
+                .mamba_out_proj
+                .as_ref()
+                .map(|t| clone_like(rt, t).unwrap()),
+            prev_mamba_out_proj: w
+                .mamba_out_proj
+                .as_ref()
+                .map(|t| clone_like(rt, t).unwrap()),
+            mag_v_mamba_out_proj: w
+                .mamba_out_proj
+                .as_ref()
+                .map(|t| clone_like(rt, t).unwrap()),
+            ema_mamba_out_proj: w
+                .mamba_out_proj
+                .as_ref()
+                .map(|t| clone_like(rt, t).unwrap()),
+            mamba_a_log: w
+                .mamba_a_log
+                .as_ref()
+                .map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
             ema_mamba_a_log: w.mamba_a_log.as_ref().map(|t| clone_like(rt, t).unwrap()),
-            mamba_d: w.mamba_d.as_ref().map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
+            mamba_d: w
+                .mamba_d
+                .as_ref()
+                .map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
             ema_mamba_d: w.mamba_d.as_ref().map(|t| clone_like(rt, t).unwrap()),
-            mamba_dt_bias: w.mamba_dt_bias.as_ref().map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
+            mamba_dt_bias: w
+                .mamba_dt_bias
+                .as_ref()
+                .map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
             ema_mamba_dt_bias: w.mamba_dt_bias.as_ref().map(|t| clone_like(rt, t).unwrap()),
-            mamba_norm: w.mamba_norm.as_ref().map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
+            mamba_norm: w
+                .mamba_norm
+                .as_ref()
+                .map(|t| AdamSlot::for_kind(rt, t, kind).unwrap()),
             ema_mamba_norm: w.mamba_norm.as_ref().map(|t| clone_like(rt, t).unwrap()),
-
-
 
             bigram_emb: AdamSlot::for_kind(rt, &w.bigram_emb, kind)?,
             ve_emb: AdamSlot::for_kind(rt, &w.ve_emb, kind)?,
@@ -558,18 +592,50 @@ impl OptimState {
             ve_layer_scales,
             skip_weights: AdamSlot::for_kind(rt, &w.skip_weights, kind)?,
             blocks,
-            mom_qo: if kind == OptimizerKind::ScheduleFreeAdamw { clone_like(rt, &w.qo_bank)? } else { zeros_like(rt, &w.qo_bank)? },
-            mom_kv: if kind == OptimizerKind::ScheduleFreeAdamw { clone_like(rt, &w.kv_bank)? } else { zeros_like(rt, &w.kv_bank)? },
-            mom_up: if kind == OptimizerKind::ScheduleFreeAdamw { clone_like(rt, &w.mlp_up)? } else { zeros_like(rt, &w.mlp_up)? },
-            mom_dn: if kind == OptimizerKind::ScheduleFreeAdamw { clone_like(rt, &w.mlp_down)? } else { zeros_like(rt, &w.mlp_down)? },
+            mom_qo: if kind == OptimizerKind::ScheduleFreeAdamw {
+                clone_like(rt, &w.qo_bank)?
+            } else {
+                zeros_like(rt, &w.qo_bank)?
+            },
+            mom_kv: if kind == OptimizerKind::ScheduleFreeAdamw {
+                clone_like(rt, &w.kv_bank)?
+            } else {
+                zeros_like(rt, &w.kv_bank)?
+            },
+            mom_up: if kind == OptimizerKind::ScheduleFreeAdamw {
+                clone_like(rt, &w.mlp_up)?
+            } else {
+                zeros_like(rt, &w.mlp_up)?
+            },
+            mom_dn: if kind == OptimizerKind::ScheduleFreeAdamw {
+                clone_like(rt, &w.mlp_down)?
+            } else {
+                zeros_like(rt, &w.mlp_down)?
+            },
             var_qo: zeros_like(rt, &w.qo_bank)?,
             var_kv: zeros_like(rt, &w.kv_bank)?,
             var_up: zeros_like(rt, &w.mlp_up)?,
             var_dn: zeros_like(rt, &w.mlp_down)?,
-            prev_qo: if matches!(kind, OptimizerKind::MuownAdamw | OptimizerKind::Prodigy) { clone_like(rt, &w.qo_bank)? } else { zeros_like(rt, &w.qo_bank)? },
-            prev_kv: if matches!(kind, OptimizerKind::MuownAdamw | OptimizerKind::Prodigy) { clone_like(rt, &w.kv_bank)? } else { zeros_like(rt, &w.kv_bank)? },
-            prev_up: if matches!(kind, OptimizerKind::MuownAdamw | OptimizerKind::Prodigy) { clone_like(rt, &w.mlp_up)? } else { zeros_like(rt, &w.mlp_up)? },
-            prev_dn: if matches!(kind, OptimizerKind::MuownAdamw | OptimizerKind::Prodigy) { clone_like(rt, &w.mlp_down)? } else { zeros_like(rt, &w.mlp_down)? },
+            prev_qo: if matches!(kind, OptimizerKind::MuownAdamw | OptimizerKind::Prodigy) {
+                clone_like(rt, &w.qo_bank)?
+            } else {
+                zeros_like(rt, &w.qo_bank)?
+            },
+            prev_kv: if matches!(kind, OptimizerKind::MuownAdamw | OptimizerKind::Prodigy) {
+                clone_like(rt, &w.kv_bank)?
+            } else {
+                zeros_like(rt, &w.kv_bank)?
+            },
+            prev_up: if matches!(kind, OptimizerKind::MuownAdamw | OptimizerKind::Prodigy) {
+                clone_like(rt, &w.mlp_up)?
+            } else {
+                zeros_like(rt, &w.mlp_up)?
+            },
+            prev_dn: if matches!(kind, OptimizerKind::MuownAdamw | OptimizerKind::Prodigy) {
+                clone_like(rt, &w.mlp_down)?
+            } else {
+                zeros_like(rt, &w.mlp_down)?
+            },
             mag_v_qo: zeros_like(rt, &w.qo_bank)?,
             mag_v_kv: zeros_like(rt, &w.kv_bank)?,
             mag_v_up: zeros_like(rt, &w.mlp_up)?,
@@ -815,8 +881,22 @@ fn adamw_ema_one(
     let ema_t = ema.unwrap_or(param);
     dispatch_1d(rt, &pipe, n, |bnd| {
         encode_adamw_ema(
-            bnd, param, grad, slot, ema_t, clip_coef, lr, beta1, beta2, eps, wd, step_size,
-            bias2_sqrt_inv, ema_decay, n, do_ema,
+            bnd,
+            param,
+            grad,
+            slot,
+            ema_t,
+            clip_coef,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            wd,
+            step_size,
+            bias2_sqrt_inv,
+            ema_decay,
+            n,
+            do_ema,
         );
     })
 }
@@ -885,8 +965,22 @@ fn adamw_ema_segment_pack(
             let tpt = width.min(n).max(1);
             let groups = (n + tpt - 1) / tpt;
             encode_adamw_ema(
-                bnd, param, grad, slot, ema_t, clip_coef, lr, beta1, beta2, eps, wd, step_size,
-                bias2_sqrt_inv, ema_decay, n, do_ema,
+                bnd,
+                param,
+                grad,
+                slot,
+                ema_t,
+                clip_coef,
+                lr,
+                beta1,
+                beta2,
+                eps,
+                wd,
+                step_size,
+                bias2_sqrt_inv,
+                ema_decay,
+                n,
+                do_ema,
             );
             bnd.dispatch(mtl_size(groups, 1, 1), mtl_size(tpt, 1, 1));
         }
@@ -930,22 +1024,134 @@ struct ProdigyItem<'a> {
 
 fn research_items<'a>(w: &'a Weights, g: &'a Grads, s: &'a OptimState) -> Vec<ResearchItem<'a>> {
     let mut items = vec![
-        ResearchItem { param: &w.tok_emb, grad: &g.tok_emb, state1: &s.tok_emb.exp_avg, state2: &s.tok_emb.exp_avg_sq, ema: &s.ema_tok_emb, role: ResearchRole::Embed, decay: true },
-        ResearchItem { param: &w.bigram_emb, grad: &g.bigram_emb, state1: &s.bigram_emb.exp_avg, state2: &s.bigram_emb.exp_avg_sq, ema: &s.ema_bigram_emb, role: ResearchRole::Embed, decay: true },
-        ResearchItem { param: &w.ve_emb, grad: &g.ve_emb, state1: &s.ve_emb.exp_avg, state2: &s.ve_emb.exp_avg_sq, ema: &s.ema_ve_emb, role: ResearchRole::Embed, decay: true },
-        ResearchItem { param: &w.bigram_proj, grad: &g.bigram_proj, state1: &s.bigram_proj.exp_avg, state2: &s.bigram_proj.exp_avg_sq, ema: &s.ema_bigram_proj, role: ResearchRole::Auxiliary, decay: true },
-        ResearchItem { param: &w.bigram_scale, grad: &g.bigram_scale, state1: &s.bigram_scale.exp_avg, state2: &s.bigram_scale.exp_avg_sq, ema: &s.ema_bigram_scale, role: ResearchRole::Auxiliary, decay: false },
-        ResearchItem { param: &w.smear_gate, grad: &g.smear_gate, state1: &s.smear_gate.exp_avg, state2: &s.smear_gate.exp_avg_sq, ema: &s.ema_smear_gate, role: ResearchRole::Auxiliary, decay: false },
-        ResearchItem { param: &w.ve_proj, grad: &g.ve_proj, state1: &s.ve_proj.exp_avg, state2: &s.ve_proj.exp_avg_sq, ema: &s.ema_ve_proj, role: ResearchRole::Auxiliary, decay: true },
-        ResearchItem { param: &w.ve_scale, grad: &g.ve_scale, state1: &s.ve_scale.exp_avg, state2: &s.ve_scale.exp_avg_sq, ema: &s.ema_ve_scale, role: ResearchRole::Auxiliary, decay: false },
-        ResearchItem { param: &w.skip_weights, grad: &g.skip_weights, state1: &s.skip_weights.exp_avg, state2: &s.skip_weights.exp_avg_sq, ema: &s.ema_skip_weights, role: ResearchRole::Auxiliary, decay: false },
-        ResearchItem { param: &w.qo_bank, grad: &g.qo_bank, state1: &s.mom_qo, state2: &s.var_qo, ema: &s.ema_qo, role: ResearchRole::Matrix, decay: true },
-        ResearchItem { param: &w.kv_bank, grad: &g.kv_bank, state1: &s.mom_kv, state2: &s.var_kv, ema: &s.ema_kv, role: ResearchRole::Matrix, decay: true },
-        ResearchItem { param: &w.mlp_up, grad: &g.mlp_up, state1: &s.mom_up, state2: &s.var_up, ema: &s.ema_up, role: ResearchRole::Matrix, decay: true },
-        ResearchItem { param: &w.mlp_down, grad: &g.mlp_down, state1: &s.mom_dn, state2: &s.var_dn, ema: &s.ema_dn, role: ResearchRole::Matrix, decay: true },
+        ResearchItem {
+            param: &w.tok_emb,
+            grad: &g.tok_emb,
+            state1: &s.tok_emb.exp_avg,
+            state2: &s.tok_emb.exp_avg_sq,
+            ema: &s.ema_tok_emb,
+            role: ResearchRole::Embed,
+            decay: true,
+        },
+        ResearchItem {
+            param: &w.bigram_emb,
+            grad: &g.bigram_emb,
+            state1: &s.bigram_emb.exp_avg,
+            state2: &s.bigram_emb.exp_avg_sq,
+            ema: &s.ema_bigram_emb,
+            role: ResearchRole::Embed,
+            decay: true,
+        },
+        ResearchItem {
+            param: &w.ve_emb,
+            grad: &g.ve_emb,
+            state1: &s.ve_emb.exp_avg,
+            state2: &s.ve_emb.exp_avg_sq,
+            ema: &s.ema_ve_emb,
+            role: ResearchRole::Embed,
+            decay: true,
+        },
+        ResearchItem {
+            param: &w.bigram_proj,
+            grad: &g.bigram_proj,
+            state1: &s.bigram_proj.exp_avg,
+            state2: &s.bigram_proj.exp_avg_sq,
+            ema: &s.ema_bigram_proj,
+            role: ResearchRole::Auxiliary,
+            decay: true,
+        },
+        ResearchItem {
+            param: &w.bigram_scale,
+            grad: &g.bigram_scale,
+            state1: &s.bigram_scale.exp_avg,
+            state2: &s.bigram_scale.exp_avg_sq,
+            ema: &s.ema_bigram_scale,
+            role: ResearchRole::Auxiliary,
+            decay: false,
+        },
+        ResearchItem {
+            param: &w.smear_gate,
+            grad: &g.smear_gate,
+            state1: &s.smear_gate.exp_avg,
+            state2: &s.smear_gate.exp_avg_sq,
+            ema: &s.ema_smear_gate,
+            role: ResearchRole::Auxiliary,
+            decay: false,
+        },
+        ResearchItem {
+            param: &w.ve_proj,
+            grad: &g.ve_proj,
+            state1: &s.ve_proj.exp_avg,
+            state2: &s.ve_proj.exp_avg_sq,
+            ema: &s.ema_ve_proj,
+            role: ResearchRole::Auxiliary,
+            decay: true,
+        },
+        ResearchItem {
+            param: &w.ve_scale,
+            grad: &g.ve_scale,
+            state1: &s.ve_scale.exp_avg,
+            state2: &s.ve_scale.exp_avg_sq,
+            ema: &s.ema_ve_scale,
+            role: ResearchRole::Auxiliary,
+            decay: false,
+        },
+        ResearchItem {
+            param: &w.skip_weights,
+            grad: &g.skip_weights,
+            state1: &s.skip_weights.exp_avg,
+            state2: &s.skip_weights.exp_avg_sq,
+            ema: &s.ema_skip_weights,
+            role: ResearchRole::Auxiliary,
+            decay: false,
+        },
+        ResearchItem {
+            param: &w.qo_bank,
+            grad: &g.qo_bank,
+            state1: &s.mom_qo,
+            state2: &s.var_qo,
+            ema: &s.ema_qo,
+            role: ResearchRole::Matrix,
+            decay: true,
+        },
+        ResearchItem {
+            param: &w.kv_bank,
+            grad: &g.kv_bank,
+            state1: &s.mom_kv,
+            state2: &s.var_kv,
+            ema: &s.ema_kv,
+            role: ResearchRole::Matrix,
+            decay: true,
+        },
+        ResearchItem {
+            param: &w.mlp_up,
+            grad: &g.mlp_up,
+            state1: &s.mom_up,
+            state2: &s.var_up,
+            ema: &s.ema_up,
+            role: ResearchRole::Matrix,
+            decay: true,
+        },
+        ResearchItem {
+            param: &w.mlp_down,
+            grad: &g.mlp_down,
+            state1: &s.mom_dn,
+            state2: &s.var_dn,
+            ema: &s.ema_dn,
+            role: ResearchRole::Matrix,
+            decay: true,
+        },
     ];
     for i in 0..w.ve_layer_scales.len() {
-        items.push(ResearchItem { param: &w.ve_layer_scales[i], grad: &g.ve_layer_scales[i], state1: &s.ve_layer_scales[i].exp_avg, state2: &s.ve_layer_scales[i].exp_avg_sq, ema: &s.ema_ve_layer_scales[i], role: ResearchRole::Auxiliary, decay: false });
+        items.push(ResearchItem {
+            param: &w.ve_layer_scales[i],
+            grad: &g.ve_layer_scales[i],
+            state1: &s.ve_layer_scales[i].exp_avg,
+            state2: &s.ve_layer_scales[i].exp_avg_sq,
+            ema: &s.ema_ve_layer_scales[i],
+            role: ResearchRole::Auxiliary,
+            decay: false,
+        });
     }
     for i in 0..w.blocks.len() {
         let wb = &w.blocks[i];
@@ -953,11 +1159,51 @@ fn research_items<'a>(w: &'a Weights, g: &'a Grads, s: &'a OptimState) -> Vec<Re
         let sb = &s.blocks[i];
         let eb = &s.ema_blocks[i];
         items.extend([
-            ResearchItem { param: &wb.q_gain, grad: &gb.q_gain, state1: &sb.q_gain.exp_avg, state2: &sb.q_gain.exp_avg_sq, ema: &eb.q_gain, role: ResearchRole::Auxiliary, decay: false },
-            ResearchItem { param: &wb.vr_lambda, grad: &gb.vr_lambda, state1: &sb.vr_lambda.exp_avg, state2: &sb.vr_lambda.exp_avg_sq, ema: &eb.vr_lambda, role: ResearchRole::Auxiliary, decay: false },
-            ResearchItem { param: &wb.attn_scale, grad: &gb.attn_scale, state1: &sb.attn_scale.exp_avg, state2: &sb.attn_scale.exp_avg_sq, ema: &eb.attn_scale, role: ResearchRole::Auxiliary, decay: false },
-            ResearchItem { param: &wb.mlp_scale, grad: &gb.mlp_scale, state1: &sb.mlp_scale.exp_avg, state2: &sb.mlp_scale.exp_avg_sq, ema: &eb.mlp_scale, role: ResearchRole::Auxiliary, decay: false },
-            ResearchItem { param: &wb.resid_mix, grad: &gb.resid_mix, state1: &sb.resid_mix.exp_avg, state2: &sb.resid_mix.exp_avg_sq, ema: &eb.resid_mix, role: ResearchRole::Auxiliary, decay: false },
+            ResearchItem {
+                param: &wb.q_gain,
+                grad: &gb.q_gain,
+                state1: &sb.q_gain.exp_avg,
+                state2: &sb.q_gain.exp_avg_sq,
+                ema: &eb.q_gain,
+                role: ResearchRole::Auxiliary,
+                decay: false,
+            },
+            ResearchItem {
+                param: &wb.vr_lambda,
+                grad: &gb.vr_lambda,
+                state1: &sb.vr_lambda.exp_avg,
+                state2: &sb.vr_lambda.exp_avg_sq,
+                ema: &eb.vr_lambda,
+                role: ResearchRole::Auxiliary,
+                decay: false,
+            },
+            ResearchItem {
+                param: &wb.attn_scale,
+                grad: &gb.attn_scale,
+                state1: &sb.attn_scale.exp_avg,
+                state2: &sb.attn_scale.exp_avg_sq,
+                ema: &eb.attn_scale,
+                role: ResearchRole::Auxiliary,
+                decay: false,
+            },
+            ResearchItem {
+                param: &wb.mlp_scale,
+                grad: &gb.mlp_scale,
+                state1: &sb.mlp_scale.exp_avg,
+                state2: &sb.mlp_scale.exp_avg_sq,
+                ema: &eb.mlp_scale,
+                role: ResearchRole::Auxiliary,
+                decay: false,
+            },
+            ResearchItem {
+                param: &wb.resid_mix,
+                grad: &gb.resid_mix,
+                state1: &sb.resid_mix.exp_avg,
+                state2: &sb.resid_mix.exp_avg_sq,
+                ema: &eb.resid_mix,
+                role: ResearchRole::Auxiliary,
+                decay: false,
+            },
         ]);
     }
     items
@@ -980,7 +1226,9 @@ fn prodigy_items<'a>(w: &'a Weights, g: &'a Grads, s: &'a OptimState) -> Vec<Pro
         (&s.mag_v_up, &s.prev_up),
         (&s.mag_v_dn, &s.prev_dn),
     ];
-    for slot in &s.ve_layer_scales { extras.push((&slot.aux, &slot.origin)); }
+    for slot in &s.ve_layer_scales {
+        extras.push((&slot.aux, &slot.origin));
+    }
     for block in &s.blocks {
         extras.extend([
             (&block.q_gain.aux, &block.q_gain.origin),
@@ -993,7 +1241,11 @@ fn prodigy_items<'a>(w: &'a Weights, g: &'a Grads, s: &'a OptimState) -> Vec<Pro
     assert_eq!(base.len(), extras.len());
     base.into_iter()
         .zip(extras)
-        .map(|(base, (state_s, p0))| ProdigyItem { base, s: state_s, p0 })
+        .map(|(base, (state_s, p0))| ProdigyItem {
+            base,
+            s: state_s,
+            p0,
+        })
         .collect()
 }
 
@@ -1022,18 +1274,30 @@ fn research_optimizer_step(
         .ok_or_else(|| format!("{} has no generic native algorithm", state.kind))?;
     let hp = &state.hp;
     let step = state.step + 1;
-    let beta1 = if algorithm == 4 { 0.9 } else if algorithm == 5 { 0.965 } else { hp.adam_beta1 };
-    let beta2 = if algorithm == 1 || algorithm == 2 { 0.99 } else { hp.adam_beta2 };
+    let beta1 = if algorithm == 4 {
+        0.9
+    } else if algorithm == 5 {
+        0.965
+    } else {
+        hp.adam_beta1
+    };
+    let beta2 = if algorithm == 1 || algorithm == 2 {
+        0.99
+    } else {
+        hp.adam_beta2
+    };
     let bc1 = 1.0 - beta1.powi(step as i32);
     let bc2 = 1.0 - beta2.powi(step as i32);
-    let hessian_update = u32::from(
-        algorithm == 5 && step % hp.sophia_hessian_interval.max(1) == 0,
-    );
+    let hessian_update = u32::from(algorithm == 5 && step % hp.sophia_hessian_interval.max(1) == 0);
     let n_sf = step as f32;
     let weight_sum = n_sf * (n_sf + 1.0) * (2.0 * n_sf + 1.0) / 6.0;
     let ckp1 = n_sf * n_sf / weight_sum;
     let sf_warm = hp.schedule_free_warmup;
-    let sf_mul = if sf_warm == 0 { 1.0 } else { (step as f32 / sf_warm as f32).min(1.0) };
+    let sf_mul = if sf_warm == 0 {
+        1.0
+    } else {
+        (step as f32 / sf_warm as f32).min(1.0)
+    };
     let effective_lr_mul = if algorithm == 6 { sf_mul } else { lr_mul };
     let update = rt.pipeline("research_optimizer_ema_f32")?;
     let count = rt.pipeline("cautious_mask_count_f32")?;
@@ -1047,7 +1311,9 @@ fn research_optimizer_step(
         };
         let lr = base_lr * effective_lr_mul;
         let mut wd = if item.decay { hp.weight_decay } else { 0.0 };
-        if algorithm == 1 || algorithm == 2 { wd *= 3.0; }
+        if algorithm == 1 || algorithm == 2 {
+            wd *= 3.0;
+        }
         let n = item.param.numel();
         let width = update.threadExecutionWidth() as usize;
         let tpt = width.min(n).max(1);
@@ -1134,7 +1400,11 @@ fn prodigy_optimizer_step(
             let width = accumulate.threadExecutionWidth() as usize;
             let tpt = width.min(n).max(1);
             let groups = n.div_ceil(tpt);
-            let wd = if item.base.decay { hp.weight_decay } else { 0.0 };
+            let wd = if item.base.decay {
+                hp.weight_decay
+            } else {
+                0.0
+            };
             rt.with_binder(|bnd| {
                 bnd.set_pipeline(&accumulate);
                 set_tensor(bnd, item.base.param, 0);
@@ -1230,9 +1500,32 @@ fn muon_bank(
 ) -> Result<(), String> {
     if rt.has_tensorops() && (rows.min(cols) >= 256 || post_kind != 0 || pre_kind != 0) {
         return muon_bank_tensorops(
-            rt, param, grad, momentum, aux_state, prev_state, extra_state, scratch,
-            clip_coef, n, rows, cols, lr, mom, wd, scale, ema, ema_decay, orthogonalizer, post_kind,
-            post_beta2, pre_kind, pre_beta, pre_alpha, first_step, optim_step,
+            rt,
+            param,
+            grad,
+            momentum,
+            aux_state,
+            prev_state,
+            extra_state,
+            scratch,
+            clip_coef,
+            n,
+            rows,
+            cols,
+            lr,
+            mom,
+            wd,
+            scale,
+            ema,
+            ema_decay,
+            orthogonalizer,
+            post_kind,
+            post_beta2,
+            pre_kind,
+            pre_beta,
+            pre_alpha,
+            first_step,
+            optim_step,
             direction_scale,
         );
     }
@@ -1271,8 +1564,8 @@ fn muon_bank(
             );
             set_u32(bnd, orthogonalizer.kernel_kind(), 20);
             bnd.dispatch(mtl_size(n as usize, 1, 1), mtl_size(tpg, 1, 1));
-        Ok(())
-    })
+            Ok(())
+        })
     } else {
         let pipe = rt.pipeline("muon_bank_ns5_f32")?;
         rt.with_binder(|bnd| {
@@ -1305,8 +1598,8 @@ fn muon_bank(
             );
             set_u32(bnd, orthogonalizer.kernel_kind(), 18);
             bnd.dispatch(mtl_size(n as usize, 1, 1), mtl_size(tpg, 1, 1));
-        Ok(())
-    })
+            Ok(())
+        })
     }
 }
 
@@ -1455,19 +1748,40 @@ fn muon_bank_tensorops(
     for (a, b, c) in orthogonalizer.coefficients() {
         if rows <= cols {
             batched_tensorops_gemm(
-                rt, "matmul2d_tensorops_batched_nt_f32", &x, &x, &gram,
-                batch, rows, rows, cols,
+                rt,
+                "matmul2d_tensorops_batched_nt_f32",
+                &x,
+                &x,
+                &gram,
+                batch,
+                rows,
+                rows,
+                cols,
             )?;
         } else {
             batched_tensorops_gemm(
-                rt, "matmul2d_tensorops_batched_tn_f32", &x, &x, &gram,
-                batch, cols, cols, rows,
+                rt,
+                "matmul2d_tensorops_batched_tn_f32",
+                &x,
+                &x,
+                &gram,
+                batch,
+                cols,
+                cols,
+                rows,
             )?;
         }
         mprof.lap(rt, "muon_xxt")?;
         batched_tensorops_gemm(
-            rt, "matmul2d_tensorops_batched_f32", &gram, &gram, &gram2,
-            batch, p, p, p,
+            rt,
+            "matmul2d_tensorops_batched_f32",
+            &gram,
+            &gram,
+            &gram2,
+            batch,
+            p,
+            p,
+            p,
         )?;
         mprof.lap(rt, "muon_a2")?;
         dispatch_1d(rt, &poly, gram_bank, |bnd| {
@@ -1479,13 +1793,27 @@ fn muon_bank_tensorops(
         })?;
         if rows <= cols {
             batched_tensorops_gemm(
-                rt, "matmul2d_tensorops_batched_f32", &gram2, &x, &y,
-                batch, rows, cols, rows,
+                rt,
+                "matmul2d_tensorops_batched_f32",
+                &gram2,
+                &x,
+                &y,
+                batch,
+                rows,
+                cols,
+                rows,
             )?;
         } else {
             batched_tensorops_gemm(
-                rt, "matmul2d_tensorops_batched_f32", &x, &gram2, &y,
-                batch, rows, cols, cols,
+                rt,
+                "matmul2d_tensorops_batched_f32",
+                &x,
+                &gram2,
+                &y,
+                batch,
+                rows,
+                cols,
+                cols,
             )?;
         }
         dispatch_1d(rt, &x_combine, mat_bank, |bnd| {
@@ -1512,7 +1840,6 @@ fn muon_bank_tensorops(
             Ok(())
         })?;
     }
-
 
     if post_kind == 2 {
         let finalize = rt.pipeline("muown_finalize_f32")?;
@@ -1877,11 +2204,7 @@ pub fn optim_step(
             mom,
             hp.weight_decay,
             bank_scale(c as usize, c as usize),
-            if apply_ema {
-                Some(&state.ema_qo)
-            } else {
-                None
-            },
+            if apply_ema { Some(&state.ema_qo) } else { None },
             ema_d,
             orthogonalizer,
             post_kind,
@@ -1912,11 +2235,7 @@ pub fn optim_step(
             mom,
             hp.weight_decay,
             bank_scale(c as usize, kv as usize),
-            if apply_ema {
-                Some(&state.ema_kv)
-            } else {
-                None
-            },
+            if apply_ema { Some(&state.ema_kv) } else { None },
             ema_d,
             orthogonalizer,
             post_kind,
@@ -1935,257 +2254,277 @@ pub fn optim_step(
     let n_mingru = w.cfg.mixer_count(MixerKind::MinGRU) as u32;
 
     if n_mamba > 0 {
-            let d_inner = w.cfg.mamba_d_inner() as u32;
-            let in_out = w.cfg.mamba_in_proj_out() as u32;
-            if let (Some(ref pw), Some(ref pg), Some(ref pm), Some(ref pv), Some(ref pp), Some(ref ema)) = (
-                w.mamba_in_proj.as_ref(),
-                grads.mamba_in_proj.as_ref(),
-                state.mom_mamba_in_proj.as_ref(),
-                state.var_mamba_in_proj.as_ref(),
-                state.prev_mamba_in_proj.as_ref(),
-                state.ema_mamba_in_proj.as_ref(),
-            ) {
-                muon_bank(
-                    rt,
-                    pw,
-                    pg,
-                    pm,
-                    pv,
-                    pp,
-                    &state.mag_v_mamba_in_proj.as_ref().unwrap(),
-                    &state.muon_scratch,
-                    muon_coef,
-                    n_mamba,
-                    c,
-                    in_out,
-                    lr_m,
-                    mom,
-                    hp.weight_decay,
-                    bank_scale(c as usize, in_out as usize),
-                    if apply_ema { Some(ema) } else { None },
-                    ema_d,
-                    orthogonalizer,
-                    post_kind,
-                    hp.adam_beta2,
-                    pre_kind,
-                    hp.mona_beta_a,
-                    pre_alpha,
-                    state.step == 0,
-                    state.step,
-                    hp.muown_direction_scale,
-                )?;
-            }
-            if let (Some(ref pw), Some(ref pg), Some(ref pm), Some(ref pv), Some(ref pp), Some(ref ema)) = (
-                w.mamba_out_proj.as_ref(),
-                grads.mamba_out_proj.as_ref(),
-                state.mom_mamba_out_proj.as_ref(),
-                state.var_mamba_out_proj.as_ref(),
-                state.prev_mamba_out_proj.as_ref(),
-                state.ema_mamba_out_proj.as_ref(),
-            ) {
-                muon_bank(
-                    rt,
-                    pw,
-                    pg,
-                    pm,
-                    pv,
-                    pp,
-                    &state.mag_v_mamba_out_proj.as_ref().unwrap(),
-                    &state.muon_scratch,
-                    muon_coef,
-                    n_mamba,
-                    d_inner,
-                    c,
-                    lr_m,
-                    mom,
-                    hp.weight_decay,
-                    bank_scale(d_inner as usize, c as usize),
-                    if apply_ema { Some(ema) } else { None },
-                    ema_d,
-                    orthogonalizer,
-                    post_kind,
-                    hp.adam_beta2,
-                    pre_kind,
-                    hp.mona_beta_a,
-                    pre_alpha,
-                    state.step == 0,
-                    state.step,
-                    hp.muown_direction_scale,
-                )?;
-            }
-            let mut mamba_scalar: Vec<(&Tensor, &Tensor, &AdamSlot, Option<&Tensor>)> = Vec::new();
-            if let (Some(t), Some(g), Some(s), Some(e)) = (
-                w.mamba_conv1d_weight.as_ref(),
-                grads.mamba_conv1d_weight.as_ref(),
-                state.mamba_conv1d_weight.as_ref(),
-                state.ema_mamba_conv1d_weight.as_ref(),
-            ) {
-                mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
-            }
-            if let (Some(t), Some(g), Some(s), Some(e)) = (
-                w.mamba_conv1d_bias.as_ref(),
-                grads.mamba_conv1d_bias.as_ref(),
-                state.mamba_conv1d_bias.as_ref(),
-                state.ema_mamba_conv1d_bias.as_ref(),
-            ) {
-                mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
-            }
-            if let (Some(t), Some(g), Some(s), Some(e)) = (
-                w.mamba_a_log.as_ref(),
-                grads.mamba_a_log.as_ref(),
-                state.mamba_a_log.as_ref(),
-                state.ema_mamba_a_log.as_ref(),
-            ) {
-                mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
-            }
-            if let (Some(t), Some(g), Some(s), Some(e)) = (
-                w.mamba_d.as_ref(),
-                grads.mamba_d.as_ref(),
-                state.mamba_d.as_ref(),
-                state.ema_mamba_d.as_ref(),
-            ) {
-                mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
-            }
-            if let (Some(t), Some(g), Some(s), Some(e)) = (
-                w.mamba_dt_bias.as_ref(),
-                grads.mamba_dt_bias.as_ref(),
-                state.mamba_dt_bias.as_ref(),
-                state.ema_mamba_dt_bias.as_ref(),
-            ) {
-                mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
-            }
-            if let (Some(t), Some(g), Some(s), Some(e)) = (
-                w.mamba_norm.as_ref(),
-                grads.mamba_norm.as_ref(),
-                state.mamba_norm.as_ref(),
-                state.ema_mamba_norm.as_ref(),
-            ) {
-                mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
-            }
-            if !mamba_scalar.is_empty() {
-                adamw_ema_segment_pack(
-                    rt,
-                    &mamba_scalar,
-                    adamw_coef,
-                    lr_s,
-                    beta1,
-                    beta2,
-                    hp.adam_eps,
-                    hp.weight_decay,
-                    step_s,
-                    bias2_sqrt_inv,
-                    decay,
-                )?;
-            }
+        let d_inner = w.cfg.mamba_d_inner() as u32;
+        let in_out = w.cfg.mamba_in_proj_out() as u32;
+        if let (
+            Some(ref pw),
+            Some(ref pg),
+            Some(ref pm),
+            Some(ref pv),
+            Some(ref pp),
+            Some(ref ema),
+        ) = (
+            w.mamba_in_proj.as_ref(),
+            grads.mamba_in_proj.as_ref(),
+            state.mom_mamba_in_proj.as_ref(),
+            state.var_mamba_in_proj.as_ref(),
+            state.prev_mamba_in_proj.as_ref(),
+            state.ema_mamba_in_proj.as_ref(),
+        ) {
+            muon_bank(
+                rt,
+                pw,
+                pg,
+                pm,
+                pv,
+                pp,
+                &state.mag_v_mamba_in_proj.as_ref().unwrap(),
+                &state.muon_scratch,
+                muon_coef,
+                n_mamba,
+                c,
+                in_out,
+                lr_m,
+                mom,
+                hp.weight_decay,
+                bank_scale(c as usize, in_out as usize),
+                if apply_ema { Some(ema) } else { None },
+                ema_d,
+                orthogonalizer,
+                post_kind,
+                hp.adam_beta2,
+                pre_kind,
+                hp.mona_beta_a,
+                pre_alpha,
+                state.step == 0,
+                state.step,
+                hp.muown_direction_scale,
+            )?;
+        }
+        if let (
+            Some(ref pw),
+            Some(ref pg),
+            Some(ref pm),
+            Some(ref pv),
+            Some(ref pp),
+            Some(ref ema),
+        ) = (
+            w.mamba_out_proj.as_ref(),
+            grads.mamba_out_proj.as_ref(),
+            state.mom_mamba_out_proj.as_ref(),
+            state.var_mamba_out_proj.as_ref(),
+            state.prev_mamba_out_proj.as_ref(),
+            state.ema_mamba_out_proj.as_ref(),
+        ) {
+            muon_bank(
+                rt,
+                pw,
+                pg,
+                pm,
+                pv,
+                pp,
+                &state.mag_v_mamba_out_proj.as_ref().unwrap(),
+                &state.muon_scratch,
+                muon_coef,
+                n_mamba,
+                d_inner,
+                c,
+                lr_m,
+                mom,
+                hp.weight_decay,
+                bank_scale(d_inner as usize, c as usize),
+                if apply_ema { Some(ema) } else { None },
+                ema_d,
+                orthogonalizer,
+                post_kind,
+                hp.adam_beta2,
+                pre_kind,
+                hp.mona_beta_a,
+                pre_alpha,
+                state.step == 0,
+                state.step,
+                hp.muown_direction_scale,
+            )?;
+        }
+        let mut mamba_scalar: Vec<(&Tensor, &Tensor, &AdamSlot, Option<&Tensor>)> = Vec::new();
+        if let (Some(t), Some(g), Some(s), Some(e)) = (
+            w.mamba_conv1d_weight.as_ref(),
+            grads.mamba_conv1d_weight.as_ref(),
+            state.mamba_conv1d_weight.as_ref(),
+            state.ema_mamba_conv1d_weight.as_ref(),
+        ) {
+            mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
+        }
+        if let (Some(t), Some(g), Some(s), Some(e)) = (
+            w.mamba_conv1d_bias.as_ref(),
+            grads.mamba_conv1d_bias.as_ref(),
+            state.mamba_conv1d_bias.as_ref(),
+            state.ema_mamba_conv1d_bias.as_ref(),
+        ) {
+            mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
+        }
+        if let (Some(t), Some(g), Some(s), Some(e)) = (
+            w.mamba_a_log.as_ref(),
+            grads.mamba_a_log.as_ref(),
+            state.mamba_a_log.as_ref(),
+            state.ema_mamba_a_log.as_ref(),
+        ) {
+            mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
+        }
+        if let (Some(t), Some(g), Some(s), Some(e)) = (
+            w.mamba_d.as_ref(),
+            grads.mamba_d.as_ref(),
+            state.mamba_d.as_ref(),
+            state.ema_mamba_d.as_ref(),
+        ) {
+            mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
+        }
+        if let (Some(t), Some(g), Some(s), Some(e)) = (
+            w.mamba_dt_bias.as_ref(),
+            grads.mamba_dt_bias.as_ref(),
+            state.mamba_dt_bias.as_ref(),
+            state.ema_mamba_dt_bias.as_ref(),
+        ) {
+            mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
+        }
+        if let (Some(t), Some(g), Some(s), Some(e)) = (
+            w.mamba_norm.as_ref(),
+            grads.mamba_norm.as_ref(),
+            state.mamba_norm.as_ref(),
+            state.ema_mamba_norm.as_ref(),
+        ) {
+            mamba_scalar.push((t, g, s, if apply_ema { Some(e) } else { None }));
+        }
+        if !mamba_scalar.is_empty() {
+            adamw_ema_segment_pack(
+                rt,
+                &mamba_scalar,
+                adamw_coef,
+                lr_s,
+                beta1,
+                beta2,
+                hp.adam_eps,
+                hp.weight_decay,
+                step_s,
+                bias2_sqrt_inv,
+                decay,
+            )?;
+        }
     }
 
     if n_mingru > 0 {
-            let hid = w.cfg.mingru_hidden() as u32;
-            let kv = w.cfg.kv_dim() as u32;
-            let mut mingru_banks: Vec<(
-                &Option<Tensor>,
-                &Option<Tensor>,
-                &Option<Tensor>,
-                &Option<Tensor>,
-                &Option<Tensor>,
-                &Option<Tensor>,
-                &Option<Tensor>,
-                u32,
-                u32,
-            )> = vec![
-                (
-                    &w.mingru_to_z,
-                    &grads.mingru_to_z,
-                    &state.mom_mingru_to_z,
-                    &state.var_mingru_to_z,
-                    &state.prev_mingru_to_z,
-                    &state.ema_mingru_to_z,
-                    &state.mag_v_mingru_to_z,
-                    c,
-                    hid,
-                ),
-                (
-                    &w.mingru_to_h,
-                    &grads.mingru_to_h,
-                    &state.mom_mingru_to_h,
-                    &state.var_mingru_to_h,
-                    &state.prev_mingru_to_h,
-                    &state.ema_mingru_to_h,
-                    &state.mag_v_mingru_to_h,
-                    c,
-                    hid,
-                ),
-                (
-                    &w.mingru_out,
-                    &grads.mingru_out,
-                    &state.mom_mingru_out,
-                    &state.var_mingru_out,
-                    &state.prev_mingru_out,
-                    &state.ema_mingru_out,
-                    &state.mag_v_mingru_out,
-                    hid,
-                    c,
-                ),
-            ];
-            if w.cfg.value_residual {
-                mingru_banks.push((
-                    &w.mingru_v_proj,
-                    &grads.mingru_v_proj,
-                    &state.mom_mingru_v_proj,
-                    &state.var_mingru_v_proj,
-                    &state.prev_mingru_v_proj,
-                    &state.ema_mingru_v_proj,
-                    &state.mag_v_mingru_v_proj,
-                    c,
-                    kv,
-                ));
-                mingru_banks.push((
-                    &w.mingru_v0_up,
-                    &grads.mingru_v0_up,
-                    &state.mom_mingru_v0_up,
-                    &state.var_mingru_v0_up,
-                    &state.prev_mingru_v0_up,
-                    &state.ema_mingru_v0_up,
-                    &state.mag_v_mingru_v0_up,
-                    kv,
-                    hid,
-                ));
+        let hid = w.cfg.mingru_hidden() as u32;
+        let kv = w.cfg.kv_dim() as u32;
+        let mut mingru_banks: Vec<(
+            &Option<Tensor>,
+            &Option<Tensor>,
+            &Option<Tensor>,
+            &Option<Tensor>,
+            &Option<Tensor>,
+            &Option<Tensor>,
+            &Option<Tensor>,
+            u32,
+            u32,
+        )> = vec![
+            (
+                &w.mingru_to_z,
+                &grads.mingru_to_z,
+                &state.mom_mingru_to_z,
+                &state.var_mingru_to_z,
+                &state.prev_mingru_to_z,
+                &state.ema_mingru_to_z,
+                &state.mag_v_mingru_to_z,
+                c,
+                hid,
+            ),
+            (
+                &w.mingru_to_h,
+                &grads.mingru_to_h,
+                &state.mom_mingru_to_h,
+                &state.var_mingru_to_h,
+                &state.prev_mingru_to_h,
+                &state.ema_mingru_to_h,
+                &state.mag_v_mingru_to_h,
+                c,
+                hid,
+            ),
+            (
+                &w.mingru_out,
+                &grads.mingru_out,
+                &state.mom_mingru_out,
+                &state.var_mingru_out,
+                &state.prev_mingru_out,
+                &state.ema_mingru_out,
+                &state.mag_v_mingru_out,
+                hid,
+                c,
+            ),
+        ];
+        if w.cfg.value_residual {
+            mingru_banks.push((
+                &w.mingru_v_proj,
+                &grads.mingru_v_proj,
+                &state.mom_mingru_v_proj,
+                &state.var_mingru_v_proj,
+                &state.prev_mingru_v_proj,
+                &state.ema_mingru_v_proj,
+                &state.mag_v_mingru_v_proj,
+                c,
+                kv,
+            ));
+            mingru_banks.push((
+                &w.mingru_v0_up,
+                &grads.mingru_v0_up,
+                &state.mom_mingru_v0_up,
+                &state.var_mingru_v0_up,
+                &state.prev_mingru_v0_up,
+                &state.ema_mingru_v0_up,
+                &state.mag_v_mingru_v0_up,
+                kv,
+                hid,
+            ));
+        }
+        for (pw, pg, pm, pv, pp, ema, mag, rows, cols) in mingru_banks {
+            if let (Some(pw), Some(pg), Some(pm), Some(pv), Some(pp), Some(ema), Some(mag)) = (
+                pw.as_ref(),
+                pg.as_ref(),
+                pm.as_ref(),
+                pv.as_ref(),
+                pp.as_ref(),
+                ema.as_ref(),
+                mag.as_ref(),
+            ) {
+                muon_bank(
+                    rt,
+                    pw,
+                    pg,
+                    pm,
+                    pv,
+                    pp,
+                    mag,
+                    &state.muon_scratch,
+                    muon_coef,
+                    n_mingru,
+                    rows,
+                    cols,
+                    lr_m,
+                    mom,
+                    hp.weight_decay,
+                    bank_scale(rows as usize, cols as usize),
+                    if apply_ema { Some(ema) } else { None },
+                    ema_d,
+                    orthogonalizer,
+                    post_kind,
+                    hp.adam_beta2,
+                    pre_kind,
+                    hp.mona_beta_a,
+                    pre_alpha,
+                    state.step == 0,
+                    state.step,
+                    hp.muown_direction_scale,
+                )?;
             }
-            for (pw, pg, pm, pv, pp, ema, mag, rows, cols) in mingru_banks {
-                if let (Some(pw), Some(pg), Some(pm), Some(pv), Some(pp), Some(ema), Some(mag)) =
-                    (pw.as_ref(), pg.as_ref(), pm.as_ref(), pv.as_ref(), pp.as_ref(), ema.as_ref(), mag.as_ref())
-                {
-                    muon_bank(
-                        rt,
-                        pw,
-                        pg,
-                        pm,
-                        pv,
-                        pp,
-                        mag,
-                        &state.muon_scratch,
-                        muon_coef,
-                        n_mingru,
-                        rows,
-                        cols,
-                        lr_m,
-                        mom,
-                        hp.weight_decay,
-                        bank_scale(rows as usize, cols as usize),
-                        if apply_ema { Some(ema) } else { None },
-                        ema_d,
-                        orthogonalizer,
-                        post_kind,
-                        hp.adam_beta2,
-                        pre_kind,
-                        hp.mona_beta_a,
-                        pre_alpha,
-                        state.step == 0,
-                        state.step,
-                        hp.muown_direction_scale,
-                    )?;
-                }
-            }
+        }
     }
 
     muon_bank(
@@ -2428,13 +2767,12 @@ mod ns5_tests {
                 OptimizerKind::Adamw | OptimizerKind::CautiousAdamw => {
                     before - hp.matrix_lr * 0.2 / (0.2 + hp.adam_eps)
                 }
-                OptimizerKind::Lion
-                | OptimizerKind::CautiousLion
-                | OptimizerKind::Sophia => before - hp.matrix_lr,
+                OptimizerKind::Lion | OptimizerKind::CautiousLion | OptimizerKind::Sophia => {
+                    before - hp.matrix_lr
+                }
                 OptimizerKind::SgdMomentum => before - hp.matrix_lr * 0.2,
                 OptimizerKind::ScheduleFreeAdamw => {
-                    let denom = ((1.0 - hp.adam_beta2) * 0.2f32.powi(2)).sqrt()
-                        + hp.adam_eps;
+                    let denom = ((1.0 - hp.adam_beta2) * 0.2f32.powi(2)).sqrt() + hp.adam_eps;
                     before - hp.matrix_lr * 0.2 / denom
                 }
                 OptimizerKind::Prodigy => {
@@ -2545,9 +2883,33 @@ mod ns5_tests {
         let clip = rt.alloc_buffer(4)?;
         clip.write_f32(&[1.0]);
         muon_bank_tensorops(
-            rt, &param, g, &mom, &aux, &prev, &extra, &scratch, &clip, n, rows, cols, 1.0,
-            0.0, 0.0, 1.0, None, 0.0, MuonOrthogonalizer::NewtonSchulz(ns_steps), 0,
-            0.95, 0, 0.99, 0.0, true, 0, 0.2,
+            rt,
+            &param,
+            g,
+            &mom,
+            &aux,
+            &prev,
+            &extra,
+            &scratch,
+            &clip,
+            n,
+            rows,
+            cols,
+            1.0,
+            0.0,
+            0.0,
+            1.0,
+            None,
+            0.0,
+            MuonOrthogonalizer::NewtonSchulz(ns_steps),
+            0,
+            0.95,
+            0,
+            0.99,
+            0.0,
+            true,
+            0,
+            0.2,
         )?;
         rt.synchronize()?;
         Ok(param.buffer.read_f32().iter().map(|x| -x).collect())
@@ -2582,13 +2944,7 @@ mod ns5_tests {
     }
 
     fn host_ns(g: &[f32], rows: usize, cols: usize, steps: usize) -> Vec<f32> {
-        host_orth(
-            g,
-            rows,
-            cols,
-            &vec![(NS_A, NS_B, NS_C); steps],
-            1.0,
-        )
+        host_orth(g, rows, cols, &vec![(NS_A, NS_B, NS_C); steps], 1.0)
     }
 
     fn host_orth(
@@ -2673,15 +3029,7 @@ mod ns5_tests {
             .collect();
         let g = rt.alloc_tensor_f32(&[2, 16, 8]).unwrap();
         g.buffer.write_f32(&data);
-        let got = run_orth_only(
-            &rt,
-            &g,
-            2,
-            16,
-            8,
-            MuonOrthogonalizer::PolarExpress,
-        )
-        .unwrap();
+        let got = run_orth_only(&rt, &g, 2, 16, 8, MuonOrthogonalizer::PolarExpress).unwrap();
         let mut expected = Vec::with_capacity(data.len());
         for matrix in data.chunks_exact(16 * 8) {
             expected.extend(host_orth(matrix, 16, 8, &POLAR_COEFFS, 1.02));
@@ -2702,7 +3050,9 @@ mod ns5_tests {
         let data: Vec<f32> = (0..batch as usize * mat)
             .map(|i| ((i % 29) as f32) * 0.009 - 0.12)
             .collect();
-        let g = rt.alloc_tensor_f32(&[batch as usize, rows as usize, cols as usize]).unwrap();
+        let g = rt
+            .alloc_tensor_f32(&[batch as usize, rows as usize, cols as usize])
+            .unwrap();
         g.buffer.write_f32(&data);
         let param = zeros_like(&rt, &g).unwrap();
         let mom = zeros_like(&rt, &g).unwrap();
@@ -2763,7 +3113,9 @@ mod ns5_tests {
                 }
             }
             let after = x.iter().map(|v| v * v).sum::<f32>().sqrt();
-            for value in &mut x { *value *= before / (after + 1e-10); }
+            for value in &mut x {
+                *value *= before / (after + 1e-10);
+            }
             expected.extend(x);
         }
         let max_abs = got
@@ -2782,7 +3134,9 @@ mod ns5_tests {
         let mat = rows as usize * cols as usize;
         let g1_data: Vec<f32> = (0..mat).map(|i| (i % 17) as f32 * 0.01 - 0.08).collect();
         let g2_data: Vec<f32> = (0..mat).map(|i| (i % 19) as f32 * 0.008 - 0.06).collect();
-        let g = rt.alloc_tensor_f32(&[1, rows as usize, cols as usize]).unwrap();
+        let g = rt
+            .alloc_tensor_f32(&[1, rows as usize, cols as usize])
+            .unwrap();
         let param = zeros_like(&rt, &g).unwrap();
         let mom = zeros_like(&rt, &g).unwrap();
         let acc = zeros_like(&rt, &g).unwrap();
@@ -2795,13 +3149,39 @@ mod ns5_tests {
         let beta = 0.95;
         let beta_a = 0.99;
         let alpha = -1.0 / (2.0 * (1.0 - beta_a));
-        for (step, values) in [g1_data.as_slice(), g2_data.as_slice()].into_iter().enumerate() {
+        for (step, values) in [g1_data.as_slice(), g2_data.as_slice()]
+            .into_iter()
+            .enumerate()
+        {
             g.buffer.write_f32(values);
             muon_bank_tensorops(
-                &rt, &param, &g, &mom, &acc, &prev, &extra, &scratch, &clip, 1, rows, cols,
-                1.0, beta, 0.0, 1.0, None, 0.0,
-                MuonOrthogonalizer::NewtonSchulz(5), 0, 0.95, 1, beta_a, alpha,
-                step == 0, step, 0.2,
+                &rt,
+                &param,
+                &g,
+                &mom,
+                &acc,
+                &prev,
+                &extra,
+                &scratch,
+                &clip,
+                1,
+                rows,
+                cols,
+                1.0,
+                beta,
+                0.0,
+                1.0,
+                None,
+                0.0,
+                MuonOrthogonalizer::NewtonSchulz(5),
+                0,
+                0.95,
+                1,
+                beta_a,
+                alpha,
+                step == 0,
+                step,
+                0.2,
             )
             .unwrap();
         }
@@ -2810,10 +3190,17 @@ mod ns5_tests {
         let mut host_acc = vec![0.0f32; mat];
         let mut host_prev = vec![0.0f32; mat];
         let mut expected_param = vec![0.0f32; mat];
-        for (step, values) in [g1_data.as_slice(), g2_data.as_slice()].into_iter().enumerate() {
+        for (step, values) in [g1_data.as_slice(), g2_data.as_slice()]
+            .into_iter()
+            .enumerate()
+        {
             let mut transformed = vec![0.0f32; mat];
             for i in 0..mat {
-                let diff = if step == 0 { 0.0 } else { values[i] - host_prev[i] };
+                let diff = if step == 0 {
+                    0.0
+                } else {
+                    values[i] - host_prev[i]
+                };
                 host_acc[i] = beta_a * host_acc[i] + (1.0 - beta_a) * diff;
                 transformed[i] = values[i] + alpha * host_acc[i];
                 host_prev[i] = values[i];
@@ -2821,7 +3208,9 @@ mod ns5_tests {
                 transformed[i] += beta * host_mom[i];
             }
             let update = host_ns(&transformed, rows as usize, cols as usize, 5);
-            for i in 0..mat { expected_param[i] -= update[i]; }
+            for i in 0..mat {
+                expected_param[i] -= update[i];
+            }
         }
         let got = param.buffer.read_f32();
         let max_abs = got
@@ -2840,7 +3229,9 @@ mod ns5_tests {
         let mat = rows as usize * cols as usize;
         let initial: Vec<f32> = (0..mat).map(|i| (i % 31) as f32 * 0.004 - 0.06).collect();
         let grad_data: Vec<f32> = (0..mat).map(|i| (i % 23) as f32 * 0.006 - 0.05).collect();
-        let param = rt.alloc_tensor_f32(&[1, rows as usize, cols as usize]).unwrap();
+        let param = rt
+            .alloc_tensor_f32(&[1, rows as usize, cols as usize])
+            .unwrap();
         param.buffer.write_f32(&initial);
         let grad = zeros_like(&rt, &param).unwrap();
         grad.buffer.write_f32(&grad_data);
@@ -2853,9 +3244,32 @@ mod ns5_tests {
         let clip = rt.alloc_buffer(4).unwrap();
         clip.write_f32(&[1.0]);
         muon_bank_tensorops(
-            &rt, &param, &grad, &direction_mom, &mag_m, &direction, &mag_v,
-            &scratch, &clip, 1, rows, cols, 0.01, 0.95, 0.0, 1.0, None, 0.0,
-            MuonOrthogonalizer::NewtonSchulz(5), 2, 0.95, 2, 0.99, 0.0, true, 0,
+            &rt,
+            &param,
+            &grad,
+            &direction_mom,
+            &mag_m,
+            &direction,
+            &mag_v,
+            &scratch,
+            &clip,
+            1,
+            rows,
+            cols,
+            0.01,
+            0.95,
+            0.0,
+            1.0,
+            None,
+            0.0,
+            MuonOrthogonalizer::NewtonSchulz(5),
+            2,
+            0.95,
+            2,
+            0.99,
+            0.0,
+            true,
+            0,
             0.2,
         )
         .unwrap();
@@ -3001,7 +3415,8 @@ mod ns5_tests {
         let clip_coef = rt.alloc_buffer(4).unwrap();
         clip_coef.write_f32(&[1.0]);
         adamw_ema_one(
-            &rt, &param, &g, &slot, None, &clip_coef, lr, beta1, beta2, eps, wd, step_size, bias2, 0.0,
+            &rt, &param, &g, &slot, None, &clip_coef, lr, beta1, beta2, eps, wd, step_size, bias2,
+            0.0,
         )
         .unwrap();
         // host

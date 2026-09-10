@@ -1,0 +1,98 @@
+{
+  "jobs": [
+    {
+      "id": "cx32lad1536_w1536_attention_lr80_s1337",
+      "arm": "w1536_attention_lr80",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x8.0",
+      "status": "running",
+      "worker": 1,
+      "started": 1788587286.462116
+    },
+    {
+      "id": "cx32lad1536_w1536_attention_lr80_s42",
+      "arm": "w1536_attention_lr80",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "E21 ladder: d_model 1536, LR x8.0",
+      "status": "running",
+      "worker": 0,
+      "started": 1788587286.490245
+    },
+    {
+      "id": "cx32lad1536_w1536_attention_lr80_s100",
+      "arm": "w1536_attention_lr80",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "E21 ladder: d_model 1536, LR x8.0",
+      "status": "pending"
+    },
+    {
+      "id": "cx32lad1536_w1536_attention_lr80_s2026",
+      "arm": "w1536_attention_lr80",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 2026,
+      "note": "E21 ladder: d_model 1536, LR x8.0",
+      "status": "pending"
+    },
+    {
+      "id": "cx32lad1536_w1536_attention_lr80_s777",
+      "arm": "w1536_attention_lr80",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 777,
+      "note": "E21 ladder: d_model 1536, LR x8.0",
+      "status": "pending"
+    },
+    {
+      "id": "cx32lad1536_w1536_mingru_lr20_s1337",
+      "arm": "w1536_mingru_lr20",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x2.0",
+      "status": "pending"
+    },
+    {
+      "id": "cx32lad1536_w1536_mingru_lr20_s42",
+      "arm": "w1536_mingru_lr20",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "E21 ladder: d_model 1536, LR x2.0",
+      "status": "pending"
+    },
+    {
+      "id": "cx32lad1536_w1536_mingru_lr20_s100",
+      "arm": "w1536_mingru_lr20",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "E21 ladder: d_model 1536, LR x2.0",
+      "status": "pending"
+    },
+    {
+      "id": "cx32lad1536_w1536_mingru_lr20_s2026",
+      "arm": "w1536_mingru_lr20",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 2026,
+      "note": "E21 ladder: d_model 1536, LR x2.0",
+      "status": "pending"
+    },
+    {
+      "id": "cx32lad1536_w1536_mingru_lr20_s777",
+      "arm": "w1536_mingru_lr20",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 777,
+      "note": "E21 ladder: d_model 1536, LR x2.0",
+      "status": "pending"
+    }
+  ]
+}

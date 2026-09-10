@@ -10,13 +10,12 @@ use crate::gemm::{
     select_backend, GemmBackend,
 };
 use crate::mixers::{mamba2_bwd, mamba2_conv1d_bwd, mingru_bwd, mingru_vr_blend_bwd};
-use crate::ssm_glue::{
-    accum_slice_grad, flatten_heads, mamba2_d_skip_bwd, mamba2_log_da_bwd, mamba2_x_scaled_bwd,
-    mul_bwd, rms_norm_weight_bwd, silu_bwd, silu_bwd_store, softplus_bias_bwd,
-    unflatten_heads,
-};
 use crate::optim::{clip_grad_norm_device, ClipState};
 use crate::runtime::{GpuRuntime, PrecisionMode};
+use crate::ssm_glue::{
+    accum_slice_grad, flatten_heads, mamba2_d_skip_bwd, mamba2_log_da_bwd, mamba2_x_scaled_bwd,
+    mul_bwd, rms_norm_weight_bwd, silu_bwd, silu_bwd_store, softplus_bias_bwd, unflatten_heads,
+};
 use crate::tape::{LayerTape, Tape};
 use crate::tensor::Tensor;
 use crate::weights::Weights;
@@ -25,9 +24,7 @@ pub const GRAD_CLIP: f32 = 0.3;
 pub const BWD_ATOL: f32 = 1e-4;
 
 fn use_persistent_bf16(rt: &GpuRuntime, backend: GemmBackend) -> bool {
-    rt.precision() == PrecisionMode::Bf16
-        && backend == GemmBackend::TensorOps
-        && rt.has_tensorops()
+    rt.precision() == PrecisionMode::Bf16 && backend == GemmBackend::TensorOps && rt.has_tensorops()
 }
 
 /// Audit 7: pre-cast a shared f32 grad operand to bf16 **once** when each
@@ -552,16 +549,66 @@ pub fn backward_f32_opts_clip(
         prof.lap(rt, "resid_glue")?;
 
         let d_attn_in = match cfg.layer_mixer(layer) {
-            crate::weights::MixerKind::Attention => {
-                attention_bwd(rt, w, grads, layer, &attn_in, &d_attn_out, ids, backend, Some(v0), b, tlen, c, kv, h, hkv, d, bt, dv0.clone(), lt, &mut prof)?
-            },
+            crate::weights::MixerKind::Attention => attention_bwd(
+                rt,
+                w,
+                grads,
+                layer,
+                &attn_in,
+                &d_attn_out,
+                ids,
+                backend,
+                Some(v0),
+                b,
+                tlen,
+                c,
+                kv,
+                h,
+                hkv,
+                d,
+                bt,
+                dv0.clone(),
+                lt,
+                &mut prof,
+            )?,
             crate::weights::MixerKind::Mamba2 => {
-                let out = mamba2_bwd_rust(rt, w, grads, layer, &attn_in, &d_attn_out, backend, b, tlen, c, bt, lt)?;
+                let out = mamba2_bwd_rust(
+                    rt,
+                    w,
+                    grads,
+                    layer,
+                    &attn_in,
+                    &d_attn_out,
+                    backend,
+                    b,
+                    tlen,
+                    c,
+                    bt,
+                    lt,
+                )?;
                 prof.lap(rt, "mixer_ssm")?;
                 out
-            },
+            }
             crate::weights::MixerKind::MinGRU => {
-                let out = mingru_bwd_rust(rt, w, grads, layer, &attn_in, &d_attn_out, backend, Some(v0), b, tlen, c, kv, hkv, d, bt, dv0.clone(), lt)?;
+                let out = mingru_bwd_rust(
+                    rt,
+                    w,
+                    grads,
+                    layer,
+                    &attn_in,
+                    &d_attn_out,
+                    backend,
+                    Some(v0),
+                    b,
+                    tlen,
+                    c,
+                    kv,
+                    hkv,
+                    d,
+                    bt,
+                    dv0.clone(),
+                    lt,
+                )?;
                 prof.lap(rt, "mixer_ssm")?;
                 out
             }
@@ -639,7 +686,6 @@ pub fn backward_f32_opts_clip(
         prof.lap(rt, "resid_glue")?;
 
         dx = dx_stream;
-
     }
 
     // dx is now d(stem); add dx0 (resid_mix path) into stem grad
@@ -827,7 +873,6 @@ fn add_inplace(rt: &Arc<GpuRuntime>, dst: &Tensor, src: &Tensor) -> Result<(), S
     Ok(())
 }
 
-
 fn attention_bwd(
     rt: &Arc<GpuRuntime>,
     w: &Weights,
@@ -851,9 +896,11 @@ fn attention_bwd(
     prof: &mut BwdProf,
 ) -> Result<Tensor, String> {
     let cfg = &w.cfg;
-    let ai = cfg.attn_local_idx(layer).ok_or("attention_bwd on non-attn layer")?;
+    let ai = cfg
+        .attn_local_idx(layer)
+        .ok_or("attention_bwd on non-attn layer")?;
     let n_attn = cfg.mixer_count(crate::weights::MixerKind::Attention);
-    
+
     let attn_y = lt.attn_y.as_ref().unwrap();
     let attn_y_flash = lt.attn_y_flash.as_ref().unwrap();
     let v_mixed = lt.v_mixed.as_ref().unwrap();
@@ -866,7 +913,7 @@ fn attention_bwd(
     let q_pre = lt.q_pre.as_ref().unwrap();
     let k_pre = lt.k_pre.as_ref().unwrap();
     let v_pre = lt.v_pre.as_ref().unwrap();
-    
+
     let raw_v = lt.raw_v.as_ref().unwrap();
     let bw = &w.blocks[layer];
     let eps = cfg.f32_eps();
@@ -874,395 +921,393 @@ fn attention_bwd(
     let _use_v0 = v0.is_some();
     let v0_buf = v0.unwrap_or(raw_v); // Dummy fallback if none, just like fwd
 
-    
     // Original extracted code (some vars might need re-binding, we'll fix compiler errors next if any)
-            // out proj: attn_out = y @ out_w — d_y is [b,t,h,d] ≡ [bt,c] layout.
-            let out_w = if use_persistent_bf16(rt, backend) {
-                if let Some(ref bf) = w.bf16_banks {
-                    w.bank_matrix(rt, &bf.qo_bank, n_attn + ai, c, c)?
-                } else {
-                    w.bank_matrix(rt, &w.qo_bank, n_attn + ai, c, c)?
-                }
-            } else {
-                w.bank_matrix(rt, &w.qo_bank, n_attn + ai, c, c)?
-            };
-            let d_y = rt.alloc_tensor_f32(&[b, tlen, h, d])?;
-            {
-                let d_ao = reshape_view(&d_attn_out, &[bt, c]);
-                let y_flat = reshape_view(attn_y, &[bt, c]);
-                let dy_flat = reshape_view(&d_y, &[bt, c]);
-                // Audit 7: d_ao feeds dY + dW — cast once under BWD_CAST_ONCE.
-                let d_ao_op = bf16_once(rt, backend, &d_ao)?;
-                gemm_nt_train(&d_ao_op, &out_w, &dy_flat, backend)?;
-                let dw = grads.qo_bank.view(&[c, c], (n_attn + ai) * c * c);
-                gemm_tn_accum_train(&y_flat, &d_ao_op, &dw, backend)?;
-            }
-            prof.lap(rt, "attn_out_gemms")?;
-    
-            // XSA bwd
-            let (d_y_flash, dv_flash) = if cfg.use_xsa(layer) {
-                let d_y_flash = rt.alloc_tensor_f32(&[b, tlen, h, d])?;
-                let dv_flash = rt.alloc_tensor_f32(&[b, tlen, hkv, d])?;
-                zero_tensor_device(&dv_flash)?;
-                let p = rt.pipeline("xsa_bwd_f32")?;
-                let n_xsa = b * tlen * hkv;
-                dispatch_1d(rt, &p, n_xsa, |bnd| {
-                    set_tensor(bnd, attn_y_flash, 0);
-                    set_tensor(bnd, v_mixed, 1);
-                    set_tensor(bnd, &d_y, 2);
-                    set_tensor(bnd, &d_y_flash, 3);
-                    set_tensor(bnd, &dv_flash, 4);
-                    set_u32(bnd, b as u32, 5);
-                    set_u32(bnd, tlen as u32, 6);
-                    set_u32(bnd, h as u32, 7);
-                    set_u32(bnd, hkv as u32, 8);
-                    set_u32(bnd, d as u32, 9);
-                    set_f32(bnd, cfg.xsa_eps(), 10);
-                })?;
-                (d_y_flash, Some(dv_flash))
-            } else {
-                // No XSA: flash output == post-XSA; reuse d_y buffer.
-                (d_y.clone(), None)
-            };
-            prof.lap(rt, "xsa")?;
-    
-            // Flash attn bwd: default row-wise O(T²)+LSE (pre-Phase2); tiled BR=BC=32
-            // via METAL_NATIVE_FA_TILED=1. Under Bf16: bf16 Q/K/V, f32 O/dO/L/Delta/grads.
-            const BR: usize = 32;
-            const BC: usize = 32;
-            let q_blocks = (tlen + BR - 1) / BR;
-            let k_blocks = (tlen + BC - 1) / BC;
-            let attn_lse = lt.attn_lse.as_ref().ok_or("attn_lse")?;
-            let delta = rt.alloc_tensor_f32(&[b, h, tlen])?;
-            {
-                let p = rt.pipeline("flash_attn_bwd_delta_f32")?;
-                dispatch_1d(rt, &p, b * h * tlen, |bnd| {
-                    set_tensor(bnd, attn_y_flash, 0);
-                    set_tensor(bnd, &d_y_flash, 1);
-                    set_tensor(bnd, &delta, 2);
-                    set_u32(bnd, b as u32, 3);
-                    set_u32(bnd, tlen as u32, 4);
-                    set_u32(bnd, h as u32, 5);
-                    set_u32(bnd, d as u32, 6);
-                })?;
-            }
-            prof.lap(rt, "fa_delta")?;
-            let dq = rt.alloc_tensor_f32(&[b, tlen, h, d])?;
-            let dk = rt.alloc_tensor_f32(&[b, tlen, hkv, d])?;
-            let dv = rt.alloc_tensor_f32(&[b, tlen, hkv, d])?;
-            {
-                let scale = 1.0 / (d as f32).sqrt();
-                // Skip bf16 QKV cast→flash: GEMM accum is f32, so f32 FA bwd is the
-                // direct path (same as fwd). Tiled bf16 twins remain available if
-                // persistent bf16 QKV lands later.
-                let use_tiled = crate::ab_flags::fa_tiled_bwd();
-                if use_tiled {
-                    // Audit 7: the Phase 4 bf16 tiled twins are drop-in
-                    // signature-compatible (only Q/K/V become bfloat) and were
-                    // previously unreferenced. `METAL_NATIVE_FA_BF16=1` now
-                    // reaches them, so bf16 FA bwd is available on the tiled
-                    // path too — not only the specialized row path.
-                    // Require *both* twins: falling back on only one would bind
-                    // bf16 buffers to an f32 kernel.
-                    let tiled_bf16 = crate::ab_flags::fa_bf16_row()
-                        && rt.precision() == PrecisionMode::Bf16
-                        && rt.pipeline("flash_attn_bwd_dq_bf16").is_ok()
-                        && rt.pipeline("flash_attn_bwd_dkv_bf16").is_ok();
-                    let (q_t, k_t, v_t) = if tiled_bf16 {
-                        (
-                            crate::gemm::cast_f32_to_bf16(q)?,
-                            crate::gemm::cast_f32_to_bf16(k)?,
-                            crate::gemm::cast_f32_to_bf16(v_mixed)?,
-                        )
-                    } else {
-                        (q.clone(), k.clone(), v_mixed.clone())
-                    };
-                    let (t1, t2) = if tiled_bf16 {
-                        ("flash_attn_bwd_dq_bf16", "flash_attn_bwd_dkv_bf16")
-                    } else {
-                        ("flash_attn_bwd_dq_f32", "flash_attn_bwd_dkv_f32")
-                    };
-                    let p1 = rt.pipeline(t1)?;
-                    dispatch_2d_tg(rt, &p1, q_blocks, b * h, BR, |bnd| {
-                        set_tensor(bnd, &q_t, 0);
-                        set_tensor(bnd, &k_t, 1);
-                        set_tensor(bnd, &v_t, 2);
-                        set_tensor(bnd, &d_y_flash, 3);
-                        set_tensor(bnd, attn_lse, 4);
-                        set_tensor(bnd, &delta, 5);
-                        set_tensor(bnd, &dq, 6);
-                        set_u32(bnd, b as u32, 7);
-                        set_u32(bnd, tlen as u32, 8);
-                        set_u32(bnd, h as u32, 9);
-                        set_u32(bnd, hkv as u32, 10);
-                        set_u32(bnd, d as u32, 11);
-                        set_f32(bnd, scale, 12);
-                    })?;
-                    let p2 = rt.pipeline(t2)?;
-                    dispatch_2d_tg(rt, &p2, k_blocks, b * hkv, BC, |bnd| {
-                        set_tensor(bnd, &q_t, 0);
-                        set_tensor(bnd, &k_t, 1);
-                        set_tensor(bnd, &v_t, 2);
-                        set_tensor(bnd, &d_y_flash, 3);
-                        set_tensor(bnd, attn_lse, 4);
-                        set_tensor(bnd, &delta, 5);
-                        set_tensor(bnd, &dk, 6);
-                        set_tensor(bnd, &dv, 7);
-                        set_u32(bnd, b as u32, 8);
-                        set_u32(bnd, tlen as u32, 9);
-                        set_u32(bnd, h as u32, 10);
-                        set_u32(bnd, hkv as u32, 11);
-                        set_u32(bnd, d as u32, 12);
-                        set_f32(bnd, scale, 13);
-                    })?;
-                } else {
-                    // Audit 7 row-path variants. `fa_fast_row` is the
-                    // head-dim-specialized kernel (identical numerics; hoists
-                    // loop-invariant Q/dO + K/V and keeps accumulators in
-                    // registers). `fa_bf16_row` additionally reads bf16 Q/K/V,
-                    // which also matches the bf16 forward's taped LSE.
-                    // Both require head_dim == 32; otherwise fall back.
-                    // bf16 FA bwd is an approximation, not a consistency fix:
-                    // `model_fwd::use_bf16_flash` is hard-coded false, so the
-                    // forward always runs f32 flash. Gate on Bf16 precision so
-                    // an `--f32` run cannot silently break the 1e-4 bwd goldens.
-                    let bf16_ok = rt.precision() == PrecisionMode::Bf16;
-                    let specialized = crate::ab_flags::fa_fast_row() && d == 32;
-                    if crate::ab_flags::fa_fast_row() && d != 32 {
-                        // Correct but silent otherwise: the flag would look
-                        // enabled while the generic kernels ran.
-                        static WARNED: std::sync::Once = std::sync::Once::new();
-                        WARNED.call_once(|| {
-                            eprintln!(
-                                "warn: METAL_NATIVE_FA_FAST/FA_BF16 require head_dim == 32 \
-                                 (this model has {d}); using generic row FA bwd"
-                            );
-                        });
-                    }
-                    let use_bf16_fa =
-                        specialized && crate::ab_flags::fa_bf16_row() && bf16_ok;
-                    let (q_op, k_op, v_op) = if use_bf16_fa {
-                        (
-                            crate::gemm::cast_f32_to_bf16(q)?,
-                            crate::gemm::cast_f32_to_bf16(k)?,
-                            crate::gemm::cast_f32_to_bf16(v_mixed)?,
-                        )
-                    } else {
-                        (q.clone(), k.clone(), v_mixed.clone())
-                    };
-                    let (n1, n2) = match (specialized, use_bf16_fa) {
-                        (true, true) => (
-                            "flash_attn_bwd_dq_row_d32_bf16",
-                            "flash_attn_bwd_dkv_row_d32_bf16",
-                        ),
-                        (true, false) => (
-                            "flash_attn_bwd_dq_row_d32_f32",
-                            "flash_attn_bwd_dkv_row_d32_f32",
-                        ),
-                        _ => ("flash_attn_bwd_dq_row_f32", "flash_attn_bwd_dkv_row_f32"),
-                    };
-                    let p1 = rt.pipeline(n1)?;
-                    dispatch_1d(rt, &p1, b * h * tlen, |bnd| {
-                        set_tensor(bnd, &q_op, 0);
-                        set_tensor(bnd, &k_op, 1);
-                        set_tensor(bnd, &v_op, 2);
-                        set_tensor(bnd, &d_y_flash, 3);
-                        set_tensor(bnd, attn_lse, 4);
-                        set_tensor(bnd, &delta, 5);
-                        set_tensor(bnd, &dq, 6);
-                        set_u32(bnd, b as u32, 7);
-                        set_u32(bnd, tlen as u32, 8);
-                        set_u32(bnd, h as u32, 9);
-                        set_u32(bnd, hkv as u32, 10);
-                        set_u32(bnd, d as u32, 11);
-                        set_f32(bnd, scale, 12);
-                    })?;
-                    let p2 = rt.pipeline(n2)?;
-                    dispatch_1d(rt, &p2, b * hkv * tlen, |bnd| {
-                        set_tensor(bnd, &q_op, 0);
-                        set_tensor(bnd, &k_op, 1);
-                        set_tensor(bnd, &v_op, 2);
-                        set_tensor(bnd, &d_y_flash, 3);
-                        set_tensor(bnd, attn_lse, 4);
-                        set_tensor(bnd, &delta, 5);
-                        set_tensor(bnd, &dk, 6);
-                        set_tensor(bnd, &dv, 7);
-                        set_u32(bnd, b as u32, 8);
-                        set_u32(bnd, tlen as u32, 9);
-                        set_u32(bnd, h as u32, 10);
-                        set_u32(bnd, hkv as u32, 11);
-                        set_u32(bnd, d as u32, 12);
-                        set_f32(bnd, scale, 13);
-                    })?;
-                }
-            }
-            // Non-XSA: no dv_flash contribution.
-            if let Some(ref dv_flash) = dv_flash {
-                add_inplace(rt, &dv, dv_flash)?;
-            }
-            prof.lap(rt, "fa_dqdkv")?;
-    
-            // qkv_post bwd
-            let use_ve = cfg.ve_scale_index(layer).is_some();
-            let use_v0 = cfg.attn_local_idx(layer).unwrap_or(0) > 0;
-            let ve = if let Some(ref ve) = lt.ve {
-                ve.clone()
-            } else {
-                rt.alloc_tensor_f32(&[bt, kv])?
-            };
-            let dq_pre = rt.alloc_tensor_f32(&[bt, h * d])?;
-            let dk_pre = rt.alloc_tensor_f32(&[bt, kv])?;
-            let dv_pre = rt.alloc_tensor_f32(&[bt, kv])?;
-            let dve = rt.alloc_tensor_f32(&[bt, kv])?;
-            {
-                let p = rt.pipeline("qkv_post_bwd_f32")?;
-                let dq_f = reshape_view(&dq, &[bt, h * d]);
-                let dk_f = reshape_view(&dk, &[bt, kv]);
-                let dv_f = reshape_view(&dv, &[bt, kv]);
-                dispatch_1d(rt, &p, bt, |bnd| {
-                    set_tensor(bnd, q_pre, 0);
-                    set_tensor(bnd, k_pre, 1);
-                    set_tensor(bnd, v_pre, 2);
-                    set_tensor(bnd, &ve, 3);
-                    set_tensor(bnd, v0_buf, 4);
-                    set_tensor(bnd, raw_v, 5);
-                    set_tensor(bnd, &bw.vr_lambda, 6);
-                    set_tensor(bnd, &bw.q_gain, 7);
-                    set_tensor(bnd, &w.rope_cos, 8);
-                    set_tensor(bnd, &w.rope_sin, 9);
-                    set_tensor(bnd, &dq_f, 10);
-                    set_tensor(bnd, &dk_f, 11);
-                    set_tensor(bnd, &dv_f, 12);
-                    set_tensor(bnd, &dq_pre, 13);
-                    set_tensor(bnd, &dk_pre, 14);
-                    set_tensor(bnd, &dv_pre, 15);
-                    set_tensor(bnd, &dve, 16);
-                    set_tensor(bnd, &dv0, 17);
-                    set_tensor(bnd, &grads.blocks[layer].vr_lambda, 18);
-                    set_tensor(bnd, &grads.blocks[layer].q_gain, 19);
-                    set_u32(bnd, b as u32, 20);
-                    set_u32(bnd, tlen as u32, 21);
-                    set_u32(bnd, h as u32, 22);
-                    set_u32(bnd, hkv as u32, 23);
-                    set_u32(bnd, d as u32, 24);
-                    set_u32(bnd, cfg.rope_dims as u32, 25);
-                    set_u32(bnd, use_ve as u32, 26);
-                    set_u32(bnd, use_v0 as u32, 27);
-                    set_f32(bnd, eps, 28);
-                })?;
-            }
-            prof.lap(rt, "qkv_post")?;
+    // out proj: attn_out = y @ out_w — d_y is [b,t,h,d] ≡ [bt,c] layout.
+    let out_w = if use_persistent_bf16(rt, backend) {
+        if let Some(ref bf) = w.bf16_banks {
+            w.bank_matrix(rt, &bf.qo_bank, n_attn + ai, c, c)?
+        } else {
+            w.bank_matrix(rt, &w.qo_bank, n_attn + ai, c, c)?
+        }
+    } else {
+        w.bank_matrix(rt, &w.qo_bank, n_attn + ai, c, c)?
+    };
+    let d_y = rt.alloc_tensor_f32(&[b, tlen, h, d])?;
+    {
+        let d_ao = reshape_view(&d_attn_out, &[bt, c]);
+        let y_flat = reshape_view(attn_y, &[bt, c]);
+        let dy_flat = reshape_view(&d_y, &[bt, c]);
+        // Audit 7: d_ao feeds dY + dW — cast once under BWD_CAST_ONCE.
+        let d_ao_op = bf16_once(rt, backend, &d_ao)?;
+        gemm_nt_train(&d_ao_op, &out_w, &dy_flat, backend)?;
+        let dw = grads.qo_bank.view(&[c, c], (n_attn + ai) * c * c);
+        gemm_tn_accum_train(&y_flat, &d_ao_op, &dw, backend)?;
+    }
+    prof.lap(rt, "attn_out_gemms")?;
 
-            // Layer 0: dv0 from later layers lands on raw v (= v_pre path)
-            if cfg.captures_v0(layer) {
-                let dv0_flat = reshape_view(&dv0, &[bt, kv]);
-                add_inplace(rt, &dv_pre, &dv0_flat)?;
-            }
-    
-            // VE bwd via gather + GEMM (Phase D)
-            if let Some(vi) = cfg.ve_scale_index(layer) {
-                let de = cfg.ve_dim;
-                let rows = rt.alloc_tensor_f32(&[bt, de])?;
-                {
-                    let p = rt.pipeline("ve_gather_f32")?;
-                    dispatch_1d(rt, &p, bt, |bnd| {
-                        set_tensor(bnd, ids, 0);
-                        set_tensor(bnd, &w.ve_emb, 1);
-                        set_tensor(bnd, &rows, 2);
-                        set_u32(bnd, bt as u32, 3);
-                        set_u32(bnd, de as u32, 4);
-                    })?;
-                }
-                let h_pre = rt.alloc_tensor_f32(&[bt, kv])?;
-                let ve_w = if use_persistent_bf16(rt, backend) {
-                    if let Some(ref bf) = w.bf16_banks {
-                        bf.ve_proj.clone()
-                    } else {
-                        w.ve_proj.clone()
-                    }
-                } else {
-                    w.ve_proj.clone()
-                };
-                gemm_train(&rows, &ve_w, &h_pre, backend)?;
-                let d_h = rt.alloc_tensor_f32(&[bt, kv])?;
-                {
-                    let p = rt.pipeline("ve_scale_bwd_f32")?;
-                    dispatch_1d(rt, &p, bt * kv, |bnd| {
-                        set_tensor(bnd, &h_pre, 0);
-                        set_tensor(bnd, &dve, 1);
-                        set_tensor(bnd, &w.ve_scale, 2);
-                        set_tensor(bnd, &w.ve_layer_scales[vi], 3);
-                        set_tensor(bnd, &d_h, 4);
-                        set_tensor(bnd, &grads.ve_scale, 5);
-                        set_tensor(bnd, &grads.ve_layer_scales[vi], 6);
-                        set_u32(bnd, (bt * kv) as u32, 7);
-                    })?;
-                }
-                // Audit 7: d_h feeds dW + d_emb — cast once under BWD_CAST_ONCE.
-                let d_h_op = bf16_once(rt, backend, &d_h)?;
-                {
-                    let dw = grads.ve_proj.view(&[de, kv], 0);
-                    gemm_tn_accum_train(&rows, &d_h_op, &dw, backend)?;
-                }
-                {
-                    let d_emb = rt.alloc_tensor_f32(&[bt, de])?;
-                    gemm_nt_train(&d_h_op, &ve_w, &d_emb, backend)?;
-                    let p = rt.pipeline("ve_scatter_emb_f32")?;
-                    dispatch_1d(rt, &p, bt, |bnd| {
-                        set_tensor(bnd, ids, 0);
-                        set_tensor(bnd, &d_emb, 1);
-                        set_tensor(bnd, &grads.ve_emb, 2);
-                        set_u32(bnd, bt as u32, 3);
-                        set_u32(bnd, de as u32, 4);
-                    })?;
-                }
-            }
-            prof.lap(rt, "ve")?;
+    // XSA bwd
+    let (d_y_flash, dv_flash) = if cfg.use_xsa(layer) {
+        let d_y_flash = rt.alloc_tensor_f32(&[b, tlen, h, d])?;
+        let dv_flash = rt.alloc_tensor_f32(&[b, tlen, hkv, d])?;
+        zero_tensor_device(&dv_flash)?;
+        let p = rt.pipeline("xsa_bwd_f32")?;
+        let n_xsa = b * tlen * hkv;
+        dispatch_1d(rt, &p, n_xsa, |bnd| {
+            set_tensor(bnd, attn_y_flash, 0);
+            set_tensor(bnd, v_mixed, 1);
+            set_tensor(bnd, &d_y, 2);
+            set_tensor(bnd, &d_y_flash, 3);
+            set_tensor(bnd, &dv_flash, 4);
+            set_u32(bnd, b as u32, 5);
+            set_u32(bnd, tlen as u32, 6);
+            set_u32(bnd, h as u32, 7);
+            set_u32(bnd, hkv as u32, 8);
+            set_u32(bnd, d as u32, 9);
+            set_f32(bnd, cfg.xsa_eps(), 10);
+        })?;
+        (d_y_flash, Some(dv_flash))
+    } else {
+        // No XSA: flash output == post-XSA; reuse d_y buffer.
+        (d_y.clone(), None)
+    };
+    prof.lap(rt, "xsa")?;
 
-            // Q/K/V GEMM bwd → d(attn_in): NT-accum into d_attn_in + TN-accum into banks.
-            let (q_w, k_w, v_w) = if use_persistent_bf16(rt, backend) {
-                if let Some(ref bf) = w.bf16_banks {
-                    (
-                        w.bank_matrix(rt, &bf.qo_bank, ai, c, c)?,
-                        w.bank_matrix(rt, &bf.kv_bank, ai, c, kv)?,
-                        w.bank_matrix(rt, &bf.kv_bank, n_attn + ai, c, kv)?,
-                    )
-                } else {
-                    (
-                        w.bank_matrix(rt, &w.qo_bank, ai, c, c)?,
-                        w.bank_matrix(rt, &w.kv_bank, ai, c, kv)?,
-                        w.bank_matrix(rt, &w.kv_bank, n_attn + ai, c, kv)?,
-                    )
-                }
-            } else {
+    // Flash attn bwd: default row-wise O(T²)+LSE (pre-Phase2); tiled BR=BC=32
+    // via METAL_NATIVE_FA_TILED=1. Under Bf16: bf16 Q/K/V, f32 O/dO/L/Delta/grads.
+    const BR: usize = 32;
+    const BC: usize = 32;
+    let q_blocks = (tlen + BR - 1) / BR;
+    let k_blocks = (tlen + BC - 1) / BC;
+    let attn_lse = lt.attn_lse.as_ref().ok_or("attn_lse")?;
+    let delta = rt.alloc_tensor_f32(&[b, h, tlen])?;
+    {
+        let p = rt.pipeline("flash_attn_bwd_delta_f32")?;
+        dispatch_1d(rt, &p, b * h * tlen, |bnd| {
+            set_tensor(bnd, attn_y_flash, 0);
+            set_tensor(bnd, &d_y_flash, 1);
+            set_tensor(bnd, &delta, 2);
+            set_u32(bnd, b as u32, 3);
+            set_u32(bnd, tlen as u32, 4);
+            set_u32(bnd, h as u32, 5);
+            set_u32(bnd, d as u32, 6);
+        })?;
+    }
+    prof.lap(rt, "fa_delta")?;
+    let dq = rt.alloc_tensor_f32(&[b, tlen, h, d])?;
+    let dk = rt.alloc_tensor_f32(&[b, tlen, hkv, d])?;
+    let dv = rt.alloc_tensor_f32(&[b, tlen, hkv, d])?;
+    {
+        let scale = 1.0 / (d as f32).sqrt();
+        // Skip bf16 QKV cast→flash: GEMM accum is f32, so f32 FA bwd is the
+        // direct path (same as fwd). Tiled bf16 twins remain available if
+        // persistent bf16 QKV lands later.
+        let use_tiled = crate::ab_flags::fa_tiled_bwd();
+        if use_tiled {
+            // Audit 7: the Phase 4 bf16 tiled twins are drop-in
+            // signature-compatible (only Q/K/V become bfloat) and were
+            // previously unreferenced. `METAL_NATIVE_FA_BF16=1` now
+            // reaches them, so bf16 FA bwd is available on the tiled
+            // path too — not only the specialized row path.
+            // Require *both* twins: falling back on only one would bind
+            // bf16 buffers to an f32 kernel.
+            let tiled_bf16 = crate::ab_flags::fa_bf16_row()
+                && rt.precision() == PrecisionMode::Bf16
+                && rt.pipeline("flash_attn_bwd_dq_bf16").is_ok()
+                && rt.pipeline("flash_attn_bwd_dkv_bf16").is_ok();
+            let (q_t, k_t, v_t) = if tiled_bf16 {
                 (
-                    w.bank_matrix(rt, &w.qo_bank, ai, c, c)?,
-                    w.bank_matrix(rt, &w.kv_bank, ai, c, kv)?,
-                    w.bank_matrix(rt, &w.kv_bank, n_attn + ai, c, kv)?,
+                    crate::gemm::cast_f32_to_bf16(q)?,
+                    crate::gemm::cast_f32_to_bf16(k)?,
+                    crate::gemm::cast_f32_to_bf16(v_mixed)?,
                 )
+            } else {
+                (q.clone(), k.clone(), v_mixed.clone())
             };
-            let ai_flat = reshape_view(attn_in, &[bt, c]);
-            let d_attn_in = rt.alloc_tensor_f32(&[bt, c])?;
-            zero_tensor_device(&d_attn_in)?;
-            {
-                // Audit 7: ai_flat feeds three dW GEMMs and dq/dk/dv_pre feed
-                // dX + dW each — cast once under BWD_CAST_ONCE (biggest
-                // duplicate-cast site: 5 casts/attn layer saved).
-                let ai_op = bf16_once(rt, backend, &ai_flat)?;
-                let dq_op = bf16_once(rt, backend, &dq_pre)?;
-                let dk_op = bf16_once(rt, backend, &dk_pre)?;
-                let dv_op = bf16_once(rt, backend, &dv_pre)?;
-                gemm_nt_accum_train(&dq_op, &q_w, &d_attn_in, backend)?;
-                let dw_q = grads.qo_bank.view(&[c, c], ai * c * c);
-                gemm_tn_accum_train(&ai_op, &dq_op, &dw_q, backend)?;
-                gemm_nt_accum_train(&dk_op, &k_w, &d_attn_in, backend)?;
-                let dw_k = grads.kv_bank.view(&[c, kv], ai * c * kv);
-                gemm_tn_accum_train(&ai_op, &dk_op, &dw_k, backend)?;
-                gemm_nt_accum_train(&dv_op, &v_w, &d_attn_in, backend)?;
-                let dw_v = grads.kv_bank.view(&[c, kv], (n_attn + ai) * c * kv);
-                gemm_tn_accum_train(&ai_op, &dv_op, &dw_v, backend)?;
+            let (t1, t2) = if tiled_bf16 {
+                ("flash_attn_bwd_dq_bf16", "flash_attn_bwd_dkv_bf16")
+            } else {
+                ("flash_attn_bwd_dq_f32", "flash_attn_bwd_dkv_f32")
+            };
+            let p1 = rt.pipeline(t1)?;
+            dispatch_2d_tg(rt, &p1, q_blocks, b * h, BR, |bnd| {
+                set_tensor(bnd, &q_t, 0);
+                set_tensor(bnd, &k_t, 1);
+                set_tensor(bnd, &v_t, 2);
+                set_tensor(bnd, &d_y_flash, 3);
+                set_tensor(bnd, attn_lse, 4);
+                set_tensor(bnd, &delta, 5);
+                set_tensor(bnd, &dq, 6);
+                set_u32(bnd, b as u32, 7);
+                set_u32(bnd, tlen as u32, 8);
+                set_u32(bnd, h as u32, 9);
+                set_u32(bnd, hkv as u32, 10);
+                set_u32(bnd, d as u32, 11);
+                set_f32(bnd, scale, 12);
+            })?;
+            let p2 = rt.pipeline(t2)?;
+            dispatch_2d_tg(rt, &p2, k_blocks, b * hkv, BC, |bnd| {
+                set_tensor(bnd, &q_t, 0);
+                set_tensor(bnd, &k_t, 1);
+                set_tensor(bnd, &v_t, 2);
+                set_tensor(bnd, &d_y_flash, 3);
+                set_tensor(bnd, attn_lse, 4);
+                set_tensor(bnd, &delta, 5);
+                set_tensor(bnd, &dk, 6);
+                set_tensor(bnd, &dv, 7);
+                set_u32(bnd, b as u32, 8);
+                set_u32(bnd, tlen as u32, 9);
+                set_u32(bnd, h as u32, 10);
+                set_u32(bnd, hkv as u32, 11);
+                set_u32(bnd, d as u32, 12);
+                set_f32(bnd, scale, 13);
+            })?;
+        } else {
+            // Audit 7 row-path variants. `fa_fast_row` is the
+            // head-dim-specialized kernel (identical numerics; hoists
+            // loop-invariant Q/dO + K/V and keeps accumulators in
+            // registers). `fa_bf16_row` additionally reads bf16 Q/K/V,
+            // which also matches the bf16 forward's taped LSE.
+            // Both require head_dim == 32; otherwise fall back.
+            // bf16 FA bwd is an approximation, not a consistency fix:
+            // `model_fwd::use_bf16_flash` is hard-coded false, so the
+            // forward always runs f32 flash. Gate on Bf16 precision so
+            // an `--f32` run cannot silently break the 1e-4 bwd goldens.
+            let bf16_ok = rt.precision() == PrecisionMode::Bf16;
+            let specialized = crate::ab_flags::fa_fast_row() && d == 32;
+            if crate::ab_flags::fa_fast_row() && d != 32 {
+                // Correct but silent otherwise: the flag would look
+                // enabled while the generic kernels ran.
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "warn: METAL_NATIVE_FA_FAST/FA_BF16 require head_dim == 32 \
+                                 (this model has {d}); using generic row FA bwd"
+                    );
+                });
             }
-            prof.lap(rt, "qkv_gemms")?;
+            let use_bf16_fa = specialized && crate::ab_flags::fa_bf16_row() && bf16_ok;
+            let (q_op, k_op, v_op) = if use_bf16_fa {
+                (
+                    crate::gemm::cast_f32_to_bf16(q)?,
+                    crate::gemm::cast_f32_to_bf16(k)?,
+                    crate::gemm::cast_f32_to_bf16(v_mixed)?,
+                )
+            } else {
+                (q.clone(), k.clone(), v_mixed.clone())
+            };
+            let (n1, n2) = match (specialized, use_bf16_fa) {
+                (true, true) => (
+                    "flash_attn_bwd_dq_row_d32_bf16",
+                    "flash_attn_bwd_dkv_row_d32_bf16",
+                ),
+                (true, false) => (
+                    "flash_attn_bwd_dq_row_d32_f32",
+                    "flash_attn_bwd_dkv_row_d32_f32",
+                ),
+                _ => ("flash_attn_bwd_dq_row_f32", "flash_attn_bwd_dkv_row_f32"),
+            };
+            let p1 = rt.pipeline(n1)?;
+            dispatch_1d(rt, &p1, b * h * tlen, |bnd| {
+                set_tensor(bnd, &q_op, 0);
+                set_tensor(bnd, &k_op, 1);
+                set_tensor(bnd, &v_op, 2);
+                set_tensor(bnd, &d_y_flash, 3);
+                set_tensor(bnd, attn_lse, 4);
+                set_tensor(bnd, &delta, 5);
+                set_tensor(bnd, &dq, 6);
+                set_u32(bnd, b as u32, 7);
+                set_u32(bnd, tlen as u32, 8);
+                set_u32(bnd, h as u32, 9);
+                set_u32(bnd, hkv as u32, 10);
+                set_u32(bnd, d as u32, 11);
+                set_f32(bnd, scale, 12);
+            })?;
+            let p2 = rt.pipeline(n2)?;
+            dispatch_1d(rt, &p2, b * hkv * tlen, |bnd| {
+                set_tensor(bnd, &q_op, 0);
+                set_tensor(bnd, &k_op, 1);
+                set_tensor(bnd, &v_op, 2);
+                set_tensor(bnd, &d_y_flash, 3);
+                set_tensor(bnd, attn_lse, 4);
+                set_tensor(bnd, &delta, 5);
+                set_tensor(bnd, &dk, 6);
+                set_tensor(bnd, &dv, 7);
+                set_u32(bnd, b as u32, 8);
+                set_u32(bnd, tlen as u32, 9);
+                set_u32(bnd, h as u32, 10);
+                set_u32(bnd, hkv as u32, 11);
+                set_u32(bnd, d as u32, 12);
+                set_f32(bnd, scale, 13);
+            })?;
+        }
+    }
+    // Non-XSA: no dv_flash contribution.
+    if let Some(ref dv_flash) = dv_flash {
+        add_inplace(rt, &dv, dv_flash)?;
+    }
+    prof.lap(rt, "fa_dqdkv")?;
+
+    // qkv_post bwd
+    let use_ve = cfg.ve_scale_index(layer).is_some();
+    let use_v0 = cfg.attn_local_idx(layer).unwrap_or(0) > 0;
+    let ve = if let Some(ref ve) = lt.ve {
+        ve.clone()
+    } else {
+        rt.alloc_tensor_f32(&[bt, kv])?
+    };
+    let dq_pre = rt.alloc_tensor_f32(&[bt, h * d])?;
+    let dk_pre = rt.alloc_tensor_f32(&[bt, kv])?;
+    let dv_pre = rt.alloc_tensor_f32(&[bt, kv])?;
+    let dve = rt.alloc_tensor_f32(&[bt, kv])?;
+    {
+        let p = rt.pipeline("qkv_post_bwd_f32")?;
+        let dq_f = reshape_view(&dq, &[bt, h * d]);
+        let dk_f = reshape_view(&dk, &[bt, kv]);
+        let dv_f = reshape_view(&dv, &[bt, kv]);
+        dispatch_1d(rt, &p, bt, |bnd| {
+            set_tensor(bnd, q_pre, 0);
+            set_tensor(bnd, k_pre, 1);
+            set_tensor(bnd, v_pre, 2);
+            set_tensor(bnd, &ve, 3);
+            set_tensor(bnd, v0_buf, 4);
+            set_tensor(bnd, raw_v, 5);
+            set_tensor(bnd, &bw.vr_lambda, 6);
+            set_tensor(bnd, &bw.q_gain, 7);
+            set_tensor(bnd, &w.rope_cos, 8);
+            set_tensor(bnd, &w.rope_sin, 9);
+            set_tensor(bnd, &dq_f, 10);
+            set_tensor(bnd, &dk_f, 11);
+            set_tensor(bnd, &dv_f, 12);
+            set_tensor(bnd, &dq_pre, 13);
+            set_tensor(bnd, &dk_pre, 14);
+            set_tensor(bnd, &dv_pre, 15);
+            set_tensor(bnd, &dve, 16);
+            set_tensor(bnd, &dv0, 17);
+            set_tensor(bnd, &grads.blocks[layer].vr_lambda, 18);
+            set_tensor(bnd, &grads.blocks[layer].q_gain, 19);
+            set_u32(bnd, b as u32, 20);
+            set_u32(bnd, tlen as u32, 21);
+            set_u32(bnd, h as u32, 22);
+            set_u32(bnd, hkv as u32, 23);
+            set_u32(bnd, d as u32, 24);
+            set_u32(bnd, cfg.rope_dims as u32, 25);
+            set_u32(bnd, use_ve as u32, 26);
+            set_u32(bnd, use_v0 as u32, 27);
+            set_f32(bnd, eps, 28);
+        })?;
+    }
+    prof.lap(rt, "qkv_post")?;
+
+    // Layer 0: dv0 from later layers lands on raw v (= v_pre path)
+    if cfg.captures_v0(layer) {
+        let dv0_flat = reshape_view(&dv0, &[bt, kv]);
+        add_inplace(rt, &dv_pre, &dv0_flat)?;
+    }
+
+    // VE bwd via gather + GEMM (Phase D)
+    if let Some(vi) = cfg.ve_scale_index(layer) {
+        let de = cfg.ve_dim;
+        let rows = rt.alloc_tensor_f32(&[bt, de])?;
+        {
+            let p = rt.pipeline("ve_gather_f32")?;
+            dispatch_1d(rt, &p, bt, |bnd| {
+                set_tensor(bnd, ids, 0);
+                set_tensor(bnd, &w.ve_emb, 1);
+                set_tensor(bnd, &rows, 2);
+                set_u32(bnd, bt as u32, 3);
+                set_u32(bnd, de as u32, 4);
+            })?;
+        }
+        let h_pre = rt.alloc_tensor_f32(&[bt, kv])?;
+        let ve_w = if use_persistent_bf16(rt, backend) {
+            if let Some(ref bf) = w.bf16_banks {
+                bf.ve_proj.clone()
+            } else {
+                w.ve_proj.clone()
+            }
+        } else {
+            w.ve_proj.clone()
+        };
+        gemm_train(&rows, &ve_w, &h_pre, backend)?;
+        let d_h = rt.alloc_tensor_f32(&[bt, kv])?;
+        {
+            let p = rt.pipeline("ve_scale_bwd_f32")?;
+            dispatch_1d(rt, &p, bt * kv, |bnd| {
+                set_tensor(bnd, &h_pre, 0);
+                set_tensor(bnd, &dve, 1);
+                set_tensor(bnd, &w.ve_scale, 2);
+                set_tensor(bnd, &w.ve_layer_scales[vi], 3);
+                set_tensor(bnd, &d_h, 4);
+                set_tensor(bnd, &grads.ve_scale, 5);
+                set_tensor(bnd, &grads.ve_layer_scales[vi], 6);
+                set_u32(bnd, (bt * kv) as u32, 7);
+            })?;
+        }
+        // Audit 7: d_h feeds dW + d_emb — cast once under BWD_CAST_ONCE.
+        let d_h_op = bf16_once(rt, backend, &d_h)?;
+        {
+            let dw = grads.ve_proj.view(&[de, kv], 0);
+            gemm_tn_accum_train(&rows, &d_h_op, &dw, backend)?;
+        }
+        {
+            let d_emb = rt.alloc_tensor_f32(&[bt, de])?;
+            gemm_nt_train(&d_h_op, &ve_w, &d_emb, backend)?;
+            let p = rt.pipeline("ve_scatter_emb_f32")?;
+            dispatch_1d(rt, &p, bt, |bnd| {
+                set_tensor(bnd, ids, 0);
+                set_tensor(bnd, &d_emb, 1);
+                set_tensor(bnd, &grads.ve_emb, 2);
+                set_u32(bnd, bt as u32, 3);
+                set_u32(bnd, de as u32, 4);
+            })?;
+        }
+    }
+    prof.lap(rt, "ve")?;
+
+    // Q/K/V GEMM bwd → d(attn_in): NT-accum into d_attn_in + TN-accum into banks.
+    let (q_w, k_w, v_w) = if use_persistent_bf16(rt, backend) {
+        if let Some(ref bf) = w.bf16_banks {
+            (
+                w.bank_matrix(rt, &bf.qo_bank, ai, c, c)?,
+                w.bank_matrix(rt, &bf.kv_bank, ai, c, kv)?,
+                w.bank_matrix(rt, &bf.kv_bank, n_attn + ai, c, kv)?,
+            )
+        } else {
+            (
+                w.bank_matrix(rt, &w.qo_bank, ai, c, c)?,
+                w.bank_matrix(rt, &w.kv_bank, ai, c, kv)?,
+                w.bank_matrix(rt, &w.kv_bank, n_attn + ai, c, kv)?,
+            )
+        }
+    } else {
+        (
+            w.bank_matrix(rt, &w.qo_bank, ai, c, c)?,
+            w.bank_matrix(rt, &w.kv_bank, ai, c, kv)?,
+            w.bank_matrix(rt, &w.kv_bank, n_attn + ai, c, kv)?,
+        )
+    };
+    let ai_flat = reshape_view(attn_in, &[bt, c]);
+    let d_attn_in = rt.alloc_tensor_f32(&[bt, c])?;
+    zero_tensor_device(&d_attn_in)?;
+    {
+        // Audit 7: ai_flat feeds three dW GEMMs and dq/dk/dv_pre feed
+        // dX + dW each — cast once under BWD_CAST_ONCE (biggest
+        // duplicate-cast site: 5 casts/attn layer saved).
+        let ai_op = bf16_once(rt, backend, &ai_flat)?;
+        let dq_op = bf16_once(rt, backend, &dq_pre)?;
+        let dk_op = bf16_once(rt, backend, &dk_pre)?;
+        let dv_op = bf16_once(rt, backend, &dv_pre)?;
+        gemm_nt_accum_train(&dq_op, &q_w, &d_attn_in, backend)?;
+        let dw_q = grads.qo_bank.view(&[c, c], ai * c * c);
+        gemm_tn_accum_train(&ai_op, &dq_op, &dw_q, backend)?;
+        gemm_nt_accum_train(&dk_op, &k_w, &d_attn_in, backend)?;
+        let dw_k = grads.kv_bank.view(&[c, kv], ai * c * kv);
+        gemm_tn_accum_train(&ai_op, &dk_op, &dw_k, backend)?;
+        gemm_nt_accum_train(&dv_op, &v_w, &d_attn_in, backend)?;
+        let dw_v = grads.kv_bank.view(&[c, kv], (n_attn + ai) * c * kv);
+        gemm_tn_accum_train(&ai_op, &dv_op, &dw_v, backend)?;
+    }
+    prof.lap(rt, "qkv_gemms")?;
     Ok(d_attn_in)
 }
 
@@ -1291,7 +1336,10 @@ fn mamba2_bwd_rust(
 
     let out_proj = w.mamba_out_proj.as_ref().ok_or("mamba_out_proj")?;
     let in_proj = w.mamba_in_proj.as_ref().ok_or("mamba_in_proj")?;
-    let conv_w = w.mamba_conv1d_weight.as_ref().ok_or("mamba_conv1d_weight")?;
+    let conv_w = w
+        .mamba_conv1d_weight
+        .as_ref()
+        .ok_or("mamba_conv1d_weight")?;
     let a_log = w.mamba_a_log.as_ref().ok_or("mamba_a_log")?;
     let d_param = w.mamba_d.as_ref().ok_or("mamba_d")?;
     let dt_bias = w.mamba_dt_bias.as_ref().ok_or("mamba_dt_bias")?;
@@ -1332,8 +1380,22 @@ fn mamba2_bwd_rust(
     silu_bwd(rt, z_pre, &d_z_silu, &d_z)?;
 
     let d_y_flat = rt.alloc_tensor_f32(&[bt, d_inner])?;
-    let d_norm_w = grads.mamba_norm.as_ref().unwrap().view(&[d_inner], mi * d_inner);
-    rms_norm_weight_bwd(rt, y_flat, &layer_norm, &d_y_norm, &d_y_flat, &d_norm_w, bt, d_inner, eps)?;
+    let d_norm_w = grads
+        .mamba_norm
+        .as_ref()
+        .unwrap()
+        .view(&[d_inner], mi * d_inner);
+    rms_norm_weight_bwd(
+        rt,
+        y_flat,
+        &layer_norm,
+        &d_y_norm,
+        &d_y_flat,
+        &d_norm_w,
+        bt,
+        d_inner,
+        eps,
+    )?;
 
     let xs_heads = lt.mamba_xs.as_ref().ok_or("mamba_xs")?;
     let h_states = lt.mamba_h_states.as_ref().ok_or("mamba_h_states")?;
@@ -1343,36 +1405,23 @@ fn mamba2_bwd_rust(
     let log_da = lt.mamba_log_da.as_ref().ok_or("mamba_log_da")?;
     let dt = lt.mamba_dt.as_ref().ok_or("mamba_dt")?;
 
-    let d_ssd_y = unflatten_heads(&reshape_view(&d_y_flat, &[b, tlen, d_inner]), n_head, head_dim);
+    let d_ssd_y = unflatten_heads(
+        &reshape_view(&d_y_flat, &[b, tlen, d_inner]),
+        n_head,
+        head_dim,
+    );
     let dxs_heads = rt.alloc_tensor_f32(&[b, tlen, n_head, head_dim])?;
     zero_tensor_device(&dxs_heads)?;
     let dd = rt.alloc_tensor_f32(&[n_head])?;
     mamba2_d_skip_bwd(
-        rt,
-        &d_ssd_y,
-        xs_heads,
-        &layer_d,
-        &dxs_heads,
-        &dd,
-        b,
-        tlen,
-        n_head,
-        head_dim,
+        rt, &d_ssd_y, xs_heads, &layer_d, &dxs_heads, &dd, b, tlen, n_head, head_dim,
     )?;
     {
         let dd_full = grads.mamba_d.as_ref().unwrap().view(&[n_head], mi * n_head);
         add_inplace(rt, &dd_full, &dd)?;
     }
 
-    let bwd = mamba2_bwd(
-        rt,
-        x_scaled,
-        bm,
-        cm,
-        log_da,
-        h_states,
-        &d_ssd_y,
-    )?;
+    let bwd = mamba2_bwd(rt, x_scaled, bm, cm, log_da, h_states, &d_ssd_y)?;
 
     let ddt = rt.alloc_tensor_f32(&[b, tlen, n_head])?;
     zero_tensor_device(&ddt)?;
@@ -1402,7 +1451,11 @@ fn mamba2_bwd_rust(
         n_head,
     )?;
     {
-        let da_full = grads.mamba_a_log.as_ref().unwrap().view(&[n_head], mi * n_head);
+        let da_full = grads
+            .mamba_a_log
+            .as_ref()
+            .unwrap()
+            .view(&[n_head], mi * n_head);
         add_inplace(rt, &da_full, &da_log)?;
     }
 
@@ -1438,13 +1491,26 @@ fn mamba2_bwd_rust(
     zero_tensor_device(&dxbc_silu)?;
     accum_slice_grad(rt, &dxbc_silu, &dxs_flat, bt, conv_dim, d_inner, 0)?;
     accum_slice_grad(rt, &dxbc_silu, &dbm_flat, bt, conv_dim, d_state, d_inner)?;
-    accum_slice_grad(rt, &dxbc_silu, &dcm_flat, bt, conv_dim, d_state, d_inner + d_state)?;
+    accum_slice_grad(
+        rt,
+        &dxbc_silu,
+        &dcm_flat,
+        bt,
+        conv_dim,
+        d_state,
+        d_inner + d_state,
+    )?;
 
     let dxbc_conv = rt.alloc_tensor_f32(&[bt, conv_dim])?;
     silu_bwd_store(rt, xbc_post, &dxbc_silu, &dxbc_conv)?;
 
     let xbc_pre = lt.mamba_xbc_pre.as_ref().ok_or("mamba_xbc_pre")?;
-    let conv_bwd = mamba2_conv1d_bwd(rt, xbc_pre, &layer_conv_w, &reshape_view(&dxbc_conv, &[b, tlen, conv_dim]))?;
+    let conv_bwd = mamba2_conv1d_bwd(
+        rt,
+        xbc_pre,
+        &layer_conv_w,
+        &reshape_view(&dxbc_conv, &[b, tlen, conv_dim]),
+    )?;
     {
         let dw = grads
             .mamba_conv1d_weight
@@ -1472,7 +1538,15 @@ fn mamba2_bwd_rust(
         conv_dim,
         d_inner,
     )?;
-    accum_slice_grad(rt, &dzxbcdt, &reshape_view(&ddt_raw, &[bt, n_head]), bt, in_out, n_head, d_inner + conv_dim)?;
+    accum_slice_grad(
+        rt,
+        &dzxbcdt,
+        &reshape_view(&ddt_raw, &[bt, n_head]),
+        bt,
+        in_out,
+        n_head,
+        d_inner + conv_dim,
+    )?;
 
     let d_attn_in = rt.alloc_tensor_f32(&[bt, c])?;
     zero_tensor_device(&d_attn_in)?;
@@ -1533,7 +1607,12 @@ fn mingru_bwd_rust(
         .as_ref()
         .unwrap()
         .view(&[hid, c], mi * hid * c);
-    gemm_tn_accum_train(&reshape_view(h_out, &[bt, hid]), &d_out_flat, &dw_out, backend)?;
+    gemm_tn_accum_train(
+        &reshape_view(h_out, &[bt, hid]),
+        &d_out_flat,
+        &dw_out,
+        backend,
+    )?;
 
     let d_h_3d = reshape_view(&d_h_flat, &[b, tlen, hid]);
     let (d_z, d_h_pre) = mingru_bwd(rt, z_raw, h_pre, h_out, &d_h_3d)?;

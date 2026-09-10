@@ -124,7 +124,7 @@
         "m8_vs_m1": 7.54
       },
       "flattens": false,
-      "tensorops_q4": "NOT shipped — Int4 unbound in objc2-metal 0.3",
+      "tensorops_q4": "NOT shipped — raw-address shader-side sub-byte tensor construction and host dispatch are missing; the Int4 host descriptor binding is separate",
       "ddtree": "not revisited (verify(M) does not flatten)"
     }
   }

@@ -861,6 +861,31 @@ run" is a publishable outcome for this entry, not a failure of it.
 
 ---
 
+## Tier 2b — the September program: E27 in flight, E28–E35 registered (2026-09-05)
+
+Registered from the September 4 architecture review
+(`docs/architecture-review-2026-09-04/README.md`); the operating document, with the
+box state, rules, launch lines, pre-registered readouts and prices, is
+`docs/architecture-review-2026-09-04/LAMBDA_HANDOFF_2026-09-05.md`. The code is
+`1b6c5d0` on `main`; the prices are from the same-day GH200 tuning sprint
+(`docs/GPU_TUNING_2026-09-05.md`, tuning branch), not from elapsed ÷ tenancy.
+
+| # | question | arms / dir | status 2026-09-05 15:05 UTC | GPU-h (est.) |
+|---|---|---|---|---|
+| E27 | the width ladder's fourth rung, 1536 | `w1536_attention_lr80` (`crossover_ladder1536`, workers 2), `w1536_mingru_lr40` (`crossover_ladder1536_mingru`, workers 1) | probe complete (minGRU argmin lr40, interior; lr20 tied within the rerun floor); minGRU arm running; attention 1/5 done, 4 OOMed in a collision with a tuning stage — one relaunch left (`scripts/tune_e27_attn.sh`) | ~1.5 remaining |
+| E28 | does the published delta rule change recall? | `gdn`, `gdn_pub`, `hybrid_gdn_periodic`, `hybrid_gdn_periodic_pub` on E8's grid; `gdn_pub` at seq 255 | scripted (`scripts/e28_gdn_rule.sh`), unrun | ~3.8 (3k cells) + ~11.5 (9k cells) |
+| E29 | MoE with a router that has a task gradient | `attention`, `moe_e{1,4,8}k1_raw` → `crossover50m_moe32d` | scripted, unrun; readable only if the one-expert control lands inside `attention` | ~3.5 |
+| E30 | the 8+4 result within-suite and at near parity | `attention` into `ratioplace32`; `hybrid_mingru8_attn4_x1`, `hybrid_mingru_periodic_x1`, `attention` → `crossover50m_parity32` | scripted, unrun | ~2.3 |
+| E31 | tied/untied × value residual | `attention`, `attention_untied`, `attention_novr`, `attention_untied_novr` → `crossover50m_tie32` | scripted, unrun | ~2.3 |
+| E32 | 8+4 on the recall grid | `hybrid_mingru8_attn4` at p=4,8 × 3k,9k | scripted, unrun | ~1.9 + ~5.7 |
+| E33 | depth for width at ~21M non-embedding | `attention`, `attn6_w512`, `attn6_w576`, `w384_attention_lr10` (+ `attn3` from `loop32`) → `crossover50m_shape32` | scripted, unrun | ~1.5 |
+| E34 | does the copy-loss drop predict the crossing? | `attention`, `mingru`, `hybrid_mingru8_attn4` with `copy_probe` → `crossover50m_copy32` | scripted, unrun | ~2.0 |
+| E35 | the token ladder at width 384 | four w384 arms at 200M (`crossover200m_w384`); 800M is a decision | scripted, unrun | ~5.7 (+ ~23 for 800M) |
+
+The handoff's §8 lists the decisions these boards wait on: MPS and compile for
+new-directory boards, whether the 9000-step recall cells are worth their price, E35's
+second rung, and which delta rule and router weighting become defaults afterwards.
+
 ## Explicitly not planned, and why
 
 - **A Titans / test-time-memory mixer.** Referenced in reading notes only; implementing
@@ -914,8 +939,11 @@ still gated on restoring `fineweb10B_sp1024` from an external copy, not on compu
    now recorded (paper section 7.3 items 7-8).
 3. **A scale ladder.** The loudest reviewer objection is that everything here is one small
    scale. Two or three model sizes would convert it into a measured quantity. Unpriced.
+   **Done as E21** (`docs/LADDER_BOARD_2026-09-04.md`: widths 384, 768, 1152 at each cell's
+   own learning rate, 66 runs); width 1536 is E27 above, in flight.
 4. **E10 placement, properly.** Re-run `hybrid_mingru10_attn2` inside `crossover50m_ratio32`
-   so bookend-vs-10+2 is a within-suite, `final_val` comparison. 5 runs.
+   so bookend-vs-10+2 is a within-suite, `final_val` comparison. 5 runs. **Done** as
+   `crossover50m_ratioplace32` (see the E10 row); E30 adds `attention` to that suite.
 5. **E12** (sliding-window attention) — unchanged, still needs code, still lowest priority.
 
 **Not worth running:** further confirmatory cells of the E8 grid (p=6 @ 9000 for the three

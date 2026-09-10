@@ -1,5 +1,6 @@
 {
   "artifact": "decode_icb_mini_token_parity",
+  "evidence_status": "historical_unverified",
   "icb_command_count": 71,
   "icb_replays": 8,
   "icb_tokens": [

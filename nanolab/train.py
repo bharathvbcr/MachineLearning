@@ -181,14 +181,28 @@ def train(cfg, overfit: int = 0, batchers=None):
     # MoE paths (recurrent loops / expert dispatch graph-break badly).
     import importlib.util
     has_triton = importlib.util.find_spec("triton") is not None
+    # The attention-only restriction was measured on the GH200 (torch 2.7.0) on
+    # 2026-09-05 and does not hold: a pure minGRU stack compiles in ~29 s and runs
+    # 1.96x eager, against attention's 1.94x. What DOES still break is a stack
+    # mixing mixer kinds -- the hybrids blow Dynamo's recompile limit and fall
+    # back to eager at 1.00x -- and GDN (0.97x) and MoE (1.08x) are not worth the
+    # recompiles. So the gate is now "one mixer kind throughout", which is the
+    # condition that actually predicts the win, rather than "that kind is
+    # attention". compile stays OFF by default everywhere (Config.compile,
+    # crossover_replicate.cluster_compile), so this widens what `compile=True`
+    # means and changes no existing run.
+    kinds = set(parse_layer_mixers(cfg))
     if (cfg.compile and has_triton and device.startswith("cuda")
-            and all(k == "attention" for k in parse_layer_mixers(cfg))
-            and cfg.ffn != "moe"):
+            and len(kinds) == 1 and cfg.ffn != "moe"):
         model = torch.compile(model)
+        log.info(f"torch.compile enabled ({kinds.pop()} x{cfg.n_layer})")
     elif cfg.compile and not has_triton:
         log.info("torch.compile requested but Triton not available -> running eager")
-    elif cfg.compile and not all(k == "attention" for k in parse_layer_mixers(cfg)):
-        log.info("torch.compile skipped: non-attention mixer in the stack")
+    elif cfg.compile and len(kinds) > 1:
+        log.info(f"torch.compile skipped: {len(kinds)} mixer kinds in the stack "
+                 "(hybrids exceed Dynamo's recompile limit and gain nothing)")
+    elif cfg.compile and cfg.ffn == "moe":
+        log.info("torch.compile skipped: MoE expert dispatch (measured 1.08x)")
 
     # ---- optimizer + schedule (guide §4, §5) ----
     optimizers = build_optimizers(model, cfg)

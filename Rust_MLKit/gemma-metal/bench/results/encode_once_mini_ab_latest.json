@@ -6,6 +6,7 @@
     "DecodeIcb default: inheritBuffers+prebuilt arg-tables (setArgumentTable × cmds; last_setAddress=0). Opt-in freeze/range/coarse (v0.5.7–0.5.9) PARKED: setArgTable=0 + execute_icb ranges, but product tok/s loses vs prebuilt — prefer prebuilt; flags default OFF"
   ],
   "artifact": "encode_once_mini_ab",
+  "evidence_status": "historical_unverified",
   "cb_replay_wired": true,
   "decode_icb": "decode_icb cmds=71 layer_graph=true encoded=true optimized=true executes=9 sticky_buf=17/427 prebuilt=71/71 freeze=false barriers=71 coarse_elided=0 last_setAddress=0/427 last_setArgTable=71 elided=427 last_execute_icb=0/0",
   "encode_us_off": 16559.75,

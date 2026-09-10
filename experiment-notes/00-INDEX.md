@@ -13,6 +13,11 @@ Copy [`_TEMPLATE.md`](_TEMPLATE.md) for new suites. Status values: `done` / `par
   proposed mechanism experiments, constrained-update oracles, and independently checked
   mathematical special cases. This review is not an additional completed training suite
   and does not change the suite counts above.
+- [Lambda GH200 handoff — September program](../docs/architecture-review-2026-09-04/LAMBDA_HANDOFF_2026-09-05.md):
+  the box's verified state, the rules every board obeys, the E27 repair, and E28–E35 with
+  launch lines, pre-registered readouts and sprint-measured prices. Revised 2026-09-05
+  after the same-day GH200 tuning sprint. Note [28](nanolab/28-september-program-planned.md)
+  is its index entry.
 
 ## Headline findings
 
@@ -68,6 +73,7 @@ Copy [`_TEMPLATE.md`](_TEMPLATE.md) for new suites. Status values: `done` / `par
 | [25-gh200-bs8](nanolab/25-gh200-bs8.md) | GH200 bs8 n=5 @ 8.192M | done | High (to 7.38M) | Lambda GH200 | No flip by 7.38M; minGRU leads from eval 1 on every seed. |
 | [26-matched32-hybrids](nanolab/26-matched32-hybrids.md) | 8 arms bs32 eval_iters=20 50M | done | High | Lambda GH200 | Attn 4.222 ties hybrid_mingru 4.232; Mamba hybrid 4.333 not 4.60. |
 | [27-swa-board-planned](nanolab/27-swa-board-planned.md) | SWA arms (E12/E15/E16): ctx512, ctx2048, MQAR | planned | Low | Target Lambda GH200 (code verified on MPS/CPU only) | No result exists; code complete and tested, 33-90 GPU-h specified in docs/SWA_BOARD_2026-08-31.md. |
+| [28-september-program-planned](nanolab/28-september-program-planned.md) | E27 (running) · E28–E35 (registered 2026-09-05) | running / planned | Low | Lambda GH200 (arms timed on the box; boards unrun) | No result exists for E28–E35; E27's probe resolved (minGRU lr40), its minGRU arm is running, and four attention jobs await one relaunch. Spec, prices and readouts in the Lambda handoff. |
 
 ## Gemma-metal
 

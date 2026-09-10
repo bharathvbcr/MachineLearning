@@ -357,6 +357,13 @@ Recurrence (gated delta rule):
 \[
 h_t = (I - \alpha_t \otimes u_t v_t^\top)\, h_{t-1} + \alpha_t \otimes \beta_t x_t^\top
 \]
+- **Two rules, one flag (2026-09-05).** As implemented, the correction is computed from the
+  *undecayed* state, `S ← aS + b(v − Sk)kᵀ`; published Gated DeltaNet (arXiv 2412.06464,
+  eq. 8) reads the decayed state, `S ← aS + b(v − aSk)kᵀ`. `Config.gdn_rule` selects
+  `"repo"` (default; every GDN number in this KB and the paper) or `"published"`; arms
+  `gdn_pub` / `hybrid_gdn_periodic_pub`; the two rules cost the same (27.8K tok/s at the
+  50M shape). E28 (`docs/architecture-review-2026-09-04/LAMBDA_HANDOFF_2026-09-05.md`) is
+  the recall ablation; which rule becomes the default is an open decision.
 - Production path: vectorized **WY / UT-transform** with `solve_triangular`.
 - Default chunk often **C=32** in GDN helpers; config `mixer_chunk` may be 64 with `min(mixer_chunk, block_size)`.
 - FP32 accumulation / autocast-off around the solve for stability.
@@ -646,6 +653,12 @@ wall-clock suite exists to measure. And **tenancy is a recipe field**: per-step
 `tok_s` falls with jobs-per-GPU and not uniformly across arms (attention recovers
 1.78× single-tenant, the GDN arms 1.04×), so a rate measured at one tenancy sizes
 a wrong budget at another. Both were caught by controls, not by review.
+*2026-09-05 sprint:* under *homogeneous* tenancy and no MPS the sign depends on the arm's
+MFU — attention, minGRU and their hybrids (~13% MFU) lose ~9% at any tenancy ≥ 2, GDN
+(2.7%) gains 1.53x at three; the 1.78x above is heterogeneous co-residency. Tenancy moves
+`final_val` by less than a rerun of the same job (0.0012 vs 0.0014 nats). MPS refunds the
+tax (1.20–1.23x) at 0.0023 nats; `torch.compile` is 1.94x on pure attention or minGRU
+stacks and was off on a stale note (`docs/GPU_TUNING_2026-09-05.md`, tuning branch).
 
 ---
 
@@ -734,6 +747,7 @@ E4B ladder:      4.78 → ~25.1 peak / ~23.9 quiet
 | 2026-08-22 | **D2 closed.** `native-optimizer-funnel.json → champion.winner_exact_gate` read `"pending"` while `research/exact-128m-gate-polar.json` recorded `passed: true` for the same candidate. Now `"passed"`, with the gate evidence inlined. |
 | 2026-08-30 | **The GH200 nanolab campaign is folded in** (new section above "Open problems"), closing the 2026-08-22 row below. Covers suites 22–26 plus everything after the 2026-08-24 paper draft: the 250-job µP/SP bundle, the recall probe (405 runs across difficulty × budget), sequence length at 2048, the ratio/placement board, both wall-clock attempts, and the release audit. Two claims are recorded as **withdrawn** rather than quietly dropped. Open problems gained items 7–10. |
 | 2026-08-22 | **GH200 crossover suites 22–26 are still not represented in this KB.** 120 completed runs at n=5 (attention/minGRU crossing at 12.35M, moving to 14.58M under a truncated cosine, absent at bs8) live only in `experiment-notes/nanolab/22–26` and `PAPER_2026-08_Recipe_Dependent_Rankings.md`. Folding them in is outstanding. |
+| 2026-09-05 | **The September program's code and state.** `1b6c5d0` adds default-preserving flags for the two comparator defects the review found (`gdn_rule`, `moe_router_weight`), a near-parity minGRU (`mingru_expand`), a repeated-span copy probe, sixteen arms, stage scripts E28–E35 and `scripts/paired_board.py`; §6 above now states both delta rules. E27 (width 1536) is half complete on the GH200; E28–E35 are priced from a same-day tuning sprint that measured every arm (`docs/GPU_TUNING_2026-09-05.md`, branch `claude/lambda-gh200-sept-2026-f54de2`): compile 1.94x and off on a stale note, tenancy's sign follows MFU, MPS refunds the tenancy tax, the sampler switches token streams below 9.27 GiB free, and two runs of one configuration differ by 0.0014 nats. Operating document: `docs/architecture-review-2026-09-04/LAMBDA_HANDOFF_2026-09-05.md`. |
 
 ---
 

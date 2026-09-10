@@ -70,7 +70,7 @@ scaling, both curricula, MoE routing, the diffusion objective, checkpoint
 round-trips. CPU-only, no pytest, exits non-zero on failure:
 
 ```bash
-python -m nanolab.tests        # 14 checks, <30s
+python -m nanolab.tests        # 172 checks, about a minute on a laptop CPU (2026-09-05)
 ```
 
 Run it after any change before a GPU run.
@@ -408,7 +408,9 @@ test that checks output *and* input-gradient (incl. non-chunk-divisible lengths)
   where the O(T) reference was hopeless. (mamba2's `d_inner=2d` is wider than gdn,
   so use `--mixer_chunk 32` at ctx1024 to keep the `C×C` intra-chunk tiles small.)
 - **`gdn`** → `gdn_chunked`, a **fully-vectorized WY / UT-transform** of the gated
-  delta rule (no per-timestep loop — the repo's reference kernels all looped, so
+  delta rule — the repo's variant by default (`gdn_rule="repo"`: correction from the
+  undecayed state; `"published"`: arXiv 2412.06464 eq. 8, decayed state; same cost) —
+  (no per-timestep loop — the repo's reference kernels all looped, so
   this was derived from scratch and checked against `_sequential`). Within a chunk
   the write vectors solve a unit-lower-triangular system `(I+M)U = R` (one batched
   `solve_triangular`); outputs and the chunk-final state are two decay-weighted
@@ -416,10 +418,31 @@ test that checks output *and* input-gradient (incl. non-chunk-divisible lengths)
   238 → 1.6K tok/s (6.7×); ctx1024 1.9K tok/s @ 2.7 GB.** Slightly behind SSD
   (the `(I+M)⁻¹` solve is extra work the SSM doesn't need) but firmly usable.
 
+## Behaviour flags whose defaults preserve the record (added 2026-09-05)
+
+Each is a `Config` field; the default is exactly what every committed run did, so old
+`config.json` files stay reproducible, and the suite runner records the value in the
+recipe so runs with different values never pool.
+
+| field | values | what it changes | arms that set it |
+|---|---|---|---|
+| `gdn_rule` | `repo` (default), `published` | which state the delta correction reads (see the `gdn` bullet above) | `gdn_pub`, `hybrid_gdn_periodic_pub` |
+| `moe_router_weight` | `renorm` (default), `raw` | `renorm` divides the top-k gate weights by their sum, which at top-1 is exactly 1 and leaves the router with **no task gradient** (norm ~3e-18; it trains on the balancing loss alone); `raw` scales the expert by its softmax probability, Switch-style, and restores the gradient | `moe_e1k1_raw`, `moe_e4k1_raw`, `moe_e8k1_raw` |
+| `mingru_expand` | `2` (default), `>= 1` | minGRU hidden width as a multiple of `d_model`; `1` is near parameter parity with attention (+3.8% for the 8+4 hybrid; the value-residual projections remain) and trains at attention's rate | `mingru_x1`, `hybrid_mingru8_attn4_x1`, `hybrid_mingru_periodic_x1` |
+| `copy_probe` | `False` (default) | logs `copy_loss` at every evaluation: fixed-seed random sequences with a 32-token span repeated later, loss on the second copy only | E34 (`CROSSOVER_COPY_PROBE=1`) |
+
+`crossover_replicate.py`'s `compile` recipe field (`CROSSOVER_COMPILE=1`, default off) is
+on the 2026-09-05 tuning branch and in the working tree; on `main` the runner still
+hardcodes it off. `torch.compile` is 1.94x on a pure attention stack and 1.96x on a pure
+minGRU stack on the GH200 (torch 2.7.0), nothing on the hybrids (Dynamo recompile limit),
+GDN or MoE, and shifts `final_val` by ~0.0023 nats — a numerics choice, recorded per suite.
+
 ## Hardware notes (guide §1, §7)
 
-- bf16 autocast + `torch.compile` (attention path) auto-enable on CUDA; both are
-  no-ops on CPU so `cpu_smoke` runs anywhere.
+- bf16 autocast auto-enables on CUDA; `Config.compile` defaults to `True` for direct
+  `train.py` runs and, on `main`, applies only to an all-attention stack (the tuning
+  branch widens the gate to "one mixer kind throughout", which is what predicts the win).
+  Both are no-ops on CPU so `cpu_smoke` runs anywhere.
 - Recurrent mixers (`mamba2`, `gdn`) are **pure-PyTorch FP32 references** — no
   `mamba-ssm` / `flash-linear-attention` CUDA kernels required. They are correct
   but slow; the fast chunk-parallel versions live in

@@ -1135,7 +1135,11 @@ report its recipe is not measuring a property of the methods it claims to rank. 
   far outside any plausible two-seed noise band); the *ordering within the top four* is not.
 - **`compile = False` throughout suites 22–26.** Forced by an Inductor stall on GH200 aarch64.
   Uniform across arms, but a compiled recipe is a different recipe and might move the crossings
-  again.
+  again. *(Added 2026-09-05: on torch 2.7.0 the same box compiles attention in 31 s at 1.94x and
+  a pure minGRU stack at 1.96x, so the stall was a snapshot of a toolchain, not a property of the
+  hardware. The second half of the sentence stands: compiling shifts `final_val` by about
+  0.0023 nats, 1.6x the run-to-run floor of 0.0014 measured the same day, so it remains a
+  recipe field, recorded per suite and off in every suite here.)*
 - **Recipe drift in suite 22's ten-arm board.** Documented in §4.5 and repaired by suite 26; the
   original board should be read only as "what finished."
 - **A kernel bug mid-grid.** Gated DeltaNet produced NaN gradients at finite loss (batch 96
@@ -1143,6 +1147,15 @@ report its recipe is not measuring a property of the methods it claims to rank. 
   `j > t` entries overflowed, with `.tril()` masking it in the forward pass. Fixed by taking the
   lower triangle before the exponential, clamping log-ratios at max 0, and clamping alpha. All GDN
   rows in this paper are post-fix. This was a kernel defect, not a mixer-quality result.
+- **The GDN operator is a variant of the published one** *(added 2026-09-05)*. `gdn_chunked`
+  computes the delta correction from the undecayed state, `S ← αS + β(v − Sk)kᵀ`; Gated
+  DeltaNet as published [3] (eq. 8) uses the decayed state, `S ← αS + β(v − αSk)kᵀ`. The two
+  agree at α = 1 or β = 0 and differ otherwise; the paper's regression test compared the chunked
+  form against a sequential reference of the *same* variant and could not see it. Every GDN row
+  here — the bake-off placings, the throughput figures and the §6.8 recall rates — is therefore
+  a statement about the repo's operator. The published rule is now available behind a flag
+  (`gdn_rule="published"`, same cost); whether it changes the §6.8 recall picture is the E28
+  ablation of the September 2026 program and had not run when this note was added.
 - **A number we reconciled, and the wrong reconciliation we tried first.** The champion run's
   final EMA sliding BPB is **2.010659** (seed 1337) in `research/champion-run.json`, while other
   workspace documents recorded **2.015756**. We first concluded that 2.015756 was a `57`↔`75`

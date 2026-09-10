@@ -1,0 +1,56 @@
+{
+  "jobs": [
+    {
+      "id": "wct1_attention_s1337",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "capacity baseline",
+      "status": "done",
+      "worker": 0,
+      "started": 1788599666.0816467,
+      "finished": 1788599859.049301,
+      "detail": "best_val=4.773610"
+    },
+    {
+      "id": "wct1_hybrid_mingru8_attn4_s1337",
+      "arm": "hybrid_mingru8_attn4",
+      "mixer": "mingru",
+      "layer_mixers": "mingru*8,attention*4",
+      "seed": 1337,
+      "note": "1:2 ratio upper arm",
+      "status": "done",
+      "worker": 0,
+      "started": 1788599859.2470522,
+      "finished": 1788600084.259701,
+      "detail": "best_val=4.644938"
+    },
+    {
+      "id": "wct1_attention_s42",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "capacity baseline",
+      "status": "done",
+      "worker": 0,
+      "started": 1788600088.3429832,
+      "finished": 1788600280.5543694,
+      "detail": "best_val=4.748315"
+    },
+    {
+      "id": "wct1_hybrid_mingru8_attn4_s42",
+      "arm": "hybrid_mingru8_attn4",
+      "mixer": "mingru",
+      "layer_mixers": "mingru*8,attention*4",
+      "seed": 42,
+      "note": "1:2 ratio upper arm",
+      "status": "done",
+      "worker": 0,
+      "started": 1788600280.7794151,
+      "finished": 1788600505.2753296,
+      "detail": "best_val=4.633183"
+    }
+  ]
+}

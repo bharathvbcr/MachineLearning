@@ -4,6 +4,11 @@ The saved experiment snapshot is dated **2026-09-04 21:48 UTC**. It is not a liv
 campaign dashboard. These files support the [current assessment](../README.md)
 and [protocol](../MEMORY_UPDATE_PROTOCOL.md).
 
+The [September 8 second audit](../SECOND_AUDIT_PLAN_2026-09-08.md) has a separate
+[executable probe](second_audit_probe.py), [recorded results](second-audit-results.json),
+and [validation log](SECOND_AUDIT_VALIDATION.md). These check task semantics and
+operator counterexamples; they do not replace the archived training snapshot.
+
 | Artifact | Coverage |
 |---|---|
 | [evidence-tables.md](evidence-tables.md) | Archived final-CE and MQAR cells. |

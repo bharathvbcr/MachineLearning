@@ -18,10 +18,9 @@ use std::time::Instant;
 
 use tessl_arch02::bpb::{eval_sliding, TokenByteLut};
 use tessl_arch02::checkpoint::{
-    collect_divergence_norms_device, load_optim_state_python_npy,
-    read_training_checkpoint_meta, save_optim_state_python_npy,
-    save_training_checkpoint, save_weights_python_npy, TrainingCheckpointMeta,
-    CHECKPOINT_VERSION,
+    collect_divergence_norms_device, load_optim_state_python_npy, read_training_checkpoint_meta,
+    save_optim_state_python_npy, save_training_checkpoint, save_weights_python_npy,
+    TrainingCheckpointMeta, CHECKPOINT_VERSION,
 };
 use tessl_arch02::data::{load_shard, PrefetchLoader};
 use tessl_arch02::init::{fineweb_token_skip, init_weights_seeded};
@@ -34,12 +33,12 @@ use tessl_arch02::optim::{
     copy_ema_into_weights, optim_step, zero_grads, ClipMode, LrSchedule, OptimHyperparams,
     OptimState,
 };
-use tessl_arch02::OptimizerKind;
 use tessl_arch02::parity::golden_dir;
-use tessl_arch02::runtime::{GpuRuntime, PrecisionMode};
 use tessl_arch02::research::{capture_weight_snapshot, collect_research_telemetry};
+use tessl_arch02::runtime::PrecisionMode;
 use tessl_arch02::tape::Tape;
 use tessl_arch02::weights::{ModelConfig, Weights};
+use tessl_arch02::OptimizerKind;
 
 fn arg(args: &[String], key: &str) -> Option<String> {
     args.iter()
@@ -52,15 +51,17 @@ fn has_flag(args: &[String], key: &str) -> bool {
 }
 
 fn find_val_shard(data_dir: &Path) -> Option<Vec<u16>> {
-    std::fs::read_dir(data_dir).ok().and_then(|rd| {
-        let mut v: Vec<_> = rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.to_string_lossy().contains("val"))
-            .collect();
-        v.sort();
-        v.first().cloned()
-    })
-    .and_then(|p| load_shard(&p).ok())
+    std::fs::read_dir(data_dir)
+        .ok()
+        .and_then(|rd| {
+            let mut v: Vec<_> = rd
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.to_string_lossy().contains("val"))
+                .collect();
+            v.sort();
+            v.first().cloned()
+        })
+        .and_then(|p| load_shard(&p).ok())
 }
 
 fn main() -> Result<(), String> {
@@ -250,7 +251,7 @@ fn main() -> Result<(), String> {
         .or_else(|| resume_meta.as_ref().map(|m| m.preset.clone()))
         .unwrap_or_else(|| "sota".into());
     let mut cfg = ModelConfig::from_preset(&preset)?;
-    
+
     if let Some(m) = arg(&args, "--mixer") {
         cfg.mixer = match m.as_str() {
             "mingru" => tessl_arch02::weights::MixerKind::MinGRU,
@@ -270,8 +271,7 @@ fn main() -> Result<(), String> {
                 .split(',')
                 .map(tessl_arch02::weights::MixerKind::parse)
                 .collect();
-            cfg.layer_mixers =
-                tessl_arch02::weights::expand_layer_mixers(&kinds?, cfg.num_layers);
+            cfg.layer_mixers = tessl_arch02::weights::expand_layer_mixers(&kinds?, cfg.num_layers);
         }
         eprintln!(
             "hybrid layer_mixers (L={}): {:?}",
@@ -279,7 +279,7 @@ fn main() -> Result<(), String> {
             cfg.resolved_layer_mixers()
         );
     }
-    
+
     let optimizer_kind: OptimizerKind = arg(&args, "--optimizer")
         .or_else(|| resume_meta.as_ref().map(|m| m.optimizer.clone()))
         .unwrap_or_else(|| OptimizerKind::default().to_string())
@@ -414,10 +414,7 @@ fn main() -> Result<(), String> {
         }
     );
     if let Some(ref p) = load_weights {
-        eprintln!(
-            "load-weights={} start-step={start_step}",
-            p.display()
-        );
+        eprintln!("load-weights={} start-step={start_step}", p.display());
     }
     if let Some(n) = dump_at {
         eprintln!(
@@ -480,9 +477,9 @@ fn main() -> Result<(), String> {
     hp_f32!("--grad-clip", grad_clip);
     hp_f32!("--ema-decay", ema_decay);
     if let Some(value) = arg(&args, "--muon-momentum-warmup") {
-        hp.muon_momentum_warmup = value.parse::<usize>().map_err(|_| {
-            format!("--muon-momentum-warmup expects an integer, got {value}")
-        })?;
+        hp.muon_momentum_warmup = value
+            .parse::<usize>()
+            .map_err(|_| format!("--muon-momentum-warmup expects an integer, got {value}"))?;
     }
     let mut state = OptimState::new_for_kind(&rt, &w, hp, optimizer_kind)?;
     state.clip_mode = clip_mode;
@@ -500,7 +497,9 @@ fn main() -> Result<(), String> {
         }
         eprintln!(
             "resume={} | exact state step={} data_cursor_tokens={} (Adam+Muon+EMA)",
-            root.display(), meta.step, meta.data_cursor_tokens
+            root.display(),
+            meta.step,
+            meta.data_cursor_tokens
         );
     } else if let Some(ref op) = load_optim {
         state.step = start_step;
@@ -784,7 +783,10 @@ fn main() -> Result<(), String> {
                 bf16_precision: rt.precision() == PrecisionMode::Bf16,
                 bf16_shadows_saved: w.bf16_banks.is_some(),
             };
-            eprintln!("checkpoint: saving exact state → {}", checkpoint_root.display());
+            eprintln!(
+                "checkpoint: saving exact state → {}",
+                checkpoint_root.display()
+            );
             save_training_checkpoint(&rt, &w, &state, &checkpoint_root, &meta)?;
         }
 

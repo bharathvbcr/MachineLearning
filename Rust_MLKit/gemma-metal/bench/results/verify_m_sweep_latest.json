@@ -1,5 +1,6 @@
 {
   "artifact": "verify_m_sweep",
+  "evidence_status": "historical_unverified",
   "encode_once": {
     "api_gap_summary": "MTL4CommandBuffer has no replay-prior-encoding API (begin+allocator re-records); path is compute ICB only; mini+E4B Hot DecodeIcb layer-graph capture→from_commands+skip landed (flags default OFF); 31B session graph not migrated; DecodeIcb default: inheritBuffers+prebuilt arg-tables (setArgumentTable × cmds; last_setAddress=0). Opt-in freeze/range/coarse (v0.5.7–0.5.9) PARKED: setArgTable=0 + execute_icb ranges, but product tok/s loses vs prebuilt — prefer prebuilt; flags default OFF",
     "api_gaps": [
@@ -22,13 +23,13 @@
     "fp8_e8m0_tensorops_dtype": false,
     "int4_tensorops_dtype": false,
     "int8_tensorops_dtype": true,
-    "note": "Int4 unbound in objc2-metal 0.3; verify(M) = hand simdgroup Q4; TensorOps Q4 not shipped",
+    "note": "TensorOps Q4 is not shipped: raw-address kernels lack a shader-side sub-byte tensor constructor and wired host dispatch; the missing Int4 host descriptor binding is separate",
     "quant_prefill_gemm_wired": false
   },
   "notes": [
     "Mini graph via GpuDecodeSession::bench_step_verify_ms; does not touch bench.rs Lane A writer.",
     "E4B: load Hot session then same M=1..8 loop; write model=e4b into this schema.",
-    "TensorOps/NAX Int4 unbound — verify stays on simdgroup Q4; DDTree parked until verify(M) flattens."
+    "TensorOps Q4 is not shipped: raw-address kernels still lack a shader-side sub-byte tensor constructor and wired host dispatch; the missing Int4 host descriptor binding is separate."
   ],
   "prefill_tokens": 2,
   "results": [

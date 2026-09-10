@@ -47,7 +47,7 @@ The **[modern small-LM training guide](modern-small-lm-training-guide.md)** is t
 
 The **[experiment suite index](experiment-notes/00-INDEX.md)** is the lab notebook for the workspace. Each note records why an experiment was run, its setup and hardware, measured results, failures, evidence strength, artifacts, and what should—or should not—be concluded.
 
-- **[September 4 architecture research review](docs/architecture-review-2026-09-04/README.md)** consolidates the experiment audit, paired hybrid learning curves, GDN/MoE comparator findings, and the proposed binding/update-direction/retention experiments. It includes the supplied memos with explicit corrections, mathematical oracles, source evidence, and CPU reproduction probes. Proposed operators and report-backed results are distinguished from verified measurements.
+- **[September 4 architecture research review](docs/architecture-review-2026-09-04/README.md)** consolidates the experiment audit, paired hybrid learning curves, GDN/MoE comparator findings, and the proposed binding/update-direction/retention experiments. It includes the supplied memos with explicit corrections, mathematical oracles, source evidence, and CPU reproduction probes. Proposed operators and report-backed results are distinguished from verified measurements. Its [Lambda handoff](docs/architecture-review-2026-09-04/LAMBDA_HANDOFF_2026-09-05.md) carries the resulting September program — the width-1536 ladder rung in flight, E28–E35 coded, timed on the box and priced — and the decisions it waits on.
 - **[Training ablations](experiment-notes/00-INDEX.md#training)** cover Muon and learning-rate tuning, auxiliary heads, depth/width tradeoffs, gated attention, value residuals, adaptive raw-byte models, and planned H100 follow-ups.
 - **[Nanolab studies](experiment-notes/00-INDEX.md#nanolab)** track mixer quality, the recurrent-to-attention token-budget crossover, optimizer bake-offs, GPU throughput, chunk-parallel kernels, long 128M runs, and diffusion conversion. The 2026-08 GH200 campaign adds a µP/standard-parametrization tuning control, a wall-clock-matched board, a hybrid ratio-and-placement sweep, sequence length at 2048, and a 405-run recall grid across task difficulty and training budget — recorded in [`docs/EXPERIMENT_BACKLOG_2026-08-26.md`](docs/EXPERIMENT_BACKLOG_2026-08-26.md) and summarised in [`MASTER_ARCHITECTURAL_KB.md`](MASTER_ARCHITECTURAL_KB.md).
 - **[Gemma Metal studies](experiment-notes/00-INDEX.md#gemma-metal)** document native and MLX decode performance, speculative decoding, parity debugging, kernel roofline analysis, prompt caching, and product-path decisions on Apple silicon.
@@ -127,7 +127,8 @@ The submission-oriented track, mirroring techniques from the public leaderboard:
 .
 |-- Rust_MLKit/                      # native Apple-silicon ML systems work
 |   |-- gemma-metal/                 # Rust + Metal Gemma inference and benchmarks
-|   |-- crates/tessl/        # reusable Metal runtime components
+|   |-- crates/tessl/                # Metal 4 GEMM + encode runtime
+|   |-- crates/sparsl/               # sparse/scan kernels (own git repo, gitignored here)
 
 ### Crate naming
 
@@ -141,14 +142,16 @@ when they were written.
 |---|---|---|---|
 | `Rust_MLKit/crates/tessl/` | `tessl` | `tessl` | Metal 4 GEMM + encode runtime. Owns the GEMM kernels, benchmarks and audit. |
 | `Rust_MLKit/arch_02_value_resid/metal-native/` | `tessl-arch02` | `tessl_arch02` | arch_02 trainer. Depends on `tessl`; keeps only its training kernels and modules. |
+| `Rust_MLKit/crates/sparsl/` | `sparsl` | `sparsl` | Deterministic sparse (CSR SpMV/SpMM/transpose) and scan kernels, CPU + Metal. `tessl`'s sparse counterpart, developed here but **tracked in its own git repository** and gitignored from this one, so `git ls-files` shows nothing under it. |
 
 The `arch_02_value_resid/metal-native/` directory keeps its name (it is the
 arch_02 experiment's trainer), and the `METAL_NATIVE_*` / `METAL_RUNTIME_*`
 environment variables are unchanged so existing scripts keep working.
 
-See [`Rust_MLKit/docs/gemm_architecture.md`](Rust_MLKit/docs/gemm_architecture.md)
-for the GEMM kernel-selection path, the cooperative-accumulator gate, and how to
-verify and benchmark it.
+See [`Rust_MLKit/docs/kernel_hardening.md`](Rust_MLKit/docs/kernel_hardening.md)
+for the dated Tessl/Sparsl verification and performance evidence, and
+[`Rust_MLKit/docs/gemm_architecture.md`](Rust_MLKit/docs/gemm_architecture.md)
+for the GEMM kernel-selection path and cooperative-accumulator gate.
 |   |-- arch_01_gated_value_resid/   # gated-attention + value-residual port
 |   |-- arch_02_value_resid/         # value-residual Rust/Metal/MLX implementations
 |   `-- arch_03_aprdh_adaptive/      # adaptive raw-byte architecture research

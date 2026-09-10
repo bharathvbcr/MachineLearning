@@ -72,6 +72,26 @@ No in-tree download helper — Hub pulls use `hf download …` (resume via HF ca
 Diag `cache` / `weights` lines report snapshot paths, shard counts, and byte sizes so
 incomplete 31B pulls show up before decode.
 
+### Benchmark artifact writes
+
+Normal `cargo test` runs never replace tracked `bench/results/*_latest.json`
+files. The microbenchmark tests still exercise their measurement and
+serialization paths, and timestamped diagnostics may be preserved, but moving
+a diagnostic into the `latest` slot is an explicit action:
+
+```bash
+GEMMA_METAL_UPDATE_LATEST_ARTIFACTS=1 cargo test --release <exact-test-name>
+```
+
+Those test-produced records carry `evidence_status: "diagnostic_only"`; the
+environment flag is not a performance-publication gate and does not add
+revision, load, stability, or artifact-hash provenance. Do not cite them as
+current benchmark evidence without a separate gated run.
+
+Previously checked-in latest-slot records retained without a fresh gated run
+carry `evidence_status: "historical_unverified"`; `_latest` names the continuity
+slot, not the currency or publication status of its contents.
+
 ## Build / test
 
 ```bash
@@ -80,9 +100,19 @@ cargo test
 cargo run --release --bin bench
 cargo run --release --bin bench -- --e4b
 cargo run --release --bin serve -- --port 8787 --preset e4b   # or 31b
-# Offline / no metal toolchain:
-GEMMA_METAL_SKIP_AOT=1 cargo test
+# Offline / no Metal toolchain: both prebuilt artifacts must be explicit.
+TESSL_SKIP_AOT=1 TESSL_PREBUILT_METALLIB=/absolute/path/to/tessl.metallib \
+  GEMMA_METAL_SKIP_AOT=1 GEMMA_METAL_PREBUILT_METALLIB=/absolute/path/to/gemma.metallib \
+  cargo test
 ```
+
+Each prebuilt variable must name an existing absolute regular file. The build
+scripts canonicalize and track those files; neither falls back to an ignored
+`default.metallib` in a source directory.
+
+Normal AOT builds resolve the shared `gelu.h` through Tessl's
+`DEP_TESSL_KERNELS` metadata and fail if either the metadata or header is
+missing.
 
 Needs macOS 26+ Metal 4 for GPU tests. Overlay: `kernels/*.metal` → `GEMMA_METAL_METALLIB`.
 

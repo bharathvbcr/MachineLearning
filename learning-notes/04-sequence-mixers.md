@@ -97,6 +97,11 @@ beat Mamba-2 in your bake-off — the delta rule's better recall showed up even 
 `verify_gdn.py` / `verify_gdn_wy.py` validate the chunkwise ("WY"-form) delta recurrence against
 a sequential reference.
 
+*Two delta rules (2026-09-05).* nanolab's GDN computes the correction from the undecayed
+state (`v − Sᵀk`); the published operator uses the decayed one (`v − (αS)ᵀk`). Every
+recorded GDN number is the repo variant; `Config.gdn_rule="published"` runs the paper's,
+and file 21 §21.5 shows the two-token example that separates them.
+
 ---
 
 ## 4.5 The kernel problem — and why chunk-parallel mattered *enormously*

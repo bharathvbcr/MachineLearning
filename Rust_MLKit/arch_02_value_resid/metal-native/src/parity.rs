@@ -7,9 +7,7 @@ use std::sync::Arc;
 use crate::model_bwd::{backward_f32, backward_f32_opts, Grads, BWD_ATOL};
 use crate::model_fwd::{forward_f32, ForwardOutputs};
 use crate::npy::{read_npy, transpose_last2};
-use crate::optim::{
-    optim_step, zero_grads, OptimHyperparams, OptimState, OPTIM_ATOL,
-};
+use crate::optim::{optim_step, zero_grads, OptimHyperparams, OptimState, OPTIM_ATOL};
 use crate::runtime::GpuRuntime;
 use crate::tape::Tape;
 use crate::tensor::Tensor;
@@ -56,20 +54,32 @@ pub fn require_fwd_goldens(golden: &std::path::Path) {
 
 /// Error reductions must preserve non-finite evidence instead of hiding NaNs.
 pub(crate) fn max_finite_error(acc: f32, value: f32) -> f32 {
-    if acc.is_finite() && value.is_finite() { acc.max(value) } else { f32::INFINITY }
+    if acc.is_finite() && value.is_finite() {
+        acc.max(value)
+    } else {
+        f32::INFINITY
+    }
 }
 
 pub fn max_abs_err(got: &[f32], exp: &[f32]) -> f32 {
-    if got.is_empty() || got.len() != exp.len() { return f32::INFINITY; }
-    got.iter().zip(exp).map(|(g, e)| (g - e).abs())
+    if got.is_empty() || got.len() != exp.len() {
+        return f32::INFINITY;
+    }
+    got.iter()
+        .zip(exp)
+        .map(|(g, e)| (g - e).abs())
         .fold(0.0, max_finite_error)
 }
 
 pub fn mean_abs_err(got: &[f32], exp: &[f32]) -> f32 {
-    if got.is_empty() || got.len() != exp.len() { return f32::INFINITY; }
+    if got.is_empty() || got.len() != exp.len() {
+        return f32::INFINITY;
+    }
     let mut sum = 0.0f64;
     for (&g, &e) in got.iter().zip(exp) {
-        if !g.is_finite() || !e.is_finite() { return f32::INFINITY; }
+        if !g.is_finite() || !e.is_finite() {
+            return f32::INFINITY;
+        }
         sum += (f64::from(g) - f64::from(e)).abs();
     }
     (sum / got.len() as f64) as f32
@@ -158,18 +168,12 @@ pub fn compare_forward(
             &out.layer_x[i].buffer.read_f32(),
         )?;
         if let Some(ref s) = out.layer_after_skip[i] {
-            check(
-                &format!("fwd/layer{i}_after_skip"),
-                &s.buffer.read_f32(),
-            )?;
+            check(&format!("fwd/layer{i}_after_skip"), &s.buffer.read_f32())?;
         }
     }
 
     check("fwd/final_norm", &out.final_norm.buffer.read_f32())?;
-    check(
-        "fwd/logits_pre_softcap",
-        &out.logits_pre.buffer.read_f32(),
-    )?;
+    check("fwd/logits_pre_softcap", &out.logits_pre.buffer.read_f32())?;
     check(
         "fwd/logits_post_softcap",
         &out.logits_post.buffer.read_f32(),
@@ -544,14 +548,10 @@ pub fn run_optim_parity(
     results.extend(compare_muon_momentum(golden, &state)?);
     eprintln!(
         "optim parity losses (synthetic batches): {:?}",
-        losses
-            .iter()
-            .map(|l| format!("{l:.4}"))
-            .collect::<Vec<_>>()
+        losses.iter().map(|l| format!("{l:.4}")).collect::<Vec<_>>()
     );
     Ok(results)
 }
-
 
 /// 3-step optim-only parity: load post-clip grads from `grad_root/step{k}/` (Python layout),
 /// apply on-device AdamW+Muon, compare to `golden/optim_step3/`. Isolates optim kernels from
@@ -571,7 +571,12 @@ pub fn run_optim_parity_from_grad_dir(
         let arr = read_npy(path)?;
         let d = arr.f32_slice()?;
         if d.len() != t.numel() {
-            return Err(format!("{} numel {} vs {}", path.display(), d.len(), t.numel()));
+            return Err(format!(
+                "{} numel {} vs {}",
+                path.display(),
+                d.len(),
+                t.numel()
+            ));
         }
         t.buffer.write_f32(d);
         Ok(())
@@ -603,22 +608,40 @@ pub fn run_optim_parity_from_grad_dir(
         load_emb(&grads.ve_emb, &root.join("ve_shared/embed/weight.npy"))?;
         load_lin(&grads.ve_proj, &root.join("ve_shared/proj/weight.npy"))?;
         load_emb(&grads.ve_scale, &root.join("ve_shared/scale.npy"))?;
-        load_emb(&grads.ve_layer_scales[0], &root.join("ve_layer_scales/0.npy"))?;
-        load_emb(&grads.ve_layer_scales[1], &root.join("ve_layer_scales/1.npy"))?;
+        load_emb(
+            &grads.ve_layer_scales[0],
+            &root.join("ve_layer_scales/0.npy"),
+        )?;
+        load_emb(
+            &grads.ve_layer_scales[1],
+            &root.join("ve_layer_scales/1.npy"),
+        )?;
         load_emb(&grads.skip_weights, &root.join("skip_weights.npy"))?;
         load_lin(&grads.qo_bank, &root.join("qo_bank.npy"))?;
         load_lin(&grads.kv_bank, &root.join("kv_bank.npy"))?;
         load_lin(&grads.mlp_up, &root.join("mlp_up_bank.npy"))?;
         load_lin(&grads.mlp_down, &root.join("mlp_down_bank.npy"))?;
         for i in 0..4 {
-            load_emb(&grads.blocks[i].q_gain, &root.join(format!("blocks/{i}/attn/q_gain.npy")))?;
+            load_emb(
+                &grads.blocks[i].q_gain,
+                &root.join(format!("blocks/{i}/attn/q_gain.npy")),
+            )?;
             let vr = root.join(format!("blocks/{i}/attn/vr_lambda.npy"));
             if vr.exists() {
                 load_emb(&grads.blocks[i].vr_lambda, &vr)?;
             }
-            load_emb(&grads.blocks[i].attn_scale, &root.join(format!("blocks/{i}/attn_scale.npy")))?;
-            load_emb(&grads.blocks[i].mlp_scale, &root.join(format!("blocks/{i}/mlp_scale.npy")))?;
-            load_emb(&grads.blocks[i].resid_mix, &root.join(format!("blocks/{i}/resid_mix.npy")))?;
+            load_emb(
+                &grads.blocks[i].attn_scale,
+                &root.join(format!("blocks/{i}/attn_scale.npy")),
+            )?;
+            load_emb(
+                &grads.blocks[i].mlp_scale,
+                &root.join(format!("blocks/{i}/mlp_scale.npy")),
+            )?;
+            load_emb(
+                &grads.blocks[i].resid_mix,
+                &root.join(format!("blocks/{i}/resid_mix.npy")),
+            )?;
         }
         optim_step(rt, &mut w, &grads, &mut state, false, 1.0)?;
     }
@@ -808,10 +831,7 @@ fn push_moment(
     Ok(())
 }
 
-fn compare_optim_moments(
-    golden: &Path,
-    state: &OptimState,
-) -> Result<Vec<CompareResult>, String> {
+fn compare_optim_moments(golden: &Path, state: &OptimState) -> Result<Vec<CompareResult>, String> {
     let mut results = Vec::new();
     push_moment(
         "optim/adam_tok_exp_avg",
@@ -864,10 +884,7 @@ fn compare_optim_moments(
     Ok(results)
 }
 
-fn compare_muon_momentum(
-    golden: &Path,
-    state: &OptimState,
-) -> Result<Vec<CompareResult>, String> {
+fn compare_muon_momentum(golden: &Path, state: &OptimState) -> Result<Vec<CompareResult>, String> {
     let mut results = Vec::new();
     push_moment(
         "optim/muon_qo_mom",
@@ -912,6 +929,7 @@ fn compare_muon_momentum(
 // two places to update and one of them going stale.
 mod tests {
     use super::*;
+    use objc2_metal::MTLComputePipelineState;
 
     #[test]
     fn fwd_parity_vs_goldens() {
@@ -1033,9 +1051,8 @@ mod tests {
         let pipe = rt.pipeline("qkv_post_bwd_f32").unwrap();
         dispatch_1d(&rt, &pipe, b * t * h, |bnd| {
             for (idx, tensor) in [
-                &tq, &tk, &tv, &ve, &v0, &raw_v, &lambda, &gain, &rope, &rope,
-                &tdq, &tdk, &tdv, &odq, &odk, &odv, &odve, &odv0, &dlambda,
-                &dgain,
+                &tq, &tk, &tv, &ve, &v0, &raw_v, &lambda, &gain, &rope, &rope, &tdq, &tdk, &tdv,
+                &odq, &odk, &odv, &odve, &odv0, &dlambda, &dgain,
             ]
             .iter()
             .enumerate()
@@ -1147,7 +1164,8 @@ mod tests {
         let golden = golden_dir();
         let rt = crate::gpu_runtime().expect("GpuRuntime");
         let late = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("out/step_2000_weights");
-        let use_late = late.join("tok_emb/weight.npy").exists() || late.join("tok_emb.npy").exists();
+        let use_late =
+            late.join("tok_emb/weight.npy").exists() || late.join("tok_emb.npy").exists();
         if use_late {
             eprintln!("late FD: using {}", late.display());
         } else {
@@ -1163,7 +1181,10 @@ mod tests {
         let mut grads = Grads::zeros_like(&rt, &w).unwrap();
         backward_f32_opts(&rt, &w, &tape, &mut grads, false).unwrap();
         let g = grads.qo_bank.buffer.read_f32();
-        let max_abs = g.iter().map(|x| x.abs()).fold(0.0f32, crate::parity::max_finite_error);
+        let max_abs = g
+            .iter()
+            .map(|x| x.abs())
+            .fold(0.0f32, crate::parity::max_finite_error);
         assert!(
             max_abs.is_finite() && max_abs > 0.0,
             "qo_bank grad max_abs={max_abs}"
@@ -1199,7 +1220,9 @@ mod tests {
     fn optim_step3_parity_vs_goldens() {
         let golden = golden_dir();
         assert!(
-            golden.join("optim_step3/params/tok_emb/weight.npy").exists(),
+            golden
+                .join("optim_step3/params/tok_emb/weight.npy")
+                .exists(),
             "missing optim_step3 goldens"
         );
         let rt = crate::gpu_runtime().expect("GpuRuntime");
@@ -1246,7 +1269,13 @@ mod tests {
         let mut grads = Grads::zeros_like(&rt, &w).unwrap();
         let clip = crate::optim::ClipState::new(&rt).unwrap();
         crate::model_bwd::backward_f32_opts_clip(
-            &rt, &w, &tape, &mut grads, true, Some(&clip), false,
+            &rt,
+            &w,
+            &tape,
+            &mut grads,
+            true,
+            Some(&clip),
+            false,
         )
         .unwrap();
         let coef = clip.clip_coef.contents_f32()[0];
@@ -1434,7 +1463,10 @@ mod tests {
             false,
         );
         assert!(
-            rq.iter().chain(rk.iter()).chain(rv.iter()).all(|x| x.is_finite()),
+            rq.iter()
+                .chain(rk.iter())
+                .chain(rv.iter())
+                .all(|x| x.is_finite()),
             "reference FA bwd produced non-finite values"
         );
         let mag = max_abs(&rq).max(max_abs(&rk)).max(max_abs(&rv)).max(1e-6);
@@ -1444,7 +1476,9 @@ mod tests {
             "flash_attn_bwd_dkv_row_d32_f32",
             false,
         );
-        let e_f32 = max_err(&rq, &fq).max(max_err(&rk, &fk)).max(max_err(&rv, &fv));
+        let e_f32 = max_err(&rq, &fq)
+            .max(max_err(&rk, &fk))
+            .max(max_err(&rv, &fv));
         eprintln!("FA bwd d32 f32: max_abs_err={e_f32:.3e} (ref magnitude {mag:.3e})");
         assert!(
             e_f32 <= 1e-5 * mag.max(1.0),
@@ -1458,10 +1492,15 @@ mod tests {
                 true,
             );
             assert!(
-                bq.iter().chain(bk.iter()).chain(bv.iter()).all(|x| x.is_finite()),
+                bq.iter()
+                    .chain(bk.iter())
+                    .chain(bv.iter())
+                    .all(|x| x.is_finite()),
                 "bf16 FA bwd produced non-finite values"
             );
-            let e_bf = max_err(&rq, &bq).max(max_err(&rk, &bk)).max(max_err(&rv, &bv));
+            let e_bf = max_err(&rq, &bq)
+                .max(max_err(&rk, &bk))
+                .max(max_err(&rv, &bv));
             eprintln!(
                 "FA bwd d32 bf16: max_abs_err={e_bf:.3e} ({:.2}% of ref magnitude)",
                 e_bf / mag * 100.0
@@ -1717,7 +1756,10 @@ mod tests {
         let eo = max_err(&ro, &fo);
         let el = max_err(&rl, &fl);
         eprintln!("fwd flash d32 f32: max|ΔO|={eo:.3e} max|ΔLSE|={el:.3e}");
-        assert!(eo <= 1e-5 && el <= 1e-5, "d32 fwd flash mismatch O={eo} LSE={el}");
+        assert!(
+            eo <= 1e-5 && el <= 1e-5,
+            "d32 fwd flash mismatch O={eo} LSE={el}"
+        );
 
         if rt.pipeline("flash_attn_fwd_d32_bf16").is_ok() {
             let (bo, bl) = run("flash_attn_fwd_d32_bf16", true);
@@ -1728,7 +1770,10 @@ mod tests {
             let eo_b = max_err(&ro, &bo);
             let el_b = max_err(&rl, &bl);
             eprintln!("fwd flash d32 bf16: max|ΔO|={eo_b:.3e} max|ΔLSE|={el_b:.3e}");
-            assert!(eo_b <= 5e-2, "bf16 fwd flash O beyond bf16 tolerance: {eo_b}");
+            assert!(
+                eo_b <= 5e-2,
+                "bf16 fwd flash O beyond bf16 tolerance: {eo_b}"
+            );
             assert!(el_b <= 5e-2, "bf16 fwd flash LSE beyond tolerance: {el_b}");
         }
     }
@@ -1807,7 +1852,10 @@ mod tests {
         let eg_o = max_err(&bo, &go);
         let eg_l = max_err(&bl, &gl);
         eprintln!("blocksoft generic vs d32: max|ΔO|={eg_o:.3e} max|ΔLSE|={eg_l:.3e}");
-        assert!(eg_o <= 1e-5 && eg_l <= 1e-5, "blocksoft d32≠generic O={eg_o} L={eg_l}");
+        assert!(
+            eg_o <= 1e-5 && eg_l <= 1e-5,
+            "blocksoft d32≠generic O={eg_o} L={eg_l}"
+        );
     }
 
     /// bf16 flash must emit finite LSE on the tape (training bwd requirement).
@@ -1928,8 +1976,9 @@ mod tests {
         );
     }
 
-    /// TensorOps multi-block online probe vs simdgroup FA-2 on a tiny causal tile.
-    /// Not golden-gated; documents whether the probe is numerically usable.
+    /// TensorOps multi-block online probe vs simdgroup FA-2 on a tiny ragged
+    /// causal tile. T=65 makes the final query/key blocks contain one row, so
+    /// direct strided TensorOps views cannot hide an aligned-only edge bug.
     #[test]
     fn flash_tensorops_online_probe_smoke() {
         let rt = crate::gpu_runtime().expect("GpuRuntime");
@@ -1938,7 +1987,7 @@ mod tests {
             return;
         }
         let b = 1usize;
-        let t = 64usize;
+        let t = 65usize;
         let h = 2usize;
         let hkv = 1usize;
         let d = 32usize;
@@ -1984,6 +2033,16 @@ mod tests {
         .unwrap();
 
         let p_to = rt.pipeline("flash_attn_tensorops_online_f32").unwrap();
+        let static_tg = p_to.staticThreadgroupMemoryLength();
+        eprintln!(
+            "TensorOps online static threadgroup memory: {static_tg}/{} bytes",
+            rt.max_threadgroup_memory()
+        );
+        assert!(
+            static_tg <= rt.max_threadgroup_memory(),
+            "TensorOps online static threadgroup memory {static_tg} exceeds device limit {}",
+            rt.max_threadgroup_memory()
+        );
         crate::dispatch::dispatch_2d_tg(&rt, &p_to, q_blocks, b * h, 32, |bnd| {
             crate::dispatch::set_tensor(bnd, &tq, 0);
             crate::dispatch::set_tensor(bnd, &tk, 1);
@@ -2011,9 +2070,7 @@ mod tests {
             }
             max_err = max_err.max((a - b).abs());
         }
-        eprintln!(
-            "tensorops online probe vs FA-2: max_abs_err={max_err:.3e} nonfinite={n_bad}"
-        );
+        eprintln!("tensorops online probe vs FA-2: max_abs_err={max_err:.3e} nonfinite={n_bad}");
         // Probe is experimental — only require finite + rough agreement.
         assert_eq!(n_bad, 0, "TensorOps online O has non-finite values");
         assert!(
@@ -2028,15 +2085,18 @@ mod audit_tests {
     use super::*;
     #[test]
     fn invalid_parity_evidence_never_passes() {
-        for (got,expected,atol) in [
-            (vec![f32::NAN],vec![0.0],1e-5),
-            (vec![f32::INFINITY],vec![f32::INFINITY],1e-5),
-            (vec![],vec![],1e-5),
-            (vec![0.0],vec![0.0,1.0],1e-5),
-            (vec![0.0],vec![0.0],f32::INFINITY),
+        for (got, expected, atol) in [
+            (vec![f32::NAN], vec![0.0], 1e-5),
+            (vec![f32::INFINITY], vec![f32::INFINITY], 1e-5),
+            (vec![], vec![], 1e-5),
+            (vec![0.0], vec![0.0, 1.0], 1e-5),
+            (vec![0.0], vec![0.0], f32::INFINITY),
         ] {
-            let result=std::panic::catch_unwind(||compare_f32("bad",&got,&expected,atol));
-            assert!(result.is_ok(), "comparison should report failed evidence, not panic");
+            let result = std::panic::catch_unwind(|| compare_f32("bad", &got, &expected, atol));
+            assert!(
+                result.is_ok(),
+                "comparison should report failed evidence, not panic"
+            );
             assert!(!result.unwrap().passed, "invalid evidence accepted");
         }
     }

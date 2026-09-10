@@ -116,6 +116,19 @@ SSMs (it doesn't let stale associations accumulate). The `β` and `α` gates con
 and decay. Your `gdn_chunked` (mixers.py:433) does this chunkwise in the "WY" form, verified vs the
 sequential reference (`verify_gdn_wy.py`).
 
+> **Which state the correction reads — two rules (found 2026-09-04).** The schematic above
+> hides an ordering choice. With decay `α` and write gate `β`, the published Gated DeltaNet
+> (arXiv 2412.06464, eq. 8) subtracts the prediction of the *decayed* state:
+> `S ← αS + β·k ⊗ (v − (αS)ᵀk)`. nanolab's `gdn_chunked` and `_sequential` subtract the
+> prediction of the *undecayed* state: `S ← αS + β·k ⊗ (v − Sᵀk)`. With unit keys the old
+> association's transition is `α(1−β)` in the paper and `α−β` in the repo (which can go
+> negative when `β > α`); two unit tokens at `α=β=0.5` give outputs `[0.5, 0.5]` (repo) vs
+> `[0.5, 0.625]` (paper). The regression test could not see it because its reference
+> implements the same variant. Since 2026-09-05 `Config.gdn_rule` selects `"repo"`
+> (default — every number in this repo) or `"published"`, and the chunked and sequential
+> forms are tested against each other under both. Whether the difference matters for
+> recall is the E28 ablation, not something to assume either way.
+
 The three recurrent designs, ranked by their 2M-token bake-off result (real, file 08) —
 the delta rule's cleaner memory shows up as the best of the three:
 

@@ -32,13 +32,27 @@ Core ML / Metal Performance Shaders stack.
 ```
 Rust_MLKit/
 ├── README.md                                ← you are here
+├── AGENTS.md / DECISIONS.md                 ← agent entry point; recorded decisions
+├── docs/                                    ← Apple-API + kernel reference (start: optimization_map.md)
+│   ├── gemm_architecture.md                 ← GEMM kernel selection, the coop gate, how to verify it
+│   ├── kernel_hardening.md                  ← GEMM contracts, reproduced failures, publication gates
+│   ├── machine_profile_m5_pro.md            ← host facts (20 GPU cores / 64 GB / NAX / wired budgets)
+│   ├── metal4_mpp.md, mlx.md, coreml_metal_ml.md
+│   └── optimization_map.md                  ← live gates + backlog
+├── crates/
+│   ├── tessl/                               ← Metal 4 GEMM + encode runtime (kernels, benches, audit)
+│   └── sparsl/                              ← sparse/scan kernels; own git repo, gitignored here
+├── gemma-metal/                             ← Rust + Metal Gemma inference and benchmarks
 ├── arch_01_gated_value_resid/
 │   ├── README.md                            ← architecture spec + porting notes
 │   ├── train_gpt_sprint_native.py           ← full source (run with GATED_ATTENTION=1 VALUE_RESIDUAL=1)
 │   └── submission_packaging.py              ← single-file builder + SDPA fallback prelude
 ├── arch_02_value_resid/
 │   ├── README.md                            ← architecture spec + porting notes
-│   └── train_gpt_sprint_native.py           ← same source (run with VALUE_RESIDUAL=1 GATED_ATTENTION=0)
+│   ├── train_gpt_sprint_native.py           ← same source (run with VALUE_RESIDUAL=1 GATED_ATTENTION=0)
+│   ├── metal-native/                        ← `tessl-arch02` trainer (Rust + MSL), the training hot path
+│   ├── burn-port/                           ← frozen A/B reference (do not rewrite)
+│   └── mlx-baseline/                        ← frozen MLX baseline (do not rewrite)
 ├── arch_03_aprdh_adaptive/
 │   ├── README.md                            ← architecture spec + porting notes
 │   └── train_toy_adaptive.py                ← byte-level adaptive recurrent architecture
@@ -58,7 +72,21 @@ Rust_MLKit/
 
 ---
 
-## Porting Roadmap (suggested)
+## Where the Rust work actually lives
+
+The roadmap below is the *original* plan, written before any of it was built. It
+is kept as the record of intent; it is **not** a status board. The shipped code
+and its measurements are in [`crates/tessl/`](crates/tessl/README.md#latest-checked-in-result-snapshot)
+(GEMM + encode runtime; canonical benchmark and evidence-status tables),
+[`crates/sparsl/`](crates/sparsl/README.md) (sparse/scan kernels; canonical
+crossover results), [`gemma-metal/`](gemma-metal/) (inference) and
+[`arch_02_value_resid/metal-native/`](arch_02_value_resid/metal-native/) (the
+trainer). The dated cross-crate audit summary is in
+[`docs/kernel_hardening.md`](docs/kernel_hardening.md). Check those and
+[`docs/gemm_architecture.md`](docs/gemm_architecture.md) before treating any
+roadmap item below as outstanding.
+
+## Porting Roadmap (original plan, superseded — see above)
 
 ### Phase 1 — Core Inference (arch_02, simplest path)
 1. Port `RMSNorm`, `Rotary (RoPE)`, `apply_rotary_emb` → Metal compute shaders

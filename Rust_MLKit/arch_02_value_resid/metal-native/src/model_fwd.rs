@@ -15,14 +15,14 @@ use std::sync::Arc;
 
 use crate::dispatch::{dispatch_1d, dispatch_2d_tg, set_f32, set_tensor, set_u32};
 use crate::gemm::{cast_f32_to_bf16, gemm_train, select_backend, GemmBackend};
-use crate::runtime::{GpuRuntime, PrecisionMode};
-use crate::tape::Tape;
-use crate::tensor::Tensor;
 use crate::mixers::{mamba2_conv1d_fwd, mamba2_fwd, mingru_fwd, mingru_vr_blend_fwd};
+use crate::runtime::{GpuRuntime, PrecisionMode};
 use crate::ssm_glue::{
     mamba2_d_skip_fwd, mamba2_log_da, mamba2_x_scaled, mul_fwd, reshape_heads, rms_norm_weight_fwd,
     silu_fwd, silu_fwd_store, slice_last_dim, softplus_bias_fwd,
 };
+use crate::tape::Tape;
+use crate::tensor::Tensor;
 use crate::weights::{ModelConfig, Weights};
 use objc2_metal::MTLBuffer;
 
@@ -101,11 +101,8 @@ pub fn forward_f32_uploaded(
 
     // Audit 8: METAL_NATIVE_FWD_PROFILE=1 — same synced section timing as the
     // backward profiler that located the FA bwd bottleneck.
-    let mut fprof = crate::model_bwd::BwdProf::new_labeled(
-        rt,
-        crate::ab_flags::fwd_profile(),
-        "fwd_profile",
-    )?;
+    let mut fprof =
+        crate::model_bwd::BwdProf::new_labeled(rt, crate::ab_flags::fwd_profile(), "fwd_profile")?;
     fprof.lap(rt, "stem")?;
 
     for layer in 0..cfg.num_layers {
@@ -235,13 +232,16 @@ pub fn forward_f32_uploaded(
         let p2 = rt.pipeline("mean_reduce_f32")?;
         let tpg = 256usize;
         rt.with_binder(|bnd| {
-                        bnd.set_pipeline(&p2);
+            bnd.set_pipeline(&p2);
             set_tensor(bnd, &row_loss, 0);
             set_tensor(bnd, &loss_device, 1);
             set_u32(bnd, bt as u32, 2);
-            bnd.dispatch(crate::runtime::mtl_size(1, 1, 1), crate::runtime::mtl_size(tpg, 1, 1));
-        Ok(())
-    })?;
+            bnd.dispatch(
+                crate::runtime::mtl_size(1, 1, 1),
+                crate::runtime::mtl_size(tpg, 1, 1),
+            );
+            Ok(())
+        })?;
     }
     tape.logits_pre = None;
     fprof.lap(rt, "head")?;
@@ -315,8 +315,19 @@ pub fn forward_infer_f32(
             x = skip_add(rt, &x, &skip, &sw_t)?;
         }
 
-        let (_attn_out, _mlp_out, x_new, raw_v) =
-            block_fwd(rt, w, layer, &x, &x0, &ids, v0.as_ref(), backend, None, None, None)?;
+        let (_attn_out, _mlp_out, x_new, raw_v) = block_fwd(
+            rt,
+            w,
+            layer,
+            &x,
+            &x0,
+            &ids,
+            v0.as_ref(),
+            backend,
+            None,
+            None,
+            None,
+        )?;
         if layer == 0 {
             v0 = raw_v;
         }
@@ -350,8 +361,6 @@ fn block_fwd(
     mut fprof: Option<&mut crate::model_bwd::BwdProf>,
 ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>), String> {
     let cfg = &w.cfg;
-    
-
 
     let b = cfg.batch;
     let tlen = cfg.seq_len;
@@ -406,15 +415,56 @@ fn block_fwd(
     }
 
     let (attn_out, raw_v) = match cfg.layer_mixer(layer) {
-        crate::weights::MixerKind::Attention => {
-            attention_fwd(rt, w, layer, &attn_in, ids, v0, backend, tape.as_deref_mut(), b, tlen, c, kv, h, hkv, d, bt, bw, use_bf16_stream, fprof.as_deref_mut())?
-        },
-        crate::weights::MixerKind::Mamba2 => {
-            mamba2_fwd_rust(rt, w, layer, &attn_in, ids, backend, tape.as_deref_mut(), b, tlen, c)?
-        },
-        crate::weights::MixerKind::MinGRU => {
-            mingru_fwd_rust(rt, w, layer, &attn_in, ids, v0, backend, tape.as_deref_mut(), b, tlen, c, kv, hkv, d, bw)?
-        }
+        crate::weights::MixerKind::Attention => attention_fwd(
+            rt,
+            w,
+            layer,
+            &attn_in,
+            ids,
+            v0,
+            backend,
+            tape.as_deref_mut(),
+            b,
+            tlen,
+            c,
+            kv,
+            h,
+            hkv,
+            d,
+            bt,
+            bw,
+            use_bf16_stream,
+            fprof.as_deref_mut(),
+        )?,
+        crate::weights::MixerKind::Mamba2 => mamba2_fwd_rust(
+            rt,
+            w,
+            layer,
+            &attn_in,
+            ids,
+            backend,
+            tape.as_deref_mut(),
+            b,
+            tlen,
+            c,
+        )?,
+        crate::weights::MixerKind::MinGRU => mingru_fwd_rust(
+            rt,
+            w,
+            layer,
+            &attn_in,
+            ids,
+            v0,
+            backend,
+            tape.as_deref_mut(),
+            b,
+            tlen,
+            c,
+            kv,
+            hkv,
+            d,
+            bw,
+        )?,
     };
     if let Some(lt) = tape.as_mut().and_then(|t| t.layer.get_mut(layer)) {
         lt.attn_out = Some(attn_out.clone());
@@ -750,9 +800,7 @@ fn qkv_post(
 }
 
 fn use_persistent_bf16(rt: &GpuRuntime, backend: GemmBackend) -> bool {
-    rt.precision() == PrecisionMode::Bf16
-        && backend == GemmBackend::TensorOps
-        && rt.has_tensorops()
+    rt.precision() == PrecisionMode::Bf16 && backend == GemmBackend::TensorOps && rt.has_tensorops()
 }
 
 fn use_bf16_flash(rt: &GpuRuntime) -> bool {
@@ -779,7 +827,7 @@ fn flash_attn(
     let groups_y = cfg.batch * cfg.num_heads;
 
     // Optional TensorOps multi-block probe (fwd only; bwd stays simdgroup).
-    if rt.flash_tensorops() {
+    if rt.flash_tensorops() && cfg.head_dim == 32 {
         if let Ok(p) = rt.pipeline("flash_attn_tensorops_online_f32") {
             dispatch_2d_tg(rt, &p, q_blocks, groups_y, BR, |bnd| {
                 set_tensor(bnd, q, 0);
@@ -801,8 +849,7 @@ fn flash_attn(
     // Phase G Soft quality: FA-2 blockwise online softmax (rowmax over BC +
     // one rescale). Prefer DH=32 specialized twin on the sota Soft shape.
     if crate::ab_flags::fa_blocksoft() {
-        let name = if cfg.head_dim == 32
-            && rt.pipeline("flash_attn_fwd_blocksoft_d32_f32").is_ok()
+        let name = if cfg.head_dim == 32 && rt.pipeline("flash_attn_fwd_blocksoft_d32_f32").is_ok()
         {
             "flash_attn_fwd_blocksoft_d32_f32"
         } else {
@@ -831,8 +878,8 @@ fn flash_attn(
     // Bf16 this also selects the bf16 twin — the first path that actually
     // reaches bf16 forward flash, since `use_bf16_flash` is hard-coded false.
     if crate::ab_flags::fa_fwd_fast() && cfg.head_dim == 32 {
-        let bf16 = rt.precision() == PrecisionMode::Bf16
-            && rt.pipeline("flash_attn_fwd_d32_bf16").is_ok();
+        let bf16 =
+            rt.precision() == PrecisionMode::Bf16 && rt.pipeline("flash_attn_fwd_d32_bf16").is_ok();
         let (q_op, k_op, v_op) = if bf16 {
             (
                 cast_f32_to_bf16(q)?,
@@ -1071,8 +1118,8 @@ fn alloc_i32_empty(rt: &Arc<GpuRuntime>, shape: &[usize]) -> Result<Tensor, Stri
 fn write_i32_tensor(t: &Tensor, data: &[i32]) {
     let numel = t.numel();
     assert_eq!(data.len(), numel);
-    let ptr = (t.buffer.metal().contents().as_ptr() as *mut u8).wrapping_add(t.byte_offset)
-        as *mut i32;
+    let ptr =
+        (t.buffer.metal().contents().as_ptr() as *mut u8).wrapping_add(t.byte_offset) as *mut i32;
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, numel);
     }
@@ -1094,10 +1141,7 @@ impl DualInputBuffers {
                 alloc_i32_empty(rt, &[batch, seq_len])?,
                 alloc_i32_empty(rt, &[batch, seq_len])?,
             ],
-            tgts: [
-                alloc_i32_empty(rt, &[bt])?,
-                alloc_i32_empty(rt, &[bt])?,
-            ],
+            tgts: [alloc_i32_empty(rt, &[bt])?, alloc_i32_empty(rt, &[bt])?],
             slot: 0,
             in_flight: [false, false],
         })
@@ -1149,18 +1193,20 @@ pub fn ce_mean_device(
     let p2 = rt.pipeline("mean_reduce_f32")?;
     let tpg = 256usize;
     rt.with_binder(|bnd| {
-                bnd.set_pipeline(&p2);
+        bnd.set_pipeline(&p2);
         set_tensor(bnd, &row_loss, 0);
         set_tensor(bnd, &out, 1);
         set_u32(bnd, rows as u32, 2);
-        bnd.dispatch(crate::runtime::mtl_size(1, 1, 1), crate::runtime::mtl_size(tpg, 1, 1));
+        bnd.dispatch(
+            crate::runtime::mtl_size(1, 1, 1),
+            crate::runtime::mtl_size(tpg, 1, 1),
+        );
         Ok(())
     })?;
     Ok(out)
 }
 
 pub fn forward_stub() {}
-
 
 fn attention_fwd(
     rt: &Arc<GpuRuntime>,
@@ -1185,7 +1231,9 @@ fn attention_fwd(
 ) -> Result<(Tensor, Tensor), String> {
     let cfg = &w.cfg;
     let _eps = cfg.f32_eps();
-    let ai = cfg.attn_local_idx(layer).ok_or("attention_fwd on non-attn layer")?;
+    let ai = cfg
+        .attn_local_idx(layer)
+        .ok_or("attention_fwd on non-attn layer")?;
     let n_attn = cfg.mixer_count(crate::weights::MixerKind::Attention);
     let q_w = w.bank_matrix(rt, &w.qo_bank, ai, c, c)?;
     let out_w = w.bank_matrix(rt, &w.qo_bank, n_attn + ai, c, c)?;
@@ -1264,8 +1312,23 @@ fn attention_fwd(
     let k = rt.alloc_tensor_f32(&[bt, kv])?;
     let v = rt.alloc_tensor_f32(&[bt, kv])?;
     qkv_post(
-        rt, &q_pre, &k_pre, &v_pre, &q, &k, &v, ve, &v0_buf, &raw_v, &bw.vr_lambda, &bw.q_gain,
-        &w.rope_cos, &w.rope_sin, cfg, use_ve, use_v0,
+        rt,
+        &q_pre,
+        &k_pre,
+        &v_pre,
+        &q,
+        &k,
+        &v,
+        ve,
+        &v0_buf,
+        &raw_v,
+        &bw.vr_lambda,
+        &bw.q_gain,
+        &w.rope_cos,
+        &w.rope_sin,
+        cfg,
+        use_ve,
+        use_v0,
     )?;
     if let Some(p) = fprof.as_deref_mut() {
         p.lap(rt, "qkv_post_ve")?;
@@ -1362,8 +1425,14 @@ fn mamba2_fwd_rust(
 
     let in_proj = w.mamba_in_proj.as_ref().ok_or("mamba_in_proj missing")?;
     let out_proj = w.mamba_out_proj.as_ref().ok_or("mamba_out_proj missing")?;
-    let conv_w = w.mamba_conv1d_weight.as_ref().ok_or("mamba_conv1d_weight missing")?;
-    let conv_b = w.mamba_conv1d_bias.as_ref().ok_or("mamba_conv1d_bias missing")?;
+    let conv_w = w
+        .mamba_conv1d_weight
+        .as_ref()
+        .ok_or("mamba_conv1d_weight missing")?;
+    let conv_b = w
+        .mamba_conv1d_bias
+        .as_ref()
+        .ok_or("mamba_conv1d_bias missing")?;
     let a_log = w.mamba_a_log.as_ref().ok_or("mamba_a_log missing")?;
     let d_param = w.mamba_d.as_ref().ok_or("mamba_d missing")?;
     let dt_bias = w.mamba_dt_bias.as_ref().ok_or("mamba_dt_bias missing")?;
@@ -1541,4 +1610,89 @@ fn mingru_fwd_rust(
     }
 
     Ok((attn_out, raw_v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `flash_attn_tensorops_online_f32` returns without writing O/L when
+    /// `D != 32`. Enabling the optional probe must therefore select the normal
+    /// flash implementation for every other supported head dimension.
+    #[test]
+    fn flash_tensorops_opt_in_d64_falls_back_before_shader_early_return() {
+        let rt = crate::gpu_runtime().expect("GpuRuntime");
+        let cfg = ModelConfig {
+            batch: 1,
+            seq_len: 2,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 64,
+            model_dim: 128,
+            ..ModelConfig::sota_toy()
+        };
+        cfg.validate_metal_shape().expect("D=64 is supported");
+
+        let make_input = |shape: &[usize], len: usize, modulus: usize, scale: f32| {
+            let tensor = rt.alloc_tensor_f32(shape).expect("input allocation");
+            let values: Vec<f32> = (0..len)
+                .map(|i| ((i % modulus) as f32 - modulus as f32 * 0.5) * scale)
+                .collect();
+            tensor.buffer.write_f32(&values);
+            tensor
+        };
+        let q_len = cfg.batch * cfg.seq_len * cfg.num_heads * cfg.head_dim;
+        let kv_len = cfg.batch * cfg.seq_len * cfg.num_kv_heads * cfg.head_dim;
+        let q = make_input(
+            &[cfg.batch, cfg.seq_len, cfg.num_heads, cfg.head_dim],
+            q_len,
+            17,
+            0.02,
+        );
+        let k = make_input(
+            &[cfg.batch, cfg.seq_len, cfg.num_kv_heads, cfg.head_dim],
+            kv_len,
+            13,
+            0.025,
+        );
+        let v = make_input(
+            &[cfg.batch, cfg.seq_len, cfg.num_kv_heads, cfg.head_dim],
+            kv_len,
+            11,
+            0.03,
+        );
+
+        let run = |tensorops: bool| {
+            rt.set_flash_tensorops(tensorops);
+            let o = rt
+                .alloc_tensor_f32(&[cfg.batch, cfg.seq_len, cfg.num_heads, cfg.head_dim])
+                .expect("O allocation");
+            let lse = rt
+                .alloc_tensor_f32(&[cfg.batch, cfg.num_heads, cfg.seq_len])
+                .expect("LSE allocation");
+            o.buffer.write_f32(&vec![f32::NAN; q_len]);
+            lse.buffer
+                .write_f32(&vec![f32::NAN; cfg.batch * cfg.num_heads * cfg.seq_len]);
+            flash_attn(&rt, &q, &k, &v, &o, &lse, &cfg).expect("flash dispatch");
+            rt.synchronize().expect("flash completion");
+            (o.buffer.read_f32(), lse.buffer.read_f32())
+        };
+
+        let (reference_o, reference_lse) = run(false);
+        let (fallback_o, fallback_lse) = run(true);
+        assert!(
+            fallback_o
+                .iter()
+                .chain(&fallback_lse)
+                .all(|x| x.is_finite()),
+            "D=64 TensorOps opt-in reached the D=32-only shader and left output unwritten"
+        );
+        let max_abs = reference_o
+            .iter()
+            .chain(&reference_lse)
+            .zip(fallback_o.iter().chain(&fallback_lse))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(max_abs, 0.0, "D=64 fallback differs from normal flash");
+    }
 }

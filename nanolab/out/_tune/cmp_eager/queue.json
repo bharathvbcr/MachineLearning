@@ -1,0 +1,63 @@
+{
+  "jobs": [
+    {
+      "id": "cmpeager_attention_s1337",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "capacity baseline",
+      "status": "done",
+      "worker": 0,
+      "started": 1788614887.5921493,
+      "finished": 1788615079.7350707,
+      "detail": "best_val=4.779540"
+    },
+    {
+      "id": "cmpeager_attention_s42",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "capacity baseline",
+      "status": "done",
+      "worker": 0,
+      "started": 1788615079.93256,
+      "finished": 1788615270.9046857,
+      "detail": "best_val=4.749518"
+    },
+    {
+      "id": "cmpeager_attention_s100",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "capacity baseline",
+      "status": "done",
+      "worker": 0,
+      "started": 1788615271.0989976,
+      "finished": 1788615461.3943303,
+      "detail": "best_val=4.762229"
+    },
+    {
+      "id": "cmpeager_attention_s2026",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 2026,
+      "note": "capacity baseline",
+      "status": "running",
+      "worker": 0,
+      "started": 1788615461.3989506
+    },
+    {
+      "id": "cmpeager_attention_s777",
+      "arm": "attention",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 777,
+      "note": "capacity baseline",
+      "status": "pending"
+    }
+  ]
+}

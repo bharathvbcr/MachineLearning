@@ -95,26 +95,26 @@ already made on numerics grounds.)
 ## Checking it
 
 ```bash
-# Static: every Rust TileGeom vs the kernel's constexpr SM/SN, and every coop
-# kernel's constexpr BKC vs Rust's COOP_BKC. Resolves paths from its own
+# Static: every Rust TileGeom vs the kernel's constexpr SM/SN and simdgroup
+# count. Resolves paths from its own
 # location, so it runs from any directory and survives `cargo package`. It also
 # fails if tessl-arch02 grows a local copy of the kernels again.
 python3 Rust_MLKit/crates/tessl/scripts/audit_gemm_tiles.py
 ```
 
 ```bash
-# Runtime: hand-picked adversarial shapes + a seeded fuzz that asserts its own
-# per-kernel coverage.
+# Runtime: the fixed 160-case seeded fuzz. It validates every sampled result but
+# does not claim per-kernel coverage; use `bench/kernel_coverage.py --check` for
+# the separate dispatch-coverage census.
 cd Rust_MLKit/crates/tessl
-cargo test --release --lib -- --test-threads=1 gemm_adversarial_shape_sweep gemm_randomized_shape_fuzz
+cargo test --release --lib -- --test-threads=1 --nocapture gemm_fuzz_quick
 ```
 
 ```bash
-# Deep soak. GEMM_FUZZ_SEED accepts hex or decimal and PANICS on a malformed
-# value rather than falling back to the default — an earlier version silently
-# ignored the variable and re-ran one seed eight times, passing every time.
-GEMM_FUZZ_SEED=0xdeadbeef GEMM_FUZZ_CASES=1200 \
-  cargo test --release --lib -- --test-threads=1 --nocapture gemm_randomized_shape_fuzz
+# Deep soak: 2,500 fixed cases. STRESS_SEED accepts a non-zero decimal or
+# `0x`-prefixed u64 and fails loudly on malformed, zero, or overflowing input.
+STRESS_SEED=0xdeadbeef \
+  cargo test --release --lib -- --ignored --test-threads=1 --nocapture gemm_fuzz_deep
 ```
 
 ```bash
@@ -141,12 +141,14 @@ python3 bench/gemm_sweep_mlx.py --parity-dir /tmp/parity
 ```
 
 ```bash
-# The harness itself: 21 fabricated adversarial dumps (missing lane, missing
-# seed, NaN result, shape mismatch, degenerate reference, malformed manifest,
-# no-op lane, over-budget lane), grid-merge cases, budget verdicts and CLI/env
-# contracts -- 56 assertions. Only the CLI section needs a GPU, and it announces
-# a skip rather than passing vacuously.
-python3 bench/test_parity_harness.py
+# Host-only harness: fabricated adversarial dumps, grid-merge cases, budget
+# verdicts and static contracts. GPU-backed CLI sections are visibly skipped.
+python3 bench/test_parity_harness.py --pure
+
+# Physical-GPU gate: either CLI section being unavailable is a failing exit.
+python3 bench/test_parity_harness.py --require-gpu
+# Both modes emit a machine-readable HARNESS_SUMMARY. A non-required skip is
+# `PASS WITH SKIPS`, never the same verdict as complete coverage.
 ```
 
 Measured on M5 Pro over an **8 shape x 5 distribution x 4 seed grid**
@@ -214,10 +216,13 @@ in well under 1% of cases and it never dispatched those kernels at all.
 
 ## Benchmarking
 
-The A/B rig (`crates/tessl/kernels/tune/`, 92 measurement-only kernels) is
-**not** in the default metallib — linking it takes tessl's artifact from 0.20 MB
-to 1.07 MB. It sits in a subdirectory so neither build script's directory glob
-can pick it up by accident. Opt in:
+The A/B rig (`crates/tessl/kernels/tune/`) is **not** in the default metallib. It
+sits in a subdirectory so neither build script's directory glob can pick it up by
+accident. Measured with `xcrun metal-nm` on 2026-09-03: the default library holds
+**147 entry points at 1.13 MB**, and the tuning build adds **34** `mm_bf16_*`
+variants for **181 at 1.46 MB**. (This paragraph said "92 measurement-only
+kernels" and "0.20 MB to 1.07 MB" until then; both predate the NN and attention
+kernels landing in the default library.) Opt in:
 
 ```bash
 TESSL_GEMM_TUNE=1 cargo build --release --bins
@@ -226,45 +231,77 @@ TESSL_GEMM_TUNE=1 cargo build --release --bins
 Both tuning binaries `exit(2)` with that command when the variants are absent,
 rather than printing a page of `skip(pipe)` and exiting 0.
 
+> **Evidence status.** All numeric performance results below come from
+> historical schema-v1 artifacts. They lack the current revision, dirty-state,
+> executable/metallib, host-load, and outer-round provenance contract, and none
+> carries `status: published`. They document why the implementation changed;
+> they do not establish current-tree speed.
+
 | tool | what it is for |
 |---|---|
-| `bench_gemm_coop_ab` | Paired, **interleaved** kernel A/B. Use this for kernel comparisons. |
+| `bench_gemm_tnnt_tune` | TN / NT / TN-accum kernel A/B against the production baseline. **Interleaved**, with a baseline-drift gate — use this for kernel comparisons. |
 | `bench_gemm_tile_tune` | Broad tile/BK ladder. Blocked-style timing — see the warning below. |
 | `bench_gemm_sweep` | Cross-runtime timing lane (f32 exact / tf32 / bf16), JSON out. |
 | `bench_gemm_sweep --dump-parity DIR` | Separate job, no timing: every lane x `BENCH_PARITY_SEEDS` draws at `BENCH_PARITY_SHAPE`, plus the manifest the scorer validates against. |
 | `bench/parity_ladder.py` | Drives the above across the whole ladder, one shape at a time, and merges. Use this for the accuracy numbers. |
-| `bench/test_parity_harness.py` | Adversarial cases for every harness. Only the CLI sections need a GPU. |
+| `bench/test_parity_harness.py` | Adversarial cases for every harness, with machine-readable ran/skipped/failed accounting. Use `--pure` on host-only lanes and `--require-gpu` on physical Metal. |
 | `bench_gemm_variants` | TN / NT / accumulate / split-K / batched / epilogue / f16 lanes -- the 18 GEMM kernels the cross-runtime sweep cannot reach. |
-| `bench/kernel_coverage.py` | Measures which kernels the suite dispatches (`TESSL_KERNEL_TRACE`), cross-checked against `metal-nm default.metallib`. `--check` gates on 100%. |
-| `bench_flash_attn` + `bench/attn_paired.py` | The attention kernels, prefill and decode, over 14 configs. The benchmark found them 11x (torch) / 20.5x (MLX) slower, geomean, worst case 271x. The row-parallel and KV-split rewrites fixed the dispatch geometry; four throughput changes and a routing fix followed. Prefill is now 0.90-0.97x MLX and decode kernel-only 0.91-0.97x, both ahead. See the tessl README. |
+| `bench/kernel_coverage.py` | Measures which kernels the suite dispatches (`TESSL_KERNEL_TRACE`), cross-checked against `metal-nm` on the exact OUT_DIR metallib embedded in the release binary. `--check` gates on 100%; `--metallib` selects an explicit artifact. |
+| `bench_flash_attn` + `bench/attn_paired.py` | The attention kernels, prefill and decode, over 14 configs. Historical runs first measured 11x (torch) / 20.5x (MLX) slower, geomean, worst case 271x. The row-parallel and KV-split rewrites, four throughput changes, and a routing fix followed; later schema-v1 snapshots measured 0.90-0.97x MLX prefill and 0.91-0.97x decode kernel-only. See the tessl README and do not treat those snapshots as current evidence. |
 | `bench/paired_cross_runtime.py` | Alternates the tessl and torch/MLX lanes round by round. Aborts rather than reporting a geomean over part of the ladder; `--out` writes the artifact. |
 
-Measured speed, M5 Pro, 5 alternating rounds x 30 iters over the full ladder
-(`bench/results/gemm_speed_ladder_m5pro.json`): tf32-relaxed **2.10x** torch
-MPS f32, f32-exact **1.07x** torch MPS f32, bf16 **1.00x** torch MPS bf16.
-
-That last number is a correction -- the README claimed 1.11x. An independent
-9-round x 40-iter run agrees at 1.03x. The failure was structural rather than
-arithmetic: tessl bf16 wins only at 512^3 (1.26x) and 1024^3 (1.34x), both in
-the dispatch-floor regime with per-round spreads to 3.38x, and runs 0.86x-0.95x
-on `mlp_up`, `square_4096`, `qkv_proj` and `tall_k1024`. A geomean over a ladder
-that includes dispatch-bound shapes reports host submit latency as if it were
-shader throughput. The ratios that did reproduce (1.07x, 2.01x -> 2.10x) are the
-ones whose wins are not concentrated at the floor.
-
-Absolute GFLOP/s did not reproduce earlier peaks and is not expected to; it is
-the quantity the paired design exists to avoid comparing across runs.
+The canonical numeric summary and evidence status live in the tessl README's
+[latest checked-in result snapshot](../crates/tessl/README.md#latest-checked-in-result-snapshot).
+Historical rep B measured exact f32 at **1.045× / 0.999×**, relaxed tf32 at
+**2.145× / 1.998×**, and bf16 at **0.979× / 2.631×** against torch MPS / MLX.
+All six comparisons fail the current hard 1.25× paired-spread gate, so those
+values explain tuning decisions but do not establish current-tree speed. The
+honest precision-matched conclusion is exact-f32 and bf16 parity with torch;
+the roughly 2× tf32 result trades accuracy and is not a like-for-like f32
+comparison. Absolute GFLOP/s also moved materially between runs and remains
+same-run context rather than a portable claim.
 
 **Timing protocol matters more than anything else here.** Measuring a baseline
 block and a variant block minutes apart puts all GPU clock drift into the ratio:
 run four times, `bench_gemm_tile_tune` showed the *production coop kernel against
-itself* ranging 0.92x–1.46x. `bench_gemm_coop_ab` interleaves the two arms
-iteration by iteration and reports the ratio of per-round medians across repeated
-rounds, which brings the spread to about ±5%. It also allocates one output
-buffer per shape (a fresh one per candidate let allocations pile up until the
-*baseline* drifted 0.268 -> 0.665 ms inside a single shape block) and prints its
-own baseline spread across rows, flagging `EXCEEDS 10%: ratios above are not
-comparable` when the run cannot support a comparison.
+itself* ranging 0.92x–1.46x.
+
+> **Correction (2026-09-03).** This paragraph used to continue that
+> `bench_gemm_coop_ab` "interleaves the two arms iteration by iteration", brings
+> the spread to about ±5%, and flags `EXCEEDS 10%` when a run cannot support a
+> comparison — and the tool table above named it as *the* tool for kernel
+> comparisons. **No such binary exists in this crate.** There is no
+> `src/bin/bench_gemm_coop_ab.rs` and no `[[bin]]` entry;
+> `cargo build --release --bin bench_gemm_coop_ab` fails with `no bin target
+> named`. A stale executable of that name survives in `target/release/` from a
+> build on 2026-08-30, which is the only reason the name still looked live. The
+> string `EXCEEDS` appears nowhere in the crate's sources.
+>
+> At the time of that audit, both surviving Rust tuning binaries used exactly
+> the blocked protocol this paragraph warns against. `bench_gemm_tile_tune`
+> still measures one candidate at a time and is therefore a tuning probe, not a
+> publication harness; the following restoration changed
+> `bench_gemm_tnnt_tune` into the counterbalanced comparison path.
+>
+> **Restored 2026-09-03.** `bench_gemm_tnnt_tune` now interleaves: every arm is
+> timed once per round in exact forward/reverse pairs (`BENCH_ROUNDS`, even and
+> at least 2; default 4), and it reports the median of the per-round ratios with
+> their spread. If the baseline moves more than 10% across rounds, the process
+> returns an error and publishes no comparison. It also allocates one output
+> buffer per shape, shared by the baseline and every candidate — a fresh one per
+> candidate is what let allocations pile up until the baseline drifted inside a
+> single shape block.
+>
+> The median is taken *of the ratios*, not of the two medians; those are
+> different statistics, and `median_of_ratios_is_not_ratio_of_medians` and
+> `ratio_of_medians_can_invent_a_ratio_no_round_measured` in that binary's test
+> module pin the difference. Writing those tests caught a real defect in the
+> gate itself: `f64::min`/`f64::max` *ignore* a NaN operand rather than
+> propagating it, so a run that produced a NaN timing scored a spread of 1.00 and
+> sailed through. It now fails closed.
+>
+> `bench_gemm_tile_tune` is still blocked. Use `bench_gemm_tnnt_tune` for any
+> ratio you intend to quote.
 
 The same applies across runtimes. Two back-to-back runs of the identical
 cross-runtime sweep disagreed by 16–21% on the torch lane alone, which is why
@@ -295,6 +332,10 @@ were expanded across all primary GEMM paths:
 - **Accumulate kernels:** Replaced `multiply_accumulate` with cooperative zero→run→load-add-store
   bias pattern (`TILE_COOP_ACCUM` 64×64 sg4), cutting memory traffic to 1 read + 1 write total.
 - **NN Grid Swizzle:** Added column-panel swizzling (8 tile-rows per band) for large grids
-  (`tiles_n * tiles_m >= 2048`), delivering 29,022 GFLOP/s at $4096^3$ on M5 Pro.
+  (`tiles_n * tiles_m >= 2048`). Recorded at 29,022 GFLOP/s at $4096^3$ on M5 Pro
+  when it landed. That peak has **not** reproduced: the paired ladder measured
+  26,702 GFLOP/s at that shape on 2026-09-01 and 27,734 on 2026-09-03. Absolute
+  GFLOP/s is the quantity the paired design exists to avoid comparing across runs,
+  so read this as same-run context for Round 2, not a standing figure.
 - **Edge Slices:** Ragged boundary tiles execute origin-shifted slices with register accumulation,
   eliminating the need for separate pre-zeroing passes.

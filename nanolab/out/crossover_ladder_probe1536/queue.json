@@ -1,0 +1,82 @@
+{
+  "jobs": [
+    {
+      "id": "cx32lad1536p_w1536_attention_lr40_s1337",
+      "arm": "w1536_attention_lr40",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x4.0",
+      "status": "done",
+      "worker": 1,
+      "started": 1788586373.4299915,
+      "finished": 1788586805.4838922,
+      "detail": "best_val=5.155657"
+    },
+    {
+      "id": "cx32lad1536p_w1536_attention_lr80_s1337",
+      "arm": "w1536_attention_lr80",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x8.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1788586373.4422548,
+      "finished": 1788586806.912263,
+      "detail": "best_val=5.133435"
+    },
+    {
+      "id": "cx32lad1536p_w1536_attention_lr160_s1337",
+      "arm": "w1536_attention_lr160",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x16.0",
+      "status": "done",
+      "worker": 1,
+      "started": 1788586806.9736528,
+      "finished": 1788587224.3953788,
+      "detail": "best_val=5.202203"
+    },
+    {
+      "id": "cx32lad1536p_w1536_mingru_lr20_s1337",
+      "arm": "w1536_mingru_lr20",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x2.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1788586807.0216742,
+      "finished": 1788587281.250353,
+      "detail": "best_val=4.955640"
+    },
+    {
+      "id": "cx32lad1536p_w1536_mingru_lr40_s1337",
+      "arm": "w1536_mingru_lr40",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x4.0",
+      "status": "failed",
+      "worker": 1,
+      "started": 1788587225.1761053,
+      "finished": 1788587232.602777,
+      "detail": "OutOfMemoryError: CUDA out of memory. Tried to allocate 148.00 MiB. GPU 0 has a total capacity of 94.50 GiB of which 35.38 MiB is free. Including non-PyTorch memory, this process has 45.90 GiB memory in use. Process 110912 has 48.42 GiB memory in use. Of the allocated memory 43.68 GiB is allocated by PyTorch, and 1.47 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)"
+    },
+    {
+      "id": "cx32lad1536p_w1536_mingru_lr80_s1337",
+      "arm": "w1536_mingru_lr80",
+      "mixer": "mingru",
+      "layer_mixers": "",
+      "seed": 1337,
+      "note": "E21 ladder: d_model 1536, LR x8.0",
+      "status": "failed",
+      "worker": 1,
+      "started": 1788587232.6275399,
+      "finished": 1788587239.9924812,
+      "detail": "OutOfMemoryError: CUDA out of memory. Tried to allocate 198.00 MiB. GPU 0 has a total capacity of 94.50 GiB of which 35.75 MiB is free. Including non-PyTorch memory, this process has 45.90 GiB memory in use. Process 110912 has 48.42 GiB memory in use. Of the allocated memory 43.39 GiB is allocated by PyTorch, and 1.75 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)"
+    }
+  ]
+}

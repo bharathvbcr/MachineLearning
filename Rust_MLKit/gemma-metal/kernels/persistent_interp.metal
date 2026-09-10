@@ -29,21 +29,13 @@
 // Not real softmax FA — only the grid-sync dependency shape.
 
 #include <metal_stdlib>
+#include "gelu.h"
 using namespace metal;
 
 constant uint OP_HALT        = 0u;
 constant uint OP_PRODUCE_MID = 1u;
 constant uint OP_BARRIER     = 2u;
 constant uint OP_DOWN_PROJ   = 3u;
-
-/// File-local gelu — same math as mlp_gelu_tanh.metal (precise::tanh).
-static inline float gelu_pytorch_tanh_pi(float x) {
-    float xc = clamp(x, -20.0f, 20.0f);
-    float x3 = xc * xc * xc;
-    float inner = 0.7978845608028654f * (xc + 0.044715f * x3);
-    float t = precise::tanh(clamp(inner, -10.0f, 10.0f));
-    return 0.5f * xc * (1.0f + t);
-}
 
 /// Sense-reversing grid barrier via device atomics (relaxed only — MSL limit).
 /// `deps[0]` = arrival count; `deps[1]` = generation.
@@ -119,7 +111,7 @@ kernel void persistent_interp_gate_down(
             uint begin = tgid * chunk;
             uint end = min(begin + chunk, n_mid);
             for (uint i = begin + tid; i < end; i += tptg) {
-                mid[i] = gelu_pytorch_tanh_pi(gate[i]) * up[i];
+                mid[i] = tessl_gelu_pytorch_tanh(gate[i]) * up[i];
             }
             threadgroup_barrier(mem_flags::mem_device);
             continue;
@@ -168,14 +160,6 @@ constant uint PI_Q4_SIMD_SG_PER_TG = 2u;
 constant uint PI_Q4_SIMD_PACKS = 2u;
 constant uint PI_Q4_SIMD_VPT = 8u * PI_Q4_SIMD_PACKS;
 constant uint PI_Q4_SIMD_BLOCK = PI_Q4_SIMD_SIZE * PI_Q4_SIMD_VPT;
-
-static inline float pi_q4_gelu(float v) {
-    float xc = clamp(v, -20.0f, 20.0f);
-    float x3 = xc * xc * xc;
-    float inner = 0.7978845608028654f * (xc + 0.044715f * x3);
-    float t = precise::tanh(clamp(inner, -10.0f, 10.0f));
-    return 0.5f * xc * (1.0f + t);
-}
 
 static inline float pi_load_x16_qdot(device const bfloat *x, thread float *xp) {
     bfloat4 x0 = ((device const bfloat4 *)(x))[0];
@@ -279,7 +263,7 @@ static inline void pi_q4_produce_tile_rm(
         const float gsum = simd_sum(acc_g[r]);
         const float usum = simd_sum(acc_u[r]);
         if (lane == 0u) {
-            float v = pi_q4_gelu(gsum) * usum;
+            float v = tessl_gelu_pytorch_tanh(gsum) * usum;
             if (mid_as_bf16 != 0u) {
                 ((device bfloat *)mid)[row] = bfloat(v);
             } else {

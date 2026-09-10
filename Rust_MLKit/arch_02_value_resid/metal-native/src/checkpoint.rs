@@ -8,16 +8,16 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use objc2_metal::MTLComputePipelineState;
+use serde::{Deserialize, Serialize};
 
 use crate::dispatch::{set_gpu_buf, set_tensor, set_u32};
 use crate::npy::{transpose_last2, write_npy_f32};
 use crate::optim::{AdamSlot, ClipMode, LrSchedule, OptimHyperparams, OptimState};
 use crate::runtime::{mtl_size, GpuRuntime};
 use crate::tensor::{DType, GpuBuffer, Tensor};
-use crate::weights::Weights;
 use crate::weights::ModelConfig;
+use crate::weights::Weights;
 
 pub const CHECKPOINT_VERSION: u32 = 7;
 
@@ -120,10 +120,9 @@ pub fn save_bf16_shadows(w: &Weights, dir: &Path) -> Result<bool, String> {
 
 /// Restore every persisted bf16 shadow after the runtime allocates its hot banks.
 pub fn load_bf16_shadows(w: &mut Weights, dir: &Path) -> Result<(), String> {
-    let banks = w
-        .bf16_banks
-        .as_ref()
-        .ok_or_else(|| "checkpoint contains bf16 shadows but engine is not in bf16 mode".to_string())?;
+    let banks = w.bf16_banks.as_ref().ok_or_else(|| {
+        "checkpoint contains bf16 shadows but engine is not in bf16 mode".to_string()
+    })?;
     for (name, tensor) in [
         ("qo_bank.bf16le", &banks.qo_bank),
         ("kv_bank.bf16le", &banks.kv_bank),
@@ -235,8 +234,16 @@ fn load_ssm_ema_banks(state: &mut OptimState, dir: &Path) -> Result<(), String> 
     load_opt(&mut state.ema_mingru_v_proj, "mingru_v_proj.npy", true)?;
     load_opt(&mut state.ema_mingru_v0_up, "mingru_v0_up.npy", true)?;
     load_opt(&mut state.ema_mamba_in_proj, "mamba_in_proj.npy", true)?;
-    load_opt(&mut state.ema_mamba_conv1d_weight, "mamba_conv1d_weight.npy", false)?;
-    load_opt(&mut state.ema_mamba_conv1d_bias, "mamba_conv1d_bias.npy", false)?;
+    load_opt(
+        &mut state.ema_mamba_conv1d_weight,
+        "mamba_conv1d_weight.npy",
+        false,
+    )?;
+    load_opt(
+        &mut state.ema_mamba_conv1d_bias,
+        "mamba_conv1d_bias.npy",
+        false,
+    )?;
     load_opt(&mut state.ema_mamba_out_proj, "mamba_out_proj.npy", true)?;
     load_opt(&mut state.ema_mamba_a_log, "mamba_a_log.npy", false)?;
     load_opt(&mut state.ema_mamba_d, "mamba_d.npy", false)?;
@@ -245,7 +252,13 @@ fn load_ssm_ema_banks(state: &mut OptimState, dir: &Path) -> Result<(), String> 
     Ok(())
 }
 
-fn save_adam_slot(dir: &Path, stem: &str, slot: &AdamSlot, transpose: bool, step: f32) -> Result<(), String> {
+fn save_adam_slot(
+    dir: &Path,
+    stem: &str,
+    slot: &AdamSlot,
+    transpose: bool,
+    step: f32,
+) -> Result<(), String> {
     let avg = dir.join(format!("{stem}_exp_avg.npy"));
     let sq = dir.join(format!("{stem}_exp_avg_sq.npy"));
     let step_p = dir.join(format!("{stem}_step.npy"));
@@ -276,7 +289,9 @@ fn load_tensor_f32(path: &Path, dst: &Tensor, transpose: bool) -> Result<(), Str
     if shape != dst.shape {
         return Err(format!(
             "checkpoint tensor {} shape {:?}, expected {:?}",
-            path.display(), shape, dst.shape
+            path.display(),
+            shape,
+            dst.shape
         ));
     }
     dst.buffer.write_f32(&data);
@@ -426,7 +441,6 @@ pub fn save_weights_python_npy(
         save_f32(&dir.join("mamba_norm.npy"), t)?;
     }
 
-
     save_linear_python(&dir.join("mlp_up_bank.npy"), &w.mlp_up)?;
     save_linear_python(&dir.join("mlp_down_bank.npy"), &w.mlp_down)?;
 
@@ -443,8 +457,7 @@ pub fn save_weights_python_npy(
         "{{\n  \"source\": \"metal-native\",\n  \"layout\": \"python\",\n  \"num_layers\": {},\n  \"model_dim\": {},\n  \"vocab_size\": {}\n}}\n",
         w.cfg.num_layers, w.cfg.model_dim, w.cfg.vocab_size
     );
-    std::fs::write(dir.join("manifest.json"), meta)
-        .map_err(|e| format!("manifest: {e}"))?;
+    std::fs::write(dir.join("manifest.json"), meta).map_err(|e| format!("manifest: {e}"))?;
     Ok(())
 }
 
@@ -467,7 +480,13 @@ pub fn save_optim_state_python_npy(
 
     let step = state.step as f32;
     let embed = dir.join("adamw_embed");
-    save_adam_slot(&embed.join("tok_emb"), "weight", &state.tok_emb, false, step)?;
+    save_adam_slot(
+        &embed.join("tok_emb"),
+        "weight",
+        &state.tok_emb,
+        false,
+        step,
+    )?;
     save_adam_slot(
         &embed.join("bigram/embed"),
         "weight",
@@ -491,8 +510,20 @@ pub fn save_optim_state_python_npy(
         true,
         step,
     )?;
-    save_adam_slot(&scalar.join("bigram"), "scale", &state.bigram_scale, false, step)?;
-    save_adam_slot(&scalar.join("smear"), "gate", &state.smear_gate, false, step)?;
+    save_adam_slot(
+        &scalar.join("bigram"),
+        "scale",
+        &state.bigram_scale,
+        false,
+        step,
+    )?;
+    save_adam_slot(
+        &scalar.join("smear"),
+        "gate",
+        &state.smear_gate,
+        false,
+        step,
+    )?;
     save_adam_slot(
         &scalar.join("ve_shared/proj"),
         "weight",
@@ -509,7 +540,13 @@ pub fn save_optim_state_python_npy(
     )?;
     for (i, slot) in state.ve_layer_scales.iter().enumerate() {
         // Golden naming: ve_layer_scales/{i}_exp_avg.npy (stem includes index).
-        save_adam_slot(&scalar.join("ve_layer_scales"), &format!("{i}"), slot, false, step)?;
+        save_adam_slot(
+            &scalar.join("ve_layer_scales"),
+            &format!("{i}"),
+            slot,
+            false,
+            step,
+        )?;
     }
     save_adam_slot(&scalar, "skip_weights", &state.skip_weights, false, step)?;
 
@@ -522,12 +559,13 @@ pub fn save_optim_state_python_npy(
         save_adam_slot(&base, "resid_mix", &b.resid_mix, false, step)?;
     }
 
-    let save_mamba_adam = |stem: &str, slot: &Option<AdamSlot>, transpose: bool| -> Result<(), String> {
-        if let Some(s) = slot {
-            save_adam_slot(&scalar, stem, s, transpose, step)?;
-        }
-        Ok(())
-    };
+    let save_mamba_adam =
+        |stem: &str, slot: &Option<AdamSlot>, transpose: bool| -> Result<(), String> {
+            if let Some(s) = slot {
+                save_adam_slot(&scalar, stem, s, transpose, step)?;
+            }
+            Ok(())
+        };
     save_mamba_adam("mamba_conv1d_weight", &state.mamba_conv1d_weight, false)?;
     save_mamba_adam("mamba_conv1d_bias", &state.mamba_conv1d_bias, false)?;
     save_mamba_adam("mamba_a_log", &state.mamba_a_log, false)?;
@@ -538,10 +576,7 @@ pub fn save_optim_state_python_npy(
     let muon = dir.join("muon");
     save_linear_python(&muon.join("qo_bank_momentum_buffer.npy"), &state.mom_qo)?;
     save_linear_python(&muon.join("kv_bank_momentum_buffer.npy"), &state.mom_kv)?;
-    save_linear_python(
-        &muon.join("mlp_up_bank_momentum_buffer.npy"),
-        &state.mom_up,
-    )?;
+    save_linear_python(&muon.join("mlp_up_bank_momentum_buffer.npy"), &state.mom_up)?;
     save_linear_python(
         &muon.join("mlp_down_bank_momentum_buffer.npy"),
         &state.mom_dn,
@@ -571,10 +606,7 @@ pub fn save_optim_state_python_npy(
     // scale = sqrt(max(1, out/in)) with metal-native [in, out] → out=last dim.
     save_scalar_f32(&muon.join("qo_bank_scale.npy"), muon_bank_scale(c, c))?;
     save_scalar_f32(&muon.join("kv_bank_scale.npy"), muon_bank_scale(c, kv))?;
-    save_scalar_f32(
-        &muon.join("mlp_up_bank_scale.npy"),
-        muon_bank_scale(c, mlp),
-    )?;
+    save_scalar_f32(&muon.join("mlp_up_bank_scale.npy"), muon_bank_scale(c, mlp))?;
     save_scalar_f32(
         &muon.join("mlp_down_bank_scale.npy"),
         muon_bank_scale(mlp, c),
@@ -641,16 +673,12 @@ pub fn save_optim_state_python_npy(
         "{{\n  \"source\": \"metal-native\",\n  \"layout\": \"optim_step3\",\n  \"optim_step\": {},\n  \"num_layers\": {},\n  \"model_dim\": {},\n  \"vocab_size\": {}\n}}\n",
         state.step, w.cfg.num_layers, w.cfg.model_dim, w.cfg.vocab_size
     );
-    std::fs::write(dir.join("manifest.json"), meta)
-        .map_err(|e| format!("manifest: {e}"))?;
+    std::fs::write(dir.join("manifest.json"), meta).map_err(|e| format!("manifest: {e}"))?;
     Ok(())
 }
 
 /// Save all EMA tensors in the same logical tree as model weights.
-pub fn save_ema_state_python_npy(
-    state: &OptimState,
-    dir: &Path,
-) -> Result<(), String> {
+pub fn save_ema_state_python_npy(state: &OptimState, dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     save_f32(&dir.join("tok_emb/weight.npy"), &state.ema_tok_emb)?;
     save_f32(&dir.join("bigram/embed/weight.npy"), &state.ema_bigram_emb)?;
@@ -666,7 +694,6 @@ pub fn save_ema_state_python_npy(
     save_f32(&dir.join("skip_weights.npy"), &state.ema_skip_weights)?;
     save_linear_python(&dir.join("qo_bank.npy"), &state.ema_qo)?;
     save_linear_python(&dir.join("kv_bank.npy"), &state.ema_kv)?;
-
 
     save_linear_python(&dir.join("mlp_up_bank.npy"), &state.ema_up)?;
     save_linear_python(&dir.join("mlp_down_bank.npy"), &state.ema_dn)?;
@@ -684,20 +711,43 @@ pub fn save_ema_state_python_npy(
 
 pub fn load_ema_state_python_npy(state: &mut OptimState, dir: &Path) -> Result<(), String> {
     load_tensor_f32(&dir.join("tok_emb/weight.npy"), &state.ema_tok_emb, false)?;
-    load_tensor_f32(&dir.join("bigram/embed/weight.npy"), &state.ema_bigram_emb, false)?;
-    load_tensor_f32(&dir.join("bigram/proj/weight.npy"), &state.ema_bigram_proj, true)?;
-    load_tensor_f32(&dir.join("bigram/scale.npy"), &state.ema_bigram_scale, false)?;
+    load_tensor_f32(
+        &dir.join("bigram/embed/weight.npy"),
+        &state.ema_bigram_emb,
+        false,
+    )?;
+    load_tensor_f32(
+        &dir.join("bigram/proj/weight.npy"),
+        &state.ema_bigram_proj,
+        true,
+    )?;
+    load_tensor_f32(
+        &dir.join("bigram/scale.npy"),
+        &state.ema_bigram_scale,
+        false,
+    )?;
     load_tensor_f32(&dir.join("smear/gate.npy"), &state.ema_smear_gate, false)?;
-    load_tensor_f32(&dir.join("ve_shared/embed/weight.npy"), &state.ema_ve_emb, false)?;
-    load_tensor_f32(&dir.join("ve_shared/proj/weight.npy"), &state.ema_ve_proj, true)?;
+    load_tensor_f32(
+        &dir.join("ve_shared/embed/weight.npy"),
+        &state.ema_ve_emb,
+        false,
+    )?;
+    load_tensor_f32(
+        &dir.join("ve_shared/proj/weight.npy"),
+        &state.ema_ve_proj,
+        true,
+    )?;
     load_tensor_f32(&dir.join("ve_shared/scale.npy"), &state.ema_ve_scale, false)?;
     for (i, t) in state.ema_ve_layer_scales.iter().enumerate() {
         load_tensor_f32(&dir.join(format!("ve_layer_scales/{i}.npy")), t, false)?;
     }
-    load_tensor_f32(&dir.join("skip_weights.npy"), &state.ema_skip_weights, false)?;
+    load_tensor_f32(
+        &dir.join("skip_weights.npy"),
+        &state.ema_skip_weights,
+        false,
+    )?;
     load_tensor_f32(&dir.join("qo_bank.npy"), &state.ema_qo, true)?;
     load_tensor_f32(&dir.join("kv_bank.npy"), &state.ema_kv, true)?;
-
 
     load_tensor_f32(&dir.join("mlp_up_bank.npy"), &state.ema_up, true)?;
     load_tensor_f32(&dir.join("mlp_down_bank.npy"), &state.ema_dn, true)?;
@@ -721,17 +771,42 @@ pub fn load_optim_state_python_npy(
 ) -> Result<(), String> {
     let embed = optim_dir.join("adamw_embed");
     load_adam_slot(&embed.join("tok_emb"), "weight", &state.tok_emb, false)?;
-    load_adam_slot(&embed.join("bigram/embed"), "weight", &state.bigram_emb, false)?;
-    load_adam_slot(&embed.join("ve_shared/embed"), "weight", &state.ve_emb, false)?;
+    load_adam_slot(
+        &embed.join("bigram/embed"),
+        "weight",
+        &state.bigram_emb,
+        false,
+    )?;
+    load_adam_slot(
+        &embed.join("ve_shared/embed"),
+        "weight",
+        &state.ve_emb,
+        false,
+    )?;
 
     let scalar = optim_dir.join("adamw_scalar");
-    load_adam_slot(&scalar.join("bigram/proj"), "weight", &state.bigram_proj, true)?;
+    load_adam_slot(
+        &scalar.join("bigram/proj"),
+        "weight",
+        &state.bigram_proj,
+        true,
+    )?;
     load_adam_slot(&scalar.join("bigram"), "scale", &state.bigram_scale, false)?;
     load_adam_slot(&scalar.join("smear"), "gate", &state.smear_gate, false)?;
-    load_adam_slot(&scalar.join("ve_shared/proj"), "weight", &state.ve_proj, true)?;
+    load_adam_slot(
+        &scalar.join("ve_shared/proj"),
+        "weight",
+        &state.ve_proj,
+        true,
+    )?;
     load_adam_slot(&scalar.join("ve_shared"), "scale", &state.ve_scale, false)?;
     for (i, slot) in state.ve_layer_scales.iter().enumerate() {
-        load_adam_slot(&scalar.join("ve_layer_scales"), &format!("{i}"), slot, false)?;
+        load_adam_slot(
+            &scalar.join("ve_layer_scales"),
+            &format!("{i}"),
+            slot,
+            false,
+        )?;
     }
     load_adam_slot(&scalar, "skip_weights", &state.skip_weights, false)?;
     for (i, b) in state.blocks.iter().enumerate() {
@@ -742,8 +817,18 @@ pub fn load_optim_state_python_npy(
         load_adam_slot(&base, "mlp_scale", &b.mlp_scale, false)?;
         load_adam_slot(&base, "resid_mix", &b.resid_mix, false)?;
     }
-    load_adam_slot_opt(&scalar, "mamba_conv1d_weight", &state.mamba_conv1d_weight, false)?;
-    load_adam_slot_opt(&scalar, "mamba_conv1d_bias", &state.mamba_conv1d_bias, false)?;
+    load_adam_slot_opt(
+        &scalar,
+        "mamba_conv1d_weight",
+        &state.mamba_conv1d_weight,
+        false,
+    )?;
+    load_adam_slot_opt(
+        &scalar,
+        "mamba_conv1d_bias",
+        &state.mamba_conv1d_bias,
+        false,
+    )?;
     load_adam_slot_opt(&scalar, "mamba_a_log", &state.mamba_a_log, false)?;
     load_adam_slot_opt(&scalar, "mamba_d", &state.mamba_d, false)?;
     load_adam_slot_opt(&scalar, "mamba_dt_bias", &state.mamba_dt_bias, false)?;
@@ -842,41 +927,103 @@ pub fn load_muon_momentum_python_npy(
     load(&state.mag_v_up, "mlp_up_bank_mag_v.npy")?;
     load(&state.mag_v_dn, "mlp_down_bank_mag_v.npy")?;
     let load_opt = |dst: Option<&Tensor>, name: &str| -> Result<(), String> {
-        let Some(dst) = dst else { return Ok(()); };
+        let Some(dst) = dst else {
+            return Ok(());
+        };
         let path = muon.join(name);
         if !path.exists() {
             return Ok(());
         }
         load(dst, name)
     };
-    load_opt(state.mom_mingru_to_z.as_ref(), "mingru_to_z_momentum_buffer.npy")?;
+    load_opt(
+        state.mom_mingru_to_z.as_ref(),
+        "mingru_to_z_momentum_buffer.npy",
+    )?;
     load_opt(state.var_mingru_to_z.as_ref(), "mingru_to_z_aux_state.npy")?;
-    load_opt(state.prev_mingru_to_z.as_ref(), "mingru_to_z_prev_state.npy")?;
+    load_opt(
+        state.prev_mingru_to_z.as_ref(),
+        "mingru_to_z_prev_state.npy",
+    )?;
     load_opt(state.mag_v_mingru_to_z.as_ref(), "mingru_to_z_mag_v.npy")?;
-    load_opt(state.mom_mingru_to_h.as_ref(), "mingru_to_h_momentum_buffer.npy")?;
+    load_opt(
+        state.mom_mingru_to_h.as_ref(),
+        "mingru_to_h_momentum_buffer.npy",
+    )?;
     load_opt(state.var_mingru_to_h.as_ref(), "mingru_to_h_aux_state.npy")?;
-    load_opt(state.prev_mingru_to_h.as_ref(), "mingru_to_h_prev_state.npy")?;
+    load_opt(
+        state.prev_mingru_to_h.as_ref(),
+        "mingru_to_h_prev_state.npy",
+    )?;
     load_opt(state.mag_v_mingru_to_h.as_ref(), "mingru_to_h_mag_v.npy")?;
-    load_opt(state.mom_mingru_out.as_ref(), "mingru_out_momentum_buffer.npy")?;
+    load_opt(
+        state.mom_mingru_out.as_ref(),
+        "mingru_out_momentum_buffer.npy",
+    )?;
     load_opt(state.var_mingru_out.as_ref(), "mingru_out_aux_state.npy")?;
     load_opt(state.prev_mingru_out.as_ref(), "mingru_out_prev_state.npy")?;
     load_opt(state.mag_v_mingru_out.as_ref(), "mingru_out_mag_v.npy")?;
-    load_opt(state.mom_mingru_v_proj.as_ref(), "mingru_v_proj_momentum_buffer.npy")?;
-    load_opt(state.var_mingru_v_proj.as_ref(), "mingru_v_proj_aux_state.npy")?;
-    load_opt(state.prev_mingru_v_proj.as_ref(), "mingru_v_proj_prev_state.npy")?;
-    load_opt(state.mag_v_mingru_v_proj.as_ref(), "mingru_v_proj_mag_v.npy")?;
-    load_opt(state.mom_mingru_v0_up.as_ref(), "mingru_v0_up_momentum_buffer.npy")?;
-    load_opt(state.var_mingru_v0_up.as_ref(), "mingru_v0_up_aux_state.npy")?;
-    load_opt(state.prev_mingru_v0_up.as_ref(), "mingru_v0_up_prev_state.npy")?;
+    load_opt(
+        state.mom_mingru_v_proj.as_ref(),
+        "mingru_v_proj_momentum_buffer.npy",
+    )?;
+    load_opt(
+        state.var_mingru_v_proj.as_ref(),
+        "mingru_v_proj_aux_state.npy",
+    )?;
+    load_opt(
+        state.prev_mingru_v_proj.as_ref(),
+        "mingru_v_proj_prev_state.npy",
+    )?;
+    load_opt(
+        state.mag_v_mingru_v_proj.as_ref(),
+        "mingru_v_proj_mag_v.npy",
+    )?;
+    load_opt(
+        state.mom_mingru_v0_up.as_ref(),
+        "mingru_v0_up_momentum_buffer.npy",
+    )?;
+    load_opt(
+        state.var_mingru_v0_up.as_ref(),
+        "mingru_v0_up_aux_state.npy",
+    )?;
+    load_opt(
+        state.prev_mingru_v0_up.as_ref(),
+        "mingru_v0_up_prev_state.npy",
+    )?;
     load_opt(state.mag_v_mingru_v0_up.as_ref(), "mingru_v0_up_mag_v.npy")?;
-    load_opt(state.mom_mamba_in_proj.as_ref(), "mamba_in_proj_momentum_buffer.npy")?;
-    load_opt(state.var_mamba_in_proj.as_ref(), "mamba_in_proj_aux_state.npy")?;
-    load_opt(state.prev_mamba_in_proj.as_ref(), "mamba_in_proj_prev_state.npy")?;
-    load_opt(state.mag_v_mamba_in_proj.as_ref(), "mamba_in_proj_mag_v.npy")?;
-    load_opt(state.mom_mamba_out_proj.as_ref(), "mamba_out_proj_momentum_buffer.npy")?;
-    load_opt(state.var_mamba_out_proj.as_ref(), "mamba_out_proj_aux_state.npy")?;
-    load_opt(state.prev_mamba_out_proj.as_ref(), "mamba_out_proj_prev_state.npy")?;
-    load_opt(state.mag_v_mamba_out_proj.as_ref(), "mamba_out_proj_mag_v.npy")?;
+    load_opt(
+        state.mom_mamba_in_proj.as_ref(),
+        "mamba_in_proj_momentum_buffer.npy",
+    )?;
+    load_opt(
+        state.var_mamba_in_proj.as_ref(),
+        "mamba_in_proj_aux_state.npy",
+    )?;
+    load_opt(
+        state.prev_mamba_in_proj.as_ref(),
+        "mamba_in_proj_prev_state.npy",
+    )?;
+    load_opt(
+        state.mag_v_mamba_in_proj.as_ref(),
+        "mamba_in_proj_mag_v.npy",
+    )?;
+    load_opt(
+        state.mom_mamba_out_proj.as_ref(),
+        "mamba_out_proj_momentum_buffer.npy",
+    )?;
+    load_opt(
+        state.var_mamba_out_proj.as_ref(),
+        "mamba_out_proj_aux_state.npy",
+    )?;
+    load_opt(
+        state.prev_mamba_out_proj.as_ref(),
+        "mamba_out_proj_prev_state.npy",
+    )?;
+    load_opt(
+        state.mag_v_mamba_out_proj.as_ref(),
+        "mamba_out_proj_mag_v.npy",
+    )?;
     let scalar = |name: &str| -> Result<f32, String> {
         let arr = crate::npy::read_npy(&muon.join(name))?;
         arr.f32_slice()?
@@ -1065,12 +1212,7 @@ mod tests {
         state.ema_up.buffer.contents_f32()[17] = 4.0;
         w.tok_emb.buffer.contents_f32()[0] = 0.75;
         let shadow_bit = 0x3f81;
-        w.bf16_banks
-            .as_ref()
-            .unwrap()
-            .qo_bank
-            .buffer
-            .contents_u16()[7] = shadow_bit;
+        w.bf16_banks.as_ref().unwrap().qo_bank.buffer.contents_u16()[7] = shadow_bit;
 
         let root = std::env::temp_dir().join(format!(
             "arch02_checkpoint_test_{}_{}",
@@ -1097,8 +1239,8 @@ mod tests {
 
         let loaded_meta = read_training_checkpoint_meta(&root).expect("meta");
         assert_eq!(loaded_meta, meta);
-        let mut w2 = Weights::load_from_python_npy(&rt, &root.join("weights"), cfg)
-            .expect("weights");
+        let mut w2 =
+            Weights::load_from_python_npy(&rt, &root.join("weights"), cfg).expect("weights");
         w2.ensure_bf16_banks(&rt).expect("loaded bf16 shadows");
         rt.synchronize().expect("loaded bf16 cast");
         load_bf16_shadows(&mut w2, &root.join("bf16_shadows")).expect("load bf16 bits");
@@ -1132,37 +1274,37 @@ mod tests {
         let hp = OptimHyperparams::default();
         let mut state = OptimState::new(&rt, &w, hp.clone()).expect("state");
         state.step = 3;
-        state.mamba_conv1d_weight
+        state
+            .mamba_conv1d_weight
             .as_ref()
             .unwrap()
             .exp_avg
             .buffer
             .contents_f32()[0] = 0.42;
-        state.mamba_conv1d_bias
+        state
+            .mamba_conv1d_bias
             .as_ref()
             .unwrap()
             .exp_avg_sq
             .buffer
             .contents_f32()[2] = 1.75;
-        state.mamba_a_log
+        state
+            .mamba_a_log
             .as_ref()
             .unwrap()
             .exp_avg
             .buffer
             .contents_f32()[0] = -0.5;
-        state.mamba_d
-            .as_ref()
-            .unwrap()
-            .aux
-            .buffer
-            .contents_f32()[3] = 2.25;
-        state.mamba_dt_bias
+        state.mamba_d.as_ref().unwrap().aux.buffer.contents_f32()[3] = 2.25;
+        state
+            .mamba_dt_bias
             .as_ref()
             .unwrap()
             .origin
             .buffer
             .contents_f32()[1] = -1.5;
-        state.mamba_norm
+        state
+            .mamba_norm
             .as_ref()
             .unwrap()
             .exp_avg_sq
@@ -1192,22 +1334,39 @@ mod tests {
         };
         save_training_checkpoint(&rt, &w, &state, &root, &meta).expect("save");
 
-        let w2 = Weights::load_from_python_npy(&rt, &root.join("weights"), cfg)
-            .expect("weights");
+        let w2 = Weights::load_from_python_npy(&rt, &root.join("weights"), cfg).expect("weights");
         let mut state2 = OptimState::new(&rt, &w2, hp).expect("state2");
         load_optim_state_python_npy(&mut state2, &root.join("optim"), &root.join("ema"))
             .expect("load full state");
         assert_eq!(state2.step, 3);
         assert_eq!(
-            state2.mamba_conv1d_weight.as_ref().unwrap().exp_avg.buffer.contents_f32()[0],
+            state2
+                .mamba_conv1d_weight
+                .as_ref()
+                .unwrap()
+                .exp_avg
+                .buffer
+                .contents_f32()[0],
             0.42
         );
         assert_eq!(
-            state2.mamba_conv1d_bias.as_ref().unwrap().exp_avg_sq.buffer.contents_f32()[2],
+            state2
+                .mamba_conv1d_bias
+                .as_ref()
+                .unwrap()
+                .exp_avg_sq
+                .buffer
+                .contents_f32()[2],
             1.75
         );
         assert_eq!(
-            state2.mamba_a_log.as_ref().unwrap().exp_avg.buffer.contents_f32()[0],
+            state2
+                .mamba_a_log
+                .as_ref()
+                .unwrap()
+                .exp_avg
+                .buffer
+                .contents_f32()[0],
             -0.5
         );
         assert_eq!(
@@ -1215,11 +1374,23 @@ mod tests {
             2.25
         );
         assert_eq!(
-            state2.mamba_dt_bias.as_ref().unwrap().origin.buffer.contents_f32()[1],
+            state2
+                .mamba_dt_bias
+                .as_ref()
+                .unwrap()
+                .origin
+                .buffer
+                .contents_f32()[1],
             -1.5
         );
         assert_eq!(
-            state2.mamba_norm.as_ref().unwrap().exp_avg_sq.buffer.contents_f32()[7],
+            state2
+                .mamba_norm
+                .as_ref()
+                .unwrap()
+                .exp_avg_sq
+                .buffer
+                .contents_f32()[7],
             3.5
         );
         let _ = std::fs::remove_dir_all(root);
@@ -1292,8 +1463,20 @@ mod tests {
         load_optim_state_python_npy(&mut state2, &root.join("optim"), &root.join("ema"))
             .expect("load full state");
         assert_eq!(
-            state2.mamba_conv1d_weight.as_ref().unwrap().exp_avg.buffer.read_f32(),
-            state.mamba_conv1d_weight.as_ref().unwrap().exp_avg.buffer.read_f32()
+            state2
+                .mamba_conv1d_weight
+                .as_ref()
+                .unwrap()
+                .exp_avg
+                .buffer
+                .read_f32(),
+            state
+                .mamba_conv1d_weight
+                .as_ref()
+                .unwrap()
+                .exp_avg
+                .buffer
+                .read_f32()
         );
         let _ = std::fs::remove_dir_all(root);
     }
