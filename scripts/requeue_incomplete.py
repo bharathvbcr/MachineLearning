@@ -19,6 +19,11 @@ Both go back to `pending`. A job whose metrics DO carry a `done` record is left
 alone whatever the queue says -- the artifact wins over the claim, never the
 other way round.
 
+`pending` and `held` are not claims about a run and are never touched. A held
+job is one `--hold` parked while the workers drain; it has no `done` record
+because it has not run, and releasing it here would start the very jobs the
+operator held.
+
 Dry-run by default; `--apply` writes. No GPU, no network.
 """
 from __future__ import annotations
@@ -63,7 +68,14 @@ def reconcile(suite: str, apply: bool) -> int:
             continue
         jid = job.get("id")
         status = job.get("status")
-        if not jid or status == "pending":
+        # Only `done`, `failed` and `running` assert that a run happened; those
+        # are the claims disk can contradict. `pending` and `held` assert
+        # nothing. `held` especially: `--hold` parks pending jobs so the workers
+        # can drain, so a held job has no `done` record BY CONSTRUCTION, and
+        # requeueing one releases a hold that only `--unhold` should release --
+        # this tool's own defect inverted, a queue claiming work that must not
+        # run rather than work that is not there.
+        if not jid or status in ("pending", "held"):
             continue
         on_disk = has_done_record(root / jid)
         if on_disk:

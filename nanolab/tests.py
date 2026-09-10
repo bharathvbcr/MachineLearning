@@ -5199,6 +5199,73 @@ def a_queue_entry_that_vouches_for_a_run_that_is_not_there_is_requeued():
 
 
 @test
+def a_job_the_operator_held_is_not_released_by_a_requeue():
+    """`held` does not claim a run exists -- it claims one must not start yet.
+
+    `--hold` parks pending jobs so the workers can drain (`crossover_replicate`
+    writes `status: held` for exactly that) and `--unhold` is the only thing
+    that should release them. A held job therefore has no `done` record on disk
+    *by construction*, so a reconcile that treats every non-`pending` status as
+    vouching for a run flips all of them to `pending`, and the next worker
+    starts the very jobs the operator held.
+
+    That is this tool's own defect inverted. It exists because a queue must not
+    claim work that is not there; un-holding makes the queue claim work that
+    must not run. Only `done`, `failed` and `running` assert that a run
+    happened. `pending` and `held` assert nothing, and nothing is what they
+    should be reconciled against.
+
+    Found merging the GH200 branch: `crossover_ladder1536` carried five held
+    `w1536_mingru_lr20` jobs and the dry run offered to requeue all five.
+    """
+    import importlib.util
+    import json as _json
+    import tempfile
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "requeue_incomplete", root / "scripts" / "requeue_incomplete.py")
+    if spec is None or spec.loader is None:
+        raise Skip("no scripts/requeue_incomplete.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mod.ROOT = Path(tmp)
+        suite = Path(tmp) / "nanolab" / "out" / "s"
+        suite.mkdir(parents=True)
+
+        def run(jid, done):
+            d = suite / jid
+            d.mkdir()
+            (d / "metrics.jsonl").write_text(
+                _json.dumps({"event": "done", "final_val": 4.2}) + "\n"
+                if done else _json.dumps({"event": "train", "step": 1}) + "\n")
+
+        run("held_started", False)    # held after a worker touched it
+        run("held_finished", True)    # held, but the run did complete
+        run("died_midway", False)     # the case the tool exists for
+        # 'held_untouched' has no directory at all -- the ordinary held job
+        (suite / "queue.json").write_text(_json.dumps([
+            {"id": "held_untouched", "status": "held"},
+            {"id": "held_started", "status": "held"},
+            {"id": "held_finished", "status": "held"},
+            {"id": "died_midway", "status": "failed", "detail": "OOM"},
+        ]))
+
+        mod.reconcile("s", apply=True)
+        after = {j["id"]: j for j in _json.loads((suite / "queue.json").read_text())}
+
+    for jid in ("held_untouched", "held_started", "held_finished"):
+        assert after[jid]["status"] == "held", (
+            f"{jid} was released to 'pending'; a requeue must never undo a hold, "
+            "or the workers it was draining for start the held jobs")
+    assert after["died_midway"]["status"] == "pending", (
+        "reconciling a genuinely dead job must still work")
+
+
+@test
 def re_adding_an_arm_the_board_already_carries_is_not_a_recipe_conflict():
     """G5's family probe never launched a single job because of this.
 
