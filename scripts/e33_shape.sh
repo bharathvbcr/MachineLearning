@@ -9,7 +9,8 @@
 # Pre-registered: 6L within 0.05 of 12L -> 6 layers is the latency shape;
 # 3L within 0.05 -> 3.
 source "$(dirname "$0")/_stage_common.sh"
-stage_wait; stage_start e33
+stage_wait || stage_refused e33
+stage_start e33
 export CROSSOVER_ARMS=attention,attn6_w512,attn6_w576,w384_attention_lr10
 export CROSSOVER_JOB_PREFIX=cx32shape
 python3 -u -m nanolab.crossover_replicate launch --out nanolab/out/crossover50m_shape32 --workers 3

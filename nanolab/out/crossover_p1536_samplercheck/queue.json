@@ -1,0 +1,43 @@
+{
+  "jobs": [
+    {
+      "id": "cx32sc1536_w1536_attention_lr05_s42",
+      "arm": "w1536_attention_lr05",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "E21 ladder: d_model 1536, LR x0.5",
+      "status": "done",
+      "worker": 0,
+      "started": 1789033509.4382303,
+      "finished": 1789034510.0482154,
+      "detail": "best_val=4.090074"
+    },
+    {
+      "id": "cx32sc1536_w1536_attention_lr05_s100",
+      "arm": "w1536_attention_lr05",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 100,
+      "note": "E21 ladder: d_model 1536, LR x0.5",
+      "status": "done",
+      "worker": 0,
+      "started": 1789034513.743438,
+      "finished": 1789035506.8314571,
+      "detail": "best_val=4.072597"
+    },
+    {
+      "id": "cx32sc1536_w1536_attention_lr10_s42",
+      "arm": "w1536_attention_lr10",
+      "mixer": "attention",
+      "layer_mixers": "",
+      "seed": 42,
+      "note": "E21 ladder: d_model 1536, LR x1.0",
+      "status": "done",
+      "worker": 0,
+      "started": 1789035511.439603,
+      "finished": 1789036511.8803053,
+      "detail": "best_val=4.105195"
+    }
+  ]
+}

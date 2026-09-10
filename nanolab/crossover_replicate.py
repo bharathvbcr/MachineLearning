@@ -382,7 +382,7 @@ MOE_ARMS = ("attention", "moe_e1k1", "moe_e4k1", "moe_e8k1")
 # finding at a new point: attention peaked at 8x base LR and minGRU at 4x at
 # every width so far, and an invariant that holds at three widths and breaks at
 # the fourth is worth knowing before the span is quoted.
-LADDER_WIDTHS = (384, 768, 1152, 1536)
+LADDER_WIDTHS = (384, 768, 1152, 1536, 1920)
 # 0.5/1.0/2.0 was the first sweep and it was entirely on the wrong side: at
 # 10M tokens ALL SIX cells picked 2.0, the top edge, with loss monotone
 # decreasing in LR (e.g. w768 attention 5.4948 / 5.3608 / 5.2701). An argmin at
@@ -403,7 +403,12 @@ LADDER_WIDTHS = (384, 768, 1152, 1536)
 # real finding, and it is the mechanism the paper is about: any board that
 # hands both arms one shared LR is reading them at different distances from
 # their own optima.
-LADDER_LR_MULTS = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+# 0.25 was added 2026-09-08. At 10M the first sweep ran off the TOP edge and
+# 4.0/8.0 were appended; at 50M G7 found loss monotone INCREASING in LR over
+# 1x/4x/8x for every arm it carried, which runs off the BOTTOM edge instead. An
+# argmin at the edge is not an argmin, in either direction, so the grid extends
+# down until the minimum is interior.
+LADDER_LR_MULTS = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
 _LADDER_BASE_LR, _LADDER_BASE_MATRIX_LR = 6e-4, 0.025
 _ladder = []
 for _w in LADDER_WIDTHS:
@@ -450,6 +455,7 @@ _PUB = (("gdn_rule", "published"),)
 _RAW = (("moe_router_weight", "raw"),)
 _X1 = (("mingru_expand", 1),)
 _W384 = (("d_model", 384), ("n_head", 6), ("head_dim", 64))
+_W768 = (("d_model", 768), ("n_head", 12), ("head_dim", 64))
 ARMS = ARMS + (
     # E28: is the hard-recall failure the operator variant? Same block, the
     # published decayed-read rule (arXiv:2412.06464 eq. 8) instead of the repo's.
@@ -500,7 +506,89 @@ ARMS = ARMS + (
     Arm("w384_hybrid_mingru8_attn4_lr80", "mingru", "mingru*8,attention*4",
         "8+4 at d_model 384, LR x8",
         overrides=_W384 + (("lr", _LADDER_BASE_LR * 8.0), ("matrix_lr", _LADDER_BASE_MATRIX_LR * 8.0))),
+    # G7: E10's board re-run at each arm's own argmin. Every hybrid board in the
+    # repo ran at 1x base, which is nobody's optimum -- attention's is 8x and the
+    # ladder's minGRU 4x -- so those boards read attention from further away than
+    # the hybrids, which is the confound E21 identified. These arms are the E10
+    # geometry at width 768 with only the LR changed. Both multipliers are carried
+    # for every arm: E35 put the hybrid's optimum at 4x, but at width 384 and 200M
+    # tokens, and assuming that transfers is the error this board exists to fix.
+    Arm("w768_hybrid_mingru8_attn4_lr40", "mingru", "mingru*8,attention*4",
+        "8+4 at d_model 768, LR x4",
+        overrides=_W768 + (("lr", _LADDER_BASE_LR * 4.0), ("matrix_lr", _LADDER_BASE_MATRIX_LR * 4.0))),
+    Arm("w768_hybrid_mingru8_attn4_lr80", "mingru", "mingru*8,attention*4",
+        "8+4 at d_model 768, LR x8",
+        overrides=_W768 + (("lr", _LADDER_BASE_LR * 8.0), ("matrix_lr", _LADDER_BASE_MATRIX_LR * 8.0))),
+    Arm("w768_hybrid_mingru_periodic_lr40", "mingru",
+        "mingru*3,attention,mingru*3,attention,mingru*3,attention",
+        "9+3 periodic at d_model 768, LR x4",
+        overrides=_W768 + (("lr", _LADDER_BASE_LR * 4.0), ("matrix_lr", _LADDER_BASE_MATRIX_LR * 4.0))),
+    Arm("w768_hybrid_mingru_periodic_lr80", "mingru",
+        "mingru*3,attention,mingru*3,attention,mingru*3,attention",
+        "9+3 periodic at d_model 768, LR x8",
+        overrides=_W768 + (("lr", _LADDER_BASE_LR * 8.0), ("matrix_lr", _LADDER_BASE_MATRIX_LR * 8.0))),
 )
+# G8: the same two hybrid shapes across the rest of the probe grid. A loop, not
+# eight more literal blocks -- only the multiplier varies, and hand-copying
+# six-line blocks is how one ends up transposed. lr40 and lr80 stay written out
+# above because G7 queued them by name before this grid existed.
+_HYBRID_SHAPES = (
+    ("hybrid_mingru8_attn4", "mingru*8,attention*4", "8+4"),
+    ("hybrid_mingru_periodic",
+     "mingru*3,attention,mingru*3,attention,mingru*3,attention", "9+3 periodic"),
+)
+_hyb = []
+for _nm, _mix, _lbl in _HYBRID_SHAPES:
+    for _m in (0.25, 0.5, 1.0, 2.0):
+        _hyb.append(Arm(
+            f"w768_{_nm}_lr{str(_m).replace('.', '')}", "mingru", _mix,
+            f"{_lbl} at d_model 768, LR x{_m}",
+            overrides=_W768 + (("lr", _LADDER_BASE_LR * _m),
+                               ("matrix_lr", _LADDER_BASE_MATRIX_LR * _m))))
+ARMS = ARMS + tuple(_hyb)
+_FAMILIES = ("mamba2", "mla", "gdn")
+_fam = []
+for _mx in _FAMILIES:
+    for _m in (0.25, 0.5, 1.0, 2.0, 4.0, 8.0):
+        _fam.append(Arm(
+            f"w768_{_mx}_lr{str(_m).replace('.', '')}", _mx,
+            note=f"G5: {_mx} at d_model 768, LR x{_m}",
+            overrides=_W768 + (("lr", _LADDER_BASE_LR * _m),
+                               ("matrix_lr", _LADDER_BASE_MATRIX_LR * _m))))
+ARMS = ARMS + tuple(_fam)
+# G5 probes the families on the SAME board as the pure arms so the argmins are read
+# under one recipe at one tenancy; G6 probes w1920 on its own because that width cannot
+# share a device (w1536 minGRU already OOMed two-to-a-device on 2026-09-05).
+G5_ARMS = tuple(a.name for a in _fam)
+# Five points, not six: 8x is dropped. Every 50M cell measured so far rejects it
+# decisively -- w768 attention by +0.2551 against 1x, w1152 minGRU by +0.1525 against
+# 4x, w1152 attention's 16x by +0.1352 against an 8x that is itself beaten by 4x -- and
+# a w1920 job is the most expensive in the program. 0.25x..4x still brackets every
+# argmin located to date, and if d1920 lands on an edge the planner refuses and the
+# grid extends, which is the rule doing its job rather than a gap.
+# G8d: w1536's own 50M probe. The first G9 design let this width inherit a multiplier
+# on measured width-invariance; the probe then found d384 at 2x and d768 at 1x, so there
+# was nothing to inherit. Same five points as G6 and for the same reason -- 8x is
+# rejected decisively in every 50M cell measured -- and tenancy 1, because w1536 minGRU
+# OOMed two-to-a-device on 2026-09-05.
+# G11: the 1/width law's one unverified point. Three of four widths put the 50M
+# optimum at width x lr = 0.4608 exactly; d1152 predicts lr 0.0004 = 2/3 base, and the
+# 2x-spaced ladder grid has only 0.5x (4.1659) and 1x (4.1595) -- straddling it, 0.0064
+# apart. Named `lr0667` rather than generated, because 2/3 has no clean decimal name and
+# a generated one would read as 0.6667x when the value that matters is 0.4608/1152.
+_LAW = 2.0 / 3.0
+_W1152 = (("d_model", 1152), ("n_head", 18), ("head_dim", 64))
+LAW_ARMS = ("w1152_attention_lr0667", "w1152_mingru_lr0667")
+ARMS = ARMS + tuple(
+    Arm(f"w1152_{mx}_lr0667", mx,
+        note="G11: the 1/width prediction at d1152 (lr 4e-4)",
+        overrides=_W1152 + (("lr", _LADDER_BASE_LR * _LAW),
+                            ("matrix_lr", _LADDER_BASE_MATRIX_LR * _LAW)))
+    for mx in ("attention", "mingru"))
+G8D_PROBE_ARMS = tuple(f"w1536_{mx}_lr{m}" for mx in ("attention", "mingru")
+                       for m in ("025", "05", "10", "20", "40"))
+G6_PROBE_ARMS = tuple(f"w1920_{mx}_lr{m}" for mx in ("attention", "mingru")
+                      for m in ("025", "05", "10", "20", "40"))
 # One name per board so a launcher cannot list a subset (the RATIO_ARMS rule).
 GDN_RULE_ARMS = ("gdn", "gdn_pub", "hybrid_gdn_periodic", "hybrid_gdn_periodic_pub")
 MOE_RAW_ARMS = ("attention", "moe_e1k1_raw", "moe_e4k1_raw", "moe_e8k1_raw")
@@ -510,6 +598,51 @@ SHAPE_ARMS = ("attention", "attn6_w512", "attn6_w576", "w384_attention_lr10")
 COPY_ARMS = ("attention", "mingru", "hybrid_mingru8_attn4")
 W384X_ARMS = ("w384_attention_lr80", "w384_mingru_lr40",
               "w384_hybrid_mingru8_attn4_lr40", "w384_hybrid_mingru8_attn4_lr80")
+# G3: does the LR argmin move with the HORIZON? Every argmin in the ladder was
+# located at 10M tokens on ONE seed and then spent at 50M, and two of the six
+# probe curves are nearly flat at the bottom -- minGRU's 4x beats 8x by 0.0121 at
+# w384 and beats 2x by 0.0055 at w1152, against a 0.0031-nat rerun floor. So this
+# grows `crossover_ladder50m` itself rather than opening a board: the argmin then
+# gets located at the budget the boards spend it at, at n=5, in the directory that
+# already holds the argmin arms. Both thin minGRU cases are covered; attention's
+# horizon test runs at the widest rung with a full probe grid. Listing the whole
+# board, not the six additions, is the RATIO_ARMS rule -- the six already on disk
+# are skipped as done.
+G3_ARMS = ("w384_attention_lr80", "w384_mingru_lr20", "w384_mingru_lr40",
+           "w384_mingru_lr80", "w768_attention_lr80", "w768_mingru_lr40",
+           "w1152_attention_lr40", "w1152_attention_lr80", "w1152_attention_lr160",
+           "w1152_mingru_lr20", "w1152_mingru_lr40", "w1152_mingru_lr80")
+# G7: the hybrid-vs-attention comparison at each arm's own argmin. This grows
+# `crossover50m_ratioplace32`, the board the confounded rows came from, so the 1x
+# baseline and the re-tuned arms are the same board at the same recipe -- the
+# contrast that answers the objection is then within-suite, and no part of it
+# crosses the compile boundary. Eager at tenancy 3, both fixed by the lock.
+# G8: locate the 50M LR argmin, the assumption `e21_ladder_probe.sh` recorded as
+# untested ("the best LR at 10M is not guaranteed to be the best at 50M") and G7
+# then broke. Mirrors the 10M probe exactly -- same grid shape, same n=1 at seed
+# 1337, same eager recipe -- so the only difference between the two boards is the
+# token budget, and the comparison is one subtraction. Two widths carry the pure
+# arms, which is what tests whether the 50M argmin is width-invariant the way the
+# 10M one was; w768 also carries both hybrid shapes, because whether the argmin is
+# ARM-invariant is what decides whether section 5's rows were ever confounded.
+PROBE50M_MULTS = ("025", "05", "10", "20", "40", "80")
+PROBE50M_ARMS = tuple(
+    f"w{w}_{mx}_lr{m}"
+    for w, mx in ((384, "attention"), (384, "mingru"),
+                  (768, "attention"), (768, "mingru"),
+                  (768, "hybrid_mingru8_attn4"), (768, "hybrid_mingru_periodic"))
+    for m in PROBE50M_MULTS)
+# G8b: the w1152 low side, grown into the ladder board so the three-width
+# invariance check spans 3x rather than 2x. G3 already put lr20/40/80 there for
+# minGRU and lr40/80/160 for attention, so only the bottom half is missing.
+G8B_ARMS = G3_ARMS + ("w1152_attention_lr025", "w1152_attention_lr05",
+                      "w1152_attention_lr10", "w1152_mingru_lr025",
+                      "w1152_mingru_lr05", "w1152_mingru_lr10")
+G7_ARMS = ("attention", "hybrid_mingru10_attn2", "hybrid_mingru11_attn1",
+           "hybrid_mingru8_attn4", "hybrid_mingru_bookend", "hybrid_mingru_periodic",
+           "w768_attention_lr40", "w768_attention_lr80",
+           "w768_hybrid_mingru8_attn4_lr40", "w768_hybrid_mingru8_attn4_lr80",
+           "w768_hybrid_mingru_periodic_lr40", "w768_hybrid_mingru_periodic_lr80")
 
 
 def scale_to_token_budget(batch_size: int, block_size: int = 512,
@@ -1010,10 +1143,24 @@ LEGACY_RECIPE_DEFAULTS: dict[str, object] = {
 def lock_recipe(out_root: Path) -> dict:
     """Refuse to mix two training recipes in one out dir."""
     rec = current_recipe()
+    # `arms` is a set of arms wearing a list's clothes, so a caller that appends
+    # an arm the board already carries is asking for nothing, not for a different
+    # recipe. Dedupe before anything compares it -- order-preserving, so the
+    # stored list still reads in the order the board grew.
+    #
+    # Without this, G5 and G10 both refused on `conflicting fields: ['arms']`
+    # after extending the recipe with arms already on it: the growth seam below
+    # tests `set(old) < set(rec)`, a STRICT subset, which is false when the new
+    # list adds only duplicates. G5's family probe never launched a single job
+    # because of it, and G10's exit=1 was this and nothing else.
+    if isinstance(rec.get("arms"), (list, tuple)):
+        rec["arms"] = list(dict.fromkeys(rec["arms"]))
     path = Path(out_root) / "recipe.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         old = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(old.get("arms"), (list, tuple)):
+            old["arms"] = list(dict.fromkeys(old["arms"]))
         # A field added after a suite ran is unrecorded, not conflicting. Backfill
         # it when everything actually recorded agrees; a real disagreement on any
         # shared field still refuses, which is the point of the lock.

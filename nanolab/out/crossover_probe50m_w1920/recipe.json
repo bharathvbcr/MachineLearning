@@ -1,0 +1,100 @@
+{
+  "batch_size": 32,
+  "block_size": 512,
+  "workers": 1,
+  "gpus": 1,
+  "budget_by_arm": null,
+  "arm_overrides": {
+    "w1920_attention_lr025": {
+      "d_model": 1920,
+      "n_head": 30,
+      "head_dim": 64,
+      "lr": 0.00015,
+      "matrix_lr": 0.00625
+    },
+    "w1920_attention_lr05": {
+      "d_model": 1920,
+      "n_head": 30,
+      "head_dim": 64,
+      "lr": 0.0003,
+      "matrix_lr": 0.0125
+    },
+    "w1920_attention_lr10": {
+      "d_model": 1920,
+      "n_head": 30,
+      "head_dim": 64,
+      "lr": 0.0006,
+      "matrix_lr": 0.025
+    },
+    "w1920_attention_lr20": {
+      "d_model": 1920,
+      "n_head": 30,
+      "head_dim": 64,
+      "lr": 0.0012,
+      "matrix_lr": 0.05
+    },
+    "w1920_attention_lr40": {
+      "d_model": 1920,
+      "n_head": 30,
+      "head_dim": 64,
+      "lr": 0.0024,
+      "matrix_lr": 0.1
+    },
+    "w1920_mingru_lr025": {
+      "d_model": 1920,
+      "n_head": 30,
+      "head_dim": 64,
+      "lr": 0.00015,
+      "matrix_lr": 0.00625
+    },
+    "w1920_mingru_lr05": {
+      "d_model": 1920,
+      "n_head": 30,
+      "head_dim": 64,
+      "lr": 0.0003,
+      "matrix_lr": 0.0125
+    },
+    "w1920_mingru_lr10": {
+      "d_model": 1920,
+      "n_head": 30,
+      "head_dim": 64,
+      "lr": 0.0006,
+      "matrix_lr": 0.025
+    },
+    "w1920_mingru_lr20": {
+      "d_model": 1920,
+      "n_head": 30,
+      "head_dim": 64,
+      "lr": 0.0012,
+      "matrix_lr": 0.05
+    },
+    "w1920_mingru_lr40": {
+      "d_model": 1920,
+      "n_head": 30,
+      "head_dim": 64,
+      "lr": 0.0024,
+      "matrix_lr": 0.1
+    }
+  },
+  "swa_chunk": -1,
+  "eval_iters": 20,
+  "copy_probe": false,
+  "token_budget": 50000000,
+  "lr_horizon": null,
+  "arms": [
+    "w1920_attention_lr025",
+    "w1920_attention_lr05",
+    "w1920_attention_lr10",
+    "w1920_attention_lr20",
+    "w1920_attention_lr40",
+    "w1920_mingru_lr025",
+    "w1920_mingru_lr05",
+    "w1920_mingru_lr10",
+    "w1920_mingru_lr20",
+    "w1920_mingru_lr40"
+  ],
+  "prefix": "cx32p1920",
+  "device": "NVIDIA GH200 480GB",
+  "compile": false,
+  "fused_ce": true
+}

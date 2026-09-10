@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
+import re
 import subprocess
 import sys
 import json
@@ -305,6 +306,32 @@ def _wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     c = (p + z * z / (2 * n)) / d
     h = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
     return (max(0.0, c - h), min(1.0, c + h))
+
+
+_RUN_NAME_RE = re.compile(
+    r"^mqar_p\d+(?:_b\d+)?(?:_t\d+)?_(.+?)_s\d+(?:_lr[a-z]+)?$")
+
+
+def arm_of(record: dict) -> str:
+    """The arm a ledger record belongs to, read from the run NAME.
+
+    The `arm` COLUMN is not a key. `run_one` only gained an explicit ``arm``
+    argument partway through this program; before that it fell back to
+    ``cfg.mixer``, which for a hybrid is its recurrent half. 165 rows across
+    this repo's ledgers are filed that way -- every `hybrid_mingru10_attn2` as
+    `mingru` (90 rows) and every `hybrid_gdn_periodic` as `gdn` (75) -- so any
+    consumer that groups on the column pools each hybrid into the pure arm it
+    was built to beat. That is not hypothetical: it put `mingru` at 12/30 on a
+    recall cell where pure minGRU actually solves 0/15, and the wrong number
+    reached a paper draft before a cross-check caught it.
+
+    `run_name` has always carried the arm name rather than ``spec.mixer`` --
+    that is what keeps `swa_w64` and `swa_w64_nosink` apart -- so the name is
+    the identifier and the column is a summary of it. A summary that can
+    disagree with the thing it summarises must never be the grouping key.
+    """
+    m = _RUN_NAME_RE.match(record["run"])
+    return m.group(1) if m else record.get("arm", record["run"])
 
 
 def board(records: list[dict]) -> list[dict]:

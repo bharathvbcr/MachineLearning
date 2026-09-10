@@ -14,7 +14,8 @@
 # 50M AND no re-crossing on the mean curves -> the no-regret claim survives near
 # parity; otherwise the margin was parameters.
 source "$(dirname "$0")/_stage_common.sh"
-stage_wait; stage_start e30
+stage_wait || stage_refused e30
+stage_start e30
 # (a) EAGER, and not by preference. crossover50m_ratioplace32 holds 25 runs
 # whose recipe records compile:false, and the whole point of adding `attention`
 # to that directory is that it becomes a WITHIN-suite comparison. Compiling the

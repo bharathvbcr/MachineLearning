@@ -1,0 +1,2 @@
+{"event": "start", "params": 848657304, "params_non_embed": 848657304, "sampler": "memmap"}
+{"event": "train", "step": 0, "loss": 38.418067932128906, "lr": 0.0015625, "grad_norm": 561.1529541015625, "tok_s": 36335.095854108615, "mfu": 0.18697955222716156, "tokens": 16384}

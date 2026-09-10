@@ -173,7 +173,11 @@ def train(cfg, overfit: int = 0, batchers=None):
 
     # ---- model (guide §2) ----
     model = build_model(cfg).to(device)
-    log.banner(model)
+    # Always recorded, "unknown" included: a run whose path cannot be established
+    # must not look like one that took the fast path.
+    _resident = getattr(train_batcher, "gpu_resident", None)
+    log.banner(model, sampler=("unknown" if _resident is None else
+                               "gpu_resident" if _resident else "memmap"))
 
     # torch.compile needs Triton (Inductor backend); it's absent on Windows, and
     # the failure is lazy (fires on the first forward, uncatchable here), so skip
@@ -225,6 +229,7 @@ def train(cfg, overfit: int = 0, batchers=None):
 
     # ---- resume (guide §6.4) ----
     start_step = 0
+    start_tokens = 0
     ckpt = out_dir / "ckpt.pt"
     if ckpt.exists() and os.environ.get("RESUME", "0") == "1":
         state = torch.load(ckpt, map_location=device, weights_only=False)
@@ -234,7 +239,37 @@ def train(cfg, overfit: int = 0, batchers=None):
                 opt.load_state_dict(sd)
         else:
             log.info("checkpoint has no optimizer state; resuming weights only")
-        start_step = state["step"]
+        # Resume at the step that has NOT run yet.  `step` in the blob names the
+        # update that had just been APPLIED when the checkpoint was written, and
+        # `range(start_step, max_steps)` then re-executed it, so every resume
+        # replayed one optimizer step -- an extra update, an extra batch, and a
+        # token count one step long.  `next_step` records the resume point
+        # directly instead of leaving the caller to infer it.  Found 2026-09-08
+        # by the token-counter test below, which had to pin the slack at exactly
+        # one step to keep passing; that slack is what this removes.
+        # A blob written before `next_step` existed is not ambiguous: `step` was
+        # always written from inside the loop AFTER that step's update, so the
+        # step to resume at is `step + 1` either way.  Applying the correction to
+        # old checkpoints too is deliberate.  The alternative -- preserve the
+        # replay for them -- was tried and is worse: replaying a step means the
+        # token axis must either dip or over-count by a step, and there is no
+        # third option.  Resuming at `step + 1` is the only reading under which
+        # `step` and `tokens_seen` agree, because `tokens_seen` was also taken
+        # after that update.
+        start_step = state.get("next_step", state["step"] + 1)
+        # The token counter has to resume with the step counter.  It did not
+        # until 2026-09-07: `tokens_seen` was re-zeroed on every start, so a
+        # resumed run wrote a `tokens` axis that restarted mid-file while `step`
+        # kept climbing.  Every eval after the resume was mislabelled and `done`
+        # reported the post-resume count as the run's total --
+        # cx32lad1536_w1536_attention_lr80_s1337 and _s42 each record 3050 steps
+        # as 25.41M tokens.  `final_val` was never affected, so the loss tables
+        # stand; anything keyed on the token axis did not.
+        start_tokens = state.get("tokens_seen")
+        if start_tokens is None:
+            start_tokens = _tokens_through(cfg, start_step)
+            log.info(f"checkpoint predates tokens_seen; reconstructed "
+                     f"{start_tokens} tokens from the step schedule")
         log.info(f"resumed from step {start_step}")
     elif cfg.init_ckpt:
         state = torch.load(cfg.init_ckpt, map_location=device, weights_only=False)
@@ -246,7 +281,7 @@ def train(cfg, overfit: int = 0, batchers=None):
         else model._orig_mod.flops_per_token()
     best_val = math.inf
     t0 = time.time()
-    tokens_seen = 0
+    tokens_seen = start_tokens
     lr_free = is_lr_free(cfg)            # Schedule-Free / Prodigy set their own LR
     is_sophia = cfg.optimizer == "sophia"
     model.train()
@@ -339,18 +374,24 @@ def train(cfg, overfit: int = 0, batchers=None):
                      val_ppl=math.exp(min(val, 20)), tokens=tokens_seen, **extra)
             if val < best_val:
                 best_val = val
-                _save(out_dir / "best.pt", model, optimizers, step, cfg, val, light=True)
+                _save(out_dir / "best.pt", model, optimizers, step, cfg, val,
+                      light=True, tokens_seen=tokens_seen)
 
         if step > 0 and step % cfg.ckpt_interval == 0:
-            _save(ckpt, model, optimizers, step, cfg, best_val)   # full: resume
+            # step+1: this update has been applied, so the resume point is the
+            # next one. tokens_seen matches -- it already includes this step.
+            _save(ckpt, model, optimizers, step, cfg, best_val,
+                  tokens_seen=tokens_seen, next_step=step + 1)   # full: resume
 
     # ---- final eval ----
     val = evaluate(model, val_batcher, cfg, autocast, optimizers)
-    _save(out_dir / "final.pt", model, optimizers, cfg.max_steps, cfg, val, light=True)
+    _save(out_dir / "final.pt", model, optimizers, cfg.max_steps, cfg, val,
+          light=True, tokens_seen=tokens_seen)
     # ensure best.pt always exists (e.g. when eval_interval >= max_steps, no
     # periodic eval fired and best.pt was never written).
     if val <= best_val or not (out_dir / "best.pt").exists():
-        _save(out_dir / "best.pt", model, optimizers, cfg.max_steps, cfg, val, light=True)
+        _save(out_dir / "best.pt", model, optimizers, cfg.max_steps, cfg, val,
+              light=True, tokens_seen=tokens_seen)
     best_val = min(best_val, val)
     elapsed_s = time.time() - t0
     log.done(best_val, human_time(elapsed_s), tokens_seen, elapsed_s=elapsed_s,
@@ -400,13 +441,36 @@ def _mfu(flops_per_tok, tokens, dt, device):
     return achieved / float(raw)
 
 
-def _save(path, model, optimizers, step, cfg, val, light=False):
+def _tokens_through(cfg, n_steps):
+    """Tokens consumed by the first ``n_steps`` optimizer steps.
+
+    Not ``n_steps * batch_size * block_size``: with a seqlen curriculum the
+    per-step token count is a function of the step, so summing the schedule is
+    the only exact answer.  Used to reconstruct the counter when resuming from
+    a checkpoint written before ``tokens_seen`` was stored."""
+    return sum(cfg.batch_size * cfg.grad_accum * _curriculum_len(cfg, s)
+               for s in range(n_steps))
+
+
+def _save(path, model, optimizers, step, cfg, val, light=False, tokens_seen=None,
+          next_step=None):
     """Save a checkpoint. ``light=True`` (best.pt / final.pt) stores weights
     only — for inference; ``light=False`` (resume ckpt) also stores optimizer
     state. Optimizer state (Muon momentum + Adam m/v) roughly doubles the file,
-    so the inference checkpoints stay small."""
+    so the inference checkpoints stay small.
+
+    ``tokens_seen`` travels with ``step``: a resume that restores one without
+    the other writes a metrics file whose token axis restarts mid-run.
+
+    ``next_step`` is the step a resume should START at, which is one past the
+    update ``step`` names. Only the resume checkpoint carries it; ``best.pt``
+    and ``final.pt`` are inference artifacts and are never resumed from."""
     sd = model._orig_mod.state_dict() if hasattr(model, "_orig_mod") else model.state_dict()
     blob = {"model": sd, "step": step, "cfg": cfg.to_dict(), "val_loss": val}
+    if tokens_seen is not None:
+        blob["tokens_seen"] = tokens_seen
+    if next_step is not None:
+        blob["next_step"] = next_step
     if not light:
         blob["optimizers"] = [o.state_dict() for o in optimizers]
     torch.save(blob, path)

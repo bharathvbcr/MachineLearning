@@ -62,6 +62,71 @@ have different LR sensitivities (the E21 ladder measured the same thing
 independently — attention peaks at 8× base LR, minGRU at 4×, at every width), so
 one shared wrong rule displaces them by different amounts.
 
+> **Note 2026-09-09, and it cuts closer than the first version of this note admitted.**
+>
+> The parenthetical is a **10M-token** result. Re-probed at **50M** (G8a/G8b/G8d, an
+> interior minimum in every cell), the E21 ladder says something different, and something
+> this doc has a direct stake in:
+>
+> | width | attention | minGRU | best `lr` | width x lr |
+> |---|---|---|---|---|
+> | 384 | 2x | 2x | 0.0012 | 0.4608 |
+> | 768 | 1x | 1x | 0.0006 | 0.4608 |
+> | 1152 | 0.667x | 0.667x [dagger] | 0.0004 | 0.4608 |
+> | 1536 | 0.5x | 0.5x | 0.0003 | 0.4608 |
+>
+>
+> **Every argmin now carries n=3, and none of them moved (G11b, 2026-09-10).** That was
+> the pre-registered test: *any argmin that shifts once its own point carries three seeds
+> was never located*. Each width's argmin and its tight-side neighbour were run at seeds
+> 1337/42/100, and every cell returned the same multiplier it had at n=1. Margins are
+> paired on the three seeds each pair shares, so seed-to-seed spread — which on these
+> boards reaches 0.0574, eighteen times the rerun floor — is differenced out rather than
+> averaged in:
+>
+> | width | mixer | argmin | runner-up | paired margin (n=3) | verdict |
+> |---|---|---|---|---|---|
+> | 384 | attention | 2x | 1x | +0.0144, 3/3 | resolved |
+> | 384 | minGRU | 2x | 1x | +0.0155, 3/3 | resolved |
+> | 768 | attention | 1x | 0.5x | +0.0391, 3/3 | resolved |
+> | 768 | minGRU | 1x | 0.5x | +0.0529, 3/3 | resolved |
+> | 1152 | attention | 0.667x | 1x | +0.0053, 3/3 | resolved |
+> | 1152 | minGRU | 0.667x | 1x | +0.0024, 3/3 | **flat — under the 0.0031 floor** |
+> | 1536 | attention | 0.5x | 1x | +0.0125, 3/3 | resolved |
+> | 1536 | minGRU | 0.5x | 1x | +0.0067, 3/3 | resolved |
+>
+> **Seven of the eight cells are resolved; `width x lr = 0.4608` holds at all eight.** The
+> exception is d1152 minGRU, where 0.667x leads 1x by 0.0024 — the right sign on 3 of 3
+> seeds, but under the floor, so it is reported as consistent with the law rather than
+> evidence for it.
+>
+> [dagger] d1152 was re-probed at the law's own point by G11b (2026-09-10), paired on 3
+> seeds. Attention's 0.667x beats **both** neighbours above the 0.0031 rerun floor --
+> 0.0100 over 0.5x (3/3) and 0.0053 over 1x (3/3) -- so the argmin there is **located**.
+> minGRU's 0.667x beats 0.5x by 0.0167 (3/3) but leads 1x by only +0.0024, *inside* the
+> floor: right sign, unresolved magnitude. Read minGRU's row as consistent with 0.667x,
+> not as evidence for it.
+>
+> Two things change. **The arm asymmetry is gone at 50M** -- attention and minGRU pick the
+> same rate at every width -- so the E21 corroboration cited above is 10M-only. The
+> argument here does not depend on it: the asymmetry it needs is measured on this doc's
+> own grid, where 1x costs +0.1921 nats on attention against +0.0236 on minGRU.
+>
+> **The second change is the one to take seriously.** All four widths put the
+> optimum at exactly `lr` proportional to `1/width` -- which is the Adam muP rule
+> `optim.py:750` implements and this doc concludes is *wrong*. The two are not directly
+> comparable and this note does not claim a contradiction: this doc's multipliers are on
+> the *transferred* value while E21's scale raw `lr` and `matrix_lr` together, and the E21
+> runs have `mup: False` so no divisor was applied to them at all. But both are asking
+> whether hidden LR should fall with width, they answer oppositely, and **the variable
+> that moved between them is the horizon** -- E21 itself found width-invariance at 10M and
+> 1/width at 50M.
+>
+> **So this doc's verdict should be read as horizon-local until re-measured.** What would
+> settle it: this exact grid re-run at 50M. Until then the no-divisor recommendation
+> stands on its own measurement and carries this caveat. Labelled **inferred** -- E21's
+> 50M probe is n=1 per cell on a 2x-spaced grid, and d1152 does not resolve.
+
 ## What is *not* resolved, and does not need to be
 
 Both argmins are **not sign-consistent**: the curves are flat between 2× and 4×,

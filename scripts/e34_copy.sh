@@ -6,7 +6,8 @@
 # Pre-registered: per seed, the copy-loss drop within +-1M tokens of the
 # attention-over-minGRU crossing on 4/5 seeds -> predictive; else withdrawn.
 source "$(dirname "$0")/_stage_common.sh"
-stage_wait; stage_start e34
+stage_wait || stage_refused e34
+stage_start e34
 export CROSSOVER_COPY_PROBE=1
 export CROSSOVER_ARMS=attention,mingru,hybrid_mingru8_attn4
 export CROSSOVER_JOB_PREFIX=cx32copy

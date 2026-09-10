@@ -10,7 +10,8 @@
 # Pre-registered: VR gain untied < half of VR gain tied -> interaction;
 # unchanged -> independent.
 source "$(dirname "$0")/_stage_common.sh"
-stage_wait; stage_start e31
+stage_wait || stage_refused e31
+stage_start e31
 export CROSSOVER_ARMS=attention,attention_untied,attention_novr,attention_untied_novr
 export CROSSOVER_JOB_PREFIX=cx32tie
 python3 -u -m nanolab.crossover_replicate launch --out nanolab/out/crossover50m_tie32 --workers 3

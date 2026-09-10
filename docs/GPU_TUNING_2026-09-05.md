@@ -293,6 +293,30 @@ setting. This is the one place tenancy changes what a job *trains on* rather tha
 merely how it is scheduled, and it fails silently: the fallback needs *less* VRAM, so it converts an OOM into a run that
 looks fine and trains on different tokens.
 
+> **UPDATE 2026-09-10 — it stopped failing silently, after it cost something.**
+>
+> The exact threshold: `should_gpu_resident` returns True unconditionally only below
+> `_GPU_RESIDENT_MAX_TOKENS` (150M). This repo's train split is **497.5M tokens**, so the
+> branch that actually runs requires `1.85 GiB < 0.2 x free` — **free > 9.27 GiB** at
+> construction. Under that, the memmap path samples with a **CPU** generator where the
+> resident path uses a **CUDA** one: same seed, different tokens.
+>
+> On 2026-09-09 a stage-chaining fault (`stage_wait` timing out and starting anyway) put
+> four boards on one device at once, and **nothing on disk could say which path any run
+> had taken**. Nine completed runs became unreadable — not wrong, unreadable, which is
+> worse to discover late.
+>
+> `Logger.banner(sampler=...)` now writes `"sampler"` into every run's `start` record:
+> `gpu_resident`, `memmap`, or `"unknown"`. The third value is the point — a run whose
+> path cannot be established must not look like one that took the fast path. Covered by
+> `every_run_records_which_sampler_path_it_took`.
+>
+> Note what throughput does **not** buy you here: `mean_tok_s` separates solo from
+> co-resident, but a degraded rate is equally consistent with either path, so it can clear
+> a run (a cohort-topping rate means it ran alone and resident) and can never condemn one.
+> The decisive test is determinism — rerun at the same seed and compare against the
+> 0.0031 floor.
+
 ### 5. Two knobs that are simply mis-set for a 94 GiB card
 
 **Fused cross-entropy.** `crossover50m` sets `fused_ce=True, fused_ce_chunks=16`,
@@ -509,6 +533,19 @@ The repair the handoff prescribes is right, and the measurement now says *why*:
 * The attention half must stay at `workers: 2`, because `crossover_ladder1536`
   records that and the recipe is locked. That costs ~9% against serial for a
   saturating arm, which is a price already paid, not a new decision.
+
+  > **Note 2026-09-09: this prescription is no longer executable, and the conclusion
+  > is that the board cannot be grown at all.** Tried on 2026-09-09 (stage G8c): the
+  > VRAM guard refuses `--workers 2` at this shape -- "attention d_model=1536
+  > batch=32 at 40.2 GiB, so 2 of them need 80.4 GiB of a 94.5 GiB device (85%)".
+  > The guard postdates those runs, which is why they exist. Dropping to
+  > `--workers 1` is not available either, for the reason the bullet above gives:
+  > `lock_recipe` refuses a tenancy change. So new w1536 attention work needs a NEW
+  > directory at `workers: 1`, exactly as the minGRU half already does -- the
+  > asymmetry this bullet describes is gone and both halves are now in the same
+  > position. Note also that `lock_recipe` runs BEFORE the guard, so a refused launch
+  > still leaves a stub `recipe.json` recording the tenancy it was refused at; delete
+  > it before retrying, after checking it holds no run directories.
 * The orphaned `running` jobs must be reset to `pending` before any relaunch:
   `claim_job` only claims `pending`, so they are invisible to a new worker
   regardless of tenancy.
@@ -803,3 +840,24 @@ had not happened: `curl` reports the 100-continue code after a retry, so a
 successful retried PUT reads as `100`. All 49 objects were re-checked
 byte-for-byte against their on-box sizes afterwards, and that check — not the
 log — is what establishes the archive is complete.
+
+---
+
+## Per-family throughput at w768, tenancy 3 (measured 2026-09-10)
+
+The 50M family probe was budgeted as "roughly the ladder again" on the assumption that
+Mamba-2, MLA and GDN cost about what attention costs. They do not, and the spread is
+large enough to change what an experiment is worth:
+
+| family | mean tok/s | MFU | one 50M run |
+|---|---|---|---|
+| MLA | 30,479 | — | ~27 min |
+| GDN | 14,685 | — | ~57 min |
+| **Mamba-2** | **10,600** | **0.9%** | **~79 min** |
+| (attention, same board) | ~30,000 | — | ~28 min |
+
+**Mamba-2 is ~3x slower than MLA on identical shape, board and tenancy**, at 0.9% MFU —
+the signature of a sequential scan with no fused kernel, not a tuning problem. An 18-arm
+probe over the three families is **~978 run-minutes, ~5.4 h at tenancy 3**, against the
+~2.5 h a uniform-cost estimate gives. Price these per family, never as a single per-arm
+rate.

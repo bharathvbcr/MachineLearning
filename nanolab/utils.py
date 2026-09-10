@@ -73,7 +73,18 @@ class Logger:
         if self.wandb:
             self.wandb.log(record)
 
-    def banner(self, model):
+    def banner(self, model, sampler=None):
+        """`sampler` is "gpu_resident" or "memmap" -- which path Batcher took.
+
+        It is recorded because it is not a setting. Above 150M tokens the choice
+        turns on free VRAM at construction time (`data.should_gpu_resident`), so
+        a co-resident worker can flip it, and the two paths draw their windows
+        from different RNG streams -- a CUDA generator on one, a CPU generator on
+        the other. The fallback needs *less* VRAM, so it turns an OOM into a run
+        that finishes, looks ordinary, and trained on different tokens. On
+        2026-09-09 a stage cascade put four boards under memory pressure at once
+        and nothing on disk could say which path any of those runs had taken.
+        """
         n = model.num_params(non_embedding=False)
         nemb = model.num_params(non_embedding=True)
         print("=" * 70)
@@ -89,7 +100,11 @@ class Logger:
         print(f"  tokens/step: {format_count(self.cfg.tokens_per_step)}  "
               f"(bs{self.cfg.batch_size} x ga{self.cfg.grad_accum} x ctx{self.cfg.block_size})")
         print("=" * 70)
-        self._emit({"event": "start", "params": n, "params_non_embed": nemb})
+        rec = {"event": "start", "params": n, "params_non_embed": nemb}
+        if sampler is not None:
+            print(f"  sampler    : {sampler}")
+            rec["sampler"] = sampler
+        self._emit(rec)
 
     def info(self, msg):
         print(f"  [info] {msg}")
