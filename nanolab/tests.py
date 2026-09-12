@@ -5196,6 +5196,14 @@ def a_queue_entry_that_vouches_for_a_run_that_is_not_there_is_requeued():
     for k in ("worker", "detail"):
         assert k not in after["died_midway"] and k not in after["claims_done"], (
             "stale execution metadata was left on a requeued job")
+    # Requeueing must not cost the diagnosis. `crossover_probe50m_w1920` is the
+    # case: its OOM lives in the queue's `detail` and nowhere else -- the run
+    # directory holds a `start`, one `train` line, and no worker log survived --
+    # so a requeue that drops the field trades one kind of lost work for another.
+    assert after["died_midway"].get("last_failure") == "OOM", (
+        "the reason the job died was destroyed by requeueing it")
+    assert "last_failure" not in after["really_done"], (
+        "a job that was never requeued must not grow a failure record")
 
 
 @test

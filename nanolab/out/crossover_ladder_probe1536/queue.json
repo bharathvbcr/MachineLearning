@@ -59,11 +59,8 @@
       "layer_mixers": "",
       "seed": 1337,
       "note": "E21 ladder: d_model 1536, LR x4.0",
-      "status": "failed",
-      "worker": 1,
-      "started": 1788587225.1761053,
-      "finished": 1788587232.602777,
-      "detail": "OutOfMemoryError: CUDA out of memory. Tried to allocate 148.00 MiB. GPU 0 has a total capacity of 94.50 GiB of which 35.38 MiB is free. Including non-PyTorch memory, this process has 45.90 GiB memory in use. Process 110912 has 48.42 GiB memory in use. Of the allocated memory 43.68 GiB is allocated by PyTorch, and 1.47 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)"
+      "status": "pending",
+      "last_failure": "OutOfMemoryError: CUDA out of memory. Tried to allocate 148.00 MiB. GPU 0 has a total capacity of 94.50 GiB of which 35.38 MiB is free. Including non-PyTorch memory, this process has 45.90 GiB memory in use. Process 110912 has 48.42 GiB memory in use. Of the allocated memory 43.68 GiB is allocated by PyTorch, and 1.47 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)"
     },
     {
       "id": "cx32lad1536p_w1536_mingru_lr80_s1337",
@@ -72,11 +69,8 @@
       "layer_mixers": "",
       "seed": 1337,
       "note": "E21 ladder: d_model 1536, LR x8.0",
-      "status": "failed",
-      "worker": 1,
-      "started": 1788587232.6275399,
-      "finished": 1788587239.9924812,
-      "detail": "OutOfMemoryError: CUDA out of memory. Tried to allocate 198.00 MiB. GPU 0 has a total capacity of 94.50 GiB of which 35.75 MiB is free. Including non-PyTorch memory, this process has 45.90 GiB memory in use. Process 110912 has 48.42 GiB memory in use. Of the allocated memory 43.39 GiB is allocated by PyTorch, and 1.75 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)"
+      "status": "pending",
+      "last_failure": "OutOfMemoryError: CUDA out of memory. Tried to allocate 198.00 MiB. GPU 0 has a total capacity of 94.50 GiB of which 35.75 MiB is free. Including non-PyTorch memory, this process has 45.90 GiB memory in use. Process 110912 has 48.42 GiB memory in use. Of the allocated memory 43.39 GiB is allocated by PyTorch, and 1.75 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)"
     }
   ]
 }

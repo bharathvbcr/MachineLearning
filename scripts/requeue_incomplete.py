@@ -24,6 +24,11 @@ job is one `--hold` parked while the workers drain; it has no `done` record
 because it has not run, and releasing it here would start the very jobs the
 operator held.
 
+Requeueing keeps the failure reason, moved from `detail` to `last_failure`. The
+job stops claiming to be finished and a relaunch picks it up, but the diagnosis
+is not destroyed to get there -- for an OOM it is often the only place the
+ceiling was ever recorded.
+
 Dry-run by default; `--apply` writes. No GPU, no network.
 """
 from __future__ import annotations
@@ -80,12 +85,32 @@ def reconcile(suite: str, apply: bool) -> int:
         on_disk = has_done_record(root / jid)
         if on_disk:
             continue                      # the artifact wins; leave it alone
-        why = ("failed, no run on disk" if status == "failed"
-               else f"status {status!r} but no done record on disk")
+        # Say which of the two it actually is. "no run on disk" was printed for
+        # every failed job regardless, and it is wrong for the common case: the
+        # w1536 and w1920 OOMs each left a directory holding a `start`, one
+        # `train` line and a config. Claiming the run is absent when it is
+        # merely unfinished sends whoever reads this looking for the wrong thing.
+        why = (f"status {status!r}, " + ("started but never finished"
+                                         if (root / jid).exists()
+                                         else "no run directory on disk"))
         changed.append((jid, status, why))
+        # Why a job died is the one field here worth keeping. For the w1920
+        # OOM the queue's `detail` is the ONLY record anywhere that the run hit
+        # the VRAM ceiling -- that run directory holds a `start`, one `train`
+        # line and nothing else, and no worker log survived -- so dropping it
+        # to requeue the job trades one kind of lost work for another.
+        #
+        # It moves rather than stays, because `detail` on a live entry means
+        # "what this attempt is doing" and `_queue_failures` reads it for
+        # anything still marked `failed`; leaving it in place would keep the
+        # stale failure in the relaunch report, which is the whole defect. Under
+        # `last_failure` no code path treats it as a claim about this attempt.
+        was = job.get("detail")
         job["status"] = "pending"
         for k in ("worker", "started", "finished", "detail"):
             job.pop(k, None)
+        if was:
+            job["last_failure"] = was
 
     print(f"=== {suite}: {len(jobs)} entries, {len(changed)} to requeue ===")
     for jid, was, why in changed:
