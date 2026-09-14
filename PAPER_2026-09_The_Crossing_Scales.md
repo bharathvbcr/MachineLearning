@@ -4,6 +4,12 @@
 
 `nanolab` · Draft 2026-09-07
 
+**Audit qualification, September 13:** the [deeper audit](docs/architecture-review-2026-09-04/DEEP_AUDIT_2026-09-13.md)
+identifies unsupported noninferiority and scaling interpretations, a compile
+confound in the budget comparison, incomplete resume state, and newer long-recall
+results. These qualifications also apply to the status revisions below. This
+historical draft has not been rewritten or cleared for circulation.
+
 **Code and artifacts:** <https://github.com/bharathvbcr/MachineLearning>
 **License:** text CC BY 4.0; code and data artifacts MIT.
 **Competing interests:** none. **Funding:** none; compute self-funded on one rented

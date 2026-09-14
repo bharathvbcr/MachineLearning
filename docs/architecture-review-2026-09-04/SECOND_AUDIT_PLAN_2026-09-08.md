@@ -3,10 +3,16 @@
 **Date:** September 8, 2026. **Status:** source-audited proposal, with executed
 sampler/operator checks. No training campaign or mechanism result is reported.
 
+**Amended September 14, 2026.** The [September 13 deeper audit](DEEP_AUDIT_2026-09-13.md)
+governs current interpretation and priority. This plan remains the owner of the
+mechanism-study controls, reordered and narrowed by
+[§7](#7-amendment--september-14-2026). Four dated claims below are superseded
+there and marked in place; the controls themselves stand.
+
 This document replaces the experiment ordering and controls proposed in the
-preceding conversation. It is the current execution plan for the two mechanism
-studies. [MEMORY_UPDATE_PROTOCOL.md](MEMORY_UPDATE_PROTOCOL.md) remains the owner
-of the mathematical decomposition and oracle definitions. Existing registered
+preceding conversation. It remains the execution plan for the two mechanism
+studies, as amended in §7. [MEMORY_UPDATE_PROTOCOL.md](MEMORY_UPDATE_PROTOCOL.md)
+remains the owner of the mathematical decomposition and oracle definitions. Existing registered
 BINN waves retain their own hypotheses, thresholds, and amendments.
 
 The second audit changes the recommendation substantially: establish a valid
@@ -32,7 +38,7 @@ control or a shuffle-induced accuracy drop alone cannot identify a mechanism.
 | Full-state restoration followed by an identical deterministic read is a recovery identity. | **Analytical:** if the decoder, query, position, and every causal state are restored, the same function receives the same inputs. | Treat full restoration as an upper-bound/sanity control. Selective interventions and content-matched controls carry the mechanism claim. |
 | The proposed NanoLab state intervention is not exposed by the current GDN API. | **Verified:** [mixers.py](../../nanolab/mixers.py), lines 748–760 initializes and consumes state internally; lines 809–837 return outputs, not a reusable state. [model.py](../../nanolab/model.py), lines 329–359 has cached-window support for attention. | A trace/replay instrument and parity checks are prerequisites; “snapshot and compare” is not currently a ready-to-run GDN command. |
 | Historical MQAR records are not automatically available as trained checkpoints. | **Verified source:** [mqar_suite.py](../../nanolab/mqar_suite.py), lines 166–199 trains and returns metrics without saving weights. Local filename inventory: 33 `.pt`/`.pth`/`.safetensors` files under `nanolab/out`, zero with MQAR/recall/E28 in their paths. | Inventory and verify checkpoint provenance before promising evaluation-only experiments. The filename check is not proof that no relevant checkpoint exists elsewhere. New pilot runs must save weights and full configurations. |
-| E28 supplies a recurrence ablation, not a fully faithful published block or an automatic causal verdict. | **Verified:** both rules exist in [mixers.py](../../nanolab/mixers.py), lines 700–705; [e28_gdn_rule.sh](../../scripts/e28_gdn_rule.sh) reuses historical rows. No published-arm rows were found in the local MQAR ledgers inspected. | Run within-environment controls, distinguish rule-only from full-block fidelity, and do not read one solved seed as proof that the old rule caused all failures. Remote completion was not checked. |
+| E28 supplies a recurrence ablation, not a fully faithful published block or an automatic causal verdict. | **Verified:** both rules exist in [mixers.py](../../nanolab/mixers.py), lines 700–705; [e28_gdn_rule.sh](../../scripts/e28_gdn_rule.sh) reuses historical rows. ~~No published-arm rows were found in the local MQAR ledgers inspected.~~ **Superseded 2026-09-14:** `mqar_e28_p8` now holds four complete 15-seed arms, including both published-rule arms; see §7.1. | Run within-environment controls, distinguish rule-only from full-block fidelity, and do not read one solved seed as proof that the old rule caused all failures. Remote completion was not checked. |
 
 ## 2. BINN: separate representation learning from temporal readout
 
@@ -123,8 +129,10 @@ second dataset. Do not assume synthetic order labels describe SHD speech labels.
 
 - W29 remains a separately registered confirmation of the dropout asymmetry.
   Its [local-platform amendment](../../../BINN/results/AMENDMENT_2026-09-07_WAVE_29_RUNS_ON_THE_LOCAL_PLATFORM.md)
-  governs source/binary/platform accounting. No W29 cell path was found in the local
-  v3 directory scan; this audit does not establish live job status or launch it.
+  governs source/binary/platform accounting. ~~No W29 cell path was found in the
+  local v3 directory scan; this audit does not establish live job status or launch
+  it.~~ **Superseded 2026-09-14:** W29 completed on 2026-09-09 and all 48 cells
+  were independently recomputed by the deeper audit; see §7.1 and §7.5.
 - The [September 7 decomposition measurement](../../../BINN/results/MEASUREMENT_2026-09-07_THE_DECOMPOSITION_HAS_NO_TASK.md)
   leaves the 160-cell transfer study not evaluable on its task precondition. Do not
   repurpose a frozen-head diagnostic as a fix for that separate local-learning gate.
@@ -301,8 +309,9 @@ MQAR model, or a complete-state reset is insufficient on its own.
 - MLSystemsLab HEAD at audit: `fae1526b8b9fd198e0d91fe57dac4ee099cf449b`, with
   pre-existing uncommitted work. BINN HEAD: `a27ac7f7b1caa5698a4c5671388e1c843466a0f6`.
   Live source, not Git HEAD alone, defines the code inspected.
-- Local MQAR ledgers had zero published-arm rows in the inspected files. No remote
-  queue, provider machine, or remote checkpoint store was inspected.
+- ~~Local MQAR ledgers had zero published-arm rows in the inspected files.~~
+  **Superseded 2026-09-14:** see §7.1. No remote queue, provider machine, or
+  remote checkpoint store was inspected on September 8.
 - No new task generator, trained-model state intervention, head-fitting experiment,
   model repair, or scientific training replication was implemented or run. Those
   are the explicitly gated next steps above.
@@ -315,3 +324,197 @@ python3 docs/architecture-review-2026-09-04/evidence/second_audit_probe.py
 
 Navigation, source links, JSON validity, and scoped diff checks are recorded in
 [the validation log](evidence/SECOND_AUDIT_VALIDATION.md).
+
+## 7. Amendment — September 14, 2026
+
+**Status:** reconciliation with the [September 13 deeper audit](DEEP_AUDIT_2026-09-13.md).
+No experiment was run and no source was repaired for this amendment. Every claim
+below is either labelled from one of the two audits or was re-verified against
+live source and the current ledgers on 2026-09-14; those re-checks are marked
+**re-verified**.
+
+The deeper audit governs current interpretation and priority. This plan keeps
+ownership of the mechanism-study controls: the deeper audit cites it for the
+noninferiority controls (§1.1) and for the BINN frozen-encoder intervention (§7),
+and does not restate either. What changes here is the order the stages run in, a
+blocking prerequisite that did not exist on September 8, and four dated claims
+that newer records have overtaken.
+
+### 7.1 Superseded dated claims
+
+These were accurate when written. They are not accurate now, and they are marked
+in place at §1, §2, and §6.
+
+| September 8 claim | Current status, re-verified 2026-09-14 | Effect |
+|---|---|---|
+| "No published-arm rows were found in the local MQAR ledgers inspected" (§1, E28 row; repeated in §6) | **False now.** [`mqar_e28_p8/runs.jsonl`](../../nanolab/out/mqar_e28_p8/runs.jsonl) holds four complete 15-seed arms: `gdn` 2/15 solved, `gdn_pub` 1/15, `hybrid_gdn_periodic` 6/15, `hybrid_gdn_periodic_pub` 9/15. | N0's "first comparison uses `gdn` and `gdn_pub`" now has a within-environment baseline instead of a gap. The rule-versus-full-block fidelity caution in the same row is unaffected. |
+| "No W29 cell path was found in the local v3 directory scan" (§2, Existing BINN branches) | **Superseded.** BINN carries both `PREREG_2026-09-07_W29_…` and [`RESULT_2026-09-09_W29_THE_ASYMMETRY_HAS_ITS_OWN_BAR.md`](../../../BINN/results/RESULT_2026-09-09_W29_THE_ASYMMETRY_HAS_ITS_OWN_BAR.md). The deeper audit independently recomputed all 48 cells. | W29 is a completed registered result, not an unlocated branch. Its directional reading holds on its own platform; see §7.5 for what it does *not* establish. |
+| "33 `.pt`/`.pth`/`.safetensors` files under `nanolab/out`, zero with MQAR/recall/E28 in their paths" (§1, checkpoint row) | **Still true.** Re-counted: 33 files, zero matching. [`run_one`](../../nanolab/mqar_suite.py#L167) still returns metrics and saves no weights. | Unchanged. N0's checkpoint-capture prerequisite still blocks every evaluation-only intervention study. |
+| §5's prior-art set (Zoology, Revisiting associative recall, two activation-patching audits) | **Incomplete.** The deeper audit's §9 adds five close primary sources. | See §7.6. One of them overlaps the N-track premise directly. |
+
+### 7.2 A blocking prerequisite that did not exist on September 8
+
+The deeper audit reproduced two training-contract defects with the actual trainer
+and actual batchers, not with fixtures standing in for them. Both are upstream of
+every number this plan would produce, and neither is mentioned in §2–§4.
+
+**Re-verified against live source:**
+
+- The checkpoint payload at [`train.py:469`](../../nanolab/train.py#L469) stores
+  `model`, `step`, `cfg`, `val_loss`, `tokens_seen`, `next_step`, and optimizer
+  state. It stores no sampler state, and `train.py` contains no `get_state` /
+  `set_state` / `rng_state` call anywhere. The [`Batcher`](../../nanolab/data.py#L364)
+  owns a private generator seeded from `cfg.seed`, so a resumed batcher restarts
+  its draw sequence. The audit's fixture measured a maximum final-parameter
+  divergence of 0.0043052742 from uninterrupted training, falling to exactly 0.0
+  when both sampler states are restored externally.
+- [`train.py:357`](../../nanolab/train.py#L357) hands the *training* batcher to
+  `evaluate`, which draws from it in a loop at [`train.py:61`](../../nanolab/train.py#L61).
+  `eval_train`, `eval_iters`, and evaluation frequency therefore change the
+  training sample sequence; they are not logging settings.
+
+§4's stage table begins at "Assay validation … no training." That row must now
+also gate the trainer, not only the task: **a discovery seed is not a matched
+paired replicate until sampler state survives resume and train-evaluation draws
+are separately sourced.** §4 already requires "Keep task RNG, model RNG, and
+transformation RNG separate so equal seed labels actually yield matched data" —
+that requirement is currently unmet by the code, which September 8 did not know.
+
+This does not invalidate the existing ledgers. It means a resumed run is not
+interchangeable with an uninterrupted one, and that any pairing argument resting
+on seed labels across a resume boundary needs the repair first.
+
+### 7.3 §4's statistics cannot be computed with the current reader
+
+**Re-verified:** [`scripts/paired_board.py:45`](../../scripts/paired_board.py#L45)
+defines `T4` as the two-sided t constants for **4 degrees of freedom**, and
+`interval()` at [line 121](../../scripts/paired_board.py#L121) applies `T4` to
+`gaps` of any length. The error is exact at five seeds and wrong in both
+directions away from it:
+
+| Seeds | Correct two-sided 95% t | Applied ÷ correct | Consequence |
+|---:|---:|---:|---|
+| 3 | 4.302653 | 0.645 | Interval **too narrow**; overstates confidence |
+| 5 | 2.776445 | 1.000 | Exact — every existing five-seed interval is unaffected |
+| 12 | 2.200985 | 1.261 | Interval **too wide**; understates precision |
+| 32 | 2.039513 | 1.361 | Interval **too wide**; understates precision |
+
+Both of §4's sample sizes are hit, in opposite directions. The **discovery**
+stage specifies "three fresh paired training seeds per selected task/arm": at
+n=3 this reader would report an interval 35.5% narrower than correct — the
+deeper audit's §4 counterexample exactly. The **confirmation** stage specifies
+"a fixed seed count in 12–32": there the interval is 26–36% too wide, so a design
+powered to put a lower bound above a 3-point margin would systematically fail to
+clear it even when the effect is real.
+
+§4's power simulation is therefore not executable against the current tooling as
+written. Its margins (3-point superiority, 1-point noninferiority) and its
+6-point planning alternative are design choices and stand; what does not stand is
+the assumption that the repository's reader will compute them. Related, from the
+same audit section: `RECIPE_KEYS` at [line 46](../../scripts/paired_board.py#L46)
+is `batch_size, block_size, eval_iters, max_steps, lr_max_steps, lr, matrix_lr,
+warmup_steps, schedule, optimizer` — **re-verified**, and it omits compile,
+dataset, dtype, gradient accumulation, `eval_train`, and weight decay, so the
+guard does not establish a shared recipe. §4's "Freeze the handling of missing
+pairs before training" now also requires freezing the identity fields.
+
+### 7.4 Reordered execution
+
+September 8 presented BINN (§2) before NanoLab (§3). The deeper audit's §10
+places the BINN mechanism study third of four, and introduces a question this
+plan does not contain at all. The merged order:
+
+| Order | Work | Source | Status here |
+|---:|---|---|---|
+| 0 | Evidence contracts: sampler-state resume, independent train-evaluation sampling, full experiment identity, sample-size-aware intervals, directed crossing semantics. Regressions must fail against current behavior on real random batches. | Deeper audit priority 0 | **New and blocking.** See §7.2 and §7.3. |
+| 1 | Global-retrieval allocation: confirm attention, late 8+4, and periodic 9+3 in the same long-recall cell with full recorded recipe, then vary attention count against position, and pairs against distance, separately. | Deeper audit priority 1 | **New.** Not in this plan. Reuses existing ledgers and needs no new instrument. |
+| 2 | N0 → N1 → N2, broadened: the query-only task, the trace/replay instrument, the matched-filler contrast, and the persistent-transition factorial. | This plan §3, deeper audit priority 2 | **Retained, narrowed.** See §7.5. |
+| 3 | B0 → B1 → B2: assay validation, frozen-encoder × head, temporal intervention. | This plan §2, deeper audit priority 3 | **Retained, narrowed.** See §7.5. |
+| 4 | Scaling-paper completion: width-1152 confirmation at the selected rate, separated Adam/Muon group scaling, held-out width. | Deeper audit priority 4 | Outside this plan's scope. |
+
+The reason order 1 precedes this plan's own stages: it is the cheapest
+consequential question in the current record and it needs none of the new code
+§3 gates on. The deeper audit's §1.1 records — and the ledger **re-verifies** at
+[`mqar_e16_seq511/runs.jsonl`](../../nanolab/out/mqar_e16_seq511/runs.jsonl) —
+that at sequence 511 periodic 9+3 solves 0/10 while late 8+4 and attention each
+solve 8/10, with `mingru`, `gdn`, `swa_w64` and `swa_w64_nosink` all at 0/10 and
+`hybrid_mingru10_attn2` at 0/8 of 10 planned. A layout with the better
+language-model endpoint fails the capability assay outright. That is a larger
+and better-evidenced gap than the query-interference effect §3 was built to
+detect, and it is not identified: layout count and position are confounded, and
+the task change moves pairs, length, batch size, and vocabulary demands together.
+
+Order 1 does not replace §3. It is prior to it, and its outcome changes what §3
+should be run on: N1's "frozen checkpoint" should be a layout the allocation
+stage has shown to be informative, not one selected by CE endpoint.
+
+### 7.5 Narrowings to the retained stages
+
+**B2 needs count-matched controls, not only order controls.** §2's B2 table
+distinguishes information destruction from model limitation, and §2 defers
+count-matching to the later cue–value task. The deeper audit's §7 shows that is
+too late. **Re-verified** at
+[`shd_temporal.rs:792`](../../../BINN/binn-learn/src/shd_temporal.rs#L792): spike
+dropout is a per-spike Bernoulli keep (`rng.next_u64() % 100 >= deleted_below`)
+accumulating survivors, so at 90% deletion `E[kept | count] = 0.1 · count` and
+relative count structure survives thinning in expectation. The audit's analytical
+counterexample — equally likely classes at 100 versus 1,000 spikes, 90% thinning,
+a count-only threshold at 40 — retains approximately 0.9999999999995 expected
+accuracy. Consequence: a head that survives a thinning or shuffling manipulation
+has not thereby been shown to use order. B2 must carry a count-matched arm from
+the start, or its conclusions are confounded with count.
+
+The same section qualifies W29: the attention arm loses about 6.46 percentage
+points of absolute accuracy under thinning while its advantage over rate grows to
+0.165967. "Attention is not hurt" is not a supportable reading of that result.
+
+**N2's factorial is a component, not the frontier.** §3's four persistent
+transitions (ordinary / decay-only / delta-only / identity) remain correctly
+specified, and the algebra in §3 is unchanged. The deeper audit's §8 adds a
+constraint the factorial alone cannot answer: protecting a spanning key set
+forces `D = 0`, with the numerical sweep reaching projected-key norm below 1e−12
+at rank 12, and the preservation cost `‖e‖ / ‖p‖` is the diagnostic quantity.
+Deciding between "queries damage memory" and "this write rule cannot fit the
+association under its protection constraint" needs the preconditioned,
+covariance, and bounded-exception baselines from the audit's §9 — not the four
+in-repository transitions compared only against each other. §3's advancement
+gate ("advance to a learned write policy only if…") is unchanged but now also
+requires clearing those baselines at matched stored bytes.
+
+### 7.6 Claim boundary after the September 13 literature review
+
+§5 said a useful contribution is "a measured, specific failure and selective
+remedy that survives the controls above." That stands. What narrows is how much
+of the N-track premise is already claimed elsewhere. From the deeper audit's §9,
+reported as those papers' claims and not reproduced here:
+
+- [Memoir, July 2026](https://arxiv.org/html/2607.20792v1) studies read-only
+  pondering versus writing intermediate states into memory — the same
+  read-versus-write separation §3 was designed to test — and reports that its
+  small-model short-budget gap disappears at longer training. Query tokens and
+  latent pondering are related interventions, not identical ones, but §3's
+  "destructive questions" hypothesis is no longer an open framing.
+- [HOLA, July 2026](https://arxiv.org/abs/2607.02303) routes a bounded exact
+  cache by a committed-residual signal; [Hybrid Associative Memories, March 2026](https://arxiv.org/html/2603.22325v2)
+  pairs recurrent compression with selectively retained key–value memory. Both
+  are close baselines for anything N2 would propose as a write policy.
+- [Preconditioned DeltaNet, April 2026](https://arxiv.org/html/2604.21100v1) and
+  [Memory by Design, August 2026](https://arxiv.org/abs/2605.31163) cover
+  curvature-aware recurrence and uncertainty-steered writes respectively.
+
+The deeper audit states its search was targeted at seven close papers and does
+not certify novelty; neither does this amendment. The practical effect is that
+§3's result is publishable as a mechanism finding only with these comparisons
+included at matched state and compute, which §4's expansion row should now name
+explicitly.
+
+### 7.7 What this amendment does not change
+
+§2's B0/B1 design, §3's N0/N1 protocol and intervention algebra, §4's margins and
+its rule that an interval crossing the threshold is inconclusive, and §6's
+statement of what the September 8 probe did and did not execute. The September 8
+probe artifacts remain valid for what they checked:
+[second_audit_probe.py](evidence/second_audit_probe.py) was **re-run 2026-09-14**,
+exits 0, and reports `"status": "PASS"` with all three groups (`mqar`, `gdn`,
+`synthetic_order`) intact. The registered BINN waves keep their own hypotheses
+and thresholds, and W28's NOT MET verdict is unchanged.

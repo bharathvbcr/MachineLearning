@@ -4,6 +4,13 @@ The saved experiment snapshot is dated **2026-09-04 21:48 UTC**. It is not a liv
 campaign dashboard. These files support the [current assessment](../README.md)
 and [protocol](../MEMORY_UPDATE_PROTOCOL.md).
 
+The [September 13 deeper audit](../DEEP_AUDIT_2026-09-13.md) adds a separate
+[current-corpus probe](deep_audit_probe.py),
+[saved results and hashes](deep-audit-results-2026-09-13.json), and
+[validation log](DEEP_AUDIT_VALIDATION_2026-09-13.md). Unlike the older operator
+probes, this diagnostic also runs tiny temporary CPU training fixtures to test
+resume behavior. It does not rerun campaign training or change model source.
+
 The [September 8 second audit](../SECOND_AUDIT_PLAN_2026-09-08.md) has a separate
 [executable probe](second_audit_probe.py), [recorded results](second-audit-results.json),
 and [validation log](SECOND_AUDIT_VALIDATION.md). These check task semantics and
@@ -49,8 +56,21 @@ to overwrite an existing one. The example path must not already exist:
 python3 docs/architecture-review-2026-09-04/evidence/recompute.py --output-dir /tmp/mlsystems-fresh-architecture-review
 ```
 
-This regenerates a manifest, full recomputed JSON, and evidence tables from the
-current local records. It does not deserialize checkpoints or rerun training.
+**Current limitation, September 13:** this older command fails on the expanded
+MQAR corpus because its group identity merges repository-rule and published-rule
+GDN hybrids. Its archived output remains available. Use the new scoped audit
+below for the documented current comparisons; it is not a replacement for every
+table in the original broad inventory.
+
+```bash
+python3 docs/architecture-review-2026-09-04/evidence/deep_audit_probe.py
+# Optional: also recompute W29 from an existing sibling BINN checkout.
+python3 docs/architecture-review-2026-09-04/evidence/deep_audit_probe.py --binn-root ../BINN
+```
+
+The new probe prints JSON to stdout and requires the existing PyTorch, NumPy,
+and SciPy environment. It installs nothing. Preserve the dated saved JSON when
+recording a fresh run, and report missing external artifacts as a coverage limit.
 
 The paper's existing verification command is:
 

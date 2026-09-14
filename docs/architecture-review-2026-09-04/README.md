@@ -9,11 +9,21 @@ selecting a new memory layer.
 
 ## Reading order and authority
 
+**September 13 revision:** the [deeper audit](DEEP_AUDIT_2026-09-13.md) now governs
+current interpretation and research priorities. It recomputes newer recall and
+parameter-reduced hybrid results, reproduces resume and analysis-reader defects,
+qualifies the scaling and BINN claims, and reviews close prior art. The historical
+status notes below do not override its corrections.
+
 **September 8 revision:** the [second audit and revised experiment plan](SECOND_AUDIT_PLAN_2026-09-08.md)
-now governs the ordering and controls for the BINN and NanoLab mechanism studies.
+provides the detailed controls for the BINN and NanoLab mechanism studies.
 It corrects the frozen-substrate assumption, teacher-forced query task, state-reset
 interpretation, and missing replay/checkpoint prerequisites. The dated findings
 below remain historical evidence; the mathematical protocol remains applicable.
+Its [September 14 amendment](SECOND_AUDIT_PLAN_2026-09-08.md#7-amendment--september-14-2026)
+reconciles it with the deeper audit: the stage order changed, the evidence
+contracts became a blocking prerequisite, and four dated claims are marked
+superseded in place. Read the plan through that amendment, not around it.
 
 1. This page: current verdict, corrections, and research priorities.
 2. [Evidence review](EVIDENCE_REVIEW.md): the original broad review of MLSystemsLab
@@ -72,7 +82,8 @@ Dated additions; nothing above this section was rewritten.
   `attention_novr`, `attention_untied_novr`, `attn6_w512`, `attn6_w576`,
   `w384_hybrid_mingru8_attn4_lr40/lr80`); stage scripts `scripts/e28_gdn_rule.sh` …
   `scripts/e35_w384_ladder.sh`; `scripts/paired_board.py`; five new tests (172/172 pass).
-  The [Lambda handoff](LAMBDA_HANDOFF_2026-09-05.md) is the operating document.
+  The historical Lambda handoff was the operating document; it is no longer
+  retained at the former path in this checkout.
 - **Costs were measured, not divided.** A tuning sprint on the GH200
   (`docs/GPU_TUNING_2026-09-05.md`, on branch `claude/lambda-gh200-sept-2026-f54de2` at
   the time of writing) timed every arm at the board shape. Input 04 §5.1 priced arms by

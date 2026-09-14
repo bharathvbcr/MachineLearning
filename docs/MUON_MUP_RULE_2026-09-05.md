@@ -1,5 +1,11 @@
 # The µP learning-rate rule for Muon — measured, and it is the wrong one
 
+**Audit qualification, September 13:** the [deeper audit](architecture-review-2026-09-04/DEEP_AUDIT_2026-09-13.md#52-the-inverse-width-rate-is-an-empirical-candidate-not-an-established-law)
+recomputes the crucial three-seed interval, distinguishes an empirical joint-LR
+heuristic from optimizer-group scaling theory, and rejects the rerun maximum as
+a significance threshold. Read later claims that the law is established under
+those qualifications; the dated measurements below are preserved.
+
 Written 2026-09-05. Closes the "did the transfer land" question §8.4 leaves
 dangling, and identifies a second arm-asymmetric defect in the µP path.
 

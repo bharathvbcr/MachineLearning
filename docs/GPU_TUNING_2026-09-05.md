@@ -1,5 +1,11 @@
 # GH200 tuning sprint — 2026-09-05
 
+**Audit qualification, September 13:** the [deeper audit](architecture-review-2026-09-04/DEEP_AUDIT_2026-09-13.md#53-a-small-ce-difference-cannot-identify-a-historical-sampler)
+qualifies uses of the 5M-token rerun maximum as a universal floor or sampler
+classifier. It also verifies that train-loss evaluation advances the training
+sampler, so evaluation settings can change the optimization trajectory. The
+historical timing measurements below have not been rerun by that audit.
+
 **Question.** The E28–E35 program (`docs/architecture-review-2026-09-04/inputs/04-efficiency-reconciliation-memo.md` §7)
 was priced from elapsed times of past suites divided by their tenancy. Before
 spending ~$110 of GH200 time on it, measure the knobs that set how long it takes,

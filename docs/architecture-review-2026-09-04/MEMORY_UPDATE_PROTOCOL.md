@@ -13,6 +13,11 @@ rules. In particular, complete-state restoration is a sanity control, and the
 current teacher-forced MQAR task does not implement query-only evaluation.
 This document remains the mathematical reference.
 
+**September 13 qualification:** the [deeper audit](DEEP_AUDIT_2026-09-13.md#8-the-memory-update-oracle-is-useful-but-finite-protected-rank-is-decisive)
+adds protected-rank saturation, total-state versus per-update norm limits, witness
+storage accounting, and close prior-art comparisons. The equations below remain
+valid for their stated model; a trained, efficient, novel operator is unverified.
+
 ## Question and decomposition
 
 Determine whether a failure arises because the model never constructs the right
