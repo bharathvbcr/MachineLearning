@@ -6,8 +6,11 @@ sampler/operator checks. No training campaign or mechanism result is reported.
 **Amended September 14, 2026.** The [September 13 deeper audit](DEEP_AUDIT_2026-09-13.md)
 governs current interpretation and priority. This plan remains the owner of the
 mechanism-study controls, reordered and narrowed by
-[§7](#7-amendment--september-14-2026). Four dated claims below are superseded
-there and marked in place; the controls themselves stand.
+[§7](#7-amendment--september-14-2026). Four dated claims below are re-checked
+there: two are superseded and struck through in place, one is confirmed still
+true, and one is extended by newer literature. The controls themselves stand.
+The blocking prerequisite §7.2 and §7.3 identify was then repaired in source;
+[§7.8](#78-the-evidence-contracts-are-repaired--september-14-2026) records it.
 
 This document replaces the experiment ordering and controls proposed in the
 preceding conversation. It remains the execution plan for the two mechanism
@@ -338,12 +341,13 @@ ownership of the mechanism-study controls: the deeper audit cites it for the
 noninferiority controls (§1.1) and for the BINN frozen-encoder intervention (§7),
 and does not restate either. What changes here is the order the stages run in, a
 blocking prerequisite that did not exist on September 8, and four dated claims
-that newer records have overtaken.
+re-checked against newer records.
 
 ### 7.1 Superseded dated claims
 
-These were accurate when written. They are not accurate now, and they are marked
-in place at §1, §2, and §6.
+All four were accurate when written. The first two are not accurate now and are
+struck through in place at §1, §2, and §6; the third is re-confirmed; the fourth
+is incomplete rather than wrong.
 
 | September 8 claim | Current status, re-verified 2026-09-14 | Effect |
 |---|---|---|
@@ -426,7 +430,7 @@ plan does not contain at all. The merged order:
 
 | Order | Work | Source | Status here |
 |---:|---|---|---|
-| 0 | Evidence contracts: sampler-state resume, independent train-evaluation sampling, full experiment identity, sample-size-aware intervals, directed crossing semantics. Regressions must fail against current behavior on real random batches. | Deeper audit priority 0 | **New and blocking.** See §7.2 and §7.3. |
+| 0 | Evidence contracts: sampler-state resume, independent train-evaluation sampling, full experiment identity, sample-size-aware intervals, directed crossing semantics. Regressions must fail against current behavior on real random batches. | Deeper audit priority 0 | **Done 2026-09-14**, except the experiment-identity migration. See [§7.8](#78-the-evidence-contracts-are-repaired--september-14-2026). |
 | 1 | Global-retrieval allocation: confirm attention, late 8+4, and periodic 9+3 in the same long-recall cell with full recorded recipe, then vary attention count against position, and pairs against distance, separately. | Deeper audit priority 1 | **New.** Not in this plan. Reuses existing ledgers and needs no new instrument. |
 | 2 | N0 → N1 → N2, broadened: the query-only task, the trace/replay instrument, the matched-filler contrast, and the persistent-transition factorial. | This plan §3, deeper audit priority 2 | **Retained, narrowed.** See §7.5. |
 | 3 | B0 → B1 → B2: assay validation, frozen-encoder × head, temporal intervention. | This plan §2, deeper audit priority 3 | **Retained, narrowed.** See §7.5. |
@@ -518,3 +522,57 @@ probe artifacts remain valid for what they checked:
 exits 0, and reports `"status": "PASS"` with all three groups (`mqar`, `gdn`,
 `synthetic_order`) intact. The registered BINN waves keep their own hypotheses
 and thresholds, and W28's NOT MET verdict is unchanged.
+
+### 7.8 The evidence contracts are repaired — September 14, 2026
+
+§7.2 and §7.4 named stage 0 as blocking. It is now done, in source, with tests.
+This section records what changed; §7.2 and §7.3 above are left as written,
+because they are the diagnosis and the diagnosis was right.
+
+**Every fix ships with a test that fails against the pre-fix code.** That was
+checked mechanically, not by inspection: the repaired files were set aside, the
+pre-fix versions checked out of `HEAD`, the new tests run against them, and the
+repaired files restored. Six behavioural tests, six failures, and the same six
+pass afterwards. The suite is **202/202** (was 192/192; ten tests added).
+
+| Defect | Where | Repair |
+|---|---|---|
+| The 95/99/99.9% multipliers were the **4-dof row applied at every n** | `paired_board.interval` | New canonical owner [`nanolab/paired_stats.py`](../../nanolab/paired_stats.py) computes the quantile by inverting the Student-t tail (A&S 26.7.1, Lentz continued fraction, bisection). Exact to 5.3e−11 relative against SciPy over df 1–10⁵ and confidence 0.80–0.9999; reproduces the repository's own published df 1–30 table and all three carried constants. No new dependency. |
+| `native_funnel._t_critical_95` tabulated df 1–30 then **fell back to the normal quantile** | `nanolab/native_funnel.py` | Not in either audit — found while building the owner above. df=31 returned 1.959964 against the true 2.039513, so every interval past the table was ~3.9% too narrow, and a 32-seed confirmation design lands exactly there. Now a thin adapter over `paired_stats`. |
+| The recipe guard compared **ten fields of a hundred-odd** | `paired_board.RECIPE_KEYS` | New canonical owner [`nanolab/run_identity.py`](../../nanolab/run_identity.py) inverts the list: every `Config` field is identity unless named in an eight-entry denylist with a reason. 97 fields compared where 10 were. On the manuscript's 50M→200M width-384 pairing the old guard saw 2 differences; the new one sees 3, including `compile: False vs True` — the confound §5.4 of the deeper audit reported and the guard could not see. |
+| A field one config predates was treated as **equal to a value** | (same) | Three states, not two: `differ`, `by_design`, `unknown`. Unknown is reported, never silently matched — the board now prints `NOT CHECKED:` with the field names. Grouping fills `Config` defaults instead, which is safe here for a checkable reason and is reported too; the two callers want opposite errors and the module says why. |
+| Duplicate `(arm, seed)` directories **resolved by sort order** | `paired_board.load_arm` | Refuses, naming both directories. Four real cases in `gpu_bundle`, where the arm resolver maps several runs onto one name. |
+| A run with evaluations and **no terminal record loaded as finished** | (same) | Refuses: an unfinished run's curve is a prefix, and a prefix silently shortens every row it enters. One real case (`cx32p1920_w1920_attention_lr025_s1337`, 33 evaluations, no `done`). |
+| **Two terminal records** resolved by reading the last line | (same) | Refuses. Not in either audit; found while separating "no `done`" from "no `final_val`". The deeper audit counted eight metric files with multiple terminal records. |
+| Markers snapped to **each curve's own nearest** evaluation | `paired_board.at` | `at()` is now an exact lookup that raises on a miss. Markers resolve once, on the grid every seed of both arms shares, and the row prints the token actually used plus a flag when the snap exceeds a tenth of the request. |
+| The recipe guard lived **inside `main()`** | `paired_board` | Moved to `guard()`, and `crossing_token` — the paper's headline estimator, which had no guard at all — now calls it. |
+| `abs(sep) < min_separation` let an arm that finished **far ahead** through | `crossing_token` | Directed: the reference has to end in front. Two real pairs in the corpus would otherwise print a crossing token under a banner saying the arm was overtaken — `w1152_attention_lr10` "overtaken by" `w1152_mingru_lr0667` at 1.14M from 3/3 seeds while finishing **0.2274 nats ahead**, and `attention` vs `gdn` in `crossover50m_swa32` at 1.26M from 5/5 while finishing 0.2221 ahead. Both are early warmup reversals read as the whole story. |
+| Only **upward** flips were counted, so `[−1, +1, −1]` was one clean crossing | `crossing_token.seed_crossing` | The difference must stay non-negative after the last crossing. A reversal *before* the recovery stays allowed — that is the common warmup case; a reversal *after* it means there was no sustained overtake. The deeper audit's `[1,3,1]` vs `[2,2,2]` counterexample is now a test. |
+| A five-entry t table that **raised "add it"** at any other sample size | (same) | Reads `paired_stats`. Loud, but it meant the headline estimator could not run at an unanticipated seed count. |
+| A cell was `(d_model, layer_mixers)`, so **different architectures shared one** | `lr_argmin.cells` | Keyed on the full identity minus the swept axis. On the committed corpus this splits **13 cells that were collapsing more than one experiment** — five architectures in `crossover50m_loop32` (`n_layer`/`n_loops`), four window/sink variants in each SWA suite, four MoE arms in each MoE suite. 73 cells read identically and **no verdict moved**, so correct readings are untouched. Two `gpu_bundle` cells are withheld as a 2-D `matrix_lr`×`lr` grid rather than reported as a 1-D curve. |
+| Resume restored counters but **not the sampler** | `train.py`, `data.py` | `Batcher` gains `state_dict`/`load_state_dict`; the resume checkpoint carries them; resume restores them and says so in the log when it cannot. The test trains six steps straight through against six with an interruption after step 2, on the real `Batcher` over random tokens, and requires **identical final parameters**. Pre-fix that difference is ~4e−3; it is now exactly 0. |
+| `eval_train`/`eval_iters`/`eval_interval` **moved the training sample stream** | `train.py` | The train-evaluation snapshots the sampler and restores it, so those three fields are logging again rather than recipe. Test: two runs differing only in `eval_train`/`eval_iters` must end on identical weights. Pre-fix they do not. |
+| The archived inventory **died on the current corpus** | `evidence/recompute.py` | Keyed MQAR cells on the layout alone, so `gdn`/`gdn_pub` collided and the duplicate-seed check fired. Keys on the arm beside the layout now, which is what the ledger's own writer records `arm` for. It regenerates again. |
+
+**Stress coverage.** The repaired readers were driven over the whole committed
+corpus: 92 suites through `lr_argmin`, 290 (suite, arm) loads, 120 board
+pairings, 60 crossing attempts, 3,000 identity comparisons over real configs
+plus 64 adversarial junk pairs, and 2,000 t evaluations across df 1–10⁶ and
+confidence 0.5–0.9999. No crashes. Every refusal was then read individually and
+each names a real defect in the record — an unfinished run, a duplicate, a
+genuinely different budget, or an overtake that did not happen.
+
+One refusal was imprecise and was fixed: pairing a width-384 arm against a
+width-768 one refused on `n_kv_head` (6 vs 12), which is *derived* from the
+`n_head` the registry already declares. `run_identity.expand_declared` now
+propagates a declared field to the fields `Config` computes from it, so the
+refusal names the width rather than a symptom of it.
+
+**What is deliberately not done.** `recompute.py` still carries a six-entry t
+table and returns `ci95: null` outside it. That is the same defect class, but it
+already fails closed — a missing interval, not a wrong one — and the file is a
+dated evidence artifact whose archived output is the record. The **experiment-
+identity migration** is also not done: these repairs make the readers refuse an
+ambiguous grouping, they do not reconcile the 1,281 historical recall rows or
+the 30 run names carrying conflicting values. That remains the scoped decision
+§7.3 describes, and it is now the only part of stage 0 still open.

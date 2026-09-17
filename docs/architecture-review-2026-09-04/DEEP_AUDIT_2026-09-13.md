@@ -209,6 +209,12 @@ where used, optimizer/schedule state, and relevant best-checkpoint state. Test
 interrupted versus uninterrupted execution on nonconstant batches, including
 evaluation boundaries. CPU exactness here is not CUDA determinism proof.
 
+*2026-09-14:* implemented. `Batcher` carries `state_dict`/`load_state_dict`, the
+resume checkpoint stores them, and the regression trains six steps straight
+through against six with an interruption after step 2 on the real batcher over
+random tokens, requiring identical final parameters. It remains a CPU fixture,
+so the CUDA-determinism caveat above is unchanged.
+
 ### 3.2 Train-loss evaluation consumes future training samples
 
 **Verified:** [the training loop](../../nanolab/train.py#L362) gives the same
@@ -222,6 +228,12 @@ settings. The paired-reader recipe guard also omits `eval_train`.
 **Proposed repair:** use a separately seeded train-evaluation sampler or a fixed
 evaluation bank. Preserve its identity and all sampler states across resume.
 This is a training-data schedule issue, not a claim of validation-data leakage.
+
+*2026-09-14:* implemented by snapshotting the training sampler around the
+train-evaluation and restoring it, which makes the training stream bit-identical
+whatever `eval_train`, `eval_iters` and `eval_interval` are set to, and needs no
+third sampler for the injected-batcher seam. The regression requires two runs
+differing only in those fields to end on identical weights.
 
 ## 4. Analysis tools can silently change the meaning of evidence
 
@@ -259,6 +271,13 @@ architecture, optimizer, execution recipe, sampler provenance, and lineage.
 **Priority:** repair these contracts before using automatically generated tables
 as publication gates. The audit fixtures characterize failures; they do not
 deliver source fixes or claim the failing behavior is acceptable.
+
+*2026-09-14:* they were repaired, with a regression per defect verified to fail
+against the pre-fix code, plus two further defects found during the work (the
+`native_funnel` table cliff past df=30, and duplicate terminal records read by
+taking the last line). The reader tables in this section describe the behaviour
+as it stood on September 13. See
+[SECOND_AUDIT_PLAN §7.8](SECOND_AUDIT_PLAN_2026-09-08.md#78-the-evidence-contracts-are-repaired--september-14-2026).
 
 ## 5. Width and budget conclusions need narrower language
 

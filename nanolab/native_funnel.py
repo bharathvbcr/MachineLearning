@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .optimizer_funnel import BASE_LRS, MUON_FAMILY, NATIVE_BLOCKERS, write_native_plan
+from .paired_stats import student_t_critical
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -179,16 +180,6 @@ def _tuned_lrs(plan: dict[str, Any]) -> dict[str, float]:
 # runs two- and five-seed stages, where the normal quantile (1.96) understates
 # the interval badly: at df=1 the correct multiplier is 12.706, so a z-interval
 # is ~6.5x too narrow and will report separation that the sample cannot support.
-T_CRITICAL_95 = {
-    1: 12.706205, 2: 4.302653, 3: 3.182446, 4: 2.776445, 5: 2.570582,
-    6: 2.446912, 7: 2.364624, 8: 2.306004, 9: 2.262157, 10: 2.228139,
-    11: 2.200985, 12: 2.178813, 13: 2.160369, 14: 2.144787, 15: 2.131450,
-    16: 2.119905, 17: 2.109816, 18: 2.100922, 19: 2.093024, 20: 2.085963,
-    21: 2.079614, 22: 2.073873, 23: 2.068658, 24: 2.063899, 25: 2.059539,
-    26: 2.055529, 27: 2.051831, 28: 2.048407, 29: 2.045230, 30: 2.042272,
-}
-NORMAL_CRITICAL_95 = 1.959964
-
 # Below this many seeds the overlap test cannot separate candidates at all (a
 # df=1 interval spans roughly six standard errors either side), so the declared
 # systems tie breakers must not be invoked off the back of it.
@@ -196,10 +187,16 @@ MIN_SEEDS_FOR_INFORMATIVE_CI = 3
 
 
 def _t_critical_95(df: int) -> float:
-    """Two-sided 95% t multiplier; falls back to the normal quantile past df=30."""
-    if df < 1:
-        return math.inf
-    return T_CRITICAL_95.get(df, NORMAL_CRITICAL_95)
+    """Two-sided 95% t multiplier. Thin adapter over the canonical owner.
+
+    This used to be a table of df 1..30 that fell back to the NORMAL quantile
+    past its last row. That cliff was not a rounding concession: df=31 is
+    2.039513 against the normal's 1.959964, so every interval computed past the
+    table came out ~3.9% too narrow -- and a confirmation design sized at 32
+    seeds lands exactly there. ``paired_stats`` computes the quantile instead,
+    so there is no last row to fall off.
+    """
+    return student_t_critical(df, 0.95)
 
 
 def _mean_ci95(values: list[float]) -> tuple[float, float, bool]:

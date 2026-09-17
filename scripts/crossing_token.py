@@ -42,19 +42,29 @@ _spec = importlib.util.spec_from_file_location(
 paired_board = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(paired_board)
 
-T = {2: 4.302653, 3: 3.182446, 4: 2.776445, 5: 2.570582, 9: 2.262157}
+sys.path.insert(0, str(ROOT))
+from nanolab.paired_stats import student_t_critical  # noqa: E402
+
 RERUN_FLOOR = 0.0031
 
 
 def seed_crossing(arm_curve, ref_curve, marks):
-    """Tokens where (arm - ref) last turns positive: the reference overtaking.
+    """The token after which the reference is ahead AND STAYS ahead.
 
     `marks` is the intersection of the two curves' own token grids, so
-    `paired_board.at` -- which snaps to the nearest recorded eval rather than
-    interpolating -- returns each curve's exact value there. The interpolation
-    is between adjacent marks, to place the zero of the difference.
+    `paired_board.at` returns each curve's exact recorded value there. The
+    interpolation is between adjacent marks, to place the zero of the difference.
 
-    Returns (token, n_late_flips).
+    The "stays" is the part this used to get wrong. It collected every upward
+    flip and returned the last one, without ever checking that the difference
+    remained non-negative afterwards. On the difference sequence [-1, +1, -1] --
+    valid non-negative losses [1, 3, 1] against [2, 2, 2] -- it reported exactly
+    one clean crossing at 1.5 and said the arm had been overtaken, while the arm
+    finished ahead. A reversal BEFORE the recovery is a different thing and is
+    common in the real ladder (warmup), so it is counted and allowed; a reversal
+    AFTER it means there was no sustained overtake at all.
+
+    Returns (token, n_upward_flips, reversed_after).
     """
     at = paired_board.at
     diff = [at(arm_curve, t) - at(ref_curve, t) for t in marks]
@@ -62,8 +72,12 @@ def seed_crossing(arm_curve, ref_curve, marks):
     for i in range(1, len(marks)):
         if diff[i - 1] < 0 <= diff[i]:
             t0, t1, d0, d1 = marks[i - 1], marks[i], diff[i - 1], diff[i]
-            flips.append(t0 if d1 == d0 else t0 + (t1 - t0) * (-d0) / (d1 - d0))
-    return (flips[-1] if flips else None), len(flips)
+            flips.append((i, t0 if d1 == d0 else t0 + (t1 - t0) * (-d0) / (d1 - d0)))
+    if not flips:
+        return None, 0, False
+    idx, token = flips[-1]
+    reversed_after = any(d < 0 for d in diff[idx:])
+    return token, len(flips), reversed_after
 
 
 def main() -> None:
@@ -86,8 +100,14 @@ def main() -> None:
     missing = [s for s in seeds if cur[s]["final"] is None or ref[s]["final"] is None]
     if missing:
         raise SystemExit(f"seeds {missing} have no `done` record; rerun or exclude them")
+
+    # The recipe guard lived only inside `paired_board.main`, so this estimator --
+    # the paper's headline one -- read the same curves with no guard at all and
+    # could cross two arms trained on different recipes without saying so.
+    paired_board.guard(cur, ref, seeds, arm_name, ref_name, a.arm, a.ref)
+
     gaps = [cur[s]["final"] - ref[s]["final"] for s in seeds]
-    sep = statistics.mean(gaps)
+    sep = statistics.fmean(gaps)
     marks = sorted(set.intersection(
         *(set(t for t, _ in cur[s]["curve"]) for s in seeds),
         *(set(t for t, _ in ref[s]["curve"]) for s in seeds)))
@@ -96,8 +116,18 @@ def main() -> None:
     print(f"   seeds {seeds}   {len(marks)} shared markers")
     print(f"   separation at final_val: {sep:+.4f} nats "
           f"({'ref better' if sep > 0 else 'arm better'})")
-    if abs(sep) < a.min_separation:
-        print(f"   REFUSING: the arms differ by {abs(sep):.4f} < {a.min_separation} at the "
+    # Directed, not absolute. `abs(sep)` passed this guard whenever the arm
+    # finished far enough AHEAD, and the run then printed a crossing token under
+    # a banner saying the arm had been overtaken. "Overtaken" has a direction:
+    # the reference has to end in front.
+    if sep < 0:
+        print(f"   REFUSING: {a.arm} is still ahead by {-sep:.4f} nats at the end, "
+              f"so {a.ref} never overtook it.\n   A crossing token for an overtake "
+              f"that did not happen is not a small error in the estimate; it is "
+              f"the wrong quantity.")
+        raise SystemExit(3)
+    if sep < a.min_separation:
+        print(f"   REFUSING: the arms differ by {sep:.4f} < {a.min_separation} at the "
               f"end.\n   A crossing is interpolated through the difference between two "
               f"curves;\n   near zero that division is unstable and the interval is "
               f"meaningless.\n   The paper's ctx-2048 cell reads 31.94M [14.19, 49.70] "
@@ -106,9 +136,13 @@ def main() -> None:
 
     per_seed, refused = {}, []
     for s in seeds:
-        x, n = seed_crossing(cur[s]["curve"], ref[s]["curve"], marks)
+        x, n, reversed_after = seed_crossing(cur[s]["curve"], ref[s]["curve"], marks)
         if x is None:
             refused.append(f"seed {s}: no crossing on the shared markers")
+        elif reversed_after:
+            refused.append(f"seed {s}: the difference goes negative again after the "
+                           f"last crossing, so {a.arm} retakes the lead; there is no "
+                           f"sustained overtake to name")
         elif n > 1:
             refused.append(f"seed {s}: {n} crossings; which one is 'the' crossing is "
                            f"not defined")
@@ -125,12 +159,12 @@ def main() -> None:
         raise SystemExit(3)
 
     vals = [per_seed[s] for s in seeds]
-    mean = statistics.mean(vals)
+    mean = statistics.fmean(vals)
     sd = statistics.stdev(vals)
-    t = T.get(len(vals) - 1)
-    if t is None:
-        raise SystemExit(f"no t value for {len(vals) - 1} dof; add it")
-    half = t * sd / len(vals) ** 0.5
+    # This used to be a five-entry table that raised "add it" at any other
+    # sample size -- loud, but it meant the paper's headline estimator simply
+    # could not run at a seed count nobody had anticipated.
+    half = student_t_critical(len(vals) - 1, 0.95) * sd / len(vals) ** 0.5
     each = "  ".join(f"{v / 1e6:.2f}" for v in vals)
     print(f"   crossing token: {mean / 1e6:.2f}M  "
           f"95% [{(mean - half) / 1e6:.2f}, {(mean + half) / 1e6:.2f}]  "

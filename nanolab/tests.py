@@ -99,6 +99,21 @@ def _toy_model(**kw):
     return build_model(cfg), cfg
 
 
+def _load_script(name):
+    """Import a ``scripts/*.py`` CLI as a module.
+
+    They are executables rather than package members, so there is no import path
+    to them; the analysis readers still need covering, because most of what the
+    2026-09-14 evidence-contract pass repaired lives in one of them.
+    """
+    import importlib.util
+    path = pathlib.Path(__file__).resolve().parents[1] / "scripts" / (name + ".py")
+    spec = importlib.util.spec_from_file_location("_script_" + name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _batch(cfg, seed=0):
     g = torch.Generator().manual_seed(seed)
     x = torch.randint(0, cfg.vocab_size, (cfg.batch_size, cfg.block_size), generator=g)
@@ -1107,8 +1122,28 @@ def native_funnel_ci95_uses_student_t_not_the_normal_quantile():
     assert abs(half_width - 0.12706205) < 1e-6, half_width
     assert abs(_t_critical_95(1) - 12.706205) < 1e-6
     assert abs(_t_critical_95(4) - 2.776445) < 1e-6
-    # Past the tabulated range the normal quantile is the documented fallback.
-    assert abs(_t_critical_95(500) - 1.959964) < 1e-6
+    # This line used to assert the opposite of the test's own name: past df=30
+    # the helper fell back to the NORMAL quantile, so it asserted
+    # `_t_critical_95(500) == 1.959964`. That was the table's last row talking,
+    # not statistics -- the true value is 1.964720, and the error is far worse
+    # just past the cliff (df=31 is 2.039513, ~3.9% above the normal), which is
+    # precisely where a 32-seed confirmation design lands. The quantile is now
+    # computed, so there is no last row.
+    assert abs(_t_critical_95(500) - 1.964720) < 1e-6
+    assert abs(_t_critical_95(31) - 2.039513) < 1e-6
+    # The published df 1..30 table the helper used to BE, kept here as an
+    # independent reference: an implementation and its fixture must not be the
+    # same object.
+    published = {
+        1: 12.706205, 2: 4.302653, 3: 3.182446, 4: 2.776445, 5: 2.570582,
+        6: 2.446912, 7: 2.364624, 8: 2.306004, 9: 2.262157, 10: 2.228139,
+        11: 2.200985, 12: 2.178813, 13: 2.160369, 14: 2.144787, 15: 2.131450,
+        16: 2.119905, 17: 2.109816, 18: 2.100922, 19: 2.093024, 20: 2.085963,
+        21: 2.079614, 22: 2.073873, 23: 2.068658, 24: 2.063899, 25: 2.059539,
+        26: 2.055529, 27: 2.051831, 28: 2.048407, 29: 2.045230, 30: 2.042272,
+    }
+    for dof, want in published.items():
+        assert abs(_t_critical_95(dof) - want) < 1e-6, (dof, _t_critical_95(dof), want)
 
 
 @test
@@ -5726,6 +5761,357 @@ def a_planned_arm_that_duplicates_one_already_on_the_board_reuses_it():
     # An unregistered name passes through rather than raising.
     assert mod.canonical("not_an_arm", board) == "not_an_arm"
 
+
+
+
+# ---------------------------------------------------------------------------
+# Evidence contracts (2026-09-14).
+#
+# Ten defects across the analysis readers and the training-state contract, each
+# of which reported a number that looked like every other number. The tests
+# below are written so that each one FAILS against the code as it stood before
+# the repair -- a regression that only passes afterwards is not a regression
+# test, it is a description.
+# ---------------------------------------------------------------------------
+
+
+@test
+def the_t_multiplier_is_computed_at_the_sample_size_the_board_actually_has():
+    """`paired_board` applied the 4-dof row at every n; `native_funnel` fell off
+    its table at df=30 and used the normal quantile after that.
+
+    Both failures are silent and both point the wrong way at the sample sizes a
+    confirmation design uses. The published two-sided 95% values pin the fix.
+    """
+    from .paired_stats import student_t_critical, student_t_two_sided_sf
+
+    published = {1: 12.706205, 2: 4.302653, 3: 3.182446, 4: 2.776445,
+                 11: 2.200985, 19: 2.093024, 31: 2.039513, 499: 1.964729}
+    for dof, want in published.items():
+        got = student_t_critical(dof, 0.95)
+        assert abs(got - want) < 1e-5, f"t({dof}, 95%) = {got}, expected {want}"
+    assert abs(student_t_critical(4, 0.99) - 4.604095) < 1e-5
+    assert abs(student_t_critical(4, 0.999) - 8.610302) < 1e-5
+
+    # The old constant against the truth, at the two sample sizes the plan's
+    # discovery and confirmation stages actually use.
+    assert student_t_critical(2, 0.95) > 2.776445 * 1.5, "n=3 was ~35% too narrow"
+    assert student_t_critical(31, 0.95) < 2.776445 * 0.8, "n=32 was ~36% too wide"
+    # ...and the table cliff native_funnel used to fall off.
+    assert student_t_critical(31, 0.95) > 1.959964 * 1.03, "normal fallback at df=31"
+
+    # Monotone in both arguments, or it is not a quantile.
+    assert all(student_t_critical(d, 0.95) > student_t_critical(d + 1, 0.95)
+               for d in range(1, 200))
+    assert (student_t_critical(7, 0.90) < student_t_critical(7, 0.95)
+            < student_t_critical(7, 0.99))
+    # The tail and its inverse agree.
+    for dof in (1, 3, 7, 30, 120):
+        t = student_t_critical(dof, 0.95)
+        assert abs(student_t_two_sided_sf(t, dof) - 0.05) < 1e-9, dof
+
+
+@test
+def an_interval_that_could_not_be_computed_is_infinite_and_never_a_number():
+    from .paired_stats import paired_interval, student_t_critical
+    mean, lo, hi = paired_interval([2.42])
+    assert (mean, lo, hi) == (2.42, -math.inf, math.inf)
+    assert student_t_critical(0) == math.inf
+    # A non-finite difference poisons the mean and then prints as a number.
+    for bad in ([1.0, float("nan")], [1.0, float("inf")]):
+        try:
+            paired_interval(bad)
+            assert False, f"accepted {bad}"
+        except ValueError as e:
+            assert "non-finite" in str(e)
+
+
+@test
+def run_identity_sees_the_fields_the_ten_key_recipe_guard_could_not():
+    """The guard used to compare ten of Config's hundred-odd fields.
+
+    The manuscript's 50M->200M pairing says only the budget changes; the two
+    configs also differ on `compile`, which the old key list did not contain.
+    """
+    from .run_identity import compare, group_key, identity_fields, MISSING
+
+    old_recipe_keys = ("batch_size", "block_size", "eval_iters", "max_steps",
+                       "lr_max_steps", "lr", "matrix_lr", "warmup_steps",
+                       "schedule", "optimizer")
+    assert len(identity_fields()) > 90, len(identity_fields())
+    for k in ("compile", "dtype", "dataset", "grad_accum", "fused_ce", "tf32",
+              "weight_decay", "gdn_rule", "mingru_expand", "n_loops", "swa_window"):
+        assert k in identity_fields(), k
+        assert k not in old_recipe_keys
+
+    a = {"max_steps": 3051, "lr_max_steps": 3051, "compile": False, "lr": 6e-4}
+    b = {"max_steps": 12207, "lr_max_steps": 12207, "compile": True, "lr": 6e-4}
+    cmp = compare(a, b)
+    assert "compile" in cmp.differ, cmp.differ
+    assert cmp.differ["compile"] == (False, True)
+    assert not cmp.ok
+
+    # A field one side never recorded is UNKNOWN: not a difference, not a match.
+    cmp = compare({"gdn_rule": "published"}, {})
+    assert not cmp.differ and "gdn_rule" in cmp.unknown, cmp
+    assert cmp.unknown["gdn_rule"][1] is MISSING
+    assert cmp.ok, "unknown must not masquerade as a difference"
+
+    # Declared arm fields are waved through and reported separately.
+    cmp = compare({"gdn_rule": "published"}, {"gdn_rule": "repo"},
+                  declared=("gdn_rule",))
+    assert not cmp.differ and "gdn_rule" in cmp.by_design
+
+    # gdn vs gdn_pub share a layout string and must not share a group.
+    base = {"d_model": 768, "layer_mixers": "", "mixer": "gdn", "lr": 6e-4}
+    assert group_key(base) != group_key({**base, "gdn_rule": "published"})
+    # ...while a config that predates the flag groups with the default it was
+    # given, which is the behaviour already on disk.
+    assert group_key(base) == group_key({**base, "gdn_rule": "repo"})
+
+
+@test
+def lr_max_steps_zero_and_lr_max_steps_n_are_one_schedule_not_two():
+    """Older suites write 0 for "decay over max_steps"; newer ones write it out.
+
+    76 configs on this corpus use the old spelling. Without the normalization the
+    board's own documented example refuses itself.
+    """
+    from .run_identity import compare, normalize
+    a = {"max_steps": 3051, "lr_max_steps": 0}
+    b = {"max_steps": 3051, "lr_max_steps": 3051}
+    assert normalize(a)["lr_max_steps"] == 3051
+    assert not compare(a, b).differ, compare(a, b).differ
+
+
+@test
+def a_resume_restores_the_sample_stream_and_not_only_the_counters():
+    """The defect the constant-batch resume tests structurally could not see.
+
+    `Batcher` owns a private generator seeded from `cfg.seed`; the checkpoint
+    carried weights, optimizer state, `step` and `tokens_seen` but never the
+    sampler position, so a resumed run redrew windows it had already trained on
+    and diverged. This trains six steps straight through, then six with an
+    interruption after step 2, on the REAL `Batcher` over random tokens, and
+    requires the two to land on the same parameters.
+
+    Against the pre-fix trainer the maximum parameter difference here is ~4e-3.
+    """
+    import numpy as np
+    from . import train as T
+    from .data import Batcher
+
+    def corpus(directory):
+        rng = np.random.default_rng(0)
+        for split in ("train", "val"):
+            data = rng.integers(0, 256, size=20000, dtype=np.uint16)
+            data.tofile(Path(directory) / f"{split}.bin")
+        return Path(directory)
+
+    def run(directory, data_dir, name, steps, resume=False):
+        cfg = _cfg(out_dir=directory, run_name=name, max_steps=steps,
+                   ckpt_interval=2, eval_interval=1000, eval_iters=1,
+                   n_layer=1, d_model=32, n_head=2, head_dim=16,
+                   block_size=16, batch_size=2, optimizer="adamw", seed=1234,
+                   dropout=0.0)
+        batchers = (Batcher(data_dir, "train", cfg, "cpu"),
+                    Batcher(data_dir, "val", cfg, "cpu"))
+        if resume:
+            with _env_vars(RESUME="1"):
+                T.train(cfg, batchers=batchers)
+        else:
+            T.train(cfg, batchers=batchers)
+        blob = torch.load(Path(directory) / name / "final.pt", weights_only=False)
+        return blob["model"]
+
+    with tempfile.TemporaryDirectory() as directory:
+        data_dir = corpus(directory)
+        straight = run(directory, data_dir, "straight", 6)
+        run(directory, data_dir, "cut", 3)           # writes ckpt at step 2
+        resumed = run(directory, data_dir, "cut", 6, resume=True)
+
+    worst = max(float((straight[k] - resumed[k]).abs().max())
+                for k in straight if straight[k].is_floating_point())
+    assert worst == 0.0, (
+        f"a resumed run diverged from the uninterrupted one by {worst:.10f}; "
+        f"the sampler state is not being restored across the checkpoint")
+
+
+@test
+def turning_on_the_train_evaluation_does_not_change_what_the_model_trains_on():
+    """`evaluate` was handed the TRAINING batcher and drew `eval_iters` batches
+    from it, so `eval_train`, `eval_iters` and `eval_interval` moved the training
+    sample sequence. Three fields that read like logging settings deciding what
+    the model sees.
+
+    Against the pre-fix trainer these two runs end on different parameters.
+    """
+    import numpy as np
+    from . import train as T
+    from .data import Batcher
+
+    with tempfile.TemporaryDirectory() as directory:
+        rng = np.random.default_rng(1)
+        for split in ("train", "val"):
+            rng.integers(0, 256, size=20000, dtype=np.uint16).tofile(
+                Path(directory) / f"{split}.bin")
+        out = {}
+        for name, eval_train, eval_iters in (("off", False, 1), ("on", True, 5)):
+            cfg = _cfg(out_dir=directory, run_name=name, max_steps=6,
+                       ckpt_interval=1000, eval_interval=2, eval_iters=eval_iters,
+                       eval_train=eval_train, n_layer=1, d_model=32, n_head=2,
+                       head_dim=16, block_size=16, batch_size=2,
+                       optimizer="adamw", seed=99, dropout=0.0)
+            batchers = (Batcher(Path(directory), "train", cfg, "cpu"),
+                        Batcher(Path(directory), "val", cfg, "cpu"))
+            T.train(cfg, batchers=batchers)
+            out[name] = torch.load(Path(directory) / name / "final.pt",
+                                   weights_only=False)["model"]
+
+    worst = max(float((out["off"][k] - out["on"][k]).abs().max())
+                for k in out["off"] if out["off"][k].is_floating_point())
+    assert worst == 0.0, (
+        f"eval_train/eval_iters moved the trained weights by {worst:.10f}; the "
+        f"train evaluation is consuming the training sample stream")
+
+
+@test
+def the_board_refuses_a_duplicate_an_unfinished_run_and_a_doubled_terminal():
+    """Three ways `load_arm` used to return a number it should not have.
+
+    Duplicates resolved by sort order, a still-running run's prefix curve loaded
+    as though short, and two `done` records read by taking the last line.
+    """
+    board = _load_script("paired_board")
+
+    def suite(root, runs):
+        for name, rows, cfg in runs:
+            d = Path(root) / name
+            d.mkdir(parents=True)
+            (d / "metrics.jsonl").write_text(
+                "\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+            (d / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    evals = [{"event": "eval", "tokens": t, "val_loss": v}
+             for t, v in ((100, 3.0), (200, 2.0))]
+    done = {"event": "done", "final_val": 1.5}
+    cfg = {"seed": 42, "mixer": "attention", "layer_mixers": "", "lr": 6e-4,
+           "max_steps": 10, "batch_size": 4}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "nanolab" / "out"
+        board.ROOT = Path(tmp)
+
+        suite(root / "dup", [("a_attention_s42", evals + [done], cfg),
+                             ("b_attention_s42", evals + [done], cfg)])
+        try:
+            board.load_arm("dup", "attention")
+            assert False, "two runs for one (arm, seed) were silently resolved"
+        except SystemExit as e:
+            assert "two runs claim" in str(e), e
+
+        suite(root / "unfinished", [("a_attention_s42", evals, cfg)])
+        try:
+            board.load_arm("unfinished", "attention")
+            assert False, "a run with no terminal record was loaded as finished"
+        except SystemExit as e:
+            assert "no `done` record" in str(e), e
+
+        suite(root / "twice", [("a_attention_s42", evals + [done, done], cfg)])
+        try:
+            board.load_arm("twice", "attention")
+            assert False, "two terminal records were resolved by taking the last"
+        except SystemExit as e:
+            assert "`done` records" in str(e), e
+
+
+@test
+def a_marker_is_read_at_one_token_for_both_arms_not_nearest_per_curve():
+    """`at()` snapped each curve to its own nearest evaluation, so a value at
+    token 100 could be differenced against one at token 200."""
+    board = _load_script("paired_board")
+
+    # The exact-lookup contract: a marker that is not on the curve is an error,
+    # not a neighbour. This is what makes the shared-grid resolution load-bearing.
+    curve = [(100, 3.0), (200, 2.0)]
+    assert board.at(curve, 100) == 3.0
+    try:
+        board.at(curve, 150)
+        assert False, "at() returned a nearest neighbour for a missing marker"
+    except KeyError:
+        pass
+
+    arm = {1: {"curve": [(100, 3.0), (200, 2.0), (300, 1.0)]}}
+    ref = {1: {"curve": [(100, 9.0), (300, 1.5)]}}
+    marks = board.shared_markers((arm, [1]), (ref, [1]))
+    assert marks == [100, 300], marks
+    tok, rel = board.resolve_marker(marks, 200)
+    assert tok in (100, 300) and rel >= 0.33, (tok, rel)
+    assert rel > board.MARKER_SNAP_TOLERANCE, "a 50% snap must be flagged"
+
+
+@test
+def a_crossing_needs_the_reference_to_end_in_front_and_stay_there():
+    """Two defects that compound.
+
+    `abs(sep) < min_separation` let an arm that finished far AHEAD through the
+    guard, and `seed_crossing` counted only upward flips, so the difference
+    sequence [-1, +1, -1] -- valid losses [1,3,1] against [2,2,2] -- was reported
+    as one clean crossing under a banner saying the arm had been overtaken.
+    """
+    ct = _load_script("crossing_token")
+    marks = [100, 200, 300]
+    arm = [(100, 1.0), (200, 3.0), (300, 1.0)]
+    ref = [(100, 2.0), (200, 2.0), (300, 2.0)]
+    token, flips, reversed_after = ct.seed_crossing(arm, ref, marks)
+    assert token is not None and flips == 1, (token, flips)
+    assert reversed_after, (
+        "the difference goes negative again after the crossing and the arm "
+        "finishes ahead; that is not a sustained overtake")
+
+    # A genuine overtake: the arm leads early, the reference takes over and keeps
+    # it. Early warmup reversals BEFORE the recovery stay allowed.
+    arm = [(100, 1.0), (200, 2.0), (300, 3.0)]
+    ref = [(100, 2.0), (200, 1.5), (300, 1.0)]
+    token, flips, reversed_after = ct.seed_crossing(arm, ref, marks)
+    assert token is not None and not reversed_after, (token, flips, reversed_after)
+
+
+@test
+def an_lr_cell_is_the_whole_recipe_not_the_width_and_the_layout_string():
+    """Five architectures shared one cell on the committed corpus.
+
+    `crossover50m_loop32` holds `attention`, `attn3`, `attn6`, `looped_attn3x4`
+    and `looped_attn6x2`; all record mixer=attention with an empty layer_mixers
+    and differ only on n_layer/n_loops. The old key was (d_model, shape), so
+    whichever run sorted last became the cell's value.
+    """
+    lr = _load_script("lr_argmin")
+    evals = [{"event": "eval", "tokens": 100, "val_loss": 3.0}]
+    base = {"seed": 42, "mixer": "attention", "layer_mixers": "", "lr": 6e-4,
+            "matrix_lr": 0.025, "d_model": 768, "max_steps": 10}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "nanolab" / "out" / "s"
+        lr.ROOT = Path(tmp)
+        for name, extra, final in (
+                ("a_attention_s42", {"n_layer": 12, "n_loops": 1}, 4.21),
+                ("b_attn6_s42", {"n_layer": 6, "n_loops": 1}, 4.29),
+                ("c_looped_s42", {"n_layer": 6, "n_loops": 2}, 4.23)):
+            d = root / name
+            d.mkdir(parents=True)
+            (d / "metrics.jsonl").write_text("\n".join(json.dumps(r) for r in (
+                *evals, {"event": "done", "final_val": final})), encoding="utf-8")
+            (d / "config.json").write_text(json.dumps({**base, **extra}),
+                                           encoding="utf-8")
+        cells = lr.cells("s")
+
+    assert len(cells) == 3, f"three architectures collapsed into {len(cells)} cell(s)"
+    finals = sorted(round(v, 2) for c in cells.values()
+                    for m in c.values() for v in m.values())
+    assert finals == [4.21, 4.23, 4.29], finals
+    labels = sorted(c.label for c in cells)
+    assert all("n_layer=" in x and "n_loops=" in x for x in labels), labels
 
 def main():
     torch.set_num_threads(2)

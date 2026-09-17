@@ -154,16 +154,26 @@ def main():
             rows, problems = load_lines(path)
             groups = collections.defaultdict(list)
             for i, r in rows:
-                family = r.get('layer_mixers') or r['arm']
-                key = (family, r.get('n_pairs'), r.get('steps'),
-                       r.get('batch_size'), r.get('block_size'))
+                # `layer_mixers` is the LAYOUT, and two arms can share one:
+                # `gdn` and `gdn_pub` differ in the recurrence rule, not the
+                # layout, so keying on the layout alone put both in one cell and
+                # the duplicate-seed check below fired -- which is how this
+                # command stopped regenerating on the current corpus once
+                # `mqar_e28_p8` landed. The ledger's own writer says as much:
+                # `mqar_suite.run_one` records `arm` precisely because the mixer
+                # family collapses swa_w64, swa_w128 and swa_w64_nosink.
+                # Keeping the layout beside the arm preserves what the archived
+                # cells were keyed by; adding the arm is what separates them.
+                key = (r['arm'], r.get('layer_mixers'), r.get('n_pairs'),
+                       r.get('steps'), r.get('batch_size'), r.get('block_size'))
                 groups[key].append((i, r))
             cells = []
             for key, vals in sorted(groups.items(), key=lambda x: str(x[0])):
                 seeds = [r['seed'] for _, r in vals]
                 if len(set(seeds)) != len(seeds):
                     raise RuntimeError(f'duplicate MQAR cell seed {root}/{key}')
-                cells.append({'family_pairs_steps_batch_context': key, 'n': len(vals),
+                cells.append({'arm_layout_pairs_steps_batch_context': key,
+                              'n': len(vals),
                               'solved': sum(r['solved'] for _, r in vals),
                               'recall': estimate([r['recall'] for _, r in vals]),
                               'lines': [i for i, _ in vals]})
@@ -195,11 +205,11 @@ def main():
             time_text = f'{tm:.1f}' if tm else 'missing'
             lines.append(f'| {name} | {arm} | {stat["n"]} | {stat["mean"]:.6f} | {ci_text} | {row["params"]} | {time_text} |')
     lines += ['', '## Recall cells', '',
-              'A hybrid is identified by its full layer layout; grouping only by the base mixer would combine different architectures.', '',
-              '| Suite | Family / pairs / steps / batch / context | Solved | Median recall |', '|---|---|---:|---:|']
+              'A cell is identified by its ARM and its full layer layout. The layout alone is not enough: gdn and gdn_pub share one, differing in the recurrence rule, and grouping on the layout put both in a single cell.', '',
+              '| Suite | Arm / layout / pairs / steps / batch / context | Solved | Median recall |', '|---|---|---:|---:|']
     for name, suite in recall.items():
         for cell in suite['cells']:
-            lines.append(f'| {name} | {cell["family_pairs_steps_batch_context"]} | {cell["solved"]}/{cell["n"]} | {cell["recall"]["median"]:.6f} |')
+            lines.append(f'| {name} | {cell["arm_layout_pairs_steps_batch_context"]} | {cell["solved"]}/{cell["n"]} | {cell["recall"]["median"]:.6f} |')
     (DEST / 'evidence-tables.md').write_text('\n'.join(lines) + '\n')
     print(json.dumps({'inventory_files': len(inventory), 'unique_hashes': report['unique_content_hashes'],
                       'metrics_files': len(metric_inventory),

@@ -378,6 +378,37 @@ class Batcher:
     def __len__(self):
         return len(self.data)
 
+    def state_dict(self) -> dict:
+        """The sampler's position in its own random stream.
+
+        A checkpoint that restores weights, optimizer state, `step` and
+        `tokens_seen` but not this does not resume the run -- it starts a new
+        run from the old weights. The generator here is private and seeded once
+        from `cfg.seed`, so a fresh `Batcher` built on resume replays the SAME
+        windows the run already trained on and then diverges from the
+        uninterrupted trajectory. Measured on a six-step CPU fixture, maximum
+        final-parameter divergence 0.0043052742; restoring this state takes it
+        to exactly 0.0.
+
+        `device` travels with the state because a CUDA generator's state cannot
+        be loaded into a CPU one: the mismatch has to be detectable on load
+        rather than raise something opaque from torch.
+        """
+        return {"gen": self.gen.get_state(),
+                "device": "cuda" if self.gpu_resident else "cpu"}
+
+    def load_state_dict(self, state: dict) -> None:
+        want = "cuda" if self.gpu_resident else "cpu"
+        if state.get("device") != want:
+            raise RuntimeError(
+                f"sampler state was saved on a {state.get('device')!r} generator "
+                f"and this batcher has a {want!r} one (the GPU-resident path is "
+                f"chosen by dataset size and free VRAM, so it can differ between "
+                f"machines). The sample stream cannot be resumed across that "
+                f"change; rerun rather than resume, or resume on a host that "
+                f"takes the same path.")
+        self.gen.set_state(state["gen"])
+
     def batch(self, block_size=None, frontier=1.0):
         """``block_size`` overrides the default (sequence-length curriculum, §3).
         ``frontier`` (0..1] limits sampling to the first fraction of the corpus —

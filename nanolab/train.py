@@ -164,12 +164,14 @@ def train(cfg, overfit: int = 0, batchers=None):
     # ---- data (guide §3) ----
     if batchers is not None:
         train_batcher, val_batcher = batchers
+        _batchers = {"train": train_batcher, "val": val_batcher}
     else:
         data_dir, vocab_size, _ = get_dataset(cfg)
         if cfg.vocab_size == 0:       # char datasets set vocab dynamically
             cfg.vocab_size = vocab_size
         train_batcher = Batcher(data_dir, "train", cfg, device, overfit=overfit)
         val_batcher = Batcher(data_dir, "val", cfg, device)
+        _batchers = {"train": train_batcher, "val": val_batcher}
 
     # ---- model (guide §2) ----
     model = build_model(cfg).to(device)
@@ -270,7 +272,18 @@ def train(cfg, overfit: int = 0, batchers=None):
             start_tokens = _tokens_through(cfg, start_step)
             log.info(f"checkpoint predates tokens_seen; reconstructed "
                      f"{start_tokens} tokens from the step schedule")
-        log.info(f"resumed from step {start_step}")
+        # The sampler has to resume with the step and token counters. Until
+        # 2026-09-14 it did not: `Batcher` owns a private generator seeded from
+        # `cfg.seed` (data.py), the checkpoint never carried its state, and a
+        # resumed run therefore redrew the windows it had already trained on
+        # and diverged from the uninterrupted trajectory -- 0.0043052742 of
+        # maximum final-parameter difference on the six-step CPU fixture, and
+        # exactly 0.0 once both sampler states are restored. The existing
+        # counter-continuity tests could not see it because they train on
+        # constant batches, where the stream does not matter.
+        samplers_restored = _restore_samplers(_batchers, state.get("samplers"), log)
+        log.info(f"resumed from step {start_step}"
+                 + ("" if samplers_restored else " (sample stream NOT reproduced)"))
     elif cfg.init_ckpt:
         state = torch.load(cfg.init_ckpt, map_location=device, weights_only=False)
         raw = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -281,6 +294,7 @@ def train(cfg, overfit: int = 0, batchers=None):
         else model._orig_mod.flops_per_token()
     best_val = math.inf
     t0 = time.time()
+    _warned_eval_train = False
     tokens_seen = start_tokens
     lr_free = is_lr_free(cfg)            # Schedule-Free / Prodigy set their own LR
     is_sophia = cfg.optimizer == "sophia"
@@ -353,8 +367,29 @@ def train(cfg, overfit: int = 0, batchers=None):
             val = evaluate(model, val_batcher, cfg, autocast, optimizers)
             extra = {}
             if cfg.eval_train:
+                # `evaluate` draws `eval_iters` batches from whatever batcher it
+                # is given, and this one is the TRAINING batcher. So turning
+                # `eval_train` on, or changing `eval_iters` or `eval_interval`,
+                # used to move the training sample sequence -- three fields that
+                # read like logging settings quietly deciding what the model
+                # trains on, and two runs differing only in them were not
+                # comparable. Snapshot the sampler, evaluate, put it back: the
+                # training stream is then bit-identical whatever these are set
+                # to. The evaluation still draws honest i.i.d. windows from the
+                # train split; they are simply the same windows training goes on
+                # to use, which biases nothing.
+                can_snapshot = hasattr(train_batcher, "state_dict")
+                before = train_batcher.state_dict() if can_snapshot else None
                 extra["train_loss"] = evaluate(
                     model, train_batcher, cfg, autocast, optimizers)
+                if can_snapshot:
+                    train_batcher.load_state_dict(before)
+                elif not _warned_eval_train:
+                    _warned_eval_train = True
+                    log.info("eval_train is on and this train batcher cannot "
+                             "snapshot its sampler, so the evaluation consumes "
+                             "training samples: eval_iters and eval_interval "
+                             "are part of this run's recipe, not logging.")
             if getattr(schedule, "reactive", False):
                 schedule.observe(val)          # ReduceLROnPlateau
             if cfg.tokenizer == "char":        # char models: bits-per-char (§3)
@@ -381,7 +416,8 @@ def train(cfg, overfit: int = 0, batchers=None):
             # step+1: this update has been applied, so the resume point is the
             # next one. tokens_seen matches -- it already includes this step.
             _save(ckpt, model, optimizers, step, cfg, best_val,
-                  tokens_seen=tokens_seen, next_step=step + 1)   # full: resume
+                  tokens_seen=tokens_seen, next_step=step + 1,   # full: resume
+                  samplers=_sampler_states(_batchers))
 
     # ---- final eval ----
     val = evaluate(model, val_batcher, cfg, autocast, optimizers)
@@ -452,8 +488,46 @@ def _tokens_through(cfg, n_steps):
                for s in range(n_steps))
 
 
+def _sampler_states(batchers) -> dict:
+    """{name: state} for every batcher that can say where it is in its stream.
+
+    A batcher that cannot is recorded as ``None`` rather than omitted, so a
+    resume can tell "this run had no sampler state to save" apart from "this
+    checkpoint predates the field". The injected batchers the MQAR seam and the
+    tests pass are the former.
+    """
+    return {name: (b.state_dict() if hasattr(b, "state_dict") else None)
+            for name, b in batchers.items()}
+
+
+def _restore_samplers(batchers, saved, log) -> bool:
+    """Put each batcher back where it was. True only if every one was restored."""
+    if saved is None:
+        log.info("checkpoint predates sampler state: the resumed run draws a FRESH "
+                 "sample stream, so its trajectory will not match an uninterrupted "
+                 "run of the same seed. Loss tables from before the resume stand; "
+                 "anything pairing this run against another by seed does not.")
+        return False
+    ok = True
+    for name, b in batchers.items():
+        state = saved.get(name)
+        if state is None:
+            if hasattr(b, "state_dict"):
+                log.info(f"no saved sampler state for {name!r}; it resumes from a "
+                         f"fresh stream")
+                ok = False
+            continue
+        if not hasattr(b, "load_state_dict"):
+            log.info(f"saved sampler state for {name!r} but this batcher cannot "
+                     f"load one; it resumes from a fresh stream")
+            ok = False
+            continue
+        b.load_state_dict(state)
+    return ok
+
+
 def _save(path, model, optimizers, step, cfg, val, light=False, tokens_seen=None,
-          next_step=None):
+          next_step=None, samplers=None):
     """Save a checkpoint. ``light=True`` (best.pt / final.pt) stores weights
     only — for inference; ``light=False`` (resume ckpt) also stores optimizer
     state. Optimizer state (Muon momentum + Adam m/v) roughly doubles the file,
@@ -473,6 +547,11 @@ def _save(path, model, optimizers, step, cfg, val, light=False, tokens_seen=None
         blob["next_step"] = next_step
     if not light:
         blob["optimizers"] = [o.state_dict() for o in optimizers]
+        # Resume checkpoints only. `best.pt` / `final.pt` are inference
+        # artifacts and are never resumed from, so a sampler position in them
+        # would be dead weight.
+        if samplers is not None:
+            blob["samplers"] = samplers
     torch.save(blob, path)
 
 
