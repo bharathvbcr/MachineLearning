@@ -559,7 +559,7 @@ impl<'a> Binder<'a> {
         self.enc.setComputePipelineState(pipeline);
     }
 
-    pub fn bind_buf(&mut self, buf: &ProtocolObject<dyn MTLBuffer>, offset: usize, index: usize) {
+    pub(crate) fn bind_buf(&mut self, buf: &ProtocolObject<dyn MTLBuffer>, offset: usize, index: usize) {
         // A raw `MTLBuffer` carries no owning `GpuBuffer`, so there is nothing
         // for the capture tape to record or to pin. Mark the tape incomplete
         // instead of letting it silently omit the operand. Invalid binds never

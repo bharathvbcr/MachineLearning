@@ -258,7 +258,7 @@ fn bump_views_read_and_write_only_their_own_window() {
         rt.ensure_bump(1 << 16).unwrap();
         let a = rt.bump_alloc_f32(&[64]).unwrap();
         let b = rt.bump_alloc_f32(&[64]).unwrap();
-        assert_ne!(a.byte_offset, b.byte_offset);
+        assert_ne!(a.byte_offset(), b.byte_offset());
         b.write_f32(&[1.0; 64]).unwrap();
         assert!(
             a.read_f32().unwrap().iter().all(|&x| x == 0.0),
@@ -271,7 +271,7 @@ fn bump_views_read_and_write_only_their_own_window() {
         );
         // The whole-slab accessor still exists for callers who want it; the
         // view's window is where b's ones actually are.
-        assert_eq!(b.buffer.read_f32()[b.byte_offset / 4], 1.0);
+        assert_eq!(b.buffer.read_f32()[b.byte_offset() / 4], 1.0);
     });
 }
 
@@ -418,15 +418,20 @@ fn externally_allocated_storage_can_back_a_gemm_output() {
         let b_host = random_f32(k * n, 52);
         let expect = reference(Layout::Nn, &a_host, &b_host, m, n, k);
 
-        let bytes = (m * k + k * n + m * n) * DType::F32.size_of();
-        let arena = rt.alloc_buffer(bytes).unwrap();
+        // Pad each matrix start to a 16-byte boundary so validate_gemm's
+        // alignment gate is not what this wiring test exercises.
+        let a_elems = m * k;
+        let b_off_elems = a_elems.div_ceil(4) * 4;
+        let c_off_elems = (b_off_elems + k * n).div_ceil(4) * 4;
+        let total_elems = c_off_elems + m * n;
+        let arena = rt.alloc_buffer(total_elems * DType::F32.size_of()).unwrap();
         let a = Tensor::from_buffer(rt, arena.clone(), &[m, k], DType::F32, 0).unwrap();
         let b = Tensor::from_buffer(
             rt,
             arena.clone(),
             &[k, n],
             DType::F32,
-            m * k * DType::F32.size_of(),
+            b_off_elems * DType::F32.size_of(),
         )
         .unwrap();
         let c = Tensor::from_buffer(
@@ -434,15 +439,15 @@ fn externally_allocated_storage_can_back_a_gemm_output() {
             arena.clone(),
             &[m, n],
             DType::F32,
-            (m * k + k * n) * DType::F32.size_of(),
+            c_off_elems * DType::F32.size_of(),
         )
         .unwrap();
 
         {
             let mut host = arena.contents_f32();
-            host[..m * k].copy_from_slice(&a_host);
-            host[m * k..m * k + k * n].copy_from_slice(&b_host);
-            host[m * k + k * n..].fill(-7.0);
+            host[..a_elems].copy_from_slice(&a_host);
+            host[b_off_elems..b_off_elems + k * n].copy_from_slice(&b_host);
+            host[c_off_elems..].fill(-7.0);
         }
         gemm_f32(&a, &b, &c, GemmBackend::TensorOps).unwrap();
         rt.synchronize().unwrap();
@@ -450,15 +455,19 @@ fn externally_allocated_storage_can_back_a_gemm_output() {
         let host = arena.read_f32();
         assert_within_bound(
             "gemm into caller-owned storage",
-            &host[m * k + k * n..],
+            &host[c_off_elems..c_off_elems + m * n],
             &expect,
             k,
             0.0,
         );
         // The operands share the allocation; a kernel writing outside C's
         // window would have corrupted them.
-        assert_eq!(&host[..m * k], &a_host[..], "A was modified");
-        assert_eq!(&host[m * k..m * k + k * n], &b_host[..], "B was modified");
+        assert_eq!(&host[..a_elems], &a_host[..], "A was modified");
+        assert_eq!(
+            &host[b_off_elems..b_off_elems + k * n],
+            &b_host[..],
+            "B was modified"
+        );
     });
 }
 

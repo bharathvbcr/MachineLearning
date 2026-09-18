@@ -8,7 +8,7 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLBuffer;
+use objc2_metal::{MTLBuffer, MTLDevice, MTLResource};
 use std::sync::{Arc, Weak};
 
 use crate::runtime::{BufferKind, GpuRuntime};
@@ -71,7 +71,7 @@ impl Drop for PooledBuffer {
         // is unchanged: this only runs for the last Arc.
         let buffer = self.buffer.clone();
         match self.kind {
-            BufferKind::Hot => rt.schedule_hot_retirement(buffer),
+            BufferKind::Hot | BufferKind::External => rt.schedule_hot_retirement(buffer),
             BufferKind::Cold | BufferKind::Bump => rt.schedule_cold_recycle(buffer, self.nbytes),
         }
     }
@@ -322,10 +322,13 @@ impl GpuBuffer {
 #[derive(Clone)]
 pub struct Tensor {
     pub buffer: GpuBuffer,
-    pub shape: Vec<usize>,
+    /// Logical shape. Not publicly mutable: construct via [`Self::from_buffer`]
+    /// / allocators / [`Self::try_view`]. Read with [`Self::shape`].
+    pub(crate) shape: Vec<usize>,
     pub dtype: DType,
-    /// Byte offset into `buffer` for bank / slice views.
-    pub byte_offset: usize,
+    /// Byte offset into `buffer` for bank / slice views. Read with
+    /// [`Self::byte_offset`].
+    pub(crate) byte_offset: usize,
     pub(crate) runtime: Arc<GpuRuntime>,
 }
 
@@ -415,6 +418,16 @@ impl Tensor {
         &self.runtime
     }
 
+    /// Logical shape of this view.
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+
+    /// Byte offset into [`Self::buffer`] for this view.
+    pub fn byte_offset(&self) -> usize {
+        self.byte_offset
+    }
+
     /// Build a tensor over an existing buffer at `byte_offset`.
     ///
     /// The `runtime` field is private, so this is the only way to construct a
@@ -441,26 +454,71 @@ impl Tensor {
         Ok(t)
     }
 
+    /// Wrap a caller-owned `MTLBuffer` as a tessl [`Tensor`] without copying.
+    ///
+    /// Rejects buffers whose `device().registryID()` does not match
+    /// `runtime.device`. Tagged [`BufferKind::External`].
+    ///
+    /// Cross-crate SharedEvent handoff with sparsl (no queue merge): after
+    /// tessl commits, expose `(shared_event(), last_signaled_value())`; sparsl
+    /// waits before reading the shared buffer, then signals for tessl reuse.
+    pub fn from_mtl_buffer(
+        runtime: &Arc<GpuRuntime>,
+        buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        shape: &[usize],
+        dtype: DType,
+        byte_offset: usize,
+    ) -> Result<Tensor, String> {
+        if buffer.device().registryID() != runtime.device.registryID() {
+            return Err(
+                "MTLBuffer device registryID does not match GpuRuntime device".into(),
+            );
+        }
+        let nbytes = buffer.length() as usize;
+        let weak = runtime.weak_handle();
+        runtime.register_residency(&buffer);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let gpu_buf = GpuBuffer {
+            inner: Arc::new(PooledBuffer {
+                buffer,
+                nbytes,
+                kind: BufferKind::External,
+                runtime: weak,
+            }),
+        };
+        Self::from_buffer(runtime, gpu_buf, shape, dtype, byte_offset)
+    }
+
     /// View into the same buffer at an element offset (same dtype).
+    ///
+    /// Panics on overflow or out-of-bounds — the historical contract. Prefer
+    /// [`Self::try_view`] at fallible boundaries.
     pub fn view(&self, shape: &[usize], elem_offset: usize) -> Tensor {
-        self.validate().expect("invalid source view");
-        let nbytes = checked_nbytes(shape, self.dtype).expect("view size overflow");
+        self.try_view(shape, elem_offset)
+            .expect("Tensor::view: invalid source, size overflow, or out of bounds")
+    }
+
+    /// Fallible view into the same buffer at an element offset (same dtype).
+    pub fn try_view(&self, shape: &[usize], elem_offset: usize) -> Result<Tensor, String> {
+        self.validate()?;
+        let nbytes = checked_nbytes(shape, self.dtype)?;
         let off = elem_offset
             .checked_mul(self.dtype.size_of())
             .and_then(|off| self.byte_offset.checked_add(off))
-            .expect("view offset overflow");
-        assert!(
-            off.checked_add(nbytes)
-                .is_some_and(|end| end <= self.buffer.nbytes()),
-            "view out of bounds"
-        );
-        Tensor {
+            .ok_or_else(|| "view offset overflow".to_string())?;
+        let end = off
+            .checked_add(nbytes)
+            .ok_or_else(|| "view size overflow".to_string())?;
+        if end > self.buffer.nbytes() {
+            return Err("view out of bounds".into());
+        }
+        Ok(Tensor {
             buffer: self.buffer.clone(),
             shape: shape.to_vec(),
             dtype: self.dtype,
             byte_offset: off,
             runtime: Arc::clone(&self.runtime),
-        }
+        })
     }
 
     /// Validate public metadata before passing a view to a GPU kernel.
@@ -702,6 +760,22 @@ mod contract_tests {
         let rt = GpuRuntime::new().unwrap();
         let t = rt.alloc_tensor_f32(&[4]).unwrap();
         let _ = t.view(&[1], usize::MAX / 4 + 1);
+    }
+
+    #[test]
+    fn try_view_returns_err_instead_of_panicking() {
+        let rt = GpuRuntime::new().unwrap();
+        let t = rt.alloc_tensor_f32(&[4]).unwrap();
+        let err = t
+            .try_view(&[1], usize::MAX / 4 + 1)
+            .expect_err("overflowing view must Err");
+        assert!(
+            err.contains("overflow") || err.contains("bounds"),
+            "{err}"
+        );
+        let ok = t.try_view(&[2], 1).expect("in-bounds view");
+        assert_eq!(ok.shape, vec![2]);
+        assert_eq!(ok.byte_offset, 4);
     }
 }
 #[cfg(test)]

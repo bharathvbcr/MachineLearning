@@ -13,14 +13,20 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{random_f32, with_gpu};
+use common::{random_f32, round_trip_bf16, tensor_bf16, with_gpu};
 use tessl::gemm::{gemm, gemm_batched, BatchStrides, BatchedGemm, GemmBackend};
-use tessl::tensor::Tensor;
+use tessl::tensor::{f32_slice_to_f16, DType, Tensor};
 use tessl::GpuRuntime;
 
 fn tensor(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tensor {
     let t = rt.alloc_tensor_f32(shape).expect("alloc");
     t.buffer.write_f32(data);
+    t
+}
+
+fn tensor_f16(rt: &Arc<GpuRuntime>, shape: &[usize], data: &[f32]) -> Tensor {
+    let t = rt.alloc_tensor_f16(shape).expect("alloc_tensor_f16");
+    t.buffer.write_f16_bits(&f32_slice_to_f16(data));
     t
 }
 
@@ -71,6 +77,83 @@ fn every_batch_element_equals_a_single_gemm_bit_for_bit() {
                         batched[i * m * n + e].to_bits(),
                         single[e].to_bits(),
                         "{m}x{n}x{k} batch {i} element {e} differs from a single gemm"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Narrow operands must use the same cooperative path as the single-matrix
+/// kernels. Without this pin, a batched stride/offset bug can hide behind the
+/// f32-only suite while bf16/f16 training paths are wrong bit-for-bit.
+#[test]
+fn bf16_and_f16_batch_elements_match_single_gemm_bit_for_bit() {
+    with_gpu(|rt| {
+        let (m, n, k, batch) = (64usize, 64usize, 64usize, 3usize);
+        for narrow in ["bf16", "f16"] {
+            let a_h = random_f32(m * k * batch, 0xB16 + narrow.len() as u64);
+            let b_h = random_f32(k * n * batch, 0xF16 + narrow.len() as u64);
+            let (a, b) = match narrow {
+                "bf16" => (
+                    tensor_bf16(rt, &[batch * m, k], &round_trip_bf16(&a_h)),
+                    tensor_bf16(rt, &[batch * k, n], &round_trip_bf16(&b_h)),
+                ),
+                _ => (
+                    tensor_f16(rt, &[batch * m, k], &a_h),
+                    tensor_f16(rt, &[batch * k, n], &b_h),
+                ),
+            };
+            assert_eq!(a.dtype, b.dtype);
+            assert!(matches!(a.dtype, DType::BF16 | DType::F16));
+            let c = tensor(rt, &[batch * m, n], &vec![0.0f32; batch * m * n]);
+
+            gemm_batched(
+                &a,
+                &b,
+                &c,
+                GemmBackend::TensorOps,
+                BatchedGemm {
+                    m,
+                    n,
+                    k,
+                    batch,
+                    strides: BatchStrides::contiguous(m, n, k),
+                },
+            )
+            .unwrap_or_else(|e| panic!("{narrow} gemm_batched: {e}"));
+            rt.synchronize().unwrap();
+            let batched = c.buffer.read_f32();
+
+            for i in 0..batch {
+                let (ai, bi) = match narrow {
+                    "bf16" => (
+                        tensor_bf16(
+                            rt,
+                            &[m, k],
+                            &round_trip_bf16(&a_h[i * m * k..(i + 1) * m * k]),
+                        ),
+                        tensor_bf16(
+                            rt,
+                            &[k, n],
+                            &round_trip_bf16(&b_h[i * k * n..(i + 1) * k * n]),
+                        ),
+                    ),
+                    _ => (
+                        tensor_f16(rt, &[m, k], &a_h[i * m * k..(i + 1) * m * k]),
+                        tensor_f16(rt, &[k, n], &b_h[i * k * n..(i + 1) * k * n]),
+                    ),
+                };
+                let ci = tensor(rt, &[m, n], &vec![0.0f32; m * n]);
+                gemm(&ai, &bi, &ci, GemmBackend::TensorOps)
+                    .unwrap_or_else(|e| panic!("{narrow} gemm: {e}"));
+                rt.synchronize().unwrap();
+                let single = ci.buffer.read_f32();
+                for e in 0..m * n {
+                    assert_eq!(
+                        batched[i * m * n + e].to_bits(),
+                        single[e].to_bits(),
+                        "{narrow} {m}x{n}x{k} batch {i} element {e} differs from a single gemm"
                     );
                 }
             }

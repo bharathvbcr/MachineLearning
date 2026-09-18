@@ -88,7 +88,7 @@ pub use mtl_tensor::{
     nax_verify_readiness, NaxVerifyReadiness, QuantDType, QUANT_PREFILL_GEMM_WIRED,
 };
 pub use ops::softcap_f32;
-pub use runtime::{BufferKind, DeviceMemoryInfo, GpuRuntime, PrecisionMode};
+pub use runtime::{BufferKind, DeviceMemoryInfo, GpuRuntime, ParamsBuffer, PrecisionMode};
 pub use tensor::{DType, GpuBuffer, Tensor};
 
 /// Metallib produced by `build.rs` (absolute path baked at compile time).

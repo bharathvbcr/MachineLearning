@@ -11,7 +11,7 @@
 //! working-set probe; no host-zero mid-CB.
 
 use core::ptr::NonNull;
-use objc2::rc::Retained;
+use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::ProtocolObject;
 use objc2::ClassType;
 use objc2_foundation::{NSData, NSRange, NSString, NSURL};
@@ -60,6 +60,7 @@ pub const ARGUMENT_TABLE_MAX_BUFFERS: usize = 31;
 
 /// Residency / recycle policy for pooled buffers (Audit 4 P0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BufferKind {
     /// Mid-step temps — recycle + removeAllocation after CB complete.
     Cold,
@@ -71,6 +72,9 @@ pub enum BufferKind {
     /// slab for recycle, so it returns to the freelist once its last view has
     /// dropped and the CB that used it has completed.
     Bump,
+    /// Caller-owned `MTLBuffer` wrapped via [`crate::Tensor::from_mtl_buffer`].
+    /// Retires like [`Self::Hot`] (no freelist).
+    External,
 }
 
 /// Probed device memory budget (logged in train banner).
@@ -512,6 +516,69 @@ fn mutex_value_mut<T>(mutex: &mut Mutex<T>) -> &mut T {
 /// fn require_send<T: Send>() {}
 /// require_send::<GpuRuntime>();
 /// ```
+
+/// Persistent Hot scalar workspace (pos-buffer style). Bounded bump arena for
+/// stable GPU addresses across encodes — not a full decode ICB scalar graph.
+pub struct ParamsBuffer {
+    buffer: crate::tensor::GpuBuffer,
+    cursor: Mutex<usize>,
+    capacity: usize,
+}
+
+impl ParamsBuffer {
+    /// 4 KiB of Hot u32/f32 slots — enough for per-token dims without migrating
+    /// the full decode graph into an ICB scalar pool.
+    pub const CAPACITY_BYTES: usize = 4096;
+
+    fn new(rt: &GpuRuntime) -> Result<Self, String> {
+        let buffer = rt.alloc_buffer_kind(Self::CAPACITY_BYTES, BufferKind::Hot)?;
+        // SAFETY: freshly allocated Hot buffer; no live views or in-flight CB.
+        unsafe {
+            buffer.zero_unsubmitted();
+        }
+        Ok(Self {
+            buffer,
+            cursor: Mutex::new(0),
+            capacity: Self::CAPACITY_BYTES,
+        })
+    }
+
+    /// Reset the bump cursor (call once per step before binding scalars).
+    pub fn reset(&self) {
+        *self.cursor.lock().unwrap_or_else(|p| p.into_inner()) = 0;
+    }
+
+    /// Push a `u32`; returns byte offset into the params buffer.
+    pub fn push_u32(&self, v: u32) -> Result<usize, String> {
+        let mut cursor = self.cursor.lock().map_err(|e| e.to_string())?;
+        let offset = *cursor;
+        let next = offset
+            .checked_add(4)
+            .ok_or_else(|| "params buffer cursor overflow".to_string())?;
+        if next > self.capacity {
+            return Err(format!(
+                "params buffer exhausted (cap {} bytes)",
+                self.capacity
+            ));
+        }
+        let ptr = self.buffer.metal().contents().as_ptr() as *mut u8;
+        unsafe {
+            std::ptr::write_unaligned(ptr.add(offset) as *mut u32, v);
+        }
+        *cursor = next;
+        Ok(offset)
+    }
+
+    /// Push an `f32`; returns byte offset into the params buffer.
+    pub fn push_f32(&self, v: f32) -> Result<usize, String> {
+        self.push_u32(v.to_bits())
+    }
+
+    pub fn buffer(&self) -> &crate::tensor::GpuBuffer {
+        &self.buffer
+    }
+}
+
 pub struct GpuRuntime {
     access_busy: Arc<AtomicBool>,
     encode_failed: AtomicBool,
@@ -550,6 +617,8 @@ pub struct GpuRuntime {
     /// Retaining them here bridges last-handle drop to the next completed-work
     /// drain.
     pending_retirement: Mutex<Vec<PendingRetirement>>,
+    /// Bounded Hot params workspace for stable scalar binds (pos-buffer style).
+    params: Mutex<Option<ParamsBuffer>>,
     /// Self weak handle so Drop on pooled buffers can schedule recycle.
     /// Set exactly once in [`GpuRuntime::new`], right after the `Arc` exists;
     /// a `OnceLock` so no lock can be poisoned and no reader can observe an
@@ -633,6 +702,13 @@ impl GpuRuntime {
             }
         }
         Ok(access)
+    }
+
+    /// Test-only: apply the same poison `encode_failed` bit that a SharedEvent
+    /// wait timeout stores before returning.
+    #[cfg(test)]
+    pub fn poison_as_shared_event_timeout_for_test(&self) {
+        self.encode_failed.store(true, Ordering::Release);
     }
 
     /// Whether a batch is open or any allocator slot still has work in flight.
@@ -731,6 +807,7 @@ impl GpuRuntime {
             residency_dirty: Mutex::new(false),
             pending_cold_recycle: Mutex::new(Vec::new()),
             pending_retirement: Mutex::new(Vec::new()),
+            params: Mutex::new(None),
             self_weak: OnceLock::new(),
             memory_info: Mutex::new(mem_info),
         });
@@ -814,6 +891,20 @@ impl GpuRuntime {
         self.last_m4_stamps.lock().ok().and_then(|mut g| g.take())
     }
 
+    /// SharedEvent signaled on every Metal 4 commit (cross-crate handoff).
+    pub fn shared_event(&self) -> &ProtocolObject<dyn MTLSharedEvent> {
+        &*self.metal4.shared_event
+    }
+
+    /// Last timeline value this runtime has submitted a signal for.
+    pub fn last_signaled_value(&self) -> u64 {
+        *self
+            .metal4
+            .event_value
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Register a buffer in the Metal 4 residency set (deferred commit).
     pub(crate) fn register_residency(&self, buf: &ProtocolObject<dyn MTLBuffer>) {
         self.register_allocation(ProtocolObject::<dyn MTLAllocation>::from_ref(buf));
@@ -885,6 +976,25 @@ impl GpuRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         q.push(PendingRetirement::Buffer(buffer));
+    }
+
+    /// Lazily create the persistent params workspace.
+    pub fn params_buffer(&self) -> Result<(), String> {
+        let mut guard = self.params.lock().map_err(|e| e.to_string())?;
+        if guard.is_none() {
+            *guard = Some(ParamsBuffer::new(self)?);
+        }
+        Ok(())
+    }
+
+    /// Access the persistent params workspace, creating it on first use.
+    pub fn with_params<R>(&self, f: impl FnOnce(&ParamsBuffer) -> R) -> Result<R, String> {
+        self.params_buffer()?;
+        let guard = self.params.lock().map_err(|e| e.to_string())?;
+        let params = guard
+            .as_ref()
+            .ok_or_else(|| "params buffer missing after init".to_string())?;
+        Ok(f(params))
     }
 
     /// Retire an indirect command buffer after all submitted work has completed.
@@ -1157,6 +1267,9 @@ impl GpuRuntime {
         nbytes: usize,
         kind: BufferKind,
     ) -> Result<crate::tensor::GpuBuffer, String> {
+        if self.encode_failed.load(Ordering::Acquire) {
+            return Err("runtime is poisoned after encode/submit failure; recreate it".into());
+        }
         if kind == BufferKind::Cold {
             crate::infer_trace::on_cold_alloc();
         }
@@ -1541,6 +1654,7 @@ impl GpuRuntime {
                     let (i1, v1) = (1usize, slots[1].in_flight);
                     let (i, v) = if v0 <= v1 { (i0, v0) } else { (i1, v1) };
                     if !m4.shared_event.waitUntilSignaledValue_timeoutMS(v, 30_000) {
+                        self.encode_failed.store(true, Ordering::Release);
                         return Err("Metal 4 allocator SharedEvent wait timed out".to_string());
                     }
                     // Reset every slot that has completed (event ≥ in_flight).
@@ -1596,6 +1710,13 @@ impl GpuRuntime {
     }
 
     fn encode_into_batch_m4<F>(&self, skip_auto: Option<bool>, f: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
+    {
+        autoreleasepool(|_| self.encode_into_batch_m4_inner(skip_auto, f))
+    }
+
+    fn encode_into_batch_m4_inner<F>(&self, skip_auto: Option<bool>, f: F) -> Result<(), String>
     where
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
     {
@@ -1756,29 +1877,33 @@ impl GpuRuntime {
     where
         F: FnOnce(&mut crate::dispatch::Binder<'_>) -> Result<(), String>,
     {
-        // Encode into the async-style batch then wait (keeps timestamps + residency).
-        let was_async = *self
-            .async_encode
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !was_async {
-            *self
+        // One autorelease pool per CB commit drains transient ObjC objects from
+        // argument-table / encoder traffic that would otherwise accumulate.
+        autoreleasepool(|_| {
+            // Encode into the async-style batch then wait (keeps timestamps + residency).
+            let was_async = *self
                 .async_encode
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-        }
-        let _restore = if was_async {
-            None
-        } else {
-            Some(AsyncEncodeRestore {
-                mode: &self.async_encode,
-                value: was_async,
-            })
-        };
-        (|| {
-            self.encode_into_batch_m4(skip_auto, f)?;
-            self.commit_m4(true)
-        })()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !was_async {
+                *self
+                    .async_encode
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            }
+            let _restore = if was_async {
+                None
+            } else {
+                Some(AsyncEncodeRestore {
+                    mode: &self.async_encode,
+                    value: was_async,
+                })
+            };
+            (|| {
+                self.encode_into_batch_m4(skip_auto, f)?;
+                self.commit_m4(true)
+            })()
+        })
     }
 
     /// End encoding and commit without waiting (multi-step / low-sync path).
@@ -1913,6 +2038,7 @@ impl GpuRuntime {
                 .shared_event
                 .waitUntilSignaledValue_timeoutMS(next, 30_000)
             {
+                self.encode_failed.store(true, Ordering::Release);
                 return Err("Metal 4 SharedEvent wait timed out".to_string());
             }
             crate::infer_trace::record_sync_wait(t0);
@@ -1976,6 +2102,7 @@ impl GpuRuntime {
             .shared_event
             .waitUntilSignaledValue_timeoutMS(max_v, 30_000)
         {
+            self.encode_failed.store(true, Ordering::Release);
             return Err("Metal 4 SharedEvent wait timed out".to_string());
         }
         crate::infer_trace::record_sync_wait(t0);
@@ -2999,6 +3126,25 @@ mod audit_tests {
             "failed batch was submitted as success"
         );
     }
+
+    #[test]
+    fn shared_event_timeout_poison_rejects_further_encode_and_alloc() {
+        let rt = GpuRuntime::new().unwrap();
+        rt.poison_as_shared_event_timeout_for_test();
+        let err = rt
+            .with_binder(|_| Ok(()))
+            .expect_err("poisoned runtime must refuse encode");
+        assert!(
+            err.contains("poison"),
+            "expected poison refusal after SharedEvent-timeout latch, got {err}"
+        );
+        let alloc_err = rt.alloc_tensor_f32(&[4]).map(|_| ()).unwrap_err();
+        assert!(
+            alloc_err.contains("poison"),
+            "expected alloc refusal after SharedEvent-timeout latch, got {alloc_err}"
+        );
+    }
+
     #[test]
     fn a_failed_callback_closes_the_open_encoder_and_command_buffer() {
         let rt = GpuRuntime::new().unwrap();
